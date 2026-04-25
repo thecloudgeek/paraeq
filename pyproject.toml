@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "paraeq"
+version = "0.1.0"
+description = "Open-source headphone measurement and correction EQ"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "sounddevice>=0.4",
+    "platformdirs>=3.0",
+]
+
+[project.optional-dependencies]
+gui = [
+    "PyQt6>=6.5",
+    "pyqtgraph>=0.13",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
