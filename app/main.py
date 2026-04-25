@@ -26,6 +26,7 @@ def main():
     window = MainWindow()
 
     # First-launch setup wizard
+    selected_output_device: int | None = None
     if not SETUP_COMPLETE_FILE.exists():
         from app.setup.setup_wizard import SetupWizard
 
@@ -34,20 +35,54 @@ def main():
         if result:
             SETUP_COMPLETE_FILE.parent.mkdir(parents=True, exist_ok=True)
             SETUP_COMPLETE_FILE.touch()
-            logger.info("Setup complete file created at %s", SETUP_COMPLETE_FILE)
+            selected_output_device = wizard.selected_output_device
+            logger.info(
+                "Setup complete: output_device=%s, file=%s",
+                selected_output_device,
+                SETUP_COMPLETE_FILE,
+            )
         else:
             logger.info("Setup wizard cancelled — proceeding anyway")
 
     window.show()
 
+    # System tray
+    tray = None
     try:
         from app.menu_bar.tray import SystemTray
 
         tray = SystemTray(app, window)
+
+        # Wire bypass toggle → audio engine
+        tray.set_callbacks(
+            on_bypass_change=lambda bypassed: window.set_bypass(bypassed),
+            on_profile_select=lambda name: window.activate_profile_by_name(name),
+        )
+
+        # Populate tray with existing profiles
+        try:
+            from paraeq.profiles.profile import ProfileManager
+
+            pm = ProfileManager()
+            tray.update_profiles(pm.list_profiles())
+        except Exception as exc:
+            logger.warning("Could not populate tray profiles: %s", exc)
+
         tray.show()
         window._tray = tray  # keep reference alive
     except Exception as exc:  # pragma: no cover
         logger.warning("Could not create system tray icon: %s", exc)
+
+    # Start audio engine with the chosen output device
+    window.start_audio_engine(output_device=selected_output_device)
+
+    # Wire tray profile list to profile_activated signal
+    if tray is not None and hasattr(window, "_profiles_tab"):
+        profiles_tab = window._profiles_tab
+        if hasattr(profiles_tab, "profile_activated"):
+            profiles_tab.profile_activated.connect(
+                lambda p: tray.set_active_profile(p.name)
+            )
 
     sys.exit(app.exec())
 

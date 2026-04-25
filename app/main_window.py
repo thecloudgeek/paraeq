@@ -204,24 +204,63 @@ class MainWindow(QMainWindow):
 
     def _update_iir_processor(self, bands):
         """Forward new EQ bands to the running IIR processor."""
-        if self._audio_engine is not None and hasattr(self._audio_engine, "update_bands"):
-            self._audio_engine.update_bands(bands)
+        if self._audio_engine is None:
+            return
+        try:
+            from paraeq.correction.parametric_eq import ParametricEQ
+            from paraeq.engine.iir_processor import IIRProcessor
+
+            if bands:
+                peq = ParametricEQ(bands, 48_000)
+                sos = peq.combined_sos()
+                processor = IIRProcessor(sos)
+                self._audio_engine.set_processor(processor.process)
+                logger.info("IIR processor updated with %d bands", len(bands))
+            else:
+                self._audio_engine.set_processor(None)
+                logger.info("IIR processor cleared (no bands)")
+        except Exception as exc:
+            logger.error("Failed to update IIR processor: %s", exc)
 
     def start_audio_engine(self, output_device: int | None = None):
         """Start the real-time audio pass-through engine."""
         try:
+            from paraeq.audio.devices import find_blackhole_device
             from paraeq.audio.stream import AudioPassThrough
 
-            self._audio_engine = AudioPassThrough(output_device=output_device)
+            # Use BlackHole as the input (loopback) device if available
+            blackhole = find_blackhole_device()
+            input_device = blackhole.index if blackhole else output_device
+
+            if input_device is None or output_device is None:
+                logger.warning(
+                    "Audio engine not started: input_device=%s, output_device=%s",
+                    input_device,
+                    output_device,
+                )
+                self._status_bar.showMessage(
+                    "Audio engine not started — no devices configured"
+                )
+                return
+
+            self._audio_engine = AudioPassThrough(
+                input_device=input_device,
+                output_device=output_device,
+            )
+
+            # Wire spectrum analyzer feeds
+            if hasattr(self._analyzer_tab, "feed_pre"):
+                self._audio_engine.set_pre_callback(self._analyzer_tab.feed_pre)
+            if hasattr(self._analyzer_tab, "feed_post"):
+                self._audio_engine.set_post_callback(self._analyzer_tab.feed_post)
+
             self._audio_engine.start()
             self._status_bar.showMessage("Audio engine running")
-            logger.info("Audio engine started, output_device=%s", output_device)
-
-            # Wire analyzer feeds
-            if hasattr(self._analyzer_tab, "feed_pre"):
-                self._audio_engine.pre_callback = self._analyzer_tab.feed_pre
-            if hasattr(self._analyzer_tab, "feed_post"):
-                self._audio_engine.post_callback = self._analyzer_tab.feed_post
+            logger.info(
+                "Audio engine started: input=%s, output=%s",
+                input_device,
+                output_device,
+            )
         except Exception as exc:
             logger.error("Failed to start audio engine: %s", exc)
             self._status_bar.showMessage(f"Audio engine error: {exc}")
@@ -236,6 +275,23 @@ class MainWindow(QMainWindow):
                 logger.warning("Error stopping audio engine: %s", exc)
             self._audio_engine = None
         self._status_bar.showMessage("Audio engine stopped")
+
+    def set_bypass(self, bypassed: bool):
+        """Toggle audio engine bypass (EQ passthrough)."""
+        if self._audio_engine is not None:
+            self._audio_engine.set_bypass(bypassed)
+            logger.info("Audio engine bypass=%s", bypassed)
+        state = "bypassed" if bypassed else "active"
+        self._status_bar.showMessage(f"EQ {state}")
+
+    def activate_profile_by_name(self, name: str):
+        """Look up a profile by name and activate it."""
+        try:
+            profile = self._profile_manager.load(name)
+            self._on_profile_activated(profile)
+            logger.info("Profile activated by name: %s", name)
+        except Exception as exc:
+            logger.error("Could not load profile '%s': %s", name, exc)
 
     def closeEvent(self, event):
         self.stop_audio_engine()
