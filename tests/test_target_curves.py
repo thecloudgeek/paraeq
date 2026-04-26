@@ -93,3 +93,14 @@ def test_load_target_csv_ignores_unknown_keys_and_is_case_insensitive():
     assert curve.source is None
     # data still parses normally
     assert len(curve.frequencies) == 2
+
+
+def test_load_target_csv_no_metadata_falls_back_to_stem():
+    fixtures = Path(__file__).parent / "fixtures"
+    curve = load_target_csv(fixtures / "target_curve_no_metadata.csv")
+    assert curve.name == "target_curve_no_metadata"  # file stem
+    assert curve.category is None
+    assert curve.description is None
+    assert curve.source is None
+    assert len(curve.frequencies) == 3
+    assert curve.gains_db[2] == -6.0
