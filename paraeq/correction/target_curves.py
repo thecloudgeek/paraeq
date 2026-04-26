@@ -12,6 +12,8 @@ logger = logging.getLogger(__name__)
 
 TARGETS_DIR = Path(__file__).parent.parent.parent / "targets"
 
+_METADATA_KEYS: frozenset[str] = frozenset({"category", "description", "name", "source"})
+
 
 @dataclass
 class TargetCurve:
@@ -58,6 +60,8 @@ def load_target_csv(filepath: Path) -> TargetCurve:
     ``# key: value`` populate optional metadata on the returned curve;
     recognized keys (case-insensitive) are ``name``, ``category``,
     ``description``, ``source``. Unknown keys are silently ignored.
+    Recognized keys with an empty value (e.g., ``# source:`` with no text
+    after the colon) are treated as absent.
 
     Args:
         filepath: Path to the CSV file.
@@ -73,8 +77,7 @@ def load_target_csv(filepath: Path) -> TargetCurve:
     freqs: list[float] = []
     gains: list[float] = []
     metadata: dict[str, str] = {}
-    recognized_keys = {"name", "category", "description", "source"}
-    with open(filepath, "r") as f:
+    with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
             stripped = line.strip()
             if not stripped:
@@ -85,8 +88,9 @@ def load_target_csv(filepath: Path) -> TargetCurve:
                 if ":" in content:
                     key, _, value = content.partition(":")
                     key_lower = key.strip().lower()
-                    if key_lower in recognized_keys:
-                        metadata[key_lower] = value.strip()
+                    value_stripped = value.strip()
+                    if key_lower in _METADATA_KEYS and value_stripped:
+                        metadata[key_lower] = value_stripped
                 continue
             parts = stripped.split(",")
             freqs.append(float(parts[0]))
