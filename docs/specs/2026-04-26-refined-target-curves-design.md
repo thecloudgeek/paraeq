@@ -41,24 +41,26 @@ The data files and CSV schema are durable — they will be carried over verbatim
 
 ### Built-in curve set (6 curves)
 
-| Filename | Purpose |
-|---|---|
-| `flat.csv` | Reference (0 dB everywhere); no measurement correction beyond what the user explicitly draws |
-| `harman_ie_2019_v1.csv` | Sean Olive's earlier 2019 in-ear preference revision; gentler treble attenuation than v2 |
-| `harman_ie_2019_v2.csv` | Sean Olive's current modern in-ear preference target; the de facto IEM reference |
-| `harman_ie_2019_v2_bass_shy.csv` | Harman IE 2019 v2 with a −3 dB shelf below 200 Hz; preferred by treble-sensitive listeners and the audiophile-neutral community |
-| `harman_oe_2018.csv` | Sean Olive's current modern over-ear preference target |
-| `diffuse_field.csv` | IEC 60268-7 diffuse field; academic neutral reference |
+| Filename | Source (AutoEQ filename) | Purpose |
+|---|---|---|
+| `flat.csv` | (constructed locally) | Reference (0 dB everywhere); no measurement correction beyond what the user explicitly draws |
+| `harman_ie_2019.csv` | `Harman in-ear 2019.csv` | Sean Olive's modern in-ear preference target; the de facto IEM reference |
+| `harman_ie_2019_without_bass.csv` | `Harman in-ear 2019 without bass.csv` | Harman IE 2019 with the bass shelf removed; preferred by treble-sensitive listeners and the audiophile-neutral community |
+| `harman_oe_2018.csv` | `Harman over-ear 2018.csv` | Sean Olive's modern over-ear preference target |
+| `harman_oe_2018_without_bass.csv` | `Harman over-ear 2018 without bass.csv` | Harman OE 2018 with the bass shelf removed; treble-sensitive over-ear listeners |
+| `diffuse_field.csv` | `Diffuse field 5128.csv` | Diffuse field reference (B&K Type 5128 derivation); academic neutral reference |
 
-Approximate curves currently shipped (`harman_ie_2019.csv`, `harman_oe_2018.csv`, `diffuse_field.csv`) are deleted and replaced. The replacements use the same or close filename stems where appropriate; profile compatibility is addressed under Migration.
+The four approximate curves currently shipped (`harman_ie_2019.csv`, `harman_oe_2018.csv`, `diffuse_field.csv`, `flat.csv`) are overwritten with high-resolution AutoEQ-sourced data plus the new metadata header. Two new files are added (`harman_ie_2019_without_bass.csv`, `harman_oe_2018_without_bass.csv`).
+
+Note: the chosen variant set is symmetric with/without-bass pairs for both the modern Harman targets, sourced directly from AutoEQ. Older revisions (Harman in-ear 2016, 2017-1, 2017-2; Harman over-ear 2013, 2015) and alternative diffuse-field formulations (`Diffuse field GRAS KEMAR`, `Diffuse field ISO 11904-1`, `Diffuse field 5128 -1dB per octave`) are intentionally excluded to keep the curated set small. Users who want them can drop the AutoEQ CSVs into `targets/` directly.
 
 ### Data source: AutoEQ project
 
-All curves except `flat.csv` and `harman_ie_2019_v2_bass_shy.csv` are sourced from [github.com/jaakkopasanen/AutoEq](https://github.com/jaakkopasanen/AutoEq), MIT licensed. A specific commit hash is pinned and recorded in each CSV header. This makes the source auditable and reproducible — anyone can verify the data by checking out the same commit.
+All curves except `flat.csv` are sourced from [github.com/jaakkopasanen/AutoEq](https://github.com/jaakkopasanen/AutoEq), MIT licensed. The pinned commit at the time of authoring is `7ae0f56` (full SHA `7ae0f56d53074872b028649617a22bbb4232feb7`); this hash is recorded in each CSV header alongside the upstream filename. This makes the source auditable and reproducible — anyone can verify the data by checking out the same commit.
 
-`flat.csv` is trivially constructed (two points, both 0 dB).
+`flat.csv` is trivially constructed locally (two points, both 0 dB).
 
-`harman_ie_2019_v2_bass_shy.csv` is derived from `harman_ie_2019_v2.csv` by applying a low-shelf attenuation: `−3 dB` at and below 200 Hz, transitioning to `0 dB` by 400 Hz with a smooth log-frequency interpolation. The derivation is documented in the CSV header.
+No on-our-end curve derivation is required: the bass-attenuated variants exist upstream as their own AutoEQ files (`Harman in-ear 2019 without bass.csv`, `Harman over-ear 2018 without bass.csv`).
 
 ### CSV schema extension
 
@@ -121,13 +123,14 @@ AutoEQ target CSVs are typically log-spaced from 20 Hz to 20 kHz with ~140 contr
 ### Migration
 
 The four files shipped today have these stems:
-- `harman_ie_2019` → replaced by `harman_ie_2019_v2` (most users will have selected this expecting the modern reference)
-- `harman_oe_2018` → replaced by file of the same stem with new high-resolution data
-- `diffuse_field` → replaced by file of the same stem with new high-resolution data
-- `flat` → replaced by file of the same stem (effectively unchanged, plus metadata)
+- `flat` → overwritten with same stem (still two-point 0 dB, plus metadata header)
+- `harman_ie_2019` → overwritten with same stem (now AutoEQ high-resolution data + metadata)
+- `harman_oe_2018` → overwritten with same stem (now AutoEQ high-resolution data + metadata)
+- `diffuse_field` → overwritten with same stem (now AutoEQ high-resolution data + metadata)
 
-**Profile compatibility risk:** any saved profile referencing `harman_ie_2019` by exact filename stem will break (file no longer exists). Mitigation:
-- Profiles store target curve data as a snapshot, not by filename reference (verified in `paraeq/profiles/profile.py`). Re-check this assumption during implementation; if profiles store filename references, add a one-time alias map `{ "harman_ie_2019": "harman_ie_2019_v2" }` in the loader.
+Two new files added: `harman_ie_2019_without_bass.csv`, `harman_oe_2018_without_bass.csv`.
+
+**Profile compatibility:** verified — profiles persist the target curve name string (`paraeq/profiles/profile.py`, line 16: `target_curve_name: str = "flat"`). Because all four existing filename stems are preserved, no profile migration or alias-map is required. Saved profiles continue to resolve to a valid (and improved) curve.
 
 ## Test Strategy
 
@@ -139,12 +142,16 @@ The four files shipped today have these stems:
 | `test_target_csv_no_metadata_still_loads` | A CSV with only the existing comment style (no `key: value` headers) loads correctly with metadata fields as `None`, `name` falling back to file stem. |
 | `test_target_csv_unknown_header_field_ignored` | A CSV with `# foo: bar` does not raise; `foo` is silently dropped. |
 | `test_target_csv_metadata_case_insensitive_keys` | `# Name: ...`, `# NAME: ...`, `# name: ...` all populate the `name` field. |
-| `test_list_builtin_targets_returns_six` | The 6 expected curves are loaded with their categories populated. |
+| `test_list_builtin_targets_returns_six` | The 6 expected curves (`flat`, `harman_ie_2019`, `harman_ie_2019_without_bass`, `harman_oe_2018`, `harman_oe_2018_without_bass`, `diffuse_field`) are loaded with their categories populated. |
 | `test_builtin_curves_have_descriptions` | Every shipped builtin has a non-empty `description`. (Documentation contract test.) |
 
 ### Modified tests
 
-Existing tests in `tests/test_target_curves.py` that assert specific filename presence (`harman_ie_2019` stem) update to assert `harman_ie_2019_v2`. Tests asserting interpolated values at specific frequencies are recalibrated against the new high-resolution reference data — values will shift slightly (sub-dB) due to higher resolution, not algorithmic change.
+Existing tests in `tests/test_target_curves.py`:
+- `test_load_target_csv` (loads `flat.csv`, asserts 2 points, name="flat", first point 20.0 / 0.0 dB) — still passes after `flat.csv` is overwritten with the metadata-headered version, since the data lines remain `20,0` and `20000,0`.
+- `test_target_curve_interpolate` — uses a hand-constructed `TargetCurve`, no file I/O — unaffected.
+- `test_list_builtin_targets` — currently asserts `harman_ie_2019` is present. Updated to additionally assert `harman_ie_2019_without_bass`, `harman_oe_2018_without_bass`, and that the total count is 6.
+- `test_compute_correction` — pure math, unaffected.
 
 ### Smoke verification
 
@@ -156,11 +163,11 @@ Order of work:
 
 1. Add metadata fields to `TargetCurve` dataclass.
 2. Extend `load_target_csv()` to parse `# key: value` headers (TDD: write failing tests first).
-3. Pin the AutoEQ commit hash. Document it in `docs/CONTEXT.md`.
-4. Pull the 4 source curves from AutoEQ at the pinned commit; place into `targets/` with the new metadata headers.
-5. Construct `flat.csv` (trivial) and `harman_ie_2019_v2_bass_shy.csv` (derive from v2 + shelf attenuation, document the derivation in the header).
-6. Delete the old approximate CSVs.
-7. Update existing tests in `tests/test_target_curves.py` for the new filenames and updated reference values.
+3. Pin the AutoEQ commit hash (`7ae0f56`). Document it in `docs/CONTEXT.md`.
+4. Fetch the 5 source curves from AutoEQ at the pinned commit; place into `targets/` with the new metadata headers prepended.
+5. Overwrite `flat.csv` locally (still trivial 0 dB at 20 / 20 000 Hz) with metadata header.
+6. (No file deletions — all four legacy stems are reused.)
+7. Update existing tests in `tests/test_target_curves.py` to assert the new builtin set (count 6, presence of the two `_without_bass` files).
 8. Add the 6 new tests above.
 9. Run full suite (`pytest tests/ -v`); confirm all 67+ tests pass.
 10. Smoke-test the GUI.
