@@ -53,14 +53,18 @@ class TargetCurve:
 def load_target_csv(filepath: Path) -> TargetCurve:
     """Load a target curve from a CSV file.
 
-    Lines beginning with '#' and blank lines are ignored. Each data line must
-    be ``frequency_hz,gain_db``.
+    Lines beginning with '#' and blank lines are ignored. Each non-comment
+    line must be ``frequency_hz,gain_db``. Comment lines of the form
+    ``# key: value`` populate optional metadata on the returned curve;
+    recognized keys (case-insensitive) are ``name``, ``category``,
+    ``description``, ``source``. Unknown keys are silently ignored.
 
     Args:
         filepath: Path to the CSV file.
 
     Returns:
-        A :class:`TargetCurve` with ``name`` set to the file stem.
+        A :class:`TargetCurve`. ``name`` falls back to the file stem if no
+        ``# name:`` header is present.
 
     Raises:
         FileNotFoundError: If ``filepath`` does not exist.
@@ -68,20 +72,34 @@ def load_target_csv(filepath: Path) -> TargetCurve:
     """
     freqs: list[float] = []
     gains: list[float] = []
+    metadata: dict[str, str] = {}
+    recognized_keys = {"name", "category", "description", "source"}
     with open(filepath, "r") as f:
         for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
+            stripped = line.strip()
+            if not stripped:
                 continue
-            parts = line.split(",")
+            if stripped.startswith("#"):
+                # Try to parse "# key: value"
+                content = stripped.lstrip("#").strip()
+                if ":" in content:
+                    key, _, value = content.partition(":")
+                    key_lower = key.strip().lower()
+                    if key_lower in recognized_keys:
+                        metadata[key_lower] = value.strip()
+                continue
+            parts = stripped.split(",")
             freqs.append(float(parts[0]))
             gains.append(float(parts[1]))
-    name = filepath.stem
+    name = metadata.get("name", filepath.stem)
     logger.info("Loaded target curve '%s' with %d points from %s", name, len(freqs), filepath)
     return TargetCurve(
         name=name,
         frequencies=np.array(freqs, dtype=np.float64),
         gains_db=np.array(gains, dtype=np.float64),
+        category=metadata.get("category"),
+        description=metadata.get("description"),
+        source=metadata.get("source"),
     )
 
 
