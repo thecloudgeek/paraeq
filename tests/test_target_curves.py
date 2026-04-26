@@ -81,3 +81,15 @@ def test_load_target_csv_parses_metadata_header():
     assert curve.source == "hand-authored"
     assert len(curve.frequencies) == 2
     assert curve.gains_db[1] == -3.0
+
+
+def test_load_target_csv_ignores_unknown_keys_and_is_case_insensitive():
+    fixtures = Path(__file__).parent / "fixtures"
+    curve = load_target_csv(fixtures / "target_curve_unknown_and_mixed_case.csv")
+    assert curve.name == "Mixed Case Sample"
+    assert curve.category == "reference"
+    assert curve.description == "Surrounding whitespace is preserved-stripped."
+    # source not in fixture → falls back to None
+    assert curve.source is None
+    # data still parses normally
+    assert len(curve.frequencies) == 2
