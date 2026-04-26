@@ -18,6 +18,9 @@ class TargetCurve:
     name: str
     frequencies: np.ndarray
     gains_db: np.ndarray
+    category: str | None = None
+    description: str | None = None
+    source: str | None = None
 
     def interpolate(self, query_freqs: np.ndarray) -> np.ndarray:
         """Interpolate target gains at arbitrary query frequencies.

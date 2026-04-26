@@ -45,3 +45,28 @@ def test_compute_correction():
     target = np.array([0.0, 0.0, 0.0])
     correction = compute_correction(measured, target)
     np.testing.assert_array_almost_equal(correction, [0.0, -3.0, -6.0])
+
+
+def test_target_curve_metadata_fields_default_to_none():
+    curve = TargetCurve(
+        name="x",
+        frequencies=np.array([20.0, 20000.0]),
+        gains_db=np.array([0.0, 0.0]),
+    )
+    assert curve.category is None
+    assert curve.description is None
+    assert curve.source is None
+
+
+def test_target_curve_metadata_fields_can_be_set():
+    curve = TargetCurve(
+        name="x",
+        frequencies=np.array([20.0, 20000.0]),
+        gains_db=np.array([0.0, 0.0]),
+        category="reference",
+        description="A flat curve.",
+        source="hand-authored",
+    )
+    assert curve.category == "reference"
+    assert curve.description == "A flat curve."
+    assert curve.source == "hand-authored"
