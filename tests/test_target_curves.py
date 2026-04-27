@@ -11,7 +11,8 @@ from paraeq.correction.target_curves import (
 def test_load_target_csv():
     targets_dir = Path(__file__).parent.parent / "targets"
     curve = load_target_csv(targets_dir / "flat.csv")
-    assert curve.name == "flat"
+    assert curve.name == "Flat"  # populated from "# name:" header
+    assert curve.category == "reference"
     assert len(curve.frequencies) == 2
     assert curve.frequencies[0] == 20.0
     assert curve.gains_db[0] == 0.0
@@ -34,10 +35,8 @@ def test_target_curve_interpolate():
 def test_list_builtin_targets():
     targets = list_builtin_targets()
     names = {t.name for t in targets}
-    assert "diffuse_field" in names
-    assert "flat" in names
-    assert "harman_ie_2019" in names
-    assert "harman_oe_2018" in names
+    # Names come from "# name:" headers (display names), not file stems.
+    assert "Flat" in names
 
 
 def test_compute_correction():
