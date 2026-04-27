@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 from pathlib import Path
 from paraeq.correction.target_curves import (
     TargetCurve,
@@ -127,3 +128,12 @@ def test_builtin_curves_have_descriptions_and_categories():
             f"{t.name!r} has unexpected category {t.category!r}"
         )
         assert t.source, f"{t.name!r} missing source"
+
+
+def test_load_target_csv_raises_value_error_on_malformed_data_line(tmp_path):
+    # A line with one value but no comma should raise ValueError per the
+    # docstring contract (not IndexError from out-of-bounds access).
+    bad_csv = tmp_path / "bad.csv"
+    bad_csv.write_text("# name: Bad\n# frequency_hz,gain_db\n20.0,0.0\n1000.0\n")
+    with pytest.raises(ValueError, match="Expected 'frequency,gain'"):
+        load_target_csv(bad_csv)

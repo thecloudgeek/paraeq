@@ -93,6 +93,10 @@ def load_target_csv(filepath: Path) -> TargetCurve:
                         metadata[key_lower] = value_stripped
                 continue
             parts = stripped.split(",")
+            if len(parts) < 2:
+                raise ValueError(
+                    f"Expected 'frequency,gain' but got: {stripped!r}"
+                )
             freqs.append(float(parts[0]))
             gains.append(float(parts[1]))
     name = metadata.get("name", filepath.stem)
