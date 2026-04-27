@@ -67,7 +67,7 @@ We chose a hybrid approach rather than going straight to Rust:
 
 **Built-in Target Curves (`targets/`):** flat.csv, harman_ie_2019.csv, harman_ie_2019_without_bass.csv, harman_oe_2018.csv, harman_oe_2018_without_bass.csv, diffuse_field.csv. High-resolution data sourced from AutoEQ (MIT licensed) at commit `7ae0f56` (full SHA `7ae0f56d53074872b028649617a22bbb4232feb7`). Each CSV carries `# name:`, `# category:`, `# description:`, `# source:` metadata headers; the loader (`paraeq/correction/target_curves.py`) populates these on the `TargetCurve` dataclass.
 
-**Testing:** 67 tests, all passing, ~1.3s runtime. Includes 3 end-to-end integration tests covering measurement → FIR pipeline, measurement → PEQ pipeline, and profile save/load round-trip.
+**Testing:** 74 tests, all passing, ~1.5s runtime. Includes 3 end-to-end integration tests covering measurement → FIR pipeline, measurement → PEQ pipeline, and profile save/load round-trip; plus 7 tests covering the metadata-headered target curve loader (added in cycle 1).
 
 ### Notable Implementation Decisions
 
