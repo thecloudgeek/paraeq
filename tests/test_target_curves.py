@@ -103,3 +103,27 @@ def test_load_target_csv_no_metadata_falls_back_to_stem():
     assert curve.source is None
     assert len(curve.frequencies) == 3
     assert curve.gains_db[2] == -6.0
+
+
+def test_list_builtin_targets_returns_six():
+    targets = list_builtin_targets()
+    assert len(targets) == 6
+    names = {t.name for t in targets}
+    assert names == {
+        "Diffuse Field",
+        "Flat",
+        "Harman In-Ear 2019",
+        "Harman In-Ear 2019 (No Bass Shelf)",
+        "Harman Over-Ear 2018",
+        "Harman Over-Ear 2018 (No Bass Shelf)",
+    }
+
+
+def test_builtin_curves_have_descriptions_and_categories():
+    targets = list_builtin_targets()
+    for t in targets:
+        assert t.description, f"{t.name!r} missing description"
+        assert t.category in ("in-ear", "over-ear", "reference"), (
+            f"{t.name!r} has unexpected category {t.category!r}"
+        )
+        assert t.source, f"{t.name!r} missing source"
