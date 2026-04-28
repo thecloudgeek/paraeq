@@ -12,12 +12,17 @@ logger = logging.getLogger(__name__)
 
 TARGETS_DIR = Path(__file__).parent.parent.parent / "targets"
 
+_METADATA_KEYS: frozenset[str] = frozenset({"category", "description", "name", "source"})
+
 
 @dataclass
 class TargetCurve:
     name: str
     frequencies: np.ndarray
     gains_db: np.ndarray
+    category: str | None = None
+    description: str | None = None
+    source: str | None = None
 
     def interpolate(self, query_freqs: np.ndarray) -> np.ndarray:
         """Interpolate target gains at arbitrary query frequencies.
@@ -50,14 +55,20 @@ class TargetCurve:
 def load_target_csv(filepath: Path) -> TargetCurve:
     """Load a target curve from a CSV file.
 
-    Lines beginning with '#' and blank lines are ignored. Each data line must
-    be ``frequency_hz,gain_db``.
+    Lines beginning with '#' and blank lines are ignored. Each non-comment
+    line must be ``frequency_hz,gain_db``. Comment lines of the form
+    ``# key: value`` populate optional metadata on the returned curve;
+    recognized keys (case-insensitive) are ``name``, ``category``,
+    ``description``, ``source``. Unknown keys are silently ignored.
+    Recognized keys with an empty value (e.g., ``# source:`` with no text
+    after the colon) are treated as absent.
 
     Args:
         filepath: Path to the CSV file.
 
     Returns:
-        A :class:`TargetCurve` with ``name`` set to the file stem.
+        A :class:`TargetCurve`. ``name`` falls back to the file stem if no
+        ``# name:`` header is present.
 
     Raises:
         FileNotFoundError: If ``filepath`` does not exist.
@@ -65,20 +76,38 @@ def load_target_csv(filepath: Path) -> TargetCurve:
     """
     freqs: list[float] = []
     gains: list[float] = []
-    with open(filepath, "r") as f:
+    metadata: dict[str, str] = {}
+    with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
+            stripped = line.strip()
+            if not stripped:
                 continue
-            parts = line.split(",")
+            if stripped.startswith("#"):
+                # Try to parse "# key: value"
+                content = stripped.lstrip("#").strip()
+                if ":" in content:
+                    key, _, value = content.partition(":")
+                    key_lower = key.strip().lower()
+                    value_stripped = value.strip()
+                    if key_lower in _METADATA_KEYS and value_stripped:
+                        metadata[key_lower] = value_stripped
+                continue
+            parts = stripped.split(",")
+            if len(parts) < 2:
+                raise ValueError(
+                    f"Expected 'frequency,gain' but got: {stripped!r}"
+                )
             freqs.append(float(parts[0]))
             gains.append(float(parts[1]))
-    name = filepath.stem
+    name = metadata.get("name", filepath.stem)
     logger.info("Loaded target curve '%s' with %d points from %s", name, len(freqs), filepath)
     return TargetCurve(
         name=name,
         frequencies=np.array(freqs, dtype=np.float64),
         gains_db=np.array(gains, dtype=np.float64),
+        category=metadata.get("category"),
+        description=metadata.get("description"),
+        source=metadata.get("source"),
     )
 
 

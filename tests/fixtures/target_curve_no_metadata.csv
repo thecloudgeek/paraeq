@@ -1,0 +1,5 @@
+# Some Old Curve (approximate)
+# frequency_hz,gain_db
+20.0,0.0
+1000.0,-3.0
+20000.0,-6.0

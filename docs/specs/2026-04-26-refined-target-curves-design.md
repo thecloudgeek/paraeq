@@ -112,7 +112,7 @@ class TargetCurve:
 
 ### Resolution
 
-AutoEQ target CSVs are typically log-spaced from 20 Hz to 20 kHz with ~140 control points per curve, vs. the existing ~18-point hand-typed curves. Higher resolution is a strict win for cubic-spline interpolation accuracy. No code path needs adjustment; the existing interpolator handles arbitrary point counts.
+AutoEQ target CSVs at the pinned commit are log-spaced from 20 Hz to ~19956 Hz with ~695 control points per curve, vs. the existing ~18-point hand-typed curves. Higher resolution is a strict win for cubic-spline interpolation accuracy. No code path needs adjustment; the existing interpolator handles arbitrary point counts. The upper bound (19956 Hz, not 20000 Hz) means `interpolate()` holds the boundary gain for queries between 19956 Hz and 20000 Hz — acceptable, and consistent with the boundary-hold behavior at the lower bound.
 
 ### Backward compatibility
 

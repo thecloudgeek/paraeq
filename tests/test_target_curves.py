@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 from pathlib import Path
 from paraeq.correction.target_curves import (
     TargetCurve,
@@ -11,7 +12,8 @@ from paraeq.correction.target_curves import (
 def test_load_target_csv():
     targets_dir = Path(__file__).parent.parent / "targets"
     curve = load_target_csv(targets_dir / "flat.csv")
-    assert curve.name == "flat"
+    assert curve.name == "Flat"  # populated from "# name:" header
+    assert curve.category == "reference"
     assert len(curve.frequencies) == 2
     assert curve.frequencies[0] == 20.0
     assert curve.gains_db[0] == 0.0
@@ -34,10 +36,8 @@ def test_target_curve_interpolate():
 def test_list_builtin_targets():
     targets = list_builtin_targets()
     names = {t.name for t in targets}
-    assert "diffuse_field" in names
-    assert "flat" in names
-    assert "harman_ie_2019" in names
-    assert "harman_oe_2018" in names
+    # Names come from "# name:" headers (display names), not file stems.
+    assert "Flat" in names
 
 
 def test_compute_correction():
@@ -45,3 +45,95 @@ def test_compute_correction():
     target = np.array([0.0, 0.0, 0.0])
     correction = compute_correction(measured, target)
     np.testing.assert_array_almost_equal(correction, [0.0, -3.0, -6.0])
+
+
+def test_target_curve_metadata_fields_default_to_none():
+    curve = TargetCurve(
+        name="x",
+        frequencies=np.array([20.0, 20000.0]),
+        gains_db=np.array([0.0, 0.0]),
+    )
+    assert curve.category is None
+    assert curve.description is None
+    assert curve.source is None
+
+
+def test_target_curve_metadata_fields_can_be_set():
+    curve = TargetCurve(
+        name="x",
+        frequencies=np.array([20.0, 20000.0]),
+        gains_db=np.array([0.0, 0.0]),
+        category="reference",
+        description="A flat curve.",
+        source="hand-authored",
+    )
+    assert curve.category == "reference"
+    assert curve.description == "A flat curve."
+    assert curve.source == "hand-authored"
+
+
+def test_load_target_csv_parses_metadata_header():
+    fixtures = Path(__file__).parent / "fixtures"
+    curve = load_target_csv(fixtures / "target_curve_with_metadata.csv")
+    assert curve.name == "Sample Target"
+    assert curve.category == "reference"
+    assert curve.description == "A two-point sample target for testing metadata parsing."
+    assert curve.source == "hand-authored"
+    assert len(curve.frequencies) == 2
+    assert curve.gains_db[1] == -3.0
+
+
+def test_load_target_csv_ignores_unknown_keys_and_is_case_insensitive():
+    fixtures = Path(__file__).parent / "fixtures"
+    curve = load_target_csv(fixtures / "target_curve_unknown_and_mixed_case.csv")
+    assert curve.name == "Mixed Case Sample"
+    assert curve.category == "reference"
+    assert curve.description == "Surrounding whitespace is preserved-stripped."
+    # source not in fixture → falls back to None
+    assert curve.source is None
+    # data still parses normally
+    assert len(curve.frequencies) == 2
+
+
+def test_load_target_csv_no_metadata_falls_back_to_stem():
+    fixtures = Path(__file__).parent / "fixtures"
+    curve = load_target_csv(fixtures / "target_curve_no_metadata.csv")
+    assert curve.name == "target_curve_no_metadata"  # file stem
+    assert curve.category is None
+    assert curve.description is None
+    assert curve.source is None
+    assert len(curve.frequencies) == 3
+    assert curve.gains_db[2] == -6.0
+
+
+def test_list_builtin_targets_returns_six():
+    targets = list_builtin_targets()
+    assert len(targets) == 6
+    names = {t.name for t in targets}
+    assert names == {
+        "Diffuse Field",
+        "Flat",
+        "Harman In-Ear 2019",
+        "Harman In-Ear 2019 (No Bass Shelf)",
+        "Harman Over-Ear 2018",
+        "Harman Over-Ear 2018 (No Bass Shelf)",
+    }
+
+
+def test_builtin_curves_have_descriptions_and_categories():
+    targets = list_builtin_targets()
+    for t in targets:
+        assert t.description, f"{t.name!r} missing description"
+        assert t.category in ("in-ear", "over-ear", "reference"), (
+            f"{t.name!r} has unexpected category {t.category!r}"
+        )
+        assert t.source, f"{t.name!r} missing source"
+
+
+def test_load_target_csv_raises_value_error_on_malformed_data_line(tmp_path):
+    # A line with one value but no comma should raise ValueError per the
+    # docstring contract (not IndexError from out-of-bounds access).
+    bad_csv = tmp_path / "bad.csv"
+    bad_csv.write_text("# name: Bad\n# frequency_hz,gain_db\n20.0,0.0\n1000.0\n")
+    with pytest.raises(ValueError, match="Expected 'frequency,gain'"):
+        load_target_csv(bad_csv)

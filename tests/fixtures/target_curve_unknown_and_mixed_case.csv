@@ -1,0 +1,8 @@
+# Name: Mixed Case Sample
+# CATEGORY: reference
+# Description:    Surrounding whitespace is preserved-stripped.
+# foo: this should be ignored
+# version: 1.0
+# frequency_hz,gain_db
+20.0,0.0
+20000.0,-3.0

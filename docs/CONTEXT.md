@@ -2,7 +2,7 @@
 
 This document captures the why, the goals, what's been built, and what's left. It exists so future sessions (Claude or human) can pick up the work without rebuilding context from scratch.
 
-**Last updated:** 2026-04-25
+**Last updated:** 2026-04-27
 
 ---
 
@@ -65,9 +65,9 @@ We chose a hybrid approach rather than going straight to Rust:
 | `menu_bar/tray.py` | System tray with profile switching, bypass toggle |
 | `setup/setup_wizard.py` | First-launch QWizard: BlackHole check → output device pick → done |
 
-**Built-in Target Curves (`targets/`):** harman_ie_2019.csv, harman_oe_2018.csv, diffuse_field.csv, flat.csv. Approximate reference points — refinement against authoritative sources is a future enhancement.
+**Built-in Target Curves (`targets/`):** flat.csv, harman_ie_2019.csv, harman_ie_2019_without_bass.csv, harman_oe_2018.csv, harman_oe_2018_without_bass.csv, diffuse_field.csv. High-resolution data sourced from AutoEQ (MIT licensed) at commit `7ae0f56` (full SHA `7ae0f56d53074872b028649617a22bbb4232feb7`). Each CSV carries `# name:`, `# category:`, `# description:`, `# source:` metadata headers; the loader (`paraeq/correction/target_curves.py`) populates these on the `TargetCurve` dataclass.
 
-**Testing:** 67 tests, all passing, ~1.3s runtime. Includes 3 end-to-end integration tests covering measurement → FIR pipeline, measurement → PEQ pipeline, and profile save/load round-trip.
+**Testing:** 75 tests, all passing, ~1.5s runtime. Includes 3 end-to-end integration tests covering measurement → FIR pipeline, measurement → PEQ pipeline, and profile save/load round-trip; plus 8 tests covering the metadata-headered target curve loader (added in cycle 1, including a contract-honoring test that `load_target_csv` raises `ValueError` on malformed data lines).
 
 ### Notable Implementation Decisions
 
@@ -75,6 +75,10 @@ We chose a hybrid approach rather than going straight to Rust:
 - **Minimum-phase FIR design**: `scipy.signal.minimum_phase(method="homomorphic")` takes the square root of the magnitude in cepstral domain. To produce a filter with desired magnitude M, you must build the linear-phase prototype with magnitude M² so that sqrt(M²) = M after conversion.
 - **Averaging in dB domain**, not linear, per test expectation: `(0 dB + 6 dB) / 2 = 3 dB`.
 - **BlackHole is detected by name match** (`"blackhole" in device.name.lower()`). Bundling/install of the BlackHole HAL plugin into the macOS installer pkg is **not yet implemented** — currently relies on user having BlackHole pre-installed.
+
+### Recently Completed Cycles
+
+- **2026-04-27 — Cycle 1: Refined target curve data.** Replaced the four hand-typed approximate target CSVs with high-resolution data sourced from AutoEQ at commit `7ae0f56`. Expanded built-in set to six curves (added `harman_ie_2019_without_bass`, `harman_oe_2018_without_bass`). Extended `TargetCurve` and the CSV loader with optional metadata fields (`category`, `description`, `source`); old-style CSVs without metadata still load. See `docs/specs/2026-04-26-refined-target-curves-design.md` and `docs/plans/2026-04-26-refined-target-curves.md`.
 
 ## What's Left
 
@@ -87,7 +91,6 @@ These items were specified in the design but not in the executed implementation 
 - **Homebrew cask**: `brew install --cask paraeq`.
 - **Aggregate device creation**: programmatically create a macOS Aggregate Device combining BlackHole + headphone jack via Core Audio API. Currently the user has to set this up manually.
 - **Launch-at-login**: launchd plist for auto-start.
-- **Refine target curve data**: the built-in Harman/Diffuse Field curves are approximate reference points. Replace with authoritative published data.
 - **Interactive draggable control points** on the target curve editor (currently you can pick a preset and import/export CSV, but in-plot editing of control points is not implemented).
 - **AutoEQ database integration**: searchable headphone model picker that loads presets from the AutoEQ project. Currently you can import a preset file, but there's no built-in browser.
 
