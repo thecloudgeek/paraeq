@@ -52,7 +52,7 @@ class MeasurementWorker(QThread):
             import sounddevice as sd
 
             from paraeq.measurement.deconvolution import deconvolve
-            from paraeq.measurement.sweep import generate_inverse_sweep, generate_sweep
+            from paraeq.measurement.sweep import generate_sweep
 
             sr = self.SAMPLE_RATE
             self.progress.emit(5)
@@ -88,8 +88,7 @@ class MeasurementWorker(QThread):
                 "MeasurementWorker: deconvolving (recorded %d samples)",
                 len(recorded_mono),
             )
-            inverse = generate_inverse_sweep(sweep, sr)
-            ir = deconvolve(recorded_mono, inverse, sr)
+            ir = deconvolve(recorded_mono, sweep, sr)
             self.progress.emit(95)
             logger.info("MeasurementWorker: done, IR length=%d", len(ir))
             self.finished.emit(ir, sr)
