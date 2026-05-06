@@ -11,30 +11,47 @@ logger = logging.getLogger(__name__)
 
 
 def load_compensation(filepath: Path) -> tuple[np.ndarray, np.ndarray]:
-    """Load a calibration compensation file (CSV: frequency,gain_db).
+    """Load a calibration compensation file.
+
+    Two formats are supported and auto-detected:
+
+    1. **ParaEQ CSV** — comma-separated ``frequency_hz, gain_db`` rows. Lines
+       starting with ``#`` and blank lines are ignored.
+    2. **miniDSP REW-style** (e.g. EARS calibration) — two leading quoted-string
+       header lines, ``*``-prefixed comment lines, and whitespace-separated
+       ``Freq(Hz) SPL(dB) Phase(degrees)`` data rows. Phase is discarded.
 
     Args:
-        filepath: Path to a CSV file with rows of (frequency_hz, gain_db).
-                  Lines starting with '#' and blank lines are ignored.
+        filepath: Path to the compensation file.
 
     Returns:
         Tuple of (freqs_hz, gains_db) as float64 numpy arrays.
     """
-    freqs = []
-    gains = []
     with open(filepath, "r") as f:
-        reader = csv.reader(f)
-        for row in reader:
-            if not row or row[0].startswith("#"):
-                continue
-            freqs.append(float(row[0].strip()))
-            gains.append(float(row[1].strip()))
+        first_line = f.readline().lstrip()
+
+    if first_line.startswith('"'):
+        data = np.loadtxt(filepath, skiprows=2, comments="*", usecols=(0, 1))
+        freqs = data[:, 0].astype(np.float64)
+        gains = data[:, 1].astype(np.float64)
+    else:
+        freqs_list: list[float] = []
+        gains_list: list[float] = []
+        with open(filepath, "r") as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if not row or row[0].startswith("#"):
+                    continue
+                freqs_list.append(float(row[0].strip()))
+                gains_list.append(float(row[1].strip()))
+        freqs = np.array(freqs_list, dtype=np.float64)
+        gains = np.array(gains_list, dtype=np.float64)
 
     logger.debug(
         "Loaded compensation file",
         extra={"filepath": str(filepath), "n_points": len(freqs)},
     )
-    return np.array(freqs, dtype=np.float64), np.array(gains, dtype=np.float64)
+    return freqs, gains
 
 
 def apply_compensation(

@@ -139,3 +139,40 @@ def average_measurements(measurements_db: list[np.ndarray]) -> np.ndarray:
     )
 
     return averaged  # type: ignore[return-value]
+
+
+def normalize_to_reference_band(
+    freqs: np.ndarray,
+    magnitude_db: np.ndarray,
+    low_hz: float = 200.0,
+    high_hz: float = 1000.0,
+) -> np.ndarray:
+    """Subtract the mean magnitude over a reference band so that band averages to 0 dB.
+
+    Brings raw measured magnitudes (which sit at arbitrary dBFS offsets driven
+    by recording gain) onto the same reference as normalized target curves,
+    making overlay plots and ``compute_correction`` meaningful.
+
+    Args:
+        freqs: Frequency axis in Hz.
+        magnitude_db: Magnitude spectrum in dB, same shape as ``freqs``.
+        low_hz: Lower edge of the reference band (inclusive).
+        high_hz: Upper edge of the reference band (inclusive).
+
+    Returns:
+        Normalized magnitude spectrum (same shape, mean of band = 0 dB).
+
+    Raises:
+        ValueError: If no frequency bins fall within ``[low_hz, high_hz]``.
+    """
+    band = (freqs >= low_hz) & (freqs <= high_hz)
+    if not np.any(band):
+        raise ValueError(
+            f"No frequency bins in reference band [{low_hz}, {high_hz}] Hz"
+        )
+    offset = float(np.mean(magnitude_db[band]))
+    logger.debug(
+        "Normalizing to reference band",
+        extra={"low_hz": low_hz, "high_hz": high_hz, "offset_db": offset},
+    )
+    return magnitude_db - offset

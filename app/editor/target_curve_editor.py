@@ -84,7 +84,12 @@ class TargetCurveEditor(QWidget):
         root.addWidget(gen_group)
 
         # --- Plot ---
-        self._plot_widget = pg.PlotWidget(title="Frequency Response vs Target")
+        from app.plot_utils import AudioFreqAxis
+
+        self._plot_widget = pg.PlotWidget(
+            title="Frequency Response vs Target",
+            axisItems={"bottom": AudioFreqAxis(orientation="bottom")},
+        )
         self._plot_widget.setLabel("left", "Magnitude (dB)")
         self._plot_widget.setLabel("bottom", "Frequency (Hz)")
         self._plot_widget.setLogMode(x=True, y=False)
@@ -138,9 +143,17 @@ class TargetCurveEditor(QWidget):
         self._measured_freqs = freqs
         self._measured_db = magnitude_db
         self._update_plot()
+        finite = magnitude_db[np.isfinite(magnitude_db)]
+        if finite.size:
+            y_min, y_max = float(finite.min()), float(finite.max())
+            pad = max(3.0, 0.05 * (y_max - y_min))
+            self._plot_widget.setYRange(y_min - pad, y_max + pad)
         self._status_label.setText("Measurement loaded — select target and generate.")
         logger.info(
-            "TargetCurveEditor: measurement set, freqs=%s", freqs.shape
+            "TargetCurveEditor: measurement set, freqs=%s, db_range=(%.1f, %.1f)",
+            freqs.shape,
+            float(finite.min()) if finite.size else float("nan"),
+            float(finite.max()) if finite.size else float("nan"),
         )
 
     # ------------------------------------------------------------------

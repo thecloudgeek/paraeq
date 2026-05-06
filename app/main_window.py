@@ -168,9 +168,22 @@ class MainWindow(QMainWindow):
             self._tabs.setCurrentWidget(self._target_tab)
 
     def _on_correction_generated(self, payload):
-        """Store correction in active profile and update EQ editor."""
-        logger.info("Correction generated: %s", payload)
-        self._status_bar.showMessage("Correction generated")
+        """Route generated correction to the appropriate downstream tab."""
+        kind = payload.get("type")
+        logger.info("Correction generated: type=%s", kind)
+
+        if kind == "peq":
+            bands = payload.get("data") or []
+            if hasattr(self._eq_tab, "load_bands"):
+                self._eq_tab.load_bands(bands)
+                self._tabs.setCurrentWidget(self._eq_tab)
+            self._status_bar.showMessage(f"Parametric EQ generated ({len(bands)} bands)")
+        elif kind == "fir":
+            self._status_bar.showMessage(
+                f"FIR filter generated ({len(payload.get('data', []))} taps)"
+            )
+        else:
+            self._status_bar.showMessage("Correction generated")
 
     def _on_eq_changed(self, bands):
         """Push updated EQ bands to IIR processor."""
