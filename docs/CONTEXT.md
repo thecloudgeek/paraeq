@@ -2,7 +2,7 @@
 
 This document captures the why, the goals, what's been built, and what's left. It exists so future sessions (Claude or human) can pick up the work without rebuilding context from scratch.
 
-**Last updated:** 2026-04-27
+**Last updated:** 2026-06-07
 
 ---
 
@@ -48,7 +48,7 @@ We chose a hybrid approach rather than going straight to Rust:
 | `engine/convolver.py` | Overlap-add FIR convolution (block-based, per-channel) |
 | `engine/iir_processor.py` | Cascaded biquad IIR with persistent per-channel state via scipy.signal.sosfilt |
 | `audio/devices.py` | sounddevice wrapper, BlackHole detection by name |
-| `audio/stream.py` | play / record / AudioPassThrough with pre/post callbacks for spectrum analyzer |
+| `audio/stream.py` | play / record / AudioPassThrough (real-time duplex with CoreAudio channel maps + software master gain + pre/post callbacks for the spectrum analyzer) |
 | `profiles/profile.py` | Profile dataclass + ProfileManager (JSON for metadata, WAV for IRs, .npy for FIR coefficients) |
 
 **GUI App (`app/`):**
@@ -75,6 +75,8 @@ We chose a hybrid approach rather than going straight to Rust:
 - **Minimum-phase FIR design**: `scipy.signal.minimum_phase(method="homomorphic")` takes the square root of the magnitude in cepstral domain. To produce a filter with desired magnitude M, you must build the linear-phase prototype with magnitude M² so that sqrt(M²) = M after conversion.
 - **Averaging in dB domain**, not linear, per test expectation: `(0 dB + 6 dB) / 2 = 3 dB`.
 - **BlackHole is detected by name match** (`"blackhole" in device.name.lower()`). Bundling/install of the BlackHole HAL plugin into the macOS installer pkg is **not yet implemented** — currently relies on user having BlackHole pre-installed.
+- **Real-time routing is one Aggregate Device used in duplex** (this is the hardest-won, most port-critical piece — read carefully before the Rust port). The user creates a macOS Aggregate Device that lists **BlackHole 16ch FIRST** (16 ch) and the physical headphone output **SECOND** (2 ch), giving 18 output / ≥16 input channels. macOS plays system audio to aggregate output ch 1-2 (= BlackHole 1-2); BlackHole is a loopback, so output ch *N* reappears on input ch *N*. ParaEQ therefore opens the aggregate as **both input and output** (`input_device == output_device`), reads input ch 0-1, applies EQ, and writes to aggregate output ch 17-18 (= the headphones) via CoreAudio channel maps: input `[0, 1]`, output `[-1]*16 + [0, 1]`. The `-1` is the CoreAudio "route this stream channel nowhere" sentinel; the output map length must equal the device's output-channel count; and the leading `16` *is* BlackHole 16ch's channel count (a BlackHole 2ch aggregate would need `[-1, -1, 0, 1]`). **BlackHole's position in the aggregate is load-bearing** — reorder it and the channel offsets break. (`paraeq/audio/stream.py` → `AudioPassThrough(... input_channel_map, output_channel_map)`; wired in `app/main_window.py` → `start_audio_engine`.)
+- **AudioPassThrough provides a software master volume** (`set_gain`, square-law taper in the GUI). This is **required, not a convenience**: BlackHole exposes no system volume, so the macOS volume keys do nothing once audio is routed through the aggregate — the engine's gain is the only loudness control.
 
 ### Recently Completed Cycles
 
