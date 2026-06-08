@@ -28,6 +28,22 @@ def _save_output_device(idx: int) -> None:
     OUTPUT_DEVICE_FILE.write_text(str(idx))
 
 
+# UID of the real (physical) output device, persisted so we can restore it on
+# quit and recover it after a crash that leaves the aggregate as the default.
+PHYSICAL_OUTPUT_FILE = Path(user_data_dir("ParaEQ")) / "physical_output_uid"
+
+
+def _load_physical_uid() -> str | None:
+    if not PHYSICAL_OUTPUT_FILE.exists():
+        return None
+    return PHYSICAL_OUTPUT_FILE.read_text().strip() or None
+
+
+def _save_physical_uid(uid: str) -> None:
+    PHYSICAL_OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PHYSICAL_OUTPUT_FILE.write_text(uid)
+
+
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("ParaEQ")
@@ -93,12 +109,35 @@ def main():
     except Exception as exc:  # pragma: no cover
         logger.warning("Could not create system tray icon: %s", exc)
 
-    # Start audio engine with the chosen output device
-    window.start_audio_engine(output_device=selected_output_device)
+    # Automatically build the BlackHole + physical-output Aggregate Device and
+    # route system audio through it — no manual Audio MIDI Setup required.
+    from paraeq.audio import aggregate
 
-    # Clean up the audio engine when the application actually quits
-    # (closing the window keeps the app alive via the tray).
+    routing = aggregate.setup_routing(previous_physical_uid=_load_physical_uid())
+    if routing is not None:
+        if routing.restore_output_uid:
+            _save_physical_uid(routing.restore_output_uid)
+        output_device = routing.aggregate_index
+        logger.info(
+            "Auto-aggregate ready: index=%s, restore_output=%s",
+            routing.aggregate_index,
+            routing.restore_output_uid,
+        )
+    else:
+        output_device = selected_output_device
+        logger.warning(
+            "Auto-aggregate unavailable; falling back to configured device %s",
+            selected_output_device,
+        )
+
+    # Start audio engine on the aggregate (or the fallback device)
+    window.start_audio_engine(output_device=output_device)
+
+    # On real quit (closing the window keeps the app alive via the tray):
+    # stop the engine first, then restore the system output and remove the
+    # aggregate. Slots fire in connection order, so this ordering holds.
     app.aboutToQuit.connect(window.stop_audio_engine)
+    app.aboutToQuit.connect(lambda: aggregate.teardown_routing(routing))
 
     # Wire tray profile list to profile_activated signal
     if tray is not None and hasattr(window, "_profiles_tab"):
