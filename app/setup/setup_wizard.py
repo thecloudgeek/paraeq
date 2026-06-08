@@ -108,11 +108,16 @@ class OutputDevicePage(QWizardPage):
             from paraeq.audio.devices import list_output_devices
 
             all_out = list_output_devices()
-            # Exclude BlackHole virtual devices
+            # Hide the bare BlackHole loopback device itself (it's not a useful
+            # listening output), but keep aggregate devices that include it.
+            import re
+
+            blackhole_only = re.compile(r"^BlackHole\s*\d+ch$", re.IGNORECASE)
             for dev in all_out:
-                if "blackhole" not in dev.name.lower():
-                    self._output_devices.append(dev)
-                    self._combo.addItem(dev.name, userData=dev.index)
+                if blackhole_only.match(dev.name.strip()):
+                    continue
+                self._output_devices.append(dev)
+                self._combo.addItem(dev.name, userData=dev.index)
         except Exception as exc:
             logger.warning("Could not enumerate output devices: %s", exc)
 
