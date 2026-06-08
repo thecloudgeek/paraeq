@@ -11,12 +11,30 @@ from app.main_window import MainWindow
 logger = logging.getLogger(__name__)
 
 SETUP_COMPLETE_FILE = Path(user_data_dir("ParaEQ")) / "setup_complete"
+OUTPUT_DEVICE_FILE = Path(user_data_dir("ParaEQ")) / "output_device"
+
+
+def _load_output_device() -> int | None:
+    if not OUTPUT_DEVICE_FILE.exists():
+        return None
+    try:
+        return int(OUTPUT_DEVICE_FILE.read_text().strip())
+    except ValueError:
+        return None
+
+
+def _save_output_device(idx: int) -> None:
+    OUTPUT_DEVICE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DEVICE_FILE.write_text(str(idx))
 
 
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("ParaEQ")
     app.setOrganizationName("ParaEQ")
+    # Keep the audio engine alive when the user closes the main window —
+    # the system tray keeps the app running.
+    app.setQuitOnLastWindowClosed(False)
 
     logging.basicConfig(
         level=logging.INFO,
@@ -26,7 +44,7 @@ def main():
     window = MainWindow()
 
     # First-launch setup wizard
-    selected_output_device: int | None = None
+    selected_output_device: int | None = _load_output_device()
     if not SETUP_COMPLETE_FILE.exists():
         from app.setup.setup_wizard import SetupWizard
 
@@ -36,6 +54,8 @@ def main():
             SETUP_COMPLETE_FILE.parent.mkdir(parents=True, exist_ok=True)
             SETUP_COMPLETE_FILE.touch()
             selected_output_device = wizard.selected_output_device
+            if selected_output_device is not None:
+                _save_output_device(selected_output_device)
             logger.info(
                 "Setup complete: output_device=%s, file=%s",
                 selected_output_device,
@@ -75,6 +95,10 @@ def main():
 
     # Start audio engine with the chosen output device
     window.start_audio_engine(output_device=selected_output_device)
+
+    # Clean up the audio engine when the application actually quits
+    # (closing the window keeps the app alive via the tray).
+    app.aboutToQuit.connect(window.stop_audio_engine)
 
     # Wire tray profile list to profile_activated signal
     if tray is not None and hasattr(window, "_profiles_tab"):

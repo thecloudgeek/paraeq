@@ -106,6 +106,7 @@ class MeasurementWizard(QWidget):
     """Full measurement wizard panel."""
 
     measurement_complete = pyqtSignal(dict)
+    save_profile_requested = pyqtSignal(dict)  # keys: name, ir, sample_rate
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -536,18 +537,7 @@ class MeasurementWizard(QWidget):
     def _save_to_profile(self):
         if self._current_ir is None:
             return
-
-        from paraeq.profiles.profile import Profile, ProfileManager
-
         model = self._name_edit.text() or "Unknown"
-        profile = Profile(name=model, headphone_model=model)
-        profile.set_measurement(self._current_ir, self._current_sr)
-
-        try:
-            pm = ProfileManager()
-            pm.save(profile)
-            self._status_label.setText(f"Profile '{model}' saved.")
-            logger.info("Profile saved: %s", model)
-        except Exception as exc:
-            logger.error("Failed to save profile: %s", exc)
-            QMessageBox.critical(self, "Save Error", str(exc))
+        self.save_profile_requested.emit(
+            {"name": model, "ir": self._current_ir, "sample_rate": self._current_sr}
+        )

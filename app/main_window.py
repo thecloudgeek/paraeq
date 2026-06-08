@@ -4,8 +4,10 @@ import logging
 import numpy as np
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
+    QHBoxLayout,
     QLabel,
     QMainWindow,
+    QSlider,
     QStatusBar,
     QTabWidget,
     QVBoxLayout,
@@ -39,6 +41,20 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
         layout.setContentsMargins(4, 4, 4, 4)
+
+        # --- Master output volume (BlackHole has no software volume, so we
+        # provide one in the audio engine itself).
+        vol_row = QHBoxLayout()
+        vol_row.addWidget(QLabel("Output volume:"))
+        self._volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self._volume_slider.setRange(0, 100)
+        self._volume_slider.setValue(80)
+        self._volume_slider.valueChanged.connect(self._on_volume_changed)
+        vol_row.addWidget(self._volume_slider, 1)
+        self._volume_label = QLabel("-4.4 dB")
+        self._volume_label.setMinimumWidth(60)
+        vol_row.addWidget(self._volume_label)
+        layout.addLayout(vol_row)
 
         self._tabs = QTabWidget()
         layout.addWidget(self._tabs)
@@ -132,6 +148,12 @@ class MainWindow(QMainWindow):
                 self._on_measurement_complete
             )
 
+        # Measurement → Save profile (combines IR + current EQ bands)
+        if hasattr(self._measurement_tab, "save_profile_requested"):
+            self._measurement_tab.save_profile_requested.connect(
+                self._on_save_profile_requested
+            )
+
         # Target editor → correction generated
         if hasattr(self._target_tab, "correction_generated"):
             self._target_tab.correction_generated.connect(
@@ -166,6 +188,44 @@ class MainWindow(QMainWindow):
                 data["frequencies"], data["magnitude_db"]
             )
             self._tabs.setCurrentWidget(self._target_tab)
+
+    def _on_save_profile_requested(self, payload: dict):
+        """Bundle the measurement IR with current EQ bands and save."""
+        from paraeq.profiles.profile import Profile, ProfileManager
+
+        name = payload.get("name") or "Unknown"
+        ir = payload.get("ir")
+        sample_rate = payload.get("sample_rate", 48000)
+
+        bands_dicts: list[dict] = []
+        if hasattr(self._eq_tab, "_read_bands"):
+            bands_dicts = [
+                {
+                    "filter_type": b.filter_type,
+                    "fc": b.fc,
+                    "gain_db": b.gain_db,
+                    "q": b.q,
+                }
+                for b in self._eq_tab._read_bands()
+            ]
+
+        profile = Profile(name=name, headphone_model=name)
+        if ir is not None:
+            profile.set_measurement(ir, sample_rate)
+        profile.eq_bands = bands_dicts
+        profile.correction_mode = "peq" if bands_dicts else "fir"
+
+        try:
+            ProfileManager().save(profile)
+            logger.info("Profile saved: %s (%d bands)", name, len(bands_dicts))
+            self._status_bar.showMessage(
+                f"Profile '{name}' saved ({len(bands_dicts)} bands)"
+            )
+            if hasattr(self._profiles_tab, "add_profile"):
+                self._profiles_tab.add_profile(profile)
+        except Exception as exc:
+            logger.error("Failed to save profile: %s", exc)
+            self._status_bar.showMessage(f"Save error: {exc}")
 
     def _on_correction_generated(self, payload):
         """Route generated correction to the appropriate downstream tab."""
@@ -226,9 +286,19 @@ class MainWindow(QMainWindow):
             if bands:
                 peq = ParametricEQ(bands, 48_000)
                 sos = peq.combined_sos()
-                processor = IIRProcessor(sos)
+                processor = IIRProcessor(sample_rate=48_000)
+                processor.set_sos(sos, channel=0)
+                processor.set_sos(sos, channel=1)
                 self._audio_engine.set_processor(processor.process)
-                logger.info("IIR processor updated with %d bands", len(bands))
+                logger.info(
+                    "IIR processor updated with %d bands (sos shape=%s)",
+                    len(bands), sos.shape,
+                )
+                for i, b in enumerate(bands):
+                    logger.debug(
+                        "  active band %2d: %-10s fc=%7.1f Hz  gain=%+5.1f dB  Q=%.2f",
+                        i + 1, b.filter_type, b.fc, b.gain_db, b.q,
+                    )
             else:
                 self._audio_engine.set_processor(None)
                 logger.info("IIR processor cleared (no bands)")
@@ -236,29 +306,44 @@ class MainWindow(QMainWindow):
             logger.error("Failed to update IIR processor: %s", exc)
 
     def start_audio_engine(self, output_device: int | None = None):
-        """Start the real-time audio pass-through engine."""
+        """Start the real-time audio pass-through engine.
+
+        ``output_device`` should be an Aggregate Device that lists BlackHole
+        16ch FIRST and the physical headphone output SECOND. macOS sends
+        system audio to aggregate channels 1-2 (= BlackHole 1-2), which loop
+        back to BlackHole's inputs; ParaEQ reads those, applies EQ, and
+        writes to aggregate output channels 17-18 (= the headphones).
+        """
         try:
-            from paraeq.audio.devices import find_blackhole_device
             from paraeq.audio.stream import AudioPassThrough
 
-            # Use BlackHole as the input (loopback) device if available
-            blackhole = find_blackhole_device()
-            input_device = blackhole.index if blackhole else output_device
-
-            if input_device is None or output_device is None:
-                logger.warning(
-                    "Audio engine not started: input_device=%s, output_device=%s",
-                    input_device,
-                    output_device,
-                )
+            if output_device is None:
+                logger.warning("Audio engine not started: output_device=None")
                 self._status_bar.showMessage(
-                    "Audio engine not started — no devices configured"
+                    "Audio engine not started — pick an aggregate device"
                 )
                 return
 
+            # CoreAudio channel maps route our 2 stream channels onto the
+            # aggregate device's physical channels. A map entry of -1 means
+            # "this stream channel goes nowhere"; the OUTPUT map's length must
+            # equal the device's output-channel count.
+            #
+            # Input: read stream ch 0,1 from aggregate input ch 0,1 — i.e.
+            # BlackHole loopback ch 1,2, where macOS system audio reappears.
+            input_map = [0, 1]
+            # Output: the aggregate lists BlackHole 16ch FIRST, so device output
+            # ch 0..15 are BlackHole and ch 16,17 are the physical headphones.
+            # Send our two channels to 16,17 and route nothing (-1) to BlackHole.
+            # The leading 16 is exactly BlackHole 16ch's channel count — a
+            # BlackHole 2ch aggregate would instead need [-1, -1, 0, 1].
+            output_map = [-1] * 16 + [0, 1]
+
             self._audio_engine = AudioPassThrough(
-                input_device=input_device,
+                input_device=output_device,
                 output_device=output_device,
+                input_channel_map=input_map,
+                output_channel_map=output_map,
             )
 
             # Wire spectrum analyzer feeds
@@ -268,10 +353,11 @@ class MainWindow(QMainWindow):
                 self._audio_engine.set_post_callback(self._analyzer_tab.feed_post)
 
             self._audio_engine.start()
+            # Apply current slider volume to the freshly-started engine.
+            self._on_volume_changed(self._volume_slider.value())
             self._status_bar.showMessage("Audio engine running")
             logger.info(
-                "Audio engine started: input=%s, output=%s",
-                input_device,
+                "Audio engine started: device=%s (single-aggregate duplex)",
                 output_device,
             )
         except Exception as exc:
@@ -297,6 +383,19 @@ class MainWindow(QMainWindow):
         state = "bypassed" if bypassed else "active"
         self._status_bar.showMessage(f"EQ {state}")
 
+    def _on_volume_changed(self, value: int):
+        """Map slider 0..100 to a logarithmic gain and push to the engine."""
+        if value <= 0:
+            gain = 0.0
+            self._volume_label.setText("Mute")
+        else:
+            # Audio-taper: square law gives a more natural feel.
+            gain = (value / 100.0) ** 2
+            db = 20.0 * np.log10(gain)
+            self._volume_label.setText(f"{db:+.1f} dB")
+        if self._audio_engine is not None and hasattr(self._audio_engine, "set_gain"):
+            self._audio_engine.set_gain(gain)
+
     def activate_profile_by_name(self, name: str):
         """Look up a profile by name and activate it."""
         try:
@@ -307,5 +406,7 @@ class MainWindow(QMainWindow):
             logger.error("Could not load profile '%s': %s", name, exc)
 
     def closeEvent(self, event):
-        self.stop_audio_engine()
+        # Don't stop the audio engine on window close — the app keeps
+        # running via the system tray, so the EQ should keep processing.
+        # Engine cleanup happens at QApplication.aboutToQuit (see main.py).
         super().closeEvent(event)
