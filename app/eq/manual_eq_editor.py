@@ -137,7 +137,12 @@ class ManualEQEditor(QWidget):
         root.addWidget(self._table)
 
         # --- Plot ---
-        self._plot_widget = pg.PlotWidget(title="Parametric EQ Response")
+        from app.plot_utils import AudioFreqAxis
+
+        self._plot_widget = pg.PlotWidget(
+            title="Parametric EQ Response",
+            axisItems={"bottom": AudioFreqAxis(orientation="bottom")},
+        )
         self._plot_widget.setLabel("left", "Magnitude (dB)")
         self._plot_widget.setLabel("bottom", "Frequency (Hz)")
         self._plot_widget.setLogMode(x=True, y=False)
@@ -147,8 +152,9 @@ class ManualEQEditor(QWidget):
         self._plot_widget.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
+        self._plot_widget.addLegend(offset=(10, 10))
         self._composite_curve = self._plot_widget.plot(
-            pen=pg.mkPen("w", width=2.5), name="Composite"
+            pen=pg.mkPen("w", width=2.5), name="Composite (applied)"
         )
         root.addWidget(self._plot_widget)
 

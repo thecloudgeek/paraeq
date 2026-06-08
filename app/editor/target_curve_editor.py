@@ -252,6 +252,11 @@ class TargetCurveEditor(QWidget):
 
             bands = auto_fit_parametric_eq(correction_db, freqs, sample_rate=48_000)
             logger.info("PEQ auto-fit complete: %d bands", len(bands))
+            for i, b in enumerate(bands):
+                logger.debug(
+                    "  band %2d: %-10s fc=%7.1f Hz  gain=%+5.1f dB  Q=%.2f",
+                    i + 1, b.filter_type, b.fc, b.gain_db, b.q,
+                )
             self._status_label.setText(
                 f"Parametric EQ generated ({len(bands)} bands)."
             )
