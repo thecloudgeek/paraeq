@@ -91,7 +91,7 @@ These items were specified in the design but not in the executed implementation 
 - **Installer pipeline**: DMG + pkg installer that bundles the BlackHole HAL plugin and installs ParaEQ.app to /Applications/. Currently the app only runs from source via `python -m app.main`.
 - **PyInstaller bundling**: `ParaEQ.app` build for distribution.
 - **Homebrew cask**: `brew install --cask paraeq`.
-- **Aggregate device creation**: programmatically create a macOS Aggregate Device combining BlackHole + headphone jack via Core Audio API. Currently the user has to set this up manually.
+- ~~**Aggregate device creation**~~ ✅ **Done.** `paraeq/audio/aggregate.py` programmatically creates the BlackHole + physical-output Aggregate Device via the Core Audio HAL (`AudioHardwareCreateAggregateDevice` through PyObjC), sets it as the system default on launch, and restores the real output + destroys the aggregate on quit. Fully automatic — no Audio MIDI Setup needed. (The Rust port calls the identical Core Audio API.)
 - **Launch-at-login**: launchd plist for auto-start.
 - **Interactive draggable control points** on the target curve editor (currently you can pick a preset and import/export CSV, but in-plot editing of control points is not implemented).
 - **AutoEQ database integration**: searchable headphone model picker that loads presets from the AutoEQ project. Currently you can import a preset file, but there's no built-in browser.
