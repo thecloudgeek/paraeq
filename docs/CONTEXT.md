@@ -2,7 +2,7 @@
 
 This document captures the why, the goals, what's been built, and what's left. It exists so future sessions (Claude or human) can pick up the work without rebuilding context from scratch.
 
-**Last updated:** 2026-06-07
+**Last updated:** 2026-06-18
 
 ---
 
@@ -67,7 +67,7 @@ We chose a hybrid approach rather than going straight to Rust:
 
 **Built-in Target Curves (`targets/`):** flat.csv, harman_ie_2019.csv, harman_ie_2019_without_bass.csv, harman_oe_2018.csv, harman_oe_2018_without_bass.csv, diffuse_field.csv. High-resolution data sourced from AutoEQ (MIT licensed) at commit `7ae0f56` (full SHA `7ae0f56d53074872b028649617a22bbb4232feb7`). Each CSV carries `# name:`, `# category:`, `# description:`, `# source:` metadata headers; the loader (`paraeq/correction/target_curves.py`) populates these on the `TargetCurve` dataclass.
 
-**Testing:** 75 tests, all passing, ~1.5s runtime. Includes 3 end-to-end integration tests covering measurement → FIR pipeline, measurement → PEQ pipeline, and profile save/load round-trip; plus 8 tests covering the metadata-headered target curve loader (added in cycle 1, including a contract-honoring test that `load_target_csv` raises `ValueError` on malformed data lines).
+**Testing:** 125 tests, all passing, ~1.7s runtime. Includes 3 end-to-end integration tests covering measurement → FIR pipeline, measurement → PEQ pipeline, and profile save/load round-trip; 8 tests covering the metadata-headered target curve loader; 6 tests for the interactive-editor library functions (`build_anchor_target` deviation model + `match_closest_target`); and 10 tests for the AutoEq database module (`parse_index`, `parse_parametric_eq` with preamp + shelf aliases, and `AutoEQClient` cache-hit/miss + both filename casings, all with networking mocked via a patched `_http_get`). GUI layers (`app/`) are manual-smoke only (no display in CI).
 
 ### Notable Implementation Decisions
 
@@ -77,6 +77,9 @@ We chose a hybrid approach rather than going straight to Rust:
 - **BlackHole is detected by name match** (`"blackhole" in device.name.lower()`). Bundling/install of the BlackHole HAL plugin into the macOS installer pkg is **not yet implemented** — currently relies on user having BlackHole pre-installed.
 - **Real-time routing is one Aggregate Device used in duplex** (this is the hardest-won, most port-critical piece — read carefully before the Rust port). The user creates a macOS Aggregate Device that lists **BlackHole 16ch FIRST** (16 ch) and the physical headphone output **SECOND** (2 ch), giving 18 output / ≥16 input channels. macOS plays system audio to aggregate output ch 1-2 (= BlackHole 1-2); BlackHole is a loopback, so output ch *N* reappears on input ch *N*. ParaEQ therefore opens the aggregate as **both input and output** (`input_device == output_device`), reads input ch 0-1, applies EQ, and writes to aggregate output ch 17-18 (= the headphones) via CoreAudio channel maps: input `[0, 1]`, output `[-1]*16 + [0, 1]`. The `-1` is the CoreAudio "route this stream channel nowhere" sentinel; the output map length must equal the device's output-channel count; and the leading `16` *is* BlackHole 16ch's channel count (a BlackHole 2ch aggregate would need `[-1, -1, 0, 1]`). **BlackHole's position in the aggregate is load-bearing** — reorder it and the channel offsets break. (`paraeq/audio/stream.py` → `AudioPassThrough(... input_channel_map, output_channel_map)`; wired in `app/main_window.py` → `start_audio_engine`.)
 - **AudioPassThrough provides a software master volume** (`set_gain`, square-law taper in the GUI). This is **required, not a convenience**: BlackHole exposes no system volume, so the macOS volume keys do nothing once audio is routed through the aggregate — the engine's gain is the only loudness control.
+- **Target editor uses a deviation-layer model** (`build_anchor_target` in `paraeq/correction/target_curves.py`): 16 fixed log-spaced anchors carry dB *offsets* added on top of the selected preset, sampled on the union of the base's frequencies and the anchor frequencies. This preserves a dense preset's fine detail (e.g. the Harman ear-gain peak) while letting the user tweak it. Anchors are vertical-drag-only, so anchor frequencies stay sorted/distinct and CubicSpline never sees degenerate input. The pyqtgraph overlay (`app/editor/draggable_anchors.py`) works in **log10(Hz)** coordinates because the plot is `setLogMode(x=True)` — items added to a log-mode ViewBox live in log space.
+- **Live target preview swaps a minimum-phase FIR** into the single `AudioEngine.set_processor` slot, debounced ~70 ms (`MainWindow._on_target_preview`). The convolver is built with one FIR **per channel** (`OverlapAddConvolver([fir, fir])`) — a mono convolver only allocates one overlap buffer and would `IndexError` on channel 1 inside the realtime callback. The slot is shared with the manual-EQ IIR path, so the previewed FIR **persists as the active correction** until something else sets the processor (there is no auto-restore of the prior manual EQ — known limitation, acceptable for "drag to taste"). The Rust port should keep the same single-processor contract.
+- **AutoEq browser uses `results/INDEX.md` as the index** (not `webapp/data/*.json`), because the markdown gives each model's exact relative folder path — sidestepping AutoEq's inconsistent `results/` folder layout (full tree vs recommended-list use different depths). Preset filenames vary in casing (`ParametricEq.txt` vs `ParametricEQ.txt`); the client tries both and percent-encodes spaces. Index + presets are cached under the platformdirs data dir (`autoeq_cache/`); only first access hits the network. Networking is stdlib `urllib` behind a patchable `_http_get`, run on a `QThread` worker in the dialog. (`paraeq/correction/autoeq_db.py`, `app/eq/autoeq_browser.py`.)
 
 ### Recently Completed Cycles
 
@@ -93,8 +96,8 @@ These items were specified in the design but not in the executed implementation 
 - **Homebrew cask**: `brew install --cask paraeq`.
 - ~~**Aggregate device creation**~~ ✅ **Done.** `paraeq/audio/aggregate.py` programmatically creates the BlackHole + physical-output Aggregate Device via the Core Audio HAL (`AudioHardwareCreateAggregateDevice` through PyObjC), sets it as the system default on launch, and restores the real output + destroys the aggregate on quit. Fully automatic — no Audio MIDI Setup needed. (The Rust port calls the identical Core Audio API.)
 - **Launch-at-login**: launchd plist for auto-start.
-- **Interactive draggable control points** on the target curve editor (currently you can pick a preset and import/export CSV, but in-plot editing of control points is not implemented).
-- **AutoEQ database integration**: searchable headphone model picker that loads presets from the AutoEQ project. Currently you can import a preset file, but there's no built-in browser.
+- ~~**Interactive draggable control points**~~ ✅ **Done.** The target editor overlays 16 fixed log-spaced, vertically-draggable anchors that apply a smooth dB *deviation* on top of the selected preset (`build_anchor_target`), with a debounced live minimum-phase-FIR preview to the audio engine and a "Match closest" auto-match button. See `docs/specs/2026-06-17-target-editor-autoeq-design.md` and `docs/plans/2026-06-18-target-editor-autoeq.md`.
+- ~~**AutoEQ database integration**~~ ✅ **Done.** The EQ tab's "Browse AutoEQ DB…" button opens a searchable model picker backed by `paraeq/correction/autoeq_db.py` (cache-first index sync + lazy per-model preset fetch from the AutoEq GitHub repo). Single-file import still works too.
 
 ### Phase 2 (future, designed but not built)
 
