@@ -56,6 +56,7 @@ class ManualEQEditor(QWidget):
     """Parametric EQ editor: table of bands + composite/individual FR plot."""
 
     eq_changed = pyqtSignal(list)  # list of EQBand
+    preamp_changed = pyqtSignal(float)  # AutoEq preamp in dB
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -81,6 +82,10 @@ class ManualEQEditor(QWidget):
         tb.addWidget(self._remove_btn)
 
         tb.addStretch()
+
+        self._browse_btn = QPushButton("Browse AutoEQ DB…")
+        self._browse_btn.clicked.connect(self._browse_autoeq_db)
+        tb.addWidget(self._browse_btn)
 
         self._import_btn = QPushButton("Import AutoEQ…")
         self._import_btn.clicked.connect(self._import_autoeq)
@@ -255,6 +260,22 @@ class ManualEQEditor(QWidget):
     # ------------------------------------------------------------------
     # Import / Export
     # ------------------------------------------------------------------
+
+    def _browse_autoeq_db(self):
+        from app.eq.autoeq_browser import AutoEQBrowserDialog
+
+        dlg = AutoEQBrowserDialog(self)
+        if dlg.exec() != dlg.DialogCode.Accepted:
+            return
+        if not dlg.selected_bands:
+            QMessageBox.warning(self, "AutoEQ", "That preset had no usable bands.")
+            return
+        self.load_bands(dlg.selected_bands)
+        self.preamp_changed.emit(dlg.selected_preamp_db)
+        logger.info(
+            "Loaded AutoEq preset: %d bands, preamp %.1f dB",
+            len(dlg.selected_bands), dlg.selected_preamp_db,
+        )
 
     def _import_autoeq(self):
         path, _ = QFileDialog.getOpenFileName(
