@@ -1,6 +1,5 @@
 """Manual parametric EQ editor with band table and AutoEQ import/export."""
 import logging
-import re
 from pathlib import Path
 
 import numpy as np
@@ -26,13 +25,6 @@ from PyQt6.QtWidgets import (
 
 logger = logging.getLogger(__name__)
 
-# AutoEQ filter-type short names → internal names
-_AUTOEQ_TO_INTERNAL = {
-    "PK": "peaking",
-    "LSC": "low_shelf",
-    "HSC": "high_shelf",
-    "NO": "notch",
-}
 _INTERNAL_TYPES = ["peaking", "low_shelf", "high_shelf", "notch"]
 
 # Plot colours per band (cycles)
@@ -53,29 +45,6 @@ COL_Q = 3
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _parse_autoeq(text: str) -> list[dict]:
-    """Parse AutoEQ preset text into list of band dicts."""
-    bands = []
-    pattern = re.compile(
-        r"Filter\s+\d+\s*:\s*ON\s+(\w+)\s+Fc\s+([\d.]+)\s+Hz\s+Gain\s+([-\d.]+)\s+dB\s+Q\s+([\d.]+)",
-        re.IGNORECASE,
-    )
-    for line in text.splitlines():
-        m = pattern.search(line)
-        if m:
-            short, fc, gain, q = m.group(1), m.group(2), m.group(3), m.group(4)
-            internal = _AUTOEQ_TO_INTERNAL.get(short.upper(), "peaking")
-            bands.append(
-                {
-                    "filter_type": internal,
-                    "fc": float(fc),
-                    "gain_db": float(gain),
-                    "q": float(q),
-                }
-            )
-    return bands
 
 
 # ---------------------------------------------------------------------------
@@ -295,22 +264,24 @@ class ManualEQEditor(QWidget):
         if not path:
             return
         try:
-            text = Path(path).read_text()
-            band_dicts = _parse_autoeq(text)
-            if not band_dicts:
+            from paraeq.correction.autoeq_db import parse_parametric_eq
+
+            parsed = parse_parametric_eq(Path(path).read_text())
+            if not parsed.bands:
                 QMessageBox.warning(
                     self, "Import", "No AutoEQ filter lines found in the file."
                 )
                 return
             self._table.blockSignals(True)
             self._table.setRowCount(0)
-            for bd in band_dicts:
-                self._append_row(
-                    bd["filter_type"], bd["fc"], bd["gain_db"], bd["q"]
-                )
+            for band in parsed.bands:
+                self._append_row(band.filter_type, band.fc, band.gain_db, band.q)
             self._table.blockSignals(False)
             self._refresh_plot()
-            logger.info("Imported %d bands from %s", len(band_dicts), path)
+            logger.info(
+                "Imported %d bands (preamp %.1f dB) from %s",
+                len(parsed.bands), parsed.preamp_db, path,
+            )
         except Exception as exc:
             logger.error("AutoEQ import failed: %s", exc)
             QMessageBox.critical(self, "Import Error", str(exc))
