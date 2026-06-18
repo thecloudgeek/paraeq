@@ -128,6 +128,17 @@ def test_fetch_preset_tries_both_filename_casings(tmp_path):
     assert len(parsed.bands) == 4
 
 
+def test_fetch_index_write_is_atomic_no_temp_left(tmp_path):
+    index_text = (FIXTURES / "autoeq_index_sample.md").read_text()
+    client = AutoEQClient(cache_dir=tmp_path)
+    with mock.patch(
+        "paraeq.correction.autoeq_db._http_get", return_value=index_text
+    ):
+        client.fetch_index()
+    # Only the final file should remain — no leftover ".tmp" from the atomic write.
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["INDEX.md"]
+
+
 def test_fetch_preset_uses_cache_on_second_call(tmp_path):
     preset_text = (FIXTURES / "autoeq_parametric_sample.txt").read_text()
     client = AutoEQClient(cache_dir=tmp_path)

@@ -28,6 +28,7 @@ class MainWindow(QMainWindow):
         self._profile_manager = ProfileManager()
         self._active_profile: Profile | None = None
         self._audio_engine = None
+        self._preamp_db = 0.0  # AutoEq preset headroom, folded into master gain
 
         self._setup_ui()
         self._connect_signals()
@@ -262,15 +263,14 @@ class MainWindow(QMainWindow):
         """Apply an AutoEq preset's preamp to the master volume.
 
         AutoEq presets include a negative preamp to leave headroom for their
-        boosts. We fold it into the engine's master gain (BlackHole exposes no
-        system volume), relative to the current slider position.
+        boosts. We persist it in ``self._preamp_db`` and re-derive the engine
+        gain through ``_on_volume_changed`` so it survives later volume changes
+        and engine (re)starts (BlackHole exposes no system volume).
         """
-        slider_gain = (self._volume_slider.value() / 100.0) ** 2
-        gain = slider_gain * (10.0 ** (preamp_db / 20.0))
-        if self._audio_engine is not None and hasattr(self._audio_engine, "set_gain"):
-            self._audio_engine.set_gain(gain)
+        self._preamp_db = preamp_db
+        self._on_volume_changed(self._volume_slider.value())
         self._status_bar.showMessage(f"AutoEq preamp applied: {preamp_db:+.1f} dB")
-        logger.info("Applied AutoEq preamp %.1f dB (gain=%.3f)", preamp_db, gain)
+        logger.info("Applied AutoEq preamp %.1f dB", preamp_db)
 
     def _on_profile_activated(self, profile: Profile):
         """Load and apply the activated profile."""
@@ -311,7 +311,10 @@ class MainWindow(QMainWindow):
             from paraeq.engine.convolver import OverlapAddConvolver
 
             fir = design_fir_correction(correction_db, freqs)
-            convolver = OverlapAddConvolver(fir)
+            # The engine feeds stereo (frames, 2) blocks, so give the convolver
+            # one FIR per channel — a mono convolver only allocates one overlap
+            # buffer and would IndexError on channel 1 inside the realtime callback.
+            convolver = OverlapAddConvolver([fir, fir])
             self._audio_engine.set_processor(convolver.process)
             logger.info("Live target preview applied (FIR taps=%d)", len(fir))
         except Exception as exc:
@@ -426,15 +429,21 @@ class MainWindow(QMainWindow):
         self._status_bar.showMessage(f"EQ {state}")
 
     def _on_volume_changed(self, value: int):
-        """Map slider 0..100 to a logarithmic gain and push to the engine."""
+        """Map slider 0..100 to a logarithmic gain and push to the engine.
+
+        The active AutoEq preamp (``self._preamp_db``, ≤ 0) is folded into the
+        engine gain here so it persists across volume changes and engine restarts;
+        the label still shows the user's volume position, not the preamp.
+        """
         if value <= 0:
             gain = 0.0
             self._volume_label.setText("Mute")
         else:
             # Audio-taper: square law gives a more natural feel.
-            gain = (value / 100.0) ** 2
-            db = 20.0 * np.log10(gain)
+            volume = (value / 100.0) ** 2
+            db = 20.0 * np.log10(volume)
             self._volume_label.setText(f"{db:+.1f} dB")
+            gain = volume * (10.0 ** (self._preamp_db / 20.0))
         if self._audio_engine is not None and hasattr(self._audio_engine, "set_gain"):
             self._audio_engine.set_gain(gain)
 

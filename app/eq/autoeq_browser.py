@@ -8,6 +8,7 @@ accept, the selected model's parsed bands + preamp are exposed via
 import logging
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -33,8 +34,8 @@ class _AutoEQWorker(QThread):
     preset_ready = pyqtSignal(object)     # ParsedPreset
     failed = pyqtSignal(str)
 
-    def __init__(self, client, mode, entry=None):
-        super().__init__()
+    def __init__(self, client, mode, entry=None, parent=None):
+        super().__init__(parent)
         self._client = client
         self._mode = mode                 # "index" or "preset"
         self._entry = entry
@@ -96,12 +97,35 @@ class AutoEQBrowserDialog(QDialog):
         self._buttons.rejected.connect(self.reject)
         layout.addWidget(self._buttons)
 
+    # --- worker lifecycle ---
+    def _start_worker(self, mode, entry=None) -> "_AutoEQWorker":
+        """Create a parented worker (so Qt owns it) that self-deletes on finish."""
+        worker = _AutoEQWorker(self._client, mode, entry, parent=self)
+        worker.finished.connect(worker.deleteLater)
+        self._worker = worker
+        return worker
+
+    def _shutdown_worker(self):
+        """Block until any in-flight worker finishes, so it is never destroyed
+        while running (which Qt turns into a hard process abort)."""
+        worker = self._worker
+        if worker is not None and worker.isRunning():
+            worker.wait()
+
+    def reject(self):
+        self._shutdown_worker()
+        super().reject()
+
+    def closeEvent(self, event: QCloseEvent):
+        self._shutdown_worker()
+        super().closeEvent(event)
+
     # --- index ---
     def _load_index(self):
-        self._worker = _AutoEQWorker(self._client, "index")
-        self._worker.index_ready.connect(self._on_index_ready)
-        self._worker.failed.connect(self._on_failed)
-        self._worker.start()
+        worker = self._start_worker("index")
+        worker.index_ready.connect(self._on_index_ready)
+        worker.failed.connect(self._on_failed)
+        worker.start()
 
     def _on_index_ready(self, entries):
         self._entries = entries
@@ -120,6 +144,8 @@ class AutoEQBrowserDialog(QDialog):
 
     # --- preset ---
     def _accept_selection(self):
+        if self._worker is not None and self._worker.isRunning():
+            return  # a fetch is already in flight
         item = self._list.currentItem()
         if item is None:
             self._status.setText("Select a model first.")
@@ -127,10 +153,10 @@ class AutoEQBrowserDialog(QDialog):
         entry = item.data(Qt.ItemDataRole.UserRole)
         self._status.setText(f"Fetching {entry.name}…")
         self._buttons.setEnabled(False)
-        self._worker = _AutoEQWorker(self._client, "preset", entry)
-        self._worker.preset_ready.connect(self._on_preset_ready)
-        self._worker.failed.connect(self._on_failed)
-        self._worker.start()
+        worker = self._start_worker("preset", entry)
+        worker.preset_ready.connect(self._on_preset_ready)
+        worker.failed.connect(self._on_failed)
+        worker.start()
 
     def _on_preset_ready(self, parsed):
         self.selected_bands = parsed.bands

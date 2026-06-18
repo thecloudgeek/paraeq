@@ -5,6 +5,7 @@ patch it. Data source: github.com/jaakkopasanen/AutoEq (raw.githubusercontent.co
 """
 
 import logging
+import os
 import re
 import urllib.parse
 import urllib.request
@@ -124,6 +125,14 @@ def _default_cache_dir() -> Path:
     return Path(user_data_dir("ParaEQ")) / "autoeq_cache"
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write text via a temp file + os.replace so an interrupted write never
+    leaves a truncated file that a later run would serve as a valid cache hit."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 class AutoEQClient:
     """Cache-first access to AutoEq's index and per-model presets.
 
@@ -143,7 +152,7 @@ class AutoEQClient:
         else:
             text = _http_get(f"{_RAW_BASE}/{urllib.parse.quote(_INDEX_REL)}")
             self.cache_dir.mkdir(parents=True, exist_ok=True)
-            cache_file.write_text(text, encoding="utf-8")
+            _atomic_write_text(cache_file, text)
             logger.info("AutoEq index downloaded and cached: %s", cache_file)
         return parse_index(text)
 
@@ -154,7 +163,7 @@ class AutoEQClient:
             return parse_parametric_eq(cache_file.read_text(encoding="utf-8"))
         text = self._download_preset(entry)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_file.write_text(text, encoding="utf-8")
+        _atomic_write_text(cache_file, text)
         logger.info("AutoEq preset downloaded and cached: %s", entry.name)
         return parse_parametric_eq(text)
 

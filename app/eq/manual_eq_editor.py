@@ -265,16 +265,21 @@ class ManualEQEditor(QWidget):
         from app.eq.autoeq_browser import AutoEQBrowserDialog
 
         dlg = AutoEQBrowserDialog(self)
-        if dlg.exec() != dlg.DialogCode.Accepted:
-            return
-        if not dlg.selected_bands:
+        try:
+            if dlg.exec() != dlg.DialogCode.Accepted:
+                return
+            bands = dlg.selected_bands
+            preamp_db = dlg.selected_preamp_db
+        finally:
+            dlg.deleteLater()  # parented to self, so won't free on scope exit otherwise
+
+        if not bands:
             QMessageBox.warning(self, "AutoEQ", "That preset had no usable bands.")
             return
-        self.load_bands(dlg.selected_bands)
-        self.preamp_changed.emit(dlg.selected_preamp_db)
+        self.load_bands(bands)
+        self.preamp_changed.emit(preamp_db)
         logger.info(
-            "Loaded AutoEq preset: %d bands, preamp %.1f dB",
-            len(dlg.selected_bands), dlg.selected_preamp_db,
+            "Loaded AutoEq preset: %d bands, preamp %.1f dB", len(bands), preamp_db
         )
 
     def _import_autoeq(self):
