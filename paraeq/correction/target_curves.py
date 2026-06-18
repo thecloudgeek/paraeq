@@ -14,6 +14,14 @@ TARGETS_DIR = Path(__file__).parent.parent.parent / "targets"
 
 _METADATA_KEYS: frozenset[str] = frozenset({"category", "description", "name", "source"})
 
+# Fixed, log-spaced anchor frequencies for the interactive target editor.
+# Only the gain axis is draggable, so frequencies stay sorted/distinct by
+# construction (no CubicSpline degenerate-input risk).
+ANCHOR_FREQS = np.array(
+    [20, 32, 50, 80, 125, 200, 315, 500, 800, 1250, 2000, 3150, 5000, 8000, 12500, 20000],
+    dtype=np.float64,
+)
+
 
 @dataclass
 class TargetCurve:
@@ -147,3 +155,90 @@ def compute_correction(measured_db: np.ndarray, target_db: np.ndarray) -> np.nda
         float(np.sqrt(np.mean(correction**2))),
     )
     return correction
+
+
+def build_anchor_target(
+    base: TargetCurve,
+    anchor_freqs: np.ndarray,
+    offsets_db: np.ndarray,
+    *,
+    name: str = "Custom",
+) -> TargetCurve:
+    """Return a new TargetCurve = base + a smooth deviation through the anchors.
+
+    The deviation is a cubic spline (in log-frequency space) through
+    ``(anchor_freqs, offsets_db)``, held constant outside the anchor range.
+    Sampling on the union of the base's own frequencies and the anchor
+    frequencies preserves the base preset's fine detail while applying the
+    user's anchor offsets. ``base`` is never mutated.
+
+    Args:
+        base: The preset being edited (offsets start at zero).
+        anchor_freqs: Fixed anchor frequencies in Hz (sorted, distinct).
+        offsets_db: One dB offset per anchor (same length as anchor_freqs).
+        name: Name for the returned curve.
+
+    Returns:
+        A new :class:`TargetCurve`.
+    """
+    grid = np.unique(np.concatenate([base.frequencies, anchor_freqs]))
+    base_db = base.interpolate(grid)
+
+    cs = CubicSpline(np.log10(anchor_freqs), offsets_db, extrapolate=True)
+    deviation = cs(np.log10(grid))
+    deviation = np.where(grid < anchor_freqs[0], offsets_db[0], deviation)
+    deviation = np.where(grid > anchor_freqs[-1], offsets_db[-1], deviation)
+
+    logger.debug(
+        "build_anchor_target",
+        extra={
+            "base": base.name,
+            "n_grid": len(grid),
+            "offset_max": float(np.max(np.abs(offsets_db))),
+        },
+    )
+    return TargetCurve(
+        name=name,
+        frequencies=grid,
+        gains_db=base_db + deviation,
+        category=base.category,
+        description=base.description,
+        source=base.source,
+    )
+
+
+def match_closest_target(
+    measured_freqs: np.ndarray,
+    measured_db: np.ndarray,
+    targets: list[TargetCurve],
+) -> TargetCurve:
+    """Return the target the measurement is already closest to.
+
+    Scores each target by the level-aligned RMS of ``target - measured``
+    (the mean is removed first because absolute level is arbitrary) and
+    returns the smallest-scoring target.
+
+    Args:
+        measured_freqs: Measurement frequencies in Hz.
+        measured_db: Measured response in dB (same length as measured_freqs).
+        targets: Candidate target curves (must be non-empty).
+
+    Returns:
+        The closest :class:`TargetCurve`.
+    """
+    best: TargetCurve | None = None
+    best_score = np.inf
+    for t in targets:
+        residual = t.interpolate(measured_freqs) - measured_db
+        residual = residual - residual.mean()
+        score = float(np.sqrt(np.mean(residual ** 2)))
+        logger.debug("match_closest_target candidate", extra={"target": t.name, "rms": score})
+        if score < best_score:
+            best_score = score
+            best = t
+    logger.info(
+        "match_closest_target chose '%s' (rms=%.3f dB)",
+        best.name if best else None,
+        best_score,
+    )
+    return best
