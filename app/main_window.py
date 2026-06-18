@@ -160,9 +160,16 @@ class MainWindow(QMainWindow):
                 self._on_correction_generated
             )
 
+        # Target editor → live FIR preview while dragging anchors
+        if hasattr(self._target_tab, "target_preview"):
+            self._target_tab.target_preview.connect(self._on_target_preview)
+
         # Manual EQ changed
         if hasattr(self._eq_tab, "eq_changed"):
             self._eq_tab.eq_changed.connect(self._on_eq_changed)
+
+        if hasattr(self._eq_tab, "preamp_changed"):
+            self._eq_tab.preamp_changed.connect(self._on_preamp_changed)
 
         # Profile activated
         if hasattr(self._profiles_tab, "profile_activated"):
@@ -251,6 +258,20 @@ class MainWindow(QMainWindow):
         self._status_bar.showMessage(f"EQ updated — {len(bands)} band(s)")
         self._update_iir_processor(bands)
 
+    def _on_preamp_changed(self, preamp_db: float):
+        """Apply an AutoEq preset's preamp to the master volume.
+
+        AutoEq presets include a negative preamp to leave headroom for their
+        boosts. We fold it into the engine's master gain (BlackHole exposes no
+        system volume), relative to the current slider position.
+        """
+        slider_gain = (self._volume_slider.value() / 100.0) ** 2
+        gain = slider_gain * (10.0 ** (preamp_db / 20.0))
+        if self._audio_engine is not None and hasattr(self._audio_engine, "set_gain"):
+            self._audio_engine.set_gain(gain)
+        self._status_bar.showMessage(f"AutoEq preamp applied: {preamp_db:+.1f} dB")
+        logger.info("Applied AutoEq preamp %.1f dB (gain=%.3f)", preamp_db, gain)
+
     def _on_profile_activated(self, profile: Profile):
         """Load and apply the activated profile."""
         logger.info("Profile activated: %s", profile.name)
@@ -274,6 +295,27 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Audio engine
     # ------------------------------------------------------------------
+
+    def _on_target_preview(self, freqs, correction_db):
+        """Audition a target-editor correction live by swapping in a FIR.
+
+        Designs a minimum-phase FIR from the correction curve and installs it
+        as the engine processor. Debounced upstream by the editor. The single
+        processor slot is shared with the manual-EQ IIR path, so previewing a
+        target temporarily takes over the active correction (by design).
+        """
+        if self._audio_engine is None:
+            return
+        try:
+            from paraeq.correction.fir_filter import design_fir_correction
+            from paraeq.engine.convolver import OverlapAddConvolver
+
+            fir = design_fir_correction(correction_db, freqs)
+            convolver = OverlapAddConvolver(fir)
+            self._audio_engine.set_processor(convolver.process)
+            logger.info("Live target preview applied (FIR taps=%d)", len(fir))
+        except Exception as exc:
+            logger.error("Target preview failed: %s", exc)
 
     def _update_iir_processor(self, bands):
         """Forward new EQ bands to the running IIR processor."""
