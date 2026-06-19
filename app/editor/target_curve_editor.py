@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtCore import QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -25,13 +25,24 @@ class TargetCurveEditor(QWidget):
     """Panel for choosing target curves and generating correction filters."""
 
     correction_generated = pyqtSignal(dict)  # keys: type, data, freqs, magnitude_db
+    target_preview = pyqtSignal(object, object)  # (measured_freqs, correction_db)
 
     def __init__(self, parent=None):
         super().__init__(parent)
 
+        from paraeq.correction.target_curves import ANCHOR_FREQS
+
         self._measured_freqs: np.ndarray | None = None
         self._measured_db: np.ndarray | None = None
         self._target_curve = None  # TargetCurve or None
+
+        self._base_target = None  # preset before deviation
+        self._anchor_freqs = ANCHOR_FREQS
+        self._anchor_offsets_db = np.zeros(len(ANCHOR_FREQS))
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(70)  # ms debounce
+        self._preview_timer.timeout.connect(self._emit_preview)
 
         self._setup_ui()
         self._populate_presets()
@@ -63,6 +74,11 @@ class TargetCurveEditor(QWidget):
         self._export_csv_btn = QPushButton("Export CSV…")
         self._export_csv_btn.clicked.connect(self._export_csv)
         preset_layout.addWidget(self._export_csv_btn)
+
+        self._match_btn = QPushButton("Match closest")
+        self._match_btn.setToolTip("Select the built-in target your measurement is closest to")
+        self._match_btn.clicked.connect(self._match_closest)
+        preset_layout.addWidget(self._match_btn)
 
         root.addWidget(preset_group)
 
@@ -111,6 +127,11 @@ class TargetCurveEditor(QWidget):
             pen=pg.mkPen("#66BB6A", width=1, style=pg.QtCore.Qt.PenStyle.DashLine),
             name="Correction delta",
         )
+
+        from app.editor.draggable_anchors import DraggableAnchors
+
+        self._anchors = DraggableAnchors(self._on_anchor_moved)
+        self._plot_widget.addItem(self._anchors)
 
         root.addWidget(self._plot_widget)
 
@@ -167,16 +188,69 @@ class TargetCurveEditor(QWidget):
             try:
                 from paraeq.correction.target_curves import TargetCurve
 
-                freqs = np.array([20.0, 20_000.0])
-                gains = np.array([0.0, 0.0])
-                self._target_curve = TargetCurve("Flat", freqs, gains)
+                target = TargetCurve("Flat", np.array([20.0, 20_000.0]), np.array([0.0, 0.0]))
             except Exception:
-                self._target_curve = None
-        else:
-            self._target_curve = target
-
-        self._update_plot()
+                target = None
+        self._base_target = target
+        self._anchor_offsets_db = np.zeros(len(self._anchor_freqs))
+        self._rebuild_target()
         logger.debug("Target preset changed to index=%d", index)
+
+    def _rebuild_target(self):
+        """Recompute the active target from base + anchor offsets, redraw."""
+        if self._base_target is None:
+            self._target_curve = None
+        elif np.any(self._anchor_offsets_db):
+            from paraeq.correction.target_curves import build_anchor_target
+
+            self._target_curve = build_anchor_target(
+                self._base_target, self._anchor_freqs, self._anchor_offsets_db
+            )
+        else:
+            self._target_curve = self._base_target
+        self._update_plot()
+        self._update_anchor_positions()
+
+    def _update_anchor_positions(self):
+        if self._base_target is None:
+            return
+        base_gains = self._base_target.interpolate(self._anchor_freqs)
+        self._anchors.set_anchors(self._anchor_freqs, base_gains + self._anchor_offsets_db)
+
+    def _on_anchor_moved(self, index: int, new_gain_db: float):
+        base_gain = float(self._base_target.interpolate(self._anchor_freqs[index : index + 1])[0])
+        self._anchor_offsets_db[index] = new_gain_db - base_gain
+        self._rebuild_target()
+        if self._measured_freqs is not None:
+            self._preview_timer.start()
+
+    def _emit_preview(self):
+        if self._measured_freqs is None or self._target_curve is None:
+            return
+        from paraeq.correction.target_curves import compute_correction
+
+        target_db = self._target_curve.interpolate(self._measured_freqs)
+        correction_db = compute_correction(self._measured_db, target_db)
+        self.target_preview.emit(self._measured_freqs, correction_db)
+        logger.debug("Emitted target_preview (%d freqs)", len(self._measured_freqs))
+
+    def _match_closest(self):
+        if self._measured_freqs is None or self._measured_db is None:
+            QMessageBox.warning(self, "No Measurement", "Load a measurement first.")
+            return
+        if not self._builtin_targets:
+            QMessageBox.warning(self, "No Targets", "No built-in targets available.")
+            return
+        from paraeq.correction.target_curves import match_closest_target
+
+        best = match_closest_target(self._measured_freqs, self._measured_db, self._builtin_targets)
+        for i in range(self._preset_combo.count()):
+            t = self._preset_combo.itemData(i)
+            if t is best:
+                self._preset_combo.setCurrentIndex(i)  # fires _on_preset_changed
+                break
+        self._status_label.setText(f"Closest target: {best.name}")
+        logger.info("Auto-matched closest target: %s", best.name)
 
     def _update_plot(self):
         if self._measured_freqs is not None and self._measured_db is not None:
@@ -287,8 +361,9 @@ class TargetCurveEditor(QWidget):
             self._preset_combo.addItem(f"[imported] {target.name}", userData=target)
             self._preset_combo.setCurrentIndex(self._preset_combo.count() - 1)
             self._preset_combo.blockSignals(False)
-            self._target_curve = target
-            self._update_plot()
+            self._base_target = target
+            self._anchor_offsets_db = np.zeros(len(self._anchor_freqs))
+            self._rebuild_target()
             logger.info("Imported target CSV: %s", path)
         except Exception as exc:
             logger.error("Failed to import CSV: %s", exc)

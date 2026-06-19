@@ -28,6 +28,7 @@ class MainWindow(QMainWindow):
         self._profile_manager = ProfileManager()
         self._active_profile: Profile | None = None
         self._audio_engine = None
+        self._preamp_db = 0.0  # AutoEq preset headroom, folded into master gain
 
         self._setup_ui()
         self._connect_signals()
@@ -160,9 +161,16 @@ class MainWindow(QMainWindow):
                 self._on_correction_generated
             )
 
+        # Target editor → live FIR preview while dragging anchors
+        if hasattr(self._target_tab, "target_preview"):
+            self._target_tab.target_preview.connect(self._on_target_preview)
+
         # Manual EQ changed
         if hasattr(self._eq_tab, "eq_changed"):
             self._eq_tab.eq_changed.connect(self._on_eq_changed)
+
+        if hasattr(self._eq_tab, "preamp_changed"):
+            self._eq_tab.preamp_changed.connect(self._on_preamp_changed)
 
         # Profile activated
         if hasattr(self._profiles_tab, "profile_activated"):
@@ -251,6 +259,19 @@ class MainWindow(QMainWindow):
         self._status_bar.showMessage(f"EQ updated — {len(bands)} band(s)")
         self._update_iir_processor(bands)
 
+    def _on_preamp_changed(self, preamp_db: float):
+        """Apply an AutoEq preset's preamp to the master volume.
+
+        AutoEq presets include a negative preamp to leave headroom for their
+        boosts. We persist it in ``self._preamp_db`` and re-derive the engine
+        gain through ``_on_volume_changed`` so it survives later volume changes
+        and engine (re)starts (BlackHole exposes no system volume).
+        """
+        self._preamp_db = preamp_db
+        self._on_volume_changed(self._volume_slider.value())
+        self._status_bar.showMessage(f"AutoEq preamp applied: {preamp_db:+.1f} dB")
+        logger.info("Applied AutoEq preamp %.1f dB", preamp_db)
+
     def _on_profile_activated(self, profile: Profile):
         """Load and apply the activated profile."""
         logger.info("Profile activated: %s", profile.name)
@@ -274,6 +295,30 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Audio engine
     # ------------------------------------------------------------------
+
+    def _on_target_preview(self, freqs, correction_db):
+        """Audition a target-editor correction live by swapping in a FIR.
+
+        Designs a minimum-phase FIR from the correction curve and installs it
+        as the engine processor. Debounced upstream by the editor. The single
+        processor slot is shared with the manual-EQ IIR path, so previewing a
+        target temporarily takes over the active correction (by design).
+        """
+        if self._audio_engine is None:
+            return
+        try:
+            from paraeq.correction.fir_filter import design_fir_correction
+            from paraeq.engine.convolver import OverlapAddConvolver
+
+            fir = design_fir_correction(correction_db, freqs)
+            # The engine feeds stereo (frames, 2) blocks, so give the convolver
+            # one FIR per channel — a mono convolver only allocates one overlap
+            # buffer and would IndexError on channel 1 inside the realtime callback.
+            convolver = OverlapAddConvolver([fir, fir])
+            self._audio_engine.set_processor(convolver.process)
+            logger.info("Live target preview applied (FIR taps=%d)", len(fir))
+        except Exception as exc:
+            logger.error("Target preview failed: %s", exc)
 
     def _update_iir_processor(self, bands):
         """Forward new EQ bands to the running IIR processor."""
@@ -384,15 +429,21 @@ class MainWindow(QMainWindow):
         self._status_bar.showMessage(f"EQ {state}")
 
     def _on_volume_changed(self, value: int):
-        """Map slider 0..100 to a logarithmic gain and push to the engine."""
+        """Map slider 0..100 to a logarithmic gain and push to the engine.
+
+        The active AutoEq preamp (``self._preamp_db``, ≤ 0) is folded into the
+        engine gain here so it persists across volume changes and engine restarts;
+        the label still shows the user's volume position, not the preamp.
+        """
         if value <= 0:
             gain = 0.0
             self._volume_label.setText("Mute")
         else:
             # Audio-taper: square law gives a more natural feel.
-            gain = (value / 100.0) ** 2
-            db = 20.0 * np.log10(gain)
+            volume = (value / 100.0) ** 2
+            db = 20.0 * np.log10(volume)
             self._volume_label.setText(f"{db:+.1f} dB")
+            gain = volume * (10.0 ** (self._preamp_db / 20.0))
         if self._audio_engine is not None and hasattr(self._audio_engine, "set_gain"):
             self._audio_engine.set_gain(gain)
 
