@@ -189,6 +189,29 @@ def set_default_output(device_id: int) -> None:
     logger.info("set default output device", extra={"device_id": device_id})
 
 
+def set_device_volume(device_id: int, scalar: float) -> None:
+    """Set a device's master output volume scalar (0.0–1.0).
+
+    BlackHole's volume control scales every sample passing through the
+    loopback, so setup forces it to unity — otherwise a slider someone once
+    dragged down in Audio MIDI Setup silently attenuates the whole system.
+    """
+    ca = _ca()
+    data = struct.pack("f", scalar)
+    status = ca.AudioObjectSetPropertyData(
+        device_id,
+        _addr(ca.kAudioDevicePropertyVolumeScalar, ca.kAudioObjectPropertyScopeOutput),
+        0,
+        _objc_null(),
+        len(data),
+        data,
+    )
+    _check(status, "set device volume")
+    logger.info(
+        "set device volume", extra={"device_id": device_id, "scalar": scalar}
+    )
+
+
 def create_aggregate(
     sub_uids: list[str],
     main_uid: str,
@@ -364,6 +387,12 @@ def setup_routing(previous_physical_uid: str | None = None) -> RoutingState | No
         if not _is_usable_physical(physical, blackhole):
             logger.warning("aggregate setup skipped: no usable physical output found")
             return None
+
+        # Best-effort: failure here means quieter audio, not broken routing.
+        try:
+            set_device_volume(blackhole.id, 1.0)
+        except Exception as exc:
+            logger.warning("could not normalize BlackHole volume: %s", exc)
 
         # Idempotency / crash cleanup: drop any pre-existing ParaEQ aggregate.
         for dev in devices:

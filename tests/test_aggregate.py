@@ -48,6 +48,7 @@ def _patch_setup(devices, current_default, create_id=200):
         "create_aggregate": MagicMock(return_value=create_id),
         "destroy_aggregate": MagicMock(),
         "set_default_output": MagicMock(),
+        "set_device_volume": MagicMock(),
         "reinit_portaudio": MagicMock(),
         "sd_index_for_name": MagicMock(return_value=8),
     }
@@ -106,6 +107,28 @@ def test_setup_routing_falls_back_when_default_is_stale_and_no_hint():
     with ctx:
         state = aggregate.setup_routing(previous_physical_uid=None)
     assert state.restore_output_uid == "ExtHeadphones_UID"
+
+
+def test_setup_routing_normalizes_blackhole_volume():
+    # BlackHole's device volume silently scales the loopback (a user who ever
+    # lowered it in Audio MIDI Setup gets a mysteriously quiet system) — setup
+    # must force it back to unity.
+    ctx, m = _patch_setup([SPEAKERS, BLACKHOLE], SPEAKERS)
+    with ctx:
+        state = aggregate.setup_routing()
+    assert state is not None
+    m["set_device_volume"].assert_called_once_with(BLACKHOLE.id, 1.0)
+
+
+def test_setup_routing_survives_volume_set_failure():
+    # Volume normalization is best-effort: a failure means quieter audio, not
+    # no audio — routing must still be established.
+    ctx, m = _patch_setup([SPEAKERS, BLACKHOLE], SPEAKERS)
+    m["set_device_volume"].side_effect = aggregate.AggregateError("boom")
+    with ctx:
+        state = aggregate.setup_routing()
+    assert state is not None
+    m["create_aggregate"].assert_called_once()
 
 
 def test_setup_routing_returns_none_on_create_failure():
