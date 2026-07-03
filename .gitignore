@@ -11,3 +11,7 @@ build/
 
 # Brainstorming visual companion sessions
 .superpowers/
+
+# Rust
+/target
+spikes/*/target

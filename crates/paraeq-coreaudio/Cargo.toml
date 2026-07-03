@@ -1,0 +1,14 @@
+[package]
+name = "paraeq-coreaudio"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+libc = { workspace = true }
+objc2 = { workspace = true }
+objc2-core-audio = { workspace = true }
+objc2-core-audio-types = { workspace = true }
+objc2-core-foundation = { workspace = true }
+objc2-foundation = { workspace = true }
+thiserror = { workspace = true }

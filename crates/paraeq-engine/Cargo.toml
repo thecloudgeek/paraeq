@@ -1,0 +1,11 @@
+[package]
+name = "paraeq-engine"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+arc-swap = { workspace = true }
+paraeq-dsp = { path = "../paraeq-dsp" }
+rtrb = { workspace = true }
+thiserror = { workspace = true }
