@@ -8,3 +8,6 @@ build/
 !targets/*.csv
 .DS_Store
 .worktrees/
+
+# Brainstorming visual companion sessions
+.superpowers/
