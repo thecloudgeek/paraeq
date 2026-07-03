@@ -1,0 +1,25 @@
+{
+ "arrays": {
+  "inverse": {
+   "file": "basic.inverse.f64",
+   "len": 12000,
+   "shape": [
+    12000
+   ]
+  },
+  "sweep": {
+   "file": "basic.sweep.f64",
+   "len": 12000,
+   "shape": [
+    12000
+   ]
+  }
+ },
+ "params": {
+  "duration": 0.25,
+  "f_end": 20000.0,
+  "f_start": 20.0,
+  "sample_rate": 48000
+ },
+ "scalars": {}
+}

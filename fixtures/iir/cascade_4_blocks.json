@@ -1,0 +1,32 @@
+{
+ "arrays": {
+  "input": {
+   "file": "cascade_4_blocks.input.f64",
+   "len": 4096,
+   "shape": [
+    2048,
+    2
+   ]
+  },
+  "output": {
+   "file": "cascade_4_blocks.output.f64",
+   "len": 4096,
+   "shape": [
+    2048,
+    2
+   ]
+  },
+  "sos": {
+   "file": "cascade_4_blocks.sos.f64",
+   "len": 18,
+   "shape": [
+    3,
+    6
+   ]
+  }
+ },
+ "params": {
+  "sample_rate": 48000
+ },
+ "scalars": {}
+}

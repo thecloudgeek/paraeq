@@ -1,0 +1,29 @@
+{
+ "arrays": {
+  "freqs": {
+   "file": "smooth_1_3.freqs.f64",
+   "len": 513,
+   "shape": [
+    513
+   ]
+  },
+  "mag_db": {
+   "file": "smooth_1_3.mag_db.f64",
+   "len": 513,
+   "shape": [
+    513
+   ]
+  },
+  "smoothed": {
+   "file": "smooth_1_3.smoothed.f64",
+   "len": 513,
+   "shape": [
+    513
+   ]
+  }
+ },
+ "params": {
+  "fraction": 3
+ },
+ "scalars": {}
+}

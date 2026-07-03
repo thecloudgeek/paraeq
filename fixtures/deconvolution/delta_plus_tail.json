@@ -1,0 +1,36 @@
+{
+ "arrays": {
+  "ir_out": {
+   "file": "delta_plus_tail.ir_out.f64",
+   "len": 12000,
+   "shape": [
+    12000
+   ]
+  },
+  "ir_true": {
+   "file": "delta_plus_tail.ir_true.f64",
+   "len": 256,
+   "shape": [
+    256
+   ]
+  },
+  "recorded": {
+   "file": "delta_plus_tail.recorded.f64",
+   "len": 12000,
+   "shape": [
+    12000
+   ]
+  },
+  "sweep": {
+   "file": "delta_plus_tail.sweep.f64",
+   "len": 12000,
+   "shape": [
+    12000
+   ]
+  }
+ },
+ "params": {
+  "sample_rate": 48000
+ },
+ "scalars": {}
+}

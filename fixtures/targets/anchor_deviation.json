@@ -1,0 +1,36 @@
+{
+ "arrays": {
+  "anchor_freqs": {
+   "file": "anchor_deviation.anchor_freqs.f64",
+   "len": 16,
+   "shape": [
+    16
+   ]
+  },
+  "offsets_db": {
+   "file": "anchor_deviation.offsets_db.f64",
+   "len": 16,
+   "shape": [
+    16
+   ]
+  },
+  "result_freqs": {
+   "file": "anchor_deviation.result_freqs.f64",
+   "len": 710,
+   "shape": [
+    710
+   ]
+  },
+  "result_gains": {
+   "file": "anchor_deviation.result_gains.f64",
+   "len": 710,
+   "shape": [
+    710
+   ]
+  }
+ },
+ "params": {
+  "base": "Harman In-Ear 2019"
+ },
+ "scalars": {}
+}

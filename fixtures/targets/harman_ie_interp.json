@@ -1,0 +1,50 @@
+{
+ "arrays": {
+  "curve_freqs": {
+   "file": "harman_ie_interp.curve_freqs.f64",
+   "len": 695,
+   "shape": [
+    695
+   ]
+  },
+  "curve_gains": {
+   "file": "harman_ie_interp.curve_gains.f64",
+   "len": 695,
+   "shape": [
+    695
+   ]
+  },
+  "dense": {
+   "file": "harman_ie_interp.dense.f64",
+   "len": 512,
+   "shape": [
+    512
+   ]
+  },
+  "edges": {
+   "file": "harman_ie_interp.edges.f64",
+   "len": 5,
+   "shape": [
+    5
+   ]
+  },
+  "interp_dense": {
+   "file": "harman_ie_interp.interp_dense.f64",
+   "len": 512,
+   "shape": [
+    512
+   ]
+  },
+  "interp_edges": {
+   "file": "harman_ie_interp.interp_edges.f64",
+   "len": 5,
+   "shape": [
+    5
+   ]
+  }
+ },
+ "params": {
+  "target": "Harman In-Ear 2019"
+ },
+ "scalars": {}
+}

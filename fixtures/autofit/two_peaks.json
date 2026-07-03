@@ -1,0 +1,38 @@
+{
+ "arrays": {
+  "correction_db": {
+   "file": "two_peaks.correction_db.f64",
+   "len": 512,
+   "shape": [
+    512
+   ]
+  },
+  "freqs": {
+   "file": "two_peaks.freqs.f64",
+   "len": 512,
+   "shape": [
+    512
+   ]
+  }
+ },
+ "params": {
+  "max_bands": 4,
+  "sample_rate": 48000
+ },
+ "scalars": {
+  "fitted": [
+   {
+    "fc": 149.89438936969844,
+    "filter_type": "peaking",
+    "gain_db": 5.998514579169485,
+    "q": 1.9254658821626196
+   },
+   {
+    "fc": 3013.7844478684806,
+    "filter_type": "peaking",
+    "gain_db": -4.996098535434683,
+    "q": 2.964931031258655
+   }
+  ]
+ }
+}

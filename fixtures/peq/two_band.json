@@ -1,0 +1,38 @@
+{
+ "arrays": {
+  "freqs": {
+   "file": "two_band.freqs.f64",
+   "len": 256,
+   "shape": [
+    256
+   ]
+  },
+  "response_db": {
+   "file": "two_band.response_db.f64",
+   "len": 256,
+   "shape": [
+    256
+   ]
+  }
+ },
+ "params": {
+  "sample_rate": 48000
+ },
+ "scalars": {
+  "autoeq_export": "Preamp: 0.0 dB\nFilter 1: ON PK Fc 100 Hz Gain 5.0 dB Q 1.200\nFilter 2: ON HSC Fc 9000 Hz Gain -3.5 dB Q 0.707",
+  "bands": [
+   {
+    "fc": 100.0,
+    "filter_type": "peaking",
+    "gain_db": 5.0,
+    "q": 1.2
+   },
+   {
+    "fc": 9000.0,
+    "filter_type": "high_shelf",
+    "gain_db": -3.5,
+    "q": 0.707
+   }
+  ]
+ }
+}

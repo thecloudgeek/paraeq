@@ -1,0 +1,23 @@
+{
+ "arrays": {
+  "correction_db": {
+   "file": "minimum_512.correction_db.f64",
+   "len": 2049,
+   "shape": [
+    2049
+   ]
+  },
+  "taps": {
+   "file": "minimum_512.taps.f64",
+   "len": 512,
+   "shape": [
+    512
+   ]
+  }
+ },
+ "params": {
+  "n_taps": 512,
+  "phase": "minimum"
+ },
+ "scalars": {}
+}

@@ -1,0 +1,27 @@
+{
+ "arrays": {
+  "a": {
+   "file": "average.a.f64",
+   "len": 513,
+   "shape": [
+    513
+   ]
+  },
+  "avg": {
+   "file": "average.avg.f64",
+   "len": 513,
+   "shape": [
+    513
+   ]
+  },
+  "b": {
+   "file": "average.b.f64",
+   "len": 513,
+   "shape": [
+    513
+   ]
+  }
+ },
+ "params": {},
+ "scalars": {}
+}

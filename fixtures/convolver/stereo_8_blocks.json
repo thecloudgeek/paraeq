@@ -1,0 +1,38 @@
+{
+ "arrays": {
+  "fir_l": {
+   "file": "stereo_8_blocks.fir_l.f64",
+   "len": 1024,
+   "shape": [
+    1024
+   ]
+  },
+  "fir_r": {
+   "file": "stereo_8_blocks.fir_r.f64",
+   "len": 1024,
+   "shape": [
+    1024
+   ]
+  },
+  "input": {
+   "file": "stereo_8_blocks.input.f64",
+   "len": 8192,
+   "shape": [
+    4096,
+    2
+   ]
+  },
+  "output": {
+   "file": "stereo_8_blocks.output.f64",
+   "len": 8192,
+   "shape": [
+    4096,
+    2
+   ]
+  }
+ },
+ "params": {
+  "block_size": 512
+ },
+ "scalars": {}
+}

@@ -1,0 +1,23 @@
+{
+ "arrays": {
+  "correction_db": {
+   "file": "linear_4096.correction_db.f64",
+   "len": 2049,
+   "shape": [
+    2049
+   ]
+  },
+  "taps": {
+   "file": "linear_4096.taps.f64",
+   "len": 4096,
+   "shape": [
+    4096
+   ]
+  }
+ },
+ "params": {
+  "n_taps": 4096,
+  "phase": "linear"
+ },
+ "scalars": {}
+}

@@ -1,0 +1,32 @@
+{
+ "arrays": {
+  "freqs": {
+   "file": "stereo_decay.freqs.f64",
+   "len": 513,
+   "shape": [
+    513
+   ]
+  },
+  "ir": {
+   "file": "stereo_decay.ir.f64",
+   "len": 2048,
+   "shape": [
+    1024,
+    2
+   ]
+  },
+  "mag_db": {
+   "file": "stereo_decay.mag_db.f64",
+   "len": 1026,
+   "shape": [
+    513,
+    2
+   ]
+  }
+ },
+ "params": {
+  "n_fft": 1024,
+  "sample_rate": 48000
+ },
+ "scalars": {}
+}

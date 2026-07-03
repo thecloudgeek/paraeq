@@ -1,0 +1,41 @@
+{
+ "arrays": {
+  "comp_freqs": {
+   "file": "edge_hold.comp_freqs.f64",
+   "len": 5,
+   "shape": [
+    5
+   ]
+  },
+  "comp_gains": {
+   "file": "edge_hold.comp_gains.f64",
+   "len": 5,
+   "shape": [
+    5
+   ]
+  },
+  "compensated": {
+   "file": "edge_hold.compensated.f64",
+   "len": 256,
+   "shape": [
+    256
+   ]
+  },
+  "grid": {
+   "file": "edge_hold.grid.f64",
+   "len": 256,
+   "shape": [
+    256
+   ]
+  },
+  "mag_db": {
+   "file": "edge_hold.mag_db.f64",
+   "len": 256,
+   "shape": [
+    256
+   ]
+  }
+ },
+ "params": {},
+ "scalars": {}
+}

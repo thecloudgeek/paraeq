@@ -1,0 +1,22 @@
+{
+ "arrays": {
+  "measured_db": {
+   "file": "match_closest.measured_db.f64",
+   "len": 512,
+   "shape": [
+    512
+   ]
+  },
+  "measured_freqs": {
+   "file": "match_closest.measured_freqs.f64",
+   "len": 512,
+   "shape": [
+    512
+   ]
+  }
+ },
+ "params": {},
+ "scalars": {
+  "expected_name": "Harman In-Ear 2019"
+ }
+}
