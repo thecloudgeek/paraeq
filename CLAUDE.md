@@ -4,68 +4,60 @@ Instructions for Claude when working in this repo.
 
 ## Project
 
-ParaEQ — open-source headphone measurement and correction EQ for macOS. Two-part project: a pip-installable Python DSP library (`paraeq/`) and a PyQt6 desktop app (`app/`) that wraps it.
+ParaEQ — open-source headphone measurement and correction EQ for macOS.
+**The product is the Rust port**: a Cargo workspace (`crates/`) + Tauri 2/React
+app (`desktop/`), built on Core Audio process taps. The old Python/PyQt6
+prototype lives in `prototype/` as the **numerical oracle** — it generates the
+golden fixtures in `fixtures/` that the Rust DSP core must match. Don't add
+features to the prototype.
 
-For full context, read **`docs/CONTEXT.md`** before making changes. For the design rationale, see **`docs/specs/2026-04-22-paraeq-design.md`**. For the original implementation plan, see **`docs/plans/2026-04-22-paraeq-phase1.md`**.
+Read **`docs/CONTEXT.md`** before making changes. Design spec:
+**`docs/specs/2026-07-02-rust-port-design.md`**. Current plan:
+**`docs/plans/2026-07-02-rust-port-foundation.md`**.
 
 ## Commands
 
 ```bash
-# Activate venv (always do this first)
+# Rust: build + test everything
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+
+# Desktop app (dev)
+cd desktop/ui && npx tauri dev
+
+# Frontend only
+cd desktop/ui && npx tsc --noEmit && npm run build
+
+# Tap spike (standalone, not a workspace member)
+cargo run --release --manifest-path spikes/tap-spike/Cargo.toml -- run
+
+# Python oracle (only for fixtures / verifying prototype behavior)
 source .venv/bin/activate
-
-# Run full test suite
-pytest tests/ -v
-
-# Run a single test file
-pytest tests/test_sweep.py -v
-
-# Launch the GUI
-python -m app.main
-
-# Install / reinstall in editable mode with GUI deps
-pip install -e ".[dev,gui]"
+pytest prototype/tests -v
+python prototype/tools/generate_fixtures.py   # regenerates fixtures/ — commit the diff deliberately
 ```
 
 ## Project Conventions
 
-- **TDD**: Tests are written before implementation. Every new module in `paraeq/` has a corresponding `tests/test_*.py`. The GUI layer in `app/` is not unit-tested (requires a display).
-- **Structured logging**: Modules use `logger.debug(..., extra={...})` for observability. Don't add print statements.
-- **Alphabetical ordering**: Imports, dict keys, enum values, and lists should be alphabetized where order doesn't matter functionally.
-- **Context7 for libraries**: Before using/changing 3rd-party SDK calls (sounddevice, PyQt6, pyqtgraph, scipy, hatchling), verify current usage with `npx ctx7@latest library <name> "<question>"` then `npx ctx7@latest docs <id> "<question>"`.
-- **No requirements.txt**: Dependencies live in `pyproject.toml` only. To install: `pip install -e ".[dev,gui]"`.
-
-## Architecture Boundaries
-
-The DSP library (`paraeq/`) must remain GUI-free — it should be usable from scripts without PyQt6. Don't import anything from `app/` into `paraeq/`. The GUI imports the library, never the reverse.
-
-```
-app/  ────►  paraeq/  ────►  numpy, scipy, sounddevice, platformdirs
-              (no GUI)
-```
+- **TDD**: Rust DSP modules are written against failing golden-fixture tests
+  first (`crates/paraeq-dsp/tests/`). Engine code gets synthetic-block unit
+  tests. GUI (`desktop/ui`) is typecheck + manual smoke.
+- **Fixtures are sacred**: `fixtures/` is generated ONLY by
+  `prototype/tools/generate_fixtures.py` (deterministic, seeded). Never edit
+  fixtures by hand; regenerate and commit script + output together.
+- **Crate boundaries** (spec constraints):
+  - `paraeq-dsp`: pure math, zero platform deps — no CoreAudio, no Tauri.
+  - `paraeq-coreaudio`: the ONLY crate with unsafe CoreAudio FFI.
+  - `paraeq-engine`: no Tauri deps (daemon-ready). No locks/allocation on the
+    realtime path. Teardown always destroys the tap first (never leave the
+    system muted).
+  - Forbidden deps: ndarray, scirs2-anything, fundsp.
+- **Alphabetical ordering**: imports, dict keys, dep lists where order doesn't
+  matter functionally.
+- **Context7 for libraries**: verify 3rd-party API usage with
+  `npx ctx7@latest library <name> "<question>"` before using/changing it.
 
 ## Worktrees
 
-Worktree directory: `.worktrees/` (already in `.gitignore`). Use this for feature branches when implementing multi-task plans:
-
-```bash
-git worktree add .worktrees/<feature-name> -b feature/<feature-name>
-```
-
-## File Organization
-
-- `paraeq/measurement/` — sweep, deconvolution, compensation, FR computation
-- `paraeq/correction/` — target curves, FIR/biquad/parametric filters, auto-fit
-- `paraeq/engine/` — real-time convolver and IIR processor
-- `paraeq/audio/` — device discovery, streams (sounddevice wrapper)
-- `paraeq/profiles/` — per-headphone profile save/load
-- `app/<area>/` — one subfolder per major GUI surface (wizard, editor, eq, analyzer, profiles, menu_bar, setup)
-- `targets/` — built-in target curve CSVs (Harman IE/OE, Diffuse Field, Flat)
-- `tests/fixtures/` — test data files
-
-## When Making Changes
-
-- Read existing code before modifying — patterns are already established
-- Run the full test suite before committing (`pytest tests/`)
-- Don't break the DSP library's standalone usability (no GUI imports)
-- For new functionality, follow the TDD cycle: failing test → implementation → passing test → commit
+Worktree directory: `.worktrees/` (gitignored). Use for feature branches:
+`git worktree add .worktrees/<name> -b feature/<name>`

@@ -2,7 +2,7 @@
 
 This document captures the why, the goals, what's been built, and what's left. It exists so future sessions (Claude or human) can pick up the work without rebuilding context from scratch.
 
-**Last updated:** 2026-07-02
+**Last updated:** 2026-07-02 (Rust port foundation)
 
 ---
 
@@ -25,6 +25,8 @@ We chose a hybrid approach rather than going straight to Rust:
 - **Python first** because SciPy/NumPy is the lingua franca of audio DSP — fast iteration on filter design, target curves, measurement algorithms is critical to getting the science right.
 - **Then port to Rust** once algorithms are proven, because real-world distribution (size, performance, cross-platform) is much better with Tauri + a Rust DSP core.
 - **The Python lib stays available** as `pip install paraeq` for power users who want to script measurements.
+
+Phase 2 has begun — see docs/specs/2026-07-02-rust-port-design.md (process-tap architecture supersedes BlackHole+aggregate; the aggregate knowledge below is retained as the designed fallback).
 
 ## Current State (as of 2026-04-25)
 
@@ -100,19 +102,14 @@ These items were specified in the design but not in the executed implementation 
 - ~~**Interactive draggable control points**~~ ✅ **Done.** The target editor overlays 16 fixed log-spaced, vertically-draggable anchors that apply a smooth dB *deviation* on top of the selected preset (`build_anchor_target`), with a debounced live minimum-phase-FIR preview to the audio engine and a "Match closest" auto-match button. See `docs/specs/2026-06-17-target-editor-autoeq-design.md` and `docs/plans/2026-06-18-target-editor-autoeq.md`.
 - ~~**AutoEQ database integration**~~ ✅ **Done.** The EQ tab's "Browse AutoEQ DB…" button opens a searchable model picker backed by `paraeq/correction/autoeq_db.py` (cache-first index sync + lazy per-model preset fetch from the AutoEq GitHub repo). Single-file import still works too.
 
-### Phase 2 (future, designed but not built)
+### Phase 2 (in progress)
 
-Port the DSP core to Rust and wrap in Tauri + React for cross-platform single-binary distribution:
-
-- Rust DSP library using `rustfft`, custom biquad filters
-- Tauri app with React frontend
-- PyO3 bindings so the Python `paraeq` package keeps working as a wrapper around the Rust core
-- Cross-platform builds for macOS, Windows, Linux
+In progress. Spec: docs/specs/2026-07-02-rust-port-design.md. Foundation plan: docs/plans/2026-07-02-rust-port-foundation.md. Repo restructured (Python → prototype/), fixtures committed, workspace + desktop scaffold + CI live. Tap spike findings: docs/spikes/2026-07-tap-spike.md.
 
 ## How to Pick Up the Work
 
 1. Read this document, `CLAUDE.md`, and the design spec at `docs/specs/2026-04-22-paraeq-design.md`.
-2. Decide which gap above to tackle. The most user-impactful next step is the **installer pipeline** — without it, only developers can use the app.
+2. Continue the Rust port: next stage per the spec's port order (stage 2: paraeq-dsp against fixtures/).
 3. Use the brainstorming → writing-plans → subagent-driven-development workflow for substantial new work. Smaller fixes can be done directly.
 4. Each major change should follow TDD where possible (DSP changes definitely; GUI changes by manual smoke test since no display in CI).
 
