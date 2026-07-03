@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "paraeq"
 version = "0.1.0"
 description = "Open-source headphone measurement and correction EQ"
-readme = "README.md"
+readme = "../README.md"
 license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
