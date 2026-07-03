@@ -1,0 +1,20 @@
+[package]
+name = "tap-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone project — deliberately NOT part of the repo workspace (Task 7 adds
+# an explicit exclude). Spike code is throwaway; findings are the deliverable.
+
+[dependencies]
+ctrlc = "3"
+libc = "0.2"
+objc2 = "0.6"
+objc2-core-audio = "0.3"
+objc2-core-audio-types = "0.3"
+objc2-core-foundation = "0.3"
+objc2-foundation = "0.3"
+
+[profile.release]
+debug = true
