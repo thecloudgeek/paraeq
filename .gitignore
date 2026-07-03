@@ -15,3 +15,7 @@ build/
 # Rust
 /target
 spikes/*/target
+
+# Frontend
+desktop/ui/node_modules
+desktop/ui/dist

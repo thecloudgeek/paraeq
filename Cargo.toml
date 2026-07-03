@@ -3,6 +3,7 @@ members = [
     "crates/paraeq-coreaudio",
     "crates/paraeq-dsp",
     "crates/paraeq-engine",
+    "desktop/src-tauri",
 ]
 exclude = ["spikes/tap-spike"]
 resolver = "2"
