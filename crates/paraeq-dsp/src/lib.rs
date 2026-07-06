@@ -7,6 +7,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub mod autofit;
 pub mod biquad;
 pub mod compensation;
+pub mod deconvolution;
 pub mod fir;
 pub mod fr;
 pub mod peq;
