@@ -31,7 +31,7 @@ jobs:
           cache: npm
           cache-dependency-path: desktop/ui/package-lock.json
       - run: npm ci
-      - run: npx tsc --noEmit
+      - run: npx tsc -b
       - run: npm run build
 
   prototype-oracle:

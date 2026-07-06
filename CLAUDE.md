@@ -26,7 +26,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cd desktop/ui && npx tauri dev
 
 # Frontend only
-cd desktop/ui && npx tsc --noEmit && npm run build
+cd desktop/ui && npx tsc -b && npm run build
 
 # Tap spike (standalone, not a workspace member)
 cargo run --release --manifest-path spikes/tap-spike/Cargo.toml -- run

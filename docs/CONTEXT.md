@@ -108,7 +108,7 @@ In progress. Spec: docs/specs/2026-07-02-rust-port-design.md. Foundation plan: d
 
 ## How to Pick Up the Work
 
-1. Read this document, `CLAUDE.md`, and the design spec at `docs/specs/2026-04-22-paraeq-design.md`.
+1. Read this document, `CLAUDE.md`, the Rust-port spec at `docs/specs/2026-07-02-rust-port-design.md`, and (for Phase-1 history) the original design at `docs/specs/2026-04-22-paraeq-design.md`.
 2. Continue the Rust port: next stage per the spec's port order (stage 2: paraeq-dsp against fixtures/).
 3. Use the brainstorming → writing-plans → subagent-driven-development workflow for substantial new work. Smaller fixes can be done directly.
 4. Each major change should follow TDD where possible (DSP changes definitely; GUI changes by manual smoke test since no display in CI).
