@@ -30,6 +30,11 @@ pub struct OverlapAddConvolver {
     time_scratch: Vec<f64>,
     spec_scratch: Vec<Complex<f64>>,
     full_scratch: Vec<f64>,
+    /// realfft internal scratch for `fwd.process_with_scratch` (avoids the
+    /// hidden per-call allocation that plain `RealToComplex::process` does).
+    fwd_scratch: Vec<Complex<f64>>,
+    /// realfft internal scratch for `inv.process_with_scratch`.
+    inv_scratch: Vec<Complex<f64>>,
 }
 
 impl OverlapAddConvolver {
@@ -56,6 +61,8 @@ impl OverlapAddConvolver {
             })
             .collect();
         let spec_scratch = fwd.make_output_vec();
+        let fwd_scratch = fwd.make_scratch_vec();
+        let inv_scratch = inv.make_scratch_vec();
         Self {
             block_size,
             n_fft,
@@ -66,6 +73,8 @@ impl OverlapAddConvolver {
             time_scratch: vec![0.0; n_fft],
             spec_scratch,
             full_scratch: vec![0.0; n_fft],
+            fwd_scratch,
+            inv_scratch,
         }
     }
 
@@ -92,7 +101,11 @@ impl OverlapAddConvolver {
             self.time_scratch[..self.block_size].copy_from_slice(block);
             self.time_scratch[self.block_size..].fill(0.0);
             self.fwd
-                .process(&mut self.time_scratch, &mut self.spec_scratch)
+                .process_with_scratch(
+                    &mut self.time_scratch,
+                    &mut self.spec_scratch,
+                    &mut self.fwd_scratch,
+                )
                 .unwrap();
 
             for (s, f) in self.spec_scratch.iter_mut().zip(&self.fir_spectra[fir_idx]) {
@@ -100,7 +113,11 @@ impl OverlapAddConvolver {
             }
 
             self.inv
-                .process(&mut self.spec_scratch, &mut self.full_scratch)
+                .process_with_scratch(
+                    &mut self.spec_scratch,
+                    &mut self.full_scratch,
+                    &mut self.inv_scratch,
+                )
                 .unwrap();
             let scale = 1.0 / self.n_fft as f64;
             for v in self.full_scratch.iter_mut() {
