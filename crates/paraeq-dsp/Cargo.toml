@@ -11,5 +11,6 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 approx = { workspace = true }
+biquad = "0.6"
 proptest = { workspace = true }
 serde_json = { workspace = true }

@@ -4,6 +4,7 @@
 /// Crate version, used by the desktop app's about dialog later.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub mod biquad;
 pub mod sweep;
 
 /// Error type shared by parsing/validation entry points across modules.
