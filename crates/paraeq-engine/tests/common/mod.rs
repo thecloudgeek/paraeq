@@ -103,6 +103,10 @@ pub fn assert_allclose(actual: &[f64], expected: &[f64], rtol: f64, atol: f64, c
     let mut worst = 0.0f64;
     let mut worst_i = 0usize;
     for (i, (a, e)) in actual.iter().zip(expected).enumerate() {
+        assert!(
+            a.is_finite(),
+            "{ctx}: non-finite actual at [{i}]: {a} (expected {e})"
+        );
         let tol = atol + rtol * e.abs();
         let d = (a - e).abs();
         if d > tol && d - tol > worst {

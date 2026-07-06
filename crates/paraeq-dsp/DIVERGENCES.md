@@ -62,5 +62,12 @@ differs from `prototype/paraeq/`, so a red parity test is always actionable.
    scipy release rather than to stable, version-independent numpy semantics —
    a future scipy upgrade that changes this window would need re-verification
    against regenerated fixtures.
+10. **`autofit` NaN sanitation is NaN-only.** Python's `np.nan_to_num(...,
+    nan=0.0)` also maps ±inf to ±MAX_FLOAT; Rust zeroes NaN and passes ±inf
+    through. Unreachable for designed peaking filters (the response floor
+    prevents −inf).
+11. **`fir` linear-phase peak-normalize is guarded.** Python divides by
+    `max(|ir|)` unguarded (all-zero prototype → NaN array); Rust skips the
+    division when the peak is 0, returning zeros.
 
 (add entries here as they are discovered during implementation)

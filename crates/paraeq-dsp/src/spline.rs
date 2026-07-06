@@ -1,6 +1,8 @@
 //! Not-a-knot cubic spline — direct port of scipy.interpolate.CubicSpline
 //! (bc_type='not-a-knot', extrapolate=True), 1-D real case.
-//! Oracle: scipy 1.17.1 _cubic.py:790-958. Parity gate: Task 6 target fixtures.
+//! Oracle: scipy 1.18.0 (the version that generated fixtures/; algorithm
+//! unchanged from 1.17.x) _cubic.py:790-958. Parity gate: Task 6 target
+//! fixtures.
 
 use crate::DspError;
 
