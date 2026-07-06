@@ -5,6 +5,7 @@
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod biquad;
+pub mod compensation;
 pub mod fr;
 pub mod sweep;
 
