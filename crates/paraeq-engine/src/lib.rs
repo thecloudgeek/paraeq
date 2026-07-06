@@ -2,6 +2,7 @@
 //! Zero Tauri dependencies (spec constraint: daemon-ready seams).
 
 pub mod convolver;
+pub mod iir;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
