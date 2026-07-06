@@ -16,6 +16,12 @@ pub fn parse_compensation(content: &str) -> Result<(Vec<f64>, Vec<f64>), DspErro
 }
 
 /// ParaEQ CSV: `freq,gain` rows. Blank lines and `#`-comments are skipped.
+///
+/// DIVERGENCE from the oracle (see DIVERGENCES.md once it exists): the Python
+/// CSV path checks comments/emptiness on the RAW first csv field, so an
+/// indented "# comment" or whitespace-only line raises ValueError there;
+/// this parser trims the line first and silently skips both. Reachable only
+/// on hand-edited files; current fixtures don't exercise it.
 fn parse_paraeq_csv(content: &str) -> Result<(Vec<f64>, Vec<f64>), DspError> {
     let mut freqs = Vec::new();
     let mut gains = Vec::new();
