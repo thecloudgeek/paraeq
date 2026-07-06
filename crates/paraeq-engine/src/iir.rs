@@ -24,7 +24,21 @@ impl IIRProcessor {
         self.channels[channel] = Some(ChannelState { sos, zi });
     }
 
+    /// Filter one block per channel in place, with persistent per-channel state.
+    ///
+    /// Each `input[ch]` is filtered by the cascaded-biquad state for that
+    /// channel, and the result is written to `output[ch]`. Each `output[ch]`
+    /// must be a `Vec` with capacity >= `block_len`; `clear()+extend_from_slice`
+    /// never reallocates once capacity suffices, so steady-state calls are
+    /// allocation-free. Realtime callers should therefore pass pre-sized buffers
+    /// (e.g., `vec![0.0; block_len]` once, reused every call) and warm up with
+    /// one off-thread `process` call before going live.
     pub fn process(&mut self, input: &[&[f64]], output: &mut [Vec<f64>]) {
+        assert_eq!(
+            input.len(),
+            output.len(),
+            "input/output channel count mismatch"
+        );
         for (ch, block) in input.iter().enumerate() {
             let out = &mut output[ch];
             out.clear();
