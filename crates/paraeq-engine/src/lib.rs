@@ -1,6 +1,8 @@
 //! Realtime engine graph (source -> correction -> gain -> sink).
 //! Zero Tauri dependencies (spec constraint: daemon-ready seams).
 
+pub mod convolver;
+
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(test)]

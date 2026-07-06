@@ -2180,7 +2180,10 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "paraeq-dsp",
+ "realfft",
  "rtrb",
+ "rustfft",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 
