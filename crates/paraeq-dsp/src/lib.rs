@@ -8,6 +8,7 @@ pub mod biquad;
 pub mod compensation;
 pub mod fir;
 pub mod fr;
+pub mod peq;
 pub mod spline;
 pub mod sweep;
 pub mod targets;
