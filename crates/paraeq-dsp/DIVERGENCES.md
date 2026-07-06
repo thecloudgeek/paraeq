@@ -1,0 +1,66 @@
+# Deliberate divergences from the Python oracle
+
+Spec requirement (2026-07-02 design): every place the Rust intentionally
+differs from `prototype/paraeq/`, so a red parity test is always actionable.
+
+1. **`design_fir_correction` drops the `freqs` parameter.** The Python accepts
+   `freqs` but never uses it (resampling is positional). Rust omits it.
+2. **Inverse-FFT normalization is explicit.** numpy divides by n inside
+   `ifft/irfft`; rustfft/realfft do not — every inverse in Rust carries `1/n`.
+   Numerically identical; structurally different.
+3. **`compute_frequency_response` / `deconvolve` are mono.** The Python accepts
+   `(samples, channels)` 2-D arrays; Rust callers loop channels explicitly.
+4. **`fractional_octave_smooth` window scan is O(n²) by design** to mirror the
+   oracle sample-for-sample. Any future O(n) optimization must keep the fixture
+   test byte-identical.
+5. **Errors are `Result<_, DspError>`** where the Python raises `ValueError`/
+   `FileNotFoundError`. Same conditions, different mechanism.
+6. **`compensation.rs` ParaEQ-CSV comment/blank handling is more lenient than
+   the oracle.** Python's CSV path (`csv.reader` + `row[0].startswith("#")`)
+   checks the raw, untrimmed first field, so an indented `"  # comment"` line
+   or a whitespace-only line raises `ValueError` there. The Rust parser
+   (`parse_paraeq_csv`) trims each line before checking for `#`/emptiness, so
+   both cases are silently skipped instead of erroring. Reachable only on
+   hand-edited compensation files; no current fixture exercises it.
+7. **`targets.rs` CSV metadata/data-row parsing is stricter in two ways than
+   the oracle, in opposite directions.**
+   - *Metadata keys*: Python recognizes `# key: value` headers via
+     `content.lstrip("#")`, which strips *any number* of leading `#`
+     characters — so `## name: Foo` still sets `name`. Rust's
+     `strip_prefix('#')` strips exactly one `#`, so a double-`##` header is
+     left with a leading `#` in the key and silently fails the
+     `_METADATA_KEYS` (Rust: `match key.trim().to_lowercase()`) lookup,
+     dropping the metadata instead of applying it.
+   - *Data rows*: Python's `stripped.split(",")` only requires `len(parts) >=
+     2` (extra trailing columns beyond frequency/gain are silently ignored).
+     Rust's `t.split_once(',')` puts everything after the first comma into the
+     gain field, so a `>2`-column row (e.g. `"20,1.0,extra"`) fails to parse
+     as `f64` and returns `DspError::Parse` instead of ignoring the extra
+     column. Neither direction is exercised by the current target-curve
+     corpus (no double-`#` headers, no `>2`-column rows).
+8. **`autofit.rs` degenerate all-out-of-band / all-zero-audible-residual
+   argmax case is stricter (safer) than the oracle.** Python's
+   `masked_residual = np.where(audible, np.abs(residual), 0.0)` followed by
+   `np.argmax(masked_residual)` returns the *first* index of the maximum —
+   which, when every audible-band residual is exactly zero (or there are no
+   audible-band bins at all), is index 0 of the *unmasked* array. Since
+   `peak_gain = residual[peak_idx]` then reads the raw (not masked) residual,
+   Python can place a peaking band centered on an out-of-band bin whenever
+   that bin happens to carry a non-zero raw residual. Rust's `auto_fit_parametric_eq`
+   only ever updates `peak_idx`/`peak_abs` inside the `mask[i]` branch, so it
+   either selects an in-band bin or (if no bin is in-band) leaves `peak_idx ==
+   None` and breaks cleanly — it can never select an out-of-band bin.
+   Unreachable on realistic measured curves (which always have non-zero
+   audible-band residual until convergence); no fixture exercises it.
+9. **FIR minimum-phase Nyquist-bin window weight follows scipy 1.18.0
+   semantics.** `fixtures/` was generated with scipy 1.18.0 (see
+   `fixtures/manifest.json`); `minimum_phase_homomorphic`'s Nyquist-bin
+   cepstrum window weight (`1 + n_fft % 2`) is transcribed from that version's
+   `scipy.signal._fir_filter_design.minimum_phase`. Not a behavioral
+   divergence today (n_fft is always even here, so the weight is always 1),
+   but noted because this is the one spot in `fir.rs` pinned to a specific
+   scipy release rather than to stable, version-independent numpy semantics —
+   a future scipy upgrade that changes this window would need re-verification
+   against regenerated fixtures.
+
+(add entries here as they are discovered during implementation)

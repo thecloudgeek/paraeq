@@ -33,6 +33,7 @@ cargo run --release --manifest-path spikes/tap-spike/Cargo.toml -- run
 
 # Python oracle (only for fixtures / verifying prototype behavior)
 source .venv/bin/activate
+# First-time setup: python3 -m venv .venv && .venv/bin/pip install -e "./prototype[dev,gui]"
 pytest prototype/tests -v
 python prototype/tools/generate_fixtures.py   # regenerates fixtures/ — commit the diff deliberately
 ```

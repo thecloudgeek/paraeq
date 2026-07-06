@@ -46,3 +46,17 @@ fn autoeq_export_matches_oracle_exactly() {
         c.scalar("autoeq_export").as_str().unwrap()
     );
 }
+
+#[test]
+fn empty_bands_returns_exact_zeros() {
+    // parametric_eq.py:79-90 special-cases `not self.bands` to return exact
+    // zeros, rather than the generic cascade's `20*log10(1 + 1e-10)`.
+    let peq = ParametricEQ {
+        bands: Vec::new(),
+        sample_rate: 48000.0,
+    };
+    let freqs = vec![20.0, 100.0, 1000.0, 10000.0, 20000.0];
+    let resp = peq.frequency_response(&freqs);
+    assert_eq!(resp.len(), freqs.len());
+    assert!(resp.iter().all(|&v| v == 0.0));
+}

@@ -104,7 +104,7 @@ These items were specified in the design but not in the executed implementation 
 
 ### Phase 2 (in progress)
 
-In progress. Spec: docs/specs/2026-07-02-rust-port-design.md. Foundation plan: docs/plans/2026-07-02-rust-port-foundation.md. Repo restructured (Python → prototype/), fixtures committed, workspace + desktop scaffold + CI live. Tap spike findings: docs/spikes/2026-07-tap-spike.md.
+In progress. Spec: docs/specs/2026-07-02-rust-port-design.md. Foundation plan: docs/plans/2026-07-02-rust-port-foundation.md. Repo restructured (Python → prototype/), fixtures committed, workspace + desktop scaffold + CI live. Tap spike findings: docs/spikes/2026-07-tap-spike.md. Stage 2 (DSP core) complete: all pure-DSP modules golden-matched in crates/paraeq-dsp + engine processors in crates/paraeq-engine (see crates/paraeq-dsp/DIVERGENCES.md). Next: stage 3 — production tap engine in paraeq-coreaudio/paraeq-engine (obligations from docs/spikes/2026-07-tap-spike.md: silence watchdog, ~5s tap-engage tolerance, buffer-size latency tuning, no spike unsafe patterns).
 
 ## How to Pick Up the Work
 
