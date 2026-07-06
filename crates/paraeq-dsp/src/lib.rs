@@ -9,6 +9,7 @@ pub mod compensation;
 pub mod fr;
 pub mod spline;
 pub mod sweep;
+pub mod targets;
 
 /// Error type shared by parsing/validation entry points across modules.
 #[derive(Debug, thiserror::Error)]
