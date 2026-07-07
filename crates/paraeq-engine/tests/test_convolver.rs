@@ -45,6 +45,15 @@ fn mono_fir_broadcasts_to_stereo_without_panicking() {
 }
 
 #[test]
+#[should_panic(expected = "output[ch] length")]
+fn convolver_rejects_mis_sized_output() {
+    let mut c = OverlapAddConvolver::new(vec![vec![1.0]], 64);
+    let input = [0.0f64; 64];
+    let mut out = vec![vec![0.0; 32]]; // wrong: shorter than block_size
+    c.process(&[&input], &mut out);
+}
+
+#[test]
 fn ola_equals_direct_convolution() {
     // deterministic pseudo-random input, 3 blocks of 128, FIR len 37
     let mut state = 0x9E3779B97F4A7C15u64;
