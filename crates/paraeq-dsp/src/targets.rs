@@ -25,6 +25,15 @@ fn log10_floored(freqs: &[f64]) -> Vec<f64> {
 }
 
 impl TargetCurve {
+    /// Interpolate the curve at `query` frequencies (log-f spline, clamped
+    /// to the end gains outside the curve's range).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `frequencies` are not strictly increasing or have fewer
+    /// than 2 points. Curves from [`parse_target_csv`] are validated at
+    /// parse time and can never trip this; a hand-constructed `TargetCurve`
+    /// that does is a programmer error.
     pub fn interpolate(&self, query: &[f64]) -> Vec<f64> {
         let s = NakSpline::new(&log10_floored(&self.frequencies), &self.gains_db)
             .expect("target curve freqs must be strictly increasing");
@@ -88,8 +97,18 @@ pub fn parse_target_csv(content: &str, fallback_name: &str) -> Result<TargetCurv
                 .map_err(|e| DspError::Parse(format!("{t}: {e}")))?,
         );
     }
-    if curve.frequencies.is_empty() {
-        return Err(DspError::Parse("target CSV has no data rows".into()));
+    // Validate at parse time so a parsed curve can never panic later inside
+    // `interpolate` (the spline requires >= 2 strictly increasing knots).
+    if curve.frequencies.len() < 2 {
+        return Err(DspError::Parse(format!(
+            "target CSV needs at least 2 data rows, got {}",
+            curve.frequencies.len()
+        )));
+    }
+    if curve.frequencies.windows(2).any(|w| w[1] <= w[0]) {
+        return Err(DspError::Parse(
+            "target CSV frequencies must be strictly increasing".into(),
+        ));
     }
     Ok(curve)
 }

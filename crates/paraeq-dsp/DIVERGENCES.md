@@ -69,5 +69,12 @@ differs from `prototype/paraeq/`, so a red parity test is always actionable.
 11. **`fir` linear-phase peak-normalize is guarded.** Python divides by
     `max(|ir|)` unguarded (all-zero prototype → NaN array); Rust skips the
     division when the peak is 0, returning zeros.
+12. **`parse_target_csv` validates at parse time.** The Python loader accepts
+    single-row / non-monotonic CSVs and only fails later inside
+    scipy CubicSpline; Rust rejects them at parse with `DspError::Parse`.
+    Same inputs fail in both worlds — different layer and mechanism.
+13. **`fr::compute_frequency_response` and `fr::average_measurements` return
+    `Result`.** The Python equivalents raise (ValueError / IndexError) on
+    n_fft=0, empty input, or ragged measurement lists.
 
 (add entries here as they are discovered during implementation)

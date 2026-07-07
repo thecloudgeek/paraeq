@@ -7,8 +7,13 @@ pub fn compute_frequency_response(
     ir: &[f64],
     sample_rate: u32,
     n_fft: Option<usize>,
-) -> (Vec<f64>, Vec<f64>) {
+) -> Result<(Vec<f64>, Vec<f64>), crate::DspError> {
     let n = n_fft.unwrap_or(ir.len());
+    if n == 0 {
+        return Err(crate::DspError::InvalidInput(
+            "FFT length is 0 (empty impulse response, or explicit n_fft=0)".into(),
+        ));
+    }
     let mut planner = RealFftPlanner::<f64>::new();
     let fft = planner.plan_fft_forward(n);
     let mut input = vec![0.0; n];
@@ -23,7 +28,7 @@ pub fn compute_frequency_response(
         .iter()
         .map(|c| 20.0 * c.norm().max(1e-10).log10())
         .collect();
-    (freqs, mag_db)
+    Ok((freqs, mag_db))
 }
 
 pub fn fractional_octave_smooth(magnitude_db: &[f64], freqs: &[f64], fraction: u32) -> Vec<f64> {
@@ -53,8 +58,23 @@ pub fn fractional_octave_smooth(magnitude_db: &[f64], freqs: &[f64], fraction: u
     out.iter().map(|v| 20.0 * v.max(1e-10).log10()).collect()
 }
 
-pub fn average_measurements(measurements_db: &[Vec<f64>]) -> Vec<f64> {
-    let n = measurements_db[0].len();
+pub fn average_measurements(measurements_db: &[Vec<f64>]) -> Result<Vec<f64>, crate::DspError> {
+    let n = match measurements_db.first() {
+        Some(first) => first.len(),
+        None => {
+            return Err(crate::DspError::InvalidInput(
+                "no measurements to average".into(),
+            ))
+        }
+    };
+    for (i, m) in measurements_db.iter().enumerate() {
+        if m.len() != n {
+            return Err(crate::DspError::InvalidInput(format!(
+                "measurement {i} has {} points, expected {n} (all measurements must match)",
+                m.len()
+            )));
+        }
+    }
     let mut out = vec![0.0; n];
     for m in measurements_db {
         for (o, v) in out.iter_mut().zip(m) {
@@ -64,7 +84,7 @@ pub fn average_measurements(measurements_db: &[Vec<f64>]) -> Vec<f64> {
     for o in &mut out {
         *o /= measurements_db.len() as f64;
     }
-    out
+    Ok(out)
 }
 
 pub fn normalize_to_reference_band(

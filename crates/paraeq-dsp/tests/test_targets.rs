@@ -85,6 +85,17 @@ fn csv_metadata_parsing_matches_prototype_fixtures() {
 }
 
 #[test]
+fn non_monotonic_target_csv_is_a_parse_error() {
+    assert!(targets::parse_target_csv("100,0.0\n50,1.0\n", "bad").is_err());
+    assert!(targets::parse_target_csv("100,0.0\n100,1.0\n", "dup").is_err());
+}
+
+#[test]
+fn single_row_target_csv_is_a_parse_error() {
+    assert!(targets::parse_target_csv("100,0.0\n", "one").is_err());
+}
+
+#[test]
 fn anchor_freqs_constant_matches_oracle() {
     assert_eq!(ANCHOR_FREQS.len(), 16);
     assert_eq!(ANCHOR_FREQS[0], 20.0);
