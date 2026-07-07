@@ -104,12 +104,19 @@ These items were specified in the design but not in the executed implementation 
 
 ### Phase 2 (in progress)
 
-In progress. Spec: docs/specs/2026-07-02-rust-port-design.md. Foundation plan: docs/plans/2026-07-02-rust-port-foundation.md. Repo restructured (Python → prototype/), fixtures committed, workspace + desktop scaffold + CI live. Tap spike findings: docs/spikes/2026-07-tap-spike.md. Stage 2 (DSP core) complete: all pure-DSP modules golden-matched in crates/paraeq-dsp + engine processors in crates/paraeq-engine (see crates/paraeq-dsp/DIVERGENCES.md). Next: stage 3 — production tap engine in paraeq-coreaudio/paraeq-engine (obligations from docs/spikes/2026-07-tap-spike.md: silence watchdog, ~5s tap-engage tolerance, buffer-size latency tuning, no spike unsafe patterns).
+In progress. Spec: docs/specs/2026-07-02-rust-port-design.md. Foundation plan: docs/plans/2026-07-02-rust-port-foundation.md. Repo restructured (Python → prototype/), fixtures committed, workspace + desktop scaffold + CI live. Tap spike findings: docs/spikes/2026-07-tap-spike.md. Stage 2 (DSP core) complete (merged 2026-07-06): all pure-DSP modules golden-matched in crates/paraeq-dsp + engine processors in crates/paraeq-engine (see crates/paraeq-dsp/DIVERGENCES.md; fixture oracle pin = scipy 1.18.0 per fixtures/manifest.json). Next: stage 3 — production tap engine in paraeq-coreaudio/paraeq-engine.
+
+**Stage-3 plan brief must include** (spike obligations + stage-2 review carry-forwards):
+- Silence watchdog for the TCC silent-failure mode (unsigned/ungrants deliver zeros with no error), ~5 s tap-engage tolerance before declaring failure, buffer-size latency tuning (spike measured 62.3 ms at defaults vs the 20–30 ms budget).
+- Do NOT copy the spike's unsafe patterns: `&mut EqState` aliased across threads (use `&state` + atomics/UnsafeCell) and the `buffers_of` `&'static mut` lifetime lie (docs/spikes/2026-07-tap-spike.md, last section).
+- Unify the two engine processors' output-buffer contracts and add an output-length assert to `OverlapAddConvolver::process` (convolver slices, iir clear+extend today).
+- Extend the stability proptest in crates/paraeq-dsp/tests/test_props.rs to low_shelf/high_shelf/notch (currently peaking only).
+- Input-wiring hardening: `fr::average_measurements(&[])` and n_fft=0 panics; `targets::parse_target_csv` accepts non-monotonic frequencies then panics in interpolate — convert to Result at the wiring layer.
 
 ## How to Pick Up the Work
 
 1. Read this document, `CLAUDE.md`, the Rust-port spec at `docs/specs/2026-07-02-rust-port-design.md`, and (for Phase-1 history) the original design at `docs/specs/2026-04-22-paraeq-design.md`.
-2. Continue the Rust port: next stage per the spec's port order (stage 2: paraeq-dsp against fixtures/).
+2. Continue the Rust port: next stage per the spec's port order (stage 3: production tap engine — brief requirements above).
 3. Use the brainstorming → writing-plans → subagent-driven-development workflow for substantial new work. Smaller fixes can be done directly.
 4. Each major change should follow TDD where possible (DSP changes definitely; GUI changes by manual smoke test since no display in CI).
 
