@@ -4,6 +4,7 @@
 pub mod chain;
 pub mod convolver;
 pub mod iir;
+pub mod shared;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -15,6 +16,9 @@ pub enum EngineError {
     Backend(String),
     #[error("invalid config: {0}")]
     InvalidConfig(String),
+    /// A control->realtime ring had no free slot; retry next tick.
+    #[error("ring full: {0}")]
+    RingFull(String),
 }
 
 #[cfg(test)]
