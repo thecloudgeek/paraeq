@@ -5,6 +5,7 @@ pub mod chain;
 pub mod convolver;
 pub mod iir;
 pub mod shared;
+pub mod status;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

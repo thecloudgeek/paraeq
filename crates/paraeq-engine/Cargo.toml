@@ -10,6 +10,7 @@ paraeq-dsp = { path = "../paraeq-dsp" }
 realfft = { workspace = true }
 rtrb = { workspace = true }
 rustfft = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
