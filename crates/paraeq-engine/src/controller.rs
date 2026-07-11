@@ -361,23 +361,24 @@ impl<B: AudioBackend> Controller<B> {
             self.try_start();
         }
 
-        let mut rebuild = false;
         if let Some(s) = &mut self.session {
             let callbacks = s.shared.callbacks.load(Ordering::Relaxed);
             let nonzero = s.shared.nonzero_blocks.load(Ordering::Relaxed);
             let now = self.epoch.elapsed().as_millis() as u64;
-            if matches!(
-                self.watchdog.observe(now, callbacks, nonzero),
-                EngineStatus::Stalled { .. }
-            ) {
-                // The IOProc died while callbacks had been flowing.
-                rebuild = true;
-            }
+            // Drives the informational status machine (Idle, InputSilent,
+            // ...). No watchdog state is ever a rebuild trigger: the tap
+            // aggregate's IOProc only cycles while the system renders audio
+            // (hardware finding 2026-07-11), so a frozen callback counter
+            // is normal idling -- rebuilding on it would loop forever while
+            // the system is idle. Device death arrives as backend events.
+            self.watchdog.observe(now, callbacks, nonzero);
             // Free retired corrections on the control thread.
             s.control.drain_retired();
         }
 
-        // Any backend event -> one rebuild (drain them all first).
+        // Rebuilds trigger ONLY on backend events (drain them all -> one
+        // rebuild).
+        let mut rebuild = false;
         while self.backend.0.poll_event().is_some() {
             rebuild = true;
         }

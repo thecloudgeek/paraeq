@@ -4,7 +4,7 @@
 use paraeq_engine::status::{EngineStatus, Watchdog, WatchdogConfig};
 
 fn watchdog() -> Watchdog {
-    // Defaults: engage 5000 ms, silence 3000 ms, stall 2000 ms.
+    // Defaults: engage 5000 ms, silence 3000 ms, idle 2000 ms.
     Watchdog::new(WatchdogConfig::default())
 }
 
@@ -12,8 +12,8 @@ fn watchdog() -> Watchdog {
 fn defaults_match_spec() {
     let c = WatchdogConfig::default();
     assert_eq!(c.engage_tolerance_ms, 5000);
+    assert_eq!(c.idle_window_ms, 2000);
     assert_eq!(c.silence_window_ms, 3000);
-    assert_eq!(c.stall_window_ms, 2000);
 }
 
 #[test]
@@ -82,11 +82,11 @@ fn running_to_silent_and_back() {
 }
 
 #[test]
-fn frozen_callbacks_before_first_callback_is_not_a_stall() {
+fn frozen_callbacks_before_first_callback_is_slow_engage_not_idle() {
     let mut w = watchdog();
     w.started(0);
     // The spike measured up to ~4 s with NO callbacks at all on a healthy
-    // first launch: NEVER Stalled before the first observed callback.
+    // first launch: NEVER Idle before the first observed callback.
     assert_eq!(
         *w.observe(2_500, 0, 0),
         EngineStatus::Starting { since_ms: 0 }
@@ -98,7 +98,7 @@ fn frozen_callbacks_before_first_callback_is_not_a_stall() {
 }
 
 #[test]
-fn frozen_callbacks_past_engage_tolerance_is_no_input_not_stalled() {
+fn frozen_callbacks_past_engage_tolerance_is_no_input_not_idle() {
     let mut w = watchdog();
     w.started(0);
     w.observe(2_500, 0, 0);
@@ -114,31 +114,68 @@ fn frozen_callbacks_past_engage_tolerance_is_no_input_not_stalled() {
 }
 
 #[test]
-fn callbacks_flowing_then_frozen_is_a_stall() {
+fn callbacks_flowing_then_frozen_is_idle() {
     let mut w = watchdog();
     w.started(0);
     assert_eq!(*w.observe(250, 25, 5), EngineStatus::Running);
     assert_eq!(*w.observe(500, 50, 10), EngineStatus::Running);
-    // IOProc dies: callbacks freeze at 50.
+    // Playback pauses: the tap aggregate's IOProc stops cycling entirely
+    // (hardware finding 2026-07-11) -- callbacks freeze at 50. Normal
+    // idling, informational only.
     assert_eq!(*w.observe(1_500, 50, 10), EngineStatus::Running);
     assert_eq!(
         *w.observe(2_500, 50, 10),
-        EngineStatus::Stalled { since_ms: 2_500 }
+        EngineStatus::Idle { since_ms: 2_500 }
+    );
+    // Stays informational, indefinitely.
+    assert_eq!(
+        *w.observe(60_000, 50, 10),
+        EngineStatus::Idle { since_ms: 2_500 }
     );
 }
 
 #[test]
-fn stall_detection_also_gates_from_starting_once_callbacks_were_seen() {
+fn idle_recovers_to_running_on_nonzero() {
     let mut w = watchdog();
     w.started(0);
-    // Callbacks seen (zeros only), then the IOProc dies while Starting.
+    w.observe(250, 25, 5); // Running
+    w.observe(2_500, 25, 5); // Idle (callbacks frozen)
+
+    // Playback resumes: callbacks and nonzero input flow again.
+    assert_eq!(*w.observe(9_000, 30, 8), EngineStatus::Running);
+}
+
+#[test]
+fn idle_with_resumed_zero_callbacks_is_input_silent() {
+    let mut w = watchdog();
+    w.started(0);
+    w.observe(250, 25, 5); // Running
+    assert_eq!(
+        *w.observe(2_500, 25, 5),
+        EngineStatus::Idle { since_ms: 2_500 }
+    );
+    // IO cycles resume but samples are all zero: the system is rendering
+    // silence -- InputSilent, not Idle.
+    assert_eq!(
+        *w.observe(9_000, 30, 5),
+        EngineStatus::InputSilent { since_ms: 9_000 }
+    );
+    // Then real audio -> Running.
+    assert_eq!(*w.observe(9_250, 35, 6), EngineStatus::Running);
+}
+
+#[test]
+fn idle_detection_also_gates_from_starting_once_callbacks_were_seen() {
+    let mut w = watchdog();
+    w.started(0);
+    // Callbacks seen (zeros only), then rendering stops while Starting.
     assert_eq!(
         *w.observe(250, 25, 0),
         EngineStatus::Starting { since_ms: 0 }
     );
     assert_eq!(
         *w.observe(2_250, 25, 0),
-        EngineStatus::Stalled { since_ms: 2_250 }
+        EngineStatus::Idle { since_ms: 2_250 }
     );
 }
 
@@ -157,7 +194,7 @@ fn stopped_from_anywhere() {
     w.stopped();
     assert_eq!(*w.observe(1_000, 100, 100), EngineStatus::Stopped);
 
-    // From Stalled.
+    // From Idle.
     let mut w = watchdog();
     w.started(0);
     w.observe(250, 25, 5);
@@ -173,7 +210,7 @@ fn restart_after_stop_regains_slow_engage_grace() {
     w.observe(250, 25, 5); // Running, callbacks seen
     w.stopped();
     // Restart with fresh (zeroed) counters: the slow-engage grace applies
-    // again -- frozen callbacks are NOT a stall.
+    // again -- frozen callbacks are NOT Idle before the first callback.
     w.started(10_000);
     assert_eq!(
         *w.observe(14_000, 0, 0),

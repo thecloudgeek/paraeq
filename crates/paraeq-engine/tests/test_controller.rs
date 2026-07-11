@@ -14,8 +14,8 @@ use paraeq_engine::controller::{CorrectionConfig, EngineCommand, EngineConfig, E
 use paraeq_engine::status::{EngineStatus, WatchdogConfig};
 
 const ENGAGE_MS: u64 = 200;
+const IDLE_MS: u64 = 150;
 const SILENCE_MS: u64 = 150;
-const STALL_MS: u64 = 150;
 const TICK_MS: u64 = 10;
 
 /// Generous per-wait budget; each wait normally completes in tens of ms.
@@ -28,8 +28,8 @@ fn fast_config() -> EngineConfig {
         tick_ms: TICK_MS,
         watchdog: WatchdogConfig {
             engage_tolerance_ms: ENGAGE_MS,
+            idle_window_ms: IDLE_MS,
             silence_window_ms: SILENCE_MS,
-            stall_window_ms: STALL_MS,
         },
     }
 }
@@ -75,15 +75,14 @@ fn engages_on_first_nonzero_input() {
 
     // Silence keeps callbacks flowing but never engages: Starting ->
     // NoInputDetected (informational -- TCC denial and "no music playing"
-    // are indistinguishable), never Running/Stalled/Failed.
+    // are indistinguishable), never Running or Failed. (A transient Idle is
+    // tolerated here: it only means this test thread paused pumping long
+    // enough for the idle window to elapse -- informational, not a bug.)
     assert!(wait_until(WAIT, || {
         backend.pump(512, 0.0);
         let status = handle.state().status.clone();
         assert!(
-            !matches!(
-                status,
-                EngineStatus::Running | EngineStatus::Stalled { .. } | EngineStatus::Failed { .. }
-            ),
+            !matches!(status, EngineStatus::Running | EngineStatus::Failed { .. }),
             "silence must not reach {status:?}"
         );
         matches!(status, EngineStatus::NoInputDetected { .. })
@@ -178,19 +177,45 @@ fn backend_event_triggers_stop_start_rebuild() {
 }
 
 #[test]
-fn stall_triggers_rebuild_then_failed() {
+fn idle_does_not_rebuild() {
     let (backend, handle) = spawn_engine();
 
-    // Get callbacks flowing (arms stall detection), reach Running.
+    // Get callbacks flowing, reach Running.
     assert!(wait_until(WAIT, || {
         backend.pump(512, 0.5);
         handle.state().status == EngineStatus::Running
     }));
 
-    // Freeze the callback counter (stop pumping) with start failures
-    // injected: stall -> rebuild attempt fails, retry fails -> Failed.
+    // Playback pauses: the tap aggregate's IOProc stops cycling entirely
+    // (hardware finding 2026-07-11), so the callback counter freezes. That
+    // is normal idling, NOT IOProc death: status goes Idle and NO rebuild
+    // may happen (rebuilding would loop forever while the system is idle).
+    assert!(wait_until(WAIT, || matches!(
+        handle.state().status,
+        EngineStatus::Idle { .. }
+    )));
+    assert!(!wait_until(Duration::from_millis(IDLE_MS * 3), || {
+        backend.start_count() > 1
+    }));
+    assert_eq!(backend.start_count(), 1, "idle must never trigger rebuild");
+
+    // Playback resumes -> Running again, still the same single session.
+    assert!(wait_until(WAIT, || {
+        backend.pump(512, 0.5);
+        handle.state().status == EngineStatus::Running
+    }));
+    assert_eq!(backend.start_count(), 1);
+}
+
+#[test]
+fn event_rebuild_start_failures_latch_failed() {
+    let (backend, handle) = spawn_engine();
+    assert!(wait_until(WAIT, || backend.is_running()));
+
+    // The device dies; both rebuild start attempts fail -> Failed latch.
     backend.fail_next_starts(2);
-    assert!(wait_until(Duration::from_secs(10), || matches!(
+    backend.queue_event(BackendEvent::DeviceDied);
+    assert!(wait_until(WAIT, || matches!(
         handle.state().status,
         EngineStatus::Failed { .. }
     )));
@@ -198,7 +223,7 @@ fn stall_triggers_rebuild_then_failed() {
     // Initial start + exactly 2 failed rebuild attempts...
     assert_eq!(backend.start_count(), 3);
     // ...and no rebuild-loop on a dead device afterward.
-    assert!(!wait_until(Duration::from_millis(STALL_MS * 3), || {
+    assert!(!wait_until(Duration::from_millis(IDLE_MS * 3), || {
         backend.start_count() > 3
     }));
     assert!(!backend.is_running());
@@ -301,14 +326,14 @@ fn channel_count_renegotiation() {
 fn slow_first_callback_does_not_rebuild() {
     let (backend, handle) = spawn_engine();
 
-    // No pumping at all: callbacks frozen at 0 well past stall_window. The
+    // No pumping at all: callbacks frozen at 0 well past idle_window. The
     // spike measured ~4 s with NO callbacks before a healthy tap engages,
-    // so this must be treated as a slow engage, never a stall.
+    // so this must be treated as a slow engage, never as Idle.
     assert!(wait_until(WAIT, || matches!(
         handle.state().status,
         EngineStatus::NoInputDetected { .. }
     )));
-    assert!(!wait_until(Duration::from_millis(STALL_MS * 3), || {
+    assert!(!wait_until(Duration::from_millis(IDLE_MS * 3), || {
         backend.start_count() > 1
     }));
     assert_eq!(backend.start_count(), 1, "slow engage must not rebuild");
