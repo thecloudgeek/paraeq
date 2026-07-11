@@ -5,6 +5,7 @@
 
 pub mod error;
 pub mod ioproc;
+pub mod listeners;
 pub mod properties;
 pub mod tap;
 

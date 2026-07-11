@@ -3,10 +3,12 @@
 //! `cargo test -p paraeq-coreaudio -- --ignored`
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
+use objc2_core_audio::{kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectSystemObject};
 use paraeq_coreaudio::ioproc::{IoCallback, IoProcHandle};
+use paraeq_coreaudio::listeners::PropertyListener;
 use paraeq_coreaudio::properties;
 use paraeq_coreaudio::tap::TapSystem;
 
@@ -169,4 +171,61 @@ fn ioproc_on_tap_aggregate_delivers_callbacks() {
 
     let errors = sys.teardown();
     assert!(errors.is_empty(), "teardown errored: {errors:?}");
+}
+
+/// Registration/removal round-trip on the system object. Does not need the
+/// TCC grant (property listeners are not capture); `#[ignore]` anyway for
+/// CI-safety and parity with the suite — CI has no HAL at all.
+#[test]
+#[ignore = "requires audio hardware"]
+fn property_listener_register_drop_roundtrip() {
+    let (tx, rx) = mpsc::channel();
+    let listener = PropertyListener::watch(
+        kAudioObjectSystemObject as u32,
+        kAudioHardwarePropertyDefaultOutputDevice,
+        tx,
+    )
+    .expect("PropertyListener::watch");
+    // Drop runs AudioObjectRemovePropertyListener + frees the ctx box; a
+    // failure is logged inside Drop, and a broken removal would crash or
+    // fire-after-free below.
+    drop(listener);
+
+    // A second watch on the same (object, selector) must work after removal.
+    let (tx2, rx2) = mpsc::channel();
+    let listener2 = PropertyListener::watch(
+        kAudioObjectSystemObject as u32,
+        kAudioHardwarePropertyDefaultOutputDevice,
+        tx2,
+    )
+    .expect("second PropertyListener::watch");
+    drop(listener2);
+
+    drop(rx);
+    drop(rx2);
+}
+
+/// Manual-interaction variant: with the listener registered on the
+/// default-output selector, a HUMAN must switch the output device (System
+/// Settings → Sound, or Control Center) within 10 s; the test asserts the
+/// event arrives. Run it alone with:
+/// `cargo test -p paraeq-coreaudio --test test_hardware -- --ignored manual_default_output_switch --nocapture`
+/// It is excluded from the normal ignored sweep via `--skip manual_`.
+#[test]
+#[ignore = "manual: requires switching output device"]
+fn manual_default_output_switch_delivers_event() {
+    let (tx, rx) = mpsc::channel();
+    let _listener = PropertyListener::watch(
+        kAudioObjectSystemObject as u32,
+        kAudioHardwarePropertyDefaultOutputDevice,
+        tx,
+    )
+    .expect("PropertyListener::watch");
+
+    println!(">>> switch your output device in System Settings within 10 s...");
+    let event = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("no default-output event within 10 s — did you switch devices?");
+    assert_eq!(event.selector, kAudioHardwarePropertyDefaultOutputDevice);
+    assert_eq!(event.object, kAudioObjectSystemObject as u32);
 }
