@@ -80,10 +80,12 @@ impl OverlapAddConvolver {
 
     /// Filter one block per channel in place.
     ///
-    /// Each `input[ch]` and `output[ch]` must be exactly `block_size`
-    /// samples long; `output[ch]` is fully overwritten. See the struct docs
-    /// for the allocation contract (first call may allocate, steady state
-    /// does not).
+    /// Each `input[ch]` must be exactly `block_size` samples long (asserted).
+    /// Unified output contract: `output[ch].len()` must equal
+    /// `input[ch].len()` on entry (asserted); contents are fully overwritten;
+    /// the call never allocates — a mis-sized buffer is a loud panic, never a
+    /// silent realtime allocation. See the struct docs for the warm-up
+    /// contract (first call may allocate, steady state does not).
     pub fn process(&mut self, input: &[&[f64]], output: &mut [Vec<f64>]) {
         assert_eq!(
             input.len(),
@@ -96,6 +98,11 @@ impl OverlapAddConvolver {
         }
         for (ch, block) in input.iter().enumerate() {
             assert_eq!(block.len(), self.block_size, "block size mismatch");
+            assert_eq!(
+                output[ch].len(),
+                self.block_size,
+                "output[ch] length must equal input[ch] length (fully overwritten)"
+            );
             let fir_idx = ch.min(self.fir_spectra.len() - 1);
 
             self.time_scratch[..self.block_size].copy_from_slice(block);

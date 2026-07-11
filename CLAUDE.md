@@ -50,8 +50,8 @@ python prototype/tools/generate_fixtures.py   # regenerates fixtures/ — commit
   - `paraeq-dsp`: pure math, zero platform deps — no CoreAudio, no Tauri.
   - `paraeq-coreaudio`: the ONLY crate with unsafe CoreAudio FFI.
   - `paraeq-engine`: no Tauri deps (daemon-ready). No locks/allocation on the
-    realtime path. Teardown always destroys the tap first (never leave the
-    system muted).
+    realtime path. Every exit path runs the full teardown sequence ending in
+    tap destruction — the system must never be left muted.
   - Forbidden deps: ndarray, scirs2-anything, fundsp.
 - **Alphabetical ordering**: imports, dict keys, dep lists where order doesn't
   matter functionally.

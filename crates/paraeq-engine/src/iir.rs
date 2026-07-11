@@ -27,12 +27,13 @@ impl IIRProcessor {
     /// Filter one block per channel in place, with persistent per-channel state.
     ///
     /// Each `input[ch]` is filtered by the cascaded-biquad state for that
-    /// channel, and the result is written to `output[ch]`. Each `output[ch]`
-    /// must be a `Vec` with capacity >= `block_len`; `clear()+extend_from_slice`
-    /// never reallocates once capacity suffices, so steady-state calls are
-    /// allocation-free. Realtime callers should therefore pass pre-sized buffers
-    /// (e.g., `vec![0.0; block_len]` once, reused every call) and warm up with
-    /// one off-thread `process` call before going live.
+    /// channel, and the result is written to `output[ch]`.
+    ///
+    /// Unified output contract: `output[ch].len()` must equal
+    /// `input[ch].len()` on entry (asserted); contents are fully overwritten;
+    /// the call never allocates. Realtime callers pass pre-sized buffers
+    /// (e.g., `vec![0.0; block_len]` once, reused every call) — a mis-sized
+    /// buffer is a loud panic, never a silent realtime allocation.
     pub fn process(&mut self, input: &[&[f64]], output: &mut [Vec<f64>]) {
         assert_eq!(
             input.len(),
@@ -41,8 +42,12 @@ impl IIRProcessor {
         );
         for (ch, block) in input.iter().enumerate() {
             let out = &mut output[ch];
-            out.clear();
-            out.extend_from_slice(block);
+            assert_eq!(
+                out.len(),
+                block.len(),
+                "output[ch] length must equal input[ch] length (fully overwritten)"
+            );
+            out.copy_from_slice(block);
             if let Some(Some(state)) = self.channels.get_mut(ch) {
                 for (sec, z) in state.sos.iter().zip(state.zi.iter_mut()) {
                     let [b0, b1, b2, _, a1, a2] = *sec;

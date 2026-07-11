@@ -87,11 +87,11 @@ Constraints that define the shape:
 **Key decisions:**
 
 - **One clock domain.** The tap captures the system default output device, and ParaEQ plays to that same device — both IOProcs run on one hardware clock, so there is no drift and no resampler at parity. The **output picker works by setting the system default output** (tap and output stream follow it), not by cross-routing to a second device. Cross-device redirect (à la SoundSource) is a post-parity feature that would add rubato rate-matching.
-- **Latency budget:** tap block + ring + output block ≈ 20–30 ms added at 512-frame buffers / 48 kHz. Fine for music; under the ~45 ms lip-sync threshold. Block size becomes a setting post-parity.
+- **Latency budget:** stage-3 hardware measurements: 62.3 ms added at 512-frame buffers / 51.6 ms at 256 / 46.3 ms at 128 (48 kHz), over a ~41 ms fixed tap-path floor the buffer size cannot buy back. Fine for music; still near the ~45 ms lip-sync threshold even at 128 frames. The number is exposed honestly in `EngineState.latency_ms`. Block size becomes a setting post-parity.
 - **Sample formats:** samples stay f32 (CoreAudio native); filter *design* math and biquad *state* are f64 (numerical parity with numpy/scipy; avoids low-frequency biquad quantization).
 - **Two bypass levels.** *DSP bypass*: audio still flows through ParaEQ, correction skipped — instant glitch-free A/B (tray toggle, prototype parity). *Full disable*: destroy the tap, device unmutes, system exactly as if ParaEQ never ran — used on quit and as the panic path.
 - **Rebuild on change.** Property listeners on `kAudioHardwarePropertyDefaultOutputDevice`, device-alive, and stream format: any change tears down and rebuilds tap + output stream (~100 ms mute blip). Covers unplug, AirPods handoff, sample-rate switches — and fixes the prototype's launch-time output lock-in gotcha.
-- **Fail-safe ordering.** Every teardown path, including the crash/panic handler, destroys the tap *first*: a dead ParaEQ must never leave the system muted. TCC permission revoked mid-run → full disable + UI prompt.
+- **Fail-safe ordering.** Every exit path — command, drop, panic — runs the full teardown sequence ending in tap destruction (stop IOProc → destroy IOProc → destroy aggregate → destroy tap, the spike-validated order): the system must never be left muted. TCC permission revoked mid-run → full disable + UI prompt.
 
 ## DSP Core and Numerical Parity
 

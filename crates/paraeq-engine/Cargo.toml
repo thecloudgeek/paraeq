@@ -6,10 +6,12 @@ version.workspace = true
 
 [dependencies]
 arc-swap = { workspace = true }
+log = { workspace = true }
 paraeq-dsp = { path = "../paraeq-dsp" }
 realfft = { workspace = true }
 rtrb = { workspace = true }
 rustfft = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

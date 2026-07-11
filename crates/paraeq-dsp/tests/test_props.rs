@@ -14,6 +14,33 @@ proptest! {
         prop_assert!(a1.abs() < 1.0 + a2 + 1e-9);
     }
 
+    /// Designed low-shelf filters are stable: poles inside the unit circle.
+    #[test]
+    fn low_shelf_is_stable(fc in 20.0f64..20000.0, gain in -24.0f64..24.0, q in 0.1f64..20.0) {
+        let sos = biquad::low_shelf(fc, gain, q, 48000.0);
+        let (a1, a2) = (sos[4], sos[5]);
+        prop_assert!(a2.abs() < 1.0 + 1e-12);
+        prop_assert!(a1.abs() < 1.0 + a2 + 1e-9);
+    }
+
+    /// Designed high-shelf filters are stable: poles inside the unit circle.
+    #[test]
+    fn high_shelf_is_stable(fc in 20.0f64..20000.0, gain in -24.0f64..24.0, q in 0.1f64..20.0) {
+        let sos = biquad::high_shelf(fc, gain, q, 48000.0);
+        let (a1, a2) = (sos[4], sos[5]);
+        prop_assert!(a2.abs() < 1.0 + 1e-12);
+        prop_assert!(a1.abs() < 1.0 + a2 + 1e-9);
+    }
+
+    /// Designed notch filters are stable: poles inside the unit circle.
+    #[test]
+    fn notch_is_stable(fc in 20.0f64..20000.0, q in 0.1f64..20.0) {
+        let sos = biquad::notch(fc, q, 48000.0);
+        let (a1, a2) = (sos[4], sos[5]);
+        prop_assert!(a2.abs() < 1.0 + 1e-12);
+        prop_assert!(a1.abs() < 1.0 + a2 + 1e-9);
+    }
+
     /// Smoothing preserves a flat spectrum exactly (any fraction).
     #[test]
     fn smoothing_preserves_flat(level in -60.0f64..20.0, fraction in 1u32..24) {

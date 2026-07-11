@@ -42,6 +42,16 @@ fn cascade_state_carries_across_blocks_matching_oracle() {
 }
 
 #[test]
+#[should_panic(expected = "output[ch] length")]
+fn iir_rejects_mis_sized_output() {
+    let mut p = IIRProcessor::new();
+    p.set_sos(0, vec![[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]]);
+    let input = [1.0f64; 64];
+    let mut out = vec![Vec::new()]; // wrong: empty, old contract allowed this
+    p.process(&[&input], &mut out);
+}
+
+#[test]
 fn channel_without_sos_passes_through() {
     let mut proc = IIRProcessor::new();
     proc.set_sos(0, vec![[0.5, 0.0, 0.0, 1.0, 0.0, 0.0]]); // pure -6dB gain section
