@@ -4,6 +4,7 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 pub mod error;
+pub mod ioproc;
 pub mod properties;
 pub mod tap;
 
