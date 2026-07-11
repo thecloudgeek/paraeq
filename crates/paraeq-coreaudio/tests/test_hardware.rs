@@ -3,6 +3,7 @@
 //! `cargo test -p paraeq-coreaudio -- --ignored`
 
 use paraeq_coreaudio::properties;
+use paraeq_coreaudio::tap::TapSystem;
 
 #[test]
 #[ignore = "requires audio hardware + TCC grant"]
@@ -53,4 +54,38 @@ fn buffer_frame_size_set_and_restore_roundtrip() {
         restored, original,
         "original buffer frame size not restored"
     );
+}
+
+/// Lifecycle roundtrip for the tap + private aggregate. Briefly mutes system
+/// audio (MutedWhenTapped) — a sub-second blip is expected and acceptable.
+/// Without the TCC grant creation still succeeds (silent-zeros mode), so this
+/// validates lifecycle, not capture.
+#[test]
+#[ignore = "requires audio hardware + TCC grant"]
+fn tap_system_create_teardown_roundtrip() {
+    let mut sys = TapSystem::create().expect("TapSystem::create");
+    assert!(
+        sys.format.mSampleRate > 0.0,
+        "tap format must report a sample rate, got {}",
+        sys.format.mSampleRate
+    );
+    assert!(
+        sys.format.mChannelsPerFrame >= 1,
+        "tap format must report at least one channel"
+    );
+    assert_ne!(sys.tap, 0, "tap object id must be nonzero");
+    assert_ne!(sys.aggregate, 0, "aggregate object id must be nonzero");
+    assert!(!sys.device_uid.is_empty(), "device UID must be captured");
+
+    let errors = sys.teardown();
+    assert!(errors.is_empty(), "explicit teardown errored: {errors:?}");
+
+    let again = sys.teardown();
+    assert!(again.is_empty(), "second teardown must be a no-op");
+    drop(sys);
+
+    // A fresh create → drop cycle must also work (Drop runs teardown).
+    let sys2 = TapSystem::create().expect("second TapSystem::create");
+    assert!(sys2.format.mSampleRate > 0.0);
+    drop(sys2);
 }

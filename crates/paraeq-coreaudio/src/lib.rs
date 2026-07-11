@@ -5,5 +5,6 @@
 
 pub mod error;
 pub mod properties;
+pub mod tap;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

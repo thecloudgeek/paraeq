@@ -6,6 +6,7 @@ version.workspace = true
 
 [dependencies]
 libc = { workspace = true }
+log = { workspace = true }
 objc2 = { workspace = true }
 objc2-core-audio = { workspace = true }
 objc2-core-audio-types = { workspace = true }
