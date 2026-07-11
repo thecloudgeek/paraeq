@@ -1,7 +1,9 @@
 //! Realtime engine graph (source -> correction -> gain -> sink).
 //! Zero Tauri dependencies (spec constraint: daemon-ready seams).
 
+pub mod backend;
 pub mod chain;
+pub mod controller;
 pub mod convolver;
 pub mod iir;
 pub mod shared;

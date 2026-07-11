@@ -2,6 +2,8 @@
 //! prototype/tools/generate_fixtures.py (the oracle generator).
 #![allow(dead_code)]
 
+pub mod mock_backend;
+
 use std::path::PathBuf;
 
 pub struct Array2 {

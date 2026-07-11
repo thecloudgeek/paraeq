@@ -97,6 +97,12 @@ impl Watchdog {
         self.status = EngineStatus::Stopped;
     }
 
+    /// Current status without feeding a new observation (for snapshot
+    /// publication between observes).
+    pub fn status(&self) -> &EngineStatus {
+        &self.status
+    }
+
     /// Feed one telemetry sample; returns the (possibly updated) status.
     ///
     /// `callbacks` / `nonzero_blocks` are the cumulative counters from
