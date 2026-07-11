@@ -164,13 +164,21 @@ impl<'a> BufferListMut<'a> {
 
     /// Iterate `(samples, channel_count)` per buffer, mutably. Same exposure
     /// rules as [`BufferList::buffers`]. Allocation-free.
-    pub fn buffers_mut(&mut self) -> impl Iterator<Item = (&'a mut [f32], usize)> + '_ {
+    ///
+    /// The yielded slices borrow from the `&mut self` reborrow (`'s`), NOT
+    /// from the view's full `'a`: slices from two separate `buffers_mut`
+    /// calls can therefore never coexist (the compiler rejects it), which is
+    /// what makes the aliasing argument below actually hold.
+    pub fn buffers_mut<'s>(&'s mut self) -> impl Iterator<Item = (&'s mut [f32], usize)> + 's {
         let list = self.list;
         (0..self.len()).map(move |i| {
             // SAFETY: i < mNumberBuffers; the `new` contract guarantees
             // exclusive, writable, pairwise non-overlapping buffer data for
-            // 'a, so one live `&mut` per buffer cannot alias. The `&mut self`
-            // borrow held by `'_` prevents a second iterator meanwhile.
+            // 'a, so the coexisting per-buffer `&mut`s from ONE iterator
+            // cannot alias each other. Tying the items to `'s` (the `&mut
+            // self` borrow) makes a second iterator -- and thus a second
+            // `&mut` to the SAME buffer -- unconstructible while any item
+            // lives.
             unsafe {
                 let (data, samples, channels) = raw_buffer(list, i);
                 let slice = if samples == 0 {
@@ -248,8 +256,10 @@ unsafe extern "C-unwind" fn io_trampoline(
 /// - the handle never touches the box while the IOProc is registered (no
 ///   other `&`/`&mut` exists anywhere);
 /// - the box is reclaimed and freed only AFTER `AudioDeviceDestroyIOProcID`
-///   returns, at which point the HAL guarantees the IOProc is not in flight
-///   and will never be invoked again.
+///   returns SUCCESS, at which point the HAL guarantees the IOProc is not in
+///   flight and will never be invoked again. If destroy fails, the box is
+///   intentionally leaked (see [`stop`](Self::stop)) — a bounded leak beats
+///   a use-after-free on a realtime thread.
 pub struct IoProcHandle {
     device: AudioObjectID,
     proc_id: AudioDeviceIOProcID,
@@ -328,9 +338,19 @@ impl IoProcHandle {
         // SAFETY: same live proc_id; destroyed exactly once (client was Some).
         let status = unsafe { AudioDeviceDestroyIOProcID(self.device, self.proc_id) };
         if let Err(e) = check(status, "AudioDeviceDestroyIOProcID") {
-            log::error!("ioproc stop: {e}");
+            // The never-invoked-again guarantee only holds when destroy
+            // SUCCEEDS. On failure the HAL may still invoke the IOProc, so
+            // freeing the box here would risk a use-after-free on a
+            // realtime thread. Intentionally LEAK it instead (`client` was
+            // already taken; dropping the raw pointer leaks the box): one
+            // boxed closure per failed destroy, and destroy failures are
+            // exceptional — a bounded leak is the safe trade.
+            log::error!(
+                "ioproc stop: {e}; leaking callback box (bounded leak over use-after-free)"
+            );
+            return;
         }
-        // SAFETY: AudioDeviceDestroyIOProcID has returned, so the HAL
+        // SAFETY: AudioDeviceDestroyIOProcID succeeded, so the HAL
         // guarantees the IOProc is not in flight and will never be invoked
         // again — the box is exclusively ours to free (see struct Soundness).
         drop(unsafe { Box::from_raw(client.as_ptr()) });

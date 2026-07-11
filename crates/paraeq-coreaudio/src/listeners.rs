@@ -50,10 +50,11 @@ unsafe extern "C-unwind" fn listener_trampoline(
     client: *mut c_void,
 ) -> i32 {
     let result = catch_unwind(AssertUnwindSafe(|| {
-        // SAFETY: `client` is the `Box::into_raw` ctx from `watch`, freed
-        // only after `AudioObjectRemovePropertyListener` returns, so it is
-        // live here. Shared `&` only — concurrent notification threads may
-        // run this simultaneously, which is safe because `Sender` is `Sync`.
+        // SAFETY: `client` is the `Box::into_raw` ctx from `watch`, never
+        // freed (deliberately leaked at removal — see `Drop`), so it is
+        // live here even if this notification raced the removal. Shared `&`
+        // only — concurrent notification threads may run this
+        // simultaneously, which is safe because `Sender` is `Sync`.
         let ctx = unsafe { &*client.cast::<ListenerCtx>() };
         // SAFETY: the HAL guarantees `addresses` points at `n_addresses`
         // contiguous AudioObjectPropertyAddress entries for this call.
@@ -79,10 +80,15 @@ unsafe extern "C-unwind" fn listener_trampoline(
 /// # Soundness
 ///
 /// The ctx box must outlive the registration: it is leaked to the HAL at
-/// `watch` and freed in `Drop` only AFTER `AudioObjectRemovePropertyListener`
-/// returns. Removal must pass the SAME proc + ctx pointer used at add time
-/// (AudioHardware.rs:914 contract) — `Drop` reuses the stored address and
-/// ctx pointer with the same `listener_trampoline`.
+/// `watch` and — deliberately — NEVER freed. HAL property-listener
+/// callbacks dispatch asynchronously and may still be in flight after
+/// `AudioObjectRemovePropertyListener` returns (long-standing CoreAudio
+/// behavior; Chromium and Firefox deliberately leak or defer their listener
+/// contexts for the same reason), so freeing in `Drop` would be a potential
+/// use-after-free on a HAL notification thread. See `Drop` for the bounded-
+/// leak accounting. Removal must pass the SAME proc + ctx pointer used at
+/// add time (AudioHardware.rs:914 contract) — `Drop` reuses the stored
+/// address and ctx pointer with the same `listener_trampoline`.
 pub struct PropertyListener {
     object: AudioObjectID,
     address: AudioObjectPropertyAddress,
@@ -153,8 +159,16 @@ impl Drop for PropertyListener {
             // Nothing more a Drop can do — but never silently discard it.
             log::error!("listener drop: {e}");
         }
-        // SAFETY: removal has returned, so the HAL no longer invokes the
-        // trampoline with this ctx — the box is exclusively ours to free.
-        drop(unsafe { Box::from_raw(self.ctx.as_ptr()) });
+        // SAFETY / deliberate leak: the ctx box is intentionally NOT freed.
+        // HAL notifications dispatch asynchronously, and a callback may
+        // still be IN FLIGHT (or already queued) when
+        // AudioObjectRemovePropertyListener returns — freeing here could be
+        // a use-after-free on a HAL notification thread (long-standing
+        // CoreAudio behavior; Chromium and Firefox deliberately leak or
+        // defer their listener contexts for the same reason). The leak is
+        // bounded: ~a few dozen bytes per listener, ~4 listeners per
+        // rebuild, and rebuilds are rare (device changes). The leaked
+        // `Sender` keeps one channel endpoint alive; once the backend drops
+        // the `Receiver`, any late sends are cheap no-ops.
     }
 }

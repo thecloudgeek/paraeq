@@ -8,7 +8,8 @@
 //! per-callback work is layout resolve + deinterleave + `process_block` +
 //! interleave — no allocation, no locks, no logging. HAL-supplied values
 //! are never trusted: mismatched or oversized frame counts zero the output
-//! (silence) and bump `RtShared::skipped_blocks` instead of panicking.
+//! (silence) and record the skip via `RtProcessor::note_skipped_block`
+//! (which keeps the callback counter honest) instead of panicking.
 //!
 //! Teardown: [`TapBackend::stop`] encodes the FULL invariant order in one
 //! place — `AudioDeviceStop` → `AudioDeviceDestroyIOProcID` (both inside
@@ -18,7 +19,6 @@
 //! bare `Drop` respect the same order as a backup.
 
 use std::collections::VecDeque;
-use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver};
 
 use objc2_core_audio::{
@@ -74,7 +74,7 @@ impl TapBackend {
         TapBackend::default()
     }
 
-    /// The 7-step start, with partial state stashed in `self` as it is
+    /// The 8-step start, with partial state stashed in `self` as it is
     /// created so the caller's cleanup (`stop`) can unwind any prefix.
     fn start_inner(
         &mut self,
@@ -117,7 +117,17 @@ impl TapBackend {
 
         // 4. The realtime closure. REALTIME LANE: no allocation, no locks,
         // no logging, and NEVER a panic on HAL-supplied values.
-        let shared = processor.shared();
+        //
+        // KNOWN LIMITATION — input-stream identification: the deinterleave
+        // below assumes the tap's stream(s) are the only (or first) buffers
+        // in the aggregate's input list. A default output device that ALSO
+        // exposes input streams (AirPods, USB headsets with mics) may
+        // contribute mic buffers whose position in the input buffer list is
+        // undocumented; if such a buffer preceded the tap stream, mic
+        // samples would be treated as tap input. Validation needed: an
+        // owner hardware test with a mic-capable default output (see the
+        // manual checklist in docs/CONTEXT.md). No stream-identification
+        // heuristic is attempted until that test says one is needed.
         let mut processor = processor;
         let cb: IoCallback = Box::new(move |mut block: IoBlock<'_>| {
             // Zero ALL output buffers first (spike order, main.rs:56-60):
@@ -140,14 +150,19 @@ impl TapBackend {
                     first = false;
                 } else if f != frames {
                     // Mismatched per-buffer frame counts: leave silence for
-                    // this block (outputs already zeroed) and count it.
-                    shared.skipped_blocks.fetch_add(1, Ordering::Relaxed);
+                    // this block (outputs already zeroed) and count it. The
+                    // skip still counts as a callback (note_skipped_block
+                    // bumps BOTH counters): a persistently-skipping session
+                    // must read as NoInputDetected/InputSilent to the
+                    // watchdog, not as benign Idle.
+                    processor.note_skipped_block();
                     return;
                 }
                 if f > max_frames {
                     // Oversized block: one silent >4096-frame block is
                     // acceptable and near-unreachable; allocating is not.
-                    shared.skipped_blocks.fetch_add(1, Ordering::Relaxed);
+                    // Counts as a callback too (see above).
+                    processor.note_skipped_block();
                     return;
                 }
                 for c in 0..bc {
@@ -234,7 +249,22 @@ impl TapBackend {
                 .push(PropertyListener::watch(device, selector, tx.clone())?);
         }
 
-        // 7. The effective geometry the controller negotiates against.
+        // 7. Close the rebuild-window race: the default output may have
+        // changed between TapSystem::create (which captured the then-default
+        // device) and the listener registration in step 6 — a change in that
+        // window fired no listener and would leave us taped to the WRONG
+        // device until the next unrelated event. Re-query now that the
+        // listeners are armed and queue a synthetic event so the controller
+        // immediately rebuilds onto the new device.
+        match properties::default_output_device() {
+            Ok(current) if current != device => {
+                self.pending.push_back(BackendEvent::DefaultOutputChanged);
+            }
+            Ok(_) => {}
+            Err(e) => log::warn!("post-start default-output recheck failed: {e}"),
+        }
+
+        // 8. The effective geometry the controller negotiates against.
         Ok(StreamInfo {
             buffer_frames: effective,
             channels,
