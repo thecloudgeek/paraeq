@@ -3,6 +3,7 @@
 
 #![warn(clippy::undocumented_unsafe_blocks)]
 
+pub mod backend;
 pub mod error;
 pub mod ioproc;
 pub mod listeners;

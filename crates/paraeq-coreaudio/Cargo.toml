@@ -12,4 +12,5 @@ objc2-core-audio = { workspace = true }
 objc2-core-audio-types = { workspace = true }
 objc2-core-foundation = { workspace = true }
 objc2-foundation = { workspace = true }
+paraeq-engine = { path = "../paraeq-engine" }
 thiserror = { workspace = true }

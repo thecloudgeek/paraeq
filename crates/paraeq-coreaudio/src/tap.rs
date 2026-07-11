@@ -126,6 +126,16 @@ pub struct TapSystem {
     torn_down: bool,
 }
 
+// SAFETY: every field but `desc` is Send (ids, POD format, String, bool).
+// `desc` is `Retained<CATapDescription>`, unmarked in objc2-core-audio 0.3.2:
+// it is a plain description object (no main-thread affinity — not a UI
+// class), we never call methods on it after `create` returns (it is held
+// only so the HAL's reference to its UUID stays valid), and Objective-C
+// retain/release is thread-safe, so dropping it from another thread (the
+// engine controller thread, which owns the backend) is sound. The HAL API
+// itself is documented thread-safe.
+unsafe impl Send for TapSystem {}
+
 impl TapSystem {
     /// The spike-validated setup order: default output → uid → rate →
     /// translate own pid → tap → format → aggregate.
