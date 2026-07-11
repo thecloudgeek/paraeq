@@ -16,10 +16,10 @@ use crate::EngineError;
 /// when `buffer_frames` or `channels` differ.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct StreamInfo {
-    pub sample_rate: f64,
-    pub channels: usize,
     pub buffer_frames: usize,
+    pub channels: usize,
     pub device_uid: String,
+    pub sample_rate: f64,
 }
 
 /// Out-of-band device change reported by [`AudioBackend::poll_event`].

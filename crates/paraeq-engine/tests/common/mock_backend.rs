@@ -34,6 +34,10 @@ struct Inner {
     /// `None`: honor the request (default 512).
     reported_buffer_frames: Option<usize>,
     reported_channels: usize,
+    /// Per-start `(channels, buffer_frames)` overrides: each successful
+    /// `start` pops the front one; when empty, the sticky
+    /// `reported_channels` / `reported_buffer_frames` apply.
+    reports: VecDeque<(usize, usize)>,
     /// out-vs-in sample-time delta fed to `process_block` by `pump`.
     sample_time_delta: f64,
     /// Channel count of the currently running stream (set by `start`).
@@ -62,6 +66,7 @@ impl MockBackend {
                 processor: None,
                 reported_buffer_frames: None,
                 reported_channels: 2,
+                reports: VecDeque::new(),
                 sample_time_delta: 512.0,
                 stream_channels: 2,
             })),
@@ -81,6 +86,14 @@ impl MockBackend {
     /// Report this channel count from every `start` (renegotiation trigger).
     pub fn set_reported_channels(&self, channels: usize) {
         self.lock().reported_channels = channels;
+    }
+
+    /// Queue a per-start `(channels, buffer_frames)` report: the NEXT
+    /// successful `start` reports exactly this geometry (then the queue
+    /// advances; when empty, the sticky settings apply). Lets tests script
+    /// a backend whose reported geometry shifts between starts.
+    pub fn queue_report(&self, channels: usize, buffer_frames: usize) {
+        self.lock().reports.push_back((channels, buffer_frames));
     }
 
     /// Make the next `n` calls to `start` fail.
@@ -154,18 +167,23 @@ impl AudioBackend for MockBackend {
             inner.fail_next_starts -= 1;
             return Err(EngineError::Backend("injected start failure".into()));
         }
-        let buffer_frames = inner
-            .reported_buffer_frames
-            .or(requested_buffer_frames)
-            .unwrap_or(512);
-        let channels = inner.reported_channels;
+        let (channels, buffer_frames) = match inner.reports.pop_front() {
+            Some(report) => report,
+            None => (
+                inner.reported_channels,
+                inner
+                    .reported_buffer_frames
+                    .or(requested_buffer_frames)
+                    .unwrap_or(512),
+            ),
+        };
         inner.stream_channels = channels;
         inner.processor = Some(processor);
         Ok(StreamInfo {
-            sample_rate: 48_000.0,
-            channels,
             buffer_frames,
+            channels,
             device_uid: "mock-device".into(),
+            sample_rate: 48_000.0,
         })
     }
 

@@ -26,7 +26,12 @@ use crate::EngineError;
 pub struct RtShared {
     /// User bypass (control writes, rt reads).
     pub bypass: AtomicBool,
-    /// Total realtime callbacks observed (rt writes).
+    /// Total realtime IOProc invocations observed (rt writes) -- every
+    /// invocation counts, including blocks the backend skipped before
+    /// reaching the chain (via [`RtProcessor::note_skipped_block`]), NOT
+    /// just processed blocks. The watchdog keys "the system is rendering
+    /// audio" off this counter; if skips stopped it, a persistently broken
+    /// session would misreport as benign `Idle`.
     pub callbacks: AtomicU64,
     /// Blocks passed through because the frame count did not fit the active
     /// correction (rt writes).
@@ -41,7 +46,7 @@ pub struct RtShared {
     /// Latest output-vs-input sample-time delta as f64 bits (rt writes).
     pub sample_time_delta_bits: AtomicU64,
     /// Blocks the backend skipped before reaching the chain (e.g. oversize
-    /// HAL buffers; backend writes -- Task 12).
+    /// HAL buffers; rt writes via [`RtProcessor::note_skipped_block`]).
     pub skipped_blocks: AtomicU64,
     /// All-zero input blocks (rt writes) -- the watchdog's silence signal.
     pub zero_blocks: AtomicU64,
@@ -188,6 +193,16 @@ impl RtProcessor {
     /// The shared atomics (for the controller's telemetry reads).
     pub fn shared(&self) -> Arc<RtShared> {
         Arc::clone(&self.shared)
+    }
+
+    /// Record an IOProc invocation whose block the backend skipped before
+    /// reaching [`process_block`](Self::process_block) (mismatched or
+    /// oversize HAL buffers). Increments BOTH `callbacks` (which counts
+    /// every IOProc invocation, not just processed blocks -- see the field
+    /// doc) and `skipped_blocks`. Realtime-safe: two relaxed atomic adds.
+    pub fn note_skipped_block(&mut self) {
+        self.shared.callbacks.fetch_add(1, Ordering::Relaxed);
+        self.shared.skipped_blocks.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Process one callback's block. Realtime-safe: no locks, no

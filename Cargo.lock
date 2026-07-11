@@ -2360,6 +2360,7 @@ name = "paraeq-engine"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "log",
  "paraeq-dsp",
  "realfft",
  "rtrb",

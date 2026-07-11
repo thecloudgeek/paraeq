@@ -96,6 +96,16 @@ fn single_row_target_csv_is_a_parse_error() {
 }
 
 #[test]
+fn non_finite_target_csv_is_a_parse_error() {
+    // f64::parse accepts "NaN"/"inf", and NaN slips through the
+    // strictly-increasing windows(2) check (NaN comparisons are false).
+    assert!(targets::parse_target_csv("100,0.0\nNaN,1.0\n300,2.0\n", "nan").is_err());
+    assert!(targets::parse_target_csv("100,0.0\n200,NaN\n300,2.0\n", "nan-gain").is_err());
+    assert!(targets::parse_target_csv("100,0.0\n200,inf\n300,2.0\n", "inf-gain").is_err());
+    assert!(targets::parse_target_csv("100,0.0\n200,1.0\ninf,2.0\n", "inf-freq").is_err());
+}
+
+#[test]
 fn anchor_freqs_constant_matches_oracle() {
     assert_eq!(ANCHOR_FREQS.len(), 16);
     assert_eq!(ANCHOR_FREQS[0], 20.0);

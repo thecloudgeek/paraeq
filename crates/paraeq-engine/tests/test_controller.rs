@@ -256,7 +256,9 @@ fn buffer_frames_renegotiation() {
     config.requested_buffer_frames = Some(128);
     let handle = EngineHandle::spawn(backend.clone(), config);
 
-    // Exactly one stop+start renegotiation cycle, request preserved.
+    // Exactly one stop+start renegotiation cycle; the retry requests the
+    // REPORTED size (256), not the original request (asking for 128 again
+    // would just reproduce the mismatch).
     assert!(wait_until(WAIT, || backend.start_count() == 2));
     assert_eq!(
         backend.calls()[..3],
@@ -266,7 +268,7 @@ fn buffer_frames_renegotiation() {
             },
             Call::Stop,
             Call::Start {
-                requested_buffer_frames: Some(128)
+                requested_buffer_frames: Some(256)
             },
         ]
     );
@@ -320,6 +322,109 @@ fn channel_count_renegotiation() {
         .stream
         .as_ref()
         .is_some_and(|s| s.channels == 1));
+}
+
+#[test]
+fn shifting_geometry_renegotiation_converges_on_final_report() {
+    let backend = MockBackend::new();
+    // Start 1 reports (2 ch, 256) -- differs from the provisional chain;
+    // start 2 (retrying at 2 ch / 256) reports (1 ch, 128) -- differs
+    // AGAIN; start 3 (retrying at 1 ch / 128) reports the sticky (1, 128)
+    // and converges exactly at the 3-start cap.
+    backend.queue_report(2, 256);
+    backend.queue_report(1, 128);
+    backend.set_reported_channels(1);
+    backend.set_reported_buffer_frames(128);
+    let mut config = fast_config();
+    config.requested_buffer_frames = Some(512);
+    let handle = EngineHandle::spawn(backend.clone(), config);
+
+    assert!(wait_until(WAIT, || backend.start_count() == 3));
+    // Each retry requests the LAST-reported size.
+    let starts: Vec<Call> = backend
+        .calls()
+        .into_iter()
+        .filter(|c| matches!(c, Call::Start { .. }))
+        .collect();
+    assert_eq!(
+        starts,
+        [
+            Call::Start {
+                requested_buffer_frames: Some(512)
+            },
+            Call::Start {
+                requested_buffer_frames: Some(256)
+            },
+            Call::Start {
+                requested_buffer_frames: Some(128)
+            },
+        ]
+    );
+
+    // The final chain matches the FINAL report: a FIR (which demands
+    // exactly block_size frames) corrects a mono 128-frame block.
+    handle.send(EngineCommand::SetCorrection(CorrectionConfig::Fir {
+        firs: vec![vec![2.0]],
+    }));
+    assert!(wait_until(WAIT, || {
+        backend
+            .pump(128, 0.2)
+            .is_some_and(|out| out.len() == 1 && (out[0][0] - 0.4).abs() < 1e-5)
+    }));
+    assert_eq!(backend.start_count(), 3, "renegotiation must stop at cap");
+    assert!(handle
+        .state()
+        .stream
+        .as_ref()
+        .is_some_and(|s| s.channels == 1 && s.buffer_frames == 128));
+}
+
+#[test]
+fn command_flood_does_not_starve_tick_work() {
+    let (backend, handle) = spawn_engine();
+    assert!(wait_until(WAIT, || backend.is_running()));
+
+    // A queued backend event is only noticed by tick work (poll_event).
+    backend.queue_event(BackendEvent::DefaultOutputChanged);
+
+    // Flood commands faster than tick_ms: recv_timeout keeps returning Ok,
+    // so without the in-command tick check the rebuild would never happen.
+    let deadline = Instant::now() + WAIT;
+    while backend.start_count() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "tick work starved by command flood: rebuild never happened"
+        );
+        handle.send(EngineCommand::SetGainDb(0.0));
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(backend.start_count() >= 2, "rebuild happened under flood");
+}
+
+#[test]
+fn malformed_correction_is_ignored_not_fatal() {
+    let (backend, handle) = spawn_engine();
+
+    // Degenerate configs would panic build_correction; the controller must
+    // validate and ignore them (no state change, thread stays alive).
+    handle.send(EngineCommand::SetCorrection(CorrectionConfig::Fir {
+        firs: vec![],
+    }));
+    handle.send(EngineCommand::SetCorrection(CorrectionConfig::Fir {
+        firs: vec![vec![]],
+    }));
+    handle.send(EngineCommand::SetCorrection(CorrectionConfig::Iir {
+        sos_per_channel: vec![],
+    }));
+
+    // The controller thread survived and a subsequent valid command works.
+    handle.send(EngineCommand::SetCorrection(iir_gain(2.0, 2)));
+    assert!(wait_until(WAIT, || pump_matches(&backend, 512, 0.2, 0.4)));
+    assert!(handle
+        .state()
+        .correction
+        .as_ref()
+        .is_some_and(|c| c.starts_with("iir")));
 }
 
 #[test]

@@ -236,10 +236,10 @@ impl TapBackend {
 
         // 7. The effective geometry the controller negotiates against.
         Ok(StreamInfo {
-            sample_rate,
-            channels,
             buffer_frames: effective,
+            channels,
             device_uid,
+            sample_rate,
         })
     }
 }

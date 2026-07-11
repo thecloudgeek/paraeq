@@ -183,9 +183,20 @@ impl RealtimeChain {
                     *o = (*s * gain).clamp(-1.0, 1.0);
                 }
             }
+            let frame_mismatch = !bypass && self.correction.is_some() && !fits;
+            if frame_mismatch {
+                // A mismatched block interrupted an ACTIVE correction: the
+                // samples it never saw make its overlap tail / biquad state
+                // stale, so clear it (reset is fill(0.0)-only -- rt-safe)
+                // and let the correction resume clean on the next
+                // conforming block instead of emitting a stale tail.
+                if let Some(c) = self.correction.as_mut() {
+                    c.reset();
+                }
+            }
             ChainOutcome {
                 corrected: false,
-                frame_mismatch: !bypass && self.correction.is_some() && !fits,
+                frame_mismatch,
             }
         }
     }
@@ -214,13 +225,24 @@ pub fn build_fir(firs: Vec<Vec<f64>>, channels: usize, block_size: usize) -> Cor
 }
 
 /// Build + warm up an IIR correction. Control plane only (allocates).
+///
+/// When fewer SOS sets are supplied than `channels`, the LAST provided set
+/// is broadcast to the remaining channels (mirroring
+/// [`OverlapAddConvolver`]'s documented mono-FIR broadcast), so a mono
+/// config corrects every channel of a stereo chain identically.
+/// `sos_per_channel` must be non-empty.
 pub fn build_iir(
     sos_per_channel: Vec<Vec<[f64; 6]>>,
     channels: usize,
     block_size: usize,
 ) -> Correction {
+    assert!(
+        !sos_per_channel.is_empty(),
+        "at least one SOS set is required"
+    );
     let mut p = IIRProcessor::new();
-    for (ch, sos) in sos_per_channel.into_iter().enumerate() {
+    for ch in 0..channels.max(sos_per_channel.len()) {
+        let sos = sos_per_channel[ch.min(sos_per_channel.len() - 1)].clone();
         p.set_sos(ch, sos);
     }
     let mut c = Correction::Iir(p);

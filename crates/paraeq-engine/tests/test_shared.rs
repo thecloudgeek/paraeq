@@ -161,3 +161,23 @@ fn zero_and_nonzero_blocks_counted() {
     assert_eq!(shared.callbacks.load(Ordering::Relaxed), 3);
     assert_eq!(shared.sample_time_delta(), 512.0);
 }
+
+#[test]
+fn note_skipped_block_counts_the_callback_too() {
+    let (_ctl, rt) = links(1);
+    let shared = Arc::new(RtShared::default());
+    let chain = RealtimeChain::new(2, BLOCK);
+    let mut proc_ = RtProcessor::new(shared.clone(), rt, chain);
+
+    // A backend-level skip is still an IOProc invocation: `callbacks` must
+    // advance (or the watchdog would misreport a persistently-skipping
+    // session as benign Idle) alongside `skipped_blocks`.
+    proc_.note_skipped_block();
+    assert_eq!(shared.callbacks.load(Ordering::Relaxed), 1);
+    assert_eq!(shared.skipped_blocks.load(Ordering::Relaxed), 1);
+
+    // A processed block advances callbacks only.
+    pump(&mut proc_, 2, BLOCK, 0.5);
+    assert_eq!(shared.callbacks.load(Ordering::Relaxed), 2);
+    assert_eq!(shared.skipped_blocks.load(Ordering::Relaxed), 1);
+}

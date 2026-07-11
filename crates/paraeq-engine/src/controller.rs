@@ -17,11 +17,14 @@
 //! [`StreamInfo`] only comes back from `start`. The controller therefore
 //! builds the chain provisionally for 2 channels (the parity tap is stereo)
 //! and `block_size = requested_buffer_frames.unwrap_or(512)`; if the
-//! reported `buffer_frames` OR `channels` differ, it renegotiates with ONE
-//! stop+start cycle at the reported geometry. It never renegotiates twice
-//! in a row -- if the second report *still* differs, the chain's uniform
-//! frame guard degrades gracefully (pass-through + `frame_mismatch`
-//! telemetry) until a `FormatChanged` event triggers the next rebuild.
+//! reported `buffer_frames` OR `channels` differ, it renegotiates with a
+//! stop+start cycle that rebuilds the chain at the last-REPORTED geometry
+//! and requests exactly the last-reported buffer frames -- looping until
+//! the report matches the chain, capped at 3 total starts. If the report
+//! is *still* moving after the cap, the mismatch is accepted with a
+//! warning: the chain's uniform frame guard degrades gracefully
+//! (pass-through + `frame_mismatch` telemetry) until a `FormatChanged`
+//! event triggers the next rebuild.
 //!
 //! ## Realtime discipline
 //!
@@ -33,7 +36,7 @@
 //! retire ring and are dropped here.
 
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -70,9 +73,35 @@ impl CorrectionConfig {
     }
 }
 
+/// `None` when `config` is buildable; `Some(reason)` for degenerate configs
+/// that would panic the underlying builders (empty FIR list, an empty FIR,
+/// or an empty SOS-set list). The controller checks this before every
+/// `SetCorrection` so a malformed command can never panic its thread.
+fn validate_correction(config: &CorrectionConfig) -> Option<String> {
+    match config {
+        CorrectionConfig::Fir { firs } => {
+            if firs.is_empty() {
+                Some("Fir config has no FIRs".into())
+            } else if firs.iter().any(Vec::is_empty) {
+                Some("Fir config contains an empty (0-tap) FIR".into())
+            } else {
+                None
+            }
+        }
+        CorrectionConfig::Iir { sos_per_channel } => {
+            if sos_per_channel.is_empty() {
+                Some("Iir config has no SOS sets".into())
+            } else {
+                None
+            }
+        }
+    }
+}
+
 /// Build + warm up a correction for the given stream geometry. Control
 /// plane only (allocates). Panics on degenerate configs (empty FIR list) --
-/// a programmer-error contract inherited from the underlying builders.
+/// a programmer-error contract inherited from the underlying builders; the
+/// controller pre-screens commands with [`validate_correction`].
 pub fn build_correction(
     config: &CorrectionConfig,
     channels: usize,
@@ -102,15 +131,15 @@ pub enum EngineCommand {
 /// 135); stage 4 pushes it over Tauri as-is.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct EngineState {
-    pub status: EngineStatus,
     pub bypass: bool,
-    pub gain_db: f32,
     /// Short descriptor of the retained correction, e.g. `"iir:5-band"`.
     pub correction: Option<String>,
-    pub stream: Option<StreamInfo>,
+    pub gain_db: f32,
+    pub input_peak: f32,
     /// `sample_time_delta / sample_rate * 1000` for the live stream.
     pub latency_ms: Option<f64>,
-    pub input_peak: f32,
+    pub status: EngineStatus,
+    pub stream: Option<StreamInfo>,
 }
 
 /// Controller tuning. Tests shorten the watchdog windows and tick so the
@@ -147,7 +176,7 @@ pub struct EngineHandle {
     cmd_tx: Sender<EngineCommand>,
     join: Option<JoinHandle<()>>,
     state: Arc<ArcSwap<EngineState>>,
-    subscribers: Arc<Mutex<Vec<Sender<Arc<EngineState>>>>>,
+    subscribers: Arc<Mutex<Vec<SyncSender<Arc<EngineState>>>>>,
 }
 
 impl EngineHandle {
@@ -156,16 +185,16 @@ impl EngineHandle {
         assert!(config.ring_capacity >= 1, "ring_capacity must be >= 1");
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let initial = Arc::new(EngineState {
-            status: EngineStatus::Stopped,
             bypass: false,
-            gain_db: 0.0,
             correction: None,
-            stream: None,
-            latency_ms: None,
+            gain_db: 0.0,
             input_peak: 0.0,
+            latency_ms: None,
+            status: EngineStatus::Stopped,
+            stream: None,
         });
         let state = Arc::new(ArcSwap::new(Arc::clone(&initial)));
-        let subscribers: Arc<Mutex<Vec<Sender<Arc<EngineState>>>>> =
+        let subscribers: Arc<Mutex<Vec<SyncSender<Arc<EngineState>>>>> =
             Arc::new(Mutex::new(Vec::new()));
 
         let thread_state = Arc::clone(&state);
@@ -183,6 +212,7 @@ impl EngineHandle {
                     epoch: Instant::now(),
                     failed: None,
                     gain_db: 0.0,
+                    last_tick: Instant::now(),
                     published: initial,
                     requested_buffer_frames: config.requested_buffer_frames,
                     ring_capacity: config.ring_capacity,
@@ -216,9 +246,14 @@ impl EngineHandle {
         self.state.load_full()
     }
 
-    /// Subscribe to every snapshot published from now on.
+    /// Subscribe to snapshots published from now on.
+    ///
+    /// The channel is BOUNDED (64 snapshots): a subscriber that stops
+    /// reading gets updates dropped, not queued without limit -- the latest
+    /// state is always available via [`state`](Self::state). A dropped
+    /// receiver prunes the subscription on the next publish.
     pub fn subscribe(&self) -> Receiver<Arc<EngineState>> {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(64);
         self.subscribers
             .lock()
             .expect("subscriber list lock")
@@ -272,12 +307,17 @@ struct Controller<B: AudioBackend> {
     epoch: Instant,
     failed: Option<String>,
     gain_db: f32,
+    /// When `on_tick` last ran. A command flood keeps `recv_timeout`
+    /// returning `Ok` and would otherwise starve the tick work entirely
+    /// (watchdog, event poll, retired drain, swap retry); `run` checks this
+    /// after every command and runs the tick when it is due.
+    last_tick: Instant,
     published: Arc<EngineState>,
     requested_buffer_frames: Option<usize>,
     ring_capacity: usize,
     session: Option<Session>,
     state: Arc<ArcSwap<EngineState>>,
-    subscribers: Arc<Mutex<Vec<Sender<Arc<EngineState>>>>>,
+    subscribers: Arc<Mutex<Vec<SyncSender<Arc<EngineState>>>>>,
     /// A correction send hit a full ring; rebuild from the stored config
     /// and retry next tick.
     swap_pending: bool,
@@ -294,6 +334,12 @@ impl<B: AudioBackend> Controller<B> {
                 Ok(EngineCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
                 Ok(cmd) => {
                     self.handle(cmd);
+                    // Tick starvation guard: commands arriving faster than
+                    // the tick keep recv_timeout from ever timing out, so
+                    // run the due tick work here too.
+                    if self.last_tick.elapsed() >= self.tick {
+                        self.on_tick();
+                    }
                     self.publish();
                 }
                 Err(RecvTimeoutError::Timeout) => {
@@ -342,6 +388,13 @@ impl<B: AudioBackend> Controller<B> {
                 }
             }
             EngineCommand::SetCorrection(config) => {
+                // Malformed configs would panic the builders (and take the
+                // controller thread with them): warn + ignore, no state
+                // change.
+                if let Some(reason) = validate_correction(&config) {
+                    log::warn!("SetCorrection ignored: {reason}");
+                    return;
+                }
                 self.correction = Some(config);
                 self.send_correction();
             }
@@ -356,6 +409,7 @@ impl<B: AudioBackend> Controller<B> {
     }
 
     fn on_tick(&mut self) {
+        self.last_tick = Instant::now();
         // Retry a start deferred by a single earlier failure.
         if self.session.is_none() {
             self.try_start();
@@ -408,21 +462,39 @@ impl<B: AudioBackend> Controller<B> {
         }
     }
 
-    /// One start attempt: provisional geometry, then at most ONE stop+start
-    /// renegotiation cycle when the backend reports different geometry.
+    /// One start attempt: provisional geometry, then a renegotiation loop
+    /// (capped at 3 total starts). Each retry rebuilds the chain at the
+    /// last-REPORTED geometry and requests exactly the last-reported buffer
+    /// frames; the loop breaks when the report matches the chain. If the
+    /// report is still moving after the cap, the mismatch is accepted with
+    /// a warning (the chain's uniform frame guard degrades gracefully).
     fn start_once(&mut self) -> Result<(), EngineError> {
         // Provisional: the parity tap is stereo; block from the stored
         // request. See the module docs ("Provisional start + renegotiation").
-        let channels = 2;
-        let block_size = self.requested_buffer_frames.unwrap_or(512);
-        let info = self.start_with(channels, block_size)?;
-
-        if info.buffer_frames != block_size || info.channels != channels {
-            // Renegotiate once at the reported geometry. Stop errors are
+        const MAX_STARTS: u32 = 3;
+        let mut channels = 2;
+        let mut block_size = self.requested_buffer_frames.unwrap_or(512);
+        let mut request = self.requested_buffer_frames;
+        for attempt in 1..=MAX_STARTS {
+            let info = self.start_with(channels, block_size, request)?;
+            if info.buffer_frames == block_size && info.channels == channels {
+                break;
+            }
+            if attempt == MAX_STARTS {
+                log::warn!(
+                    "renegotiation did not converge after {MAX_STARTS} starts \
+                     (chain {channels} ch x {block_size} frames, reported {info:?}); \
+                     accepting degraded pass-through until the next format event"
+                );
+                break;
+            }
+            // Renegotiate at the reported geometry. Stop errors are
             // non-fatal here (the backend contract keeps stop idempotent).
             let _ = self.backend.0.stop();
             self.session = None;
-            self.start_with(info.channels, info.buffer_frames)?;
+            channels = info.channels;
+            block_size = info.buffer_frames;
+            request = Some(info.buffer_frames);
         }
 
         self.watchdog.started(self.now_ms());
@@ -431,10 +503,14 @@ impl<B: AudioBackend> Controller<B> {
 
     /// Build a FRESH `RtShared` + links + chain, re-apply the retained
     /// bypass/gain/correction, and hand the `RtProcessor` to the backend.
+    /// `request` is the buffer-frame hint passed to the backend: the user's
+    /// stored request on the first start, the last-reported size on
+    /// renegotiation retries.
     fn start_with(
         &mut self,
         channels: usize,
         block_size: usize,
+        request: Option<usize>,
     ) -> Result<StreamInfo, EngineError> {
         let shared = Arc::new(RtShared::default());
         // Retained params re-applied to the fresh shared state BEFORE start.
@@ -454,10 +530,7 @@ impl<B: AudioBackend> Controller<B> {
         }
 
         let processor = RtProcessor::new(Arc::clone(&shared), rt, chain);
-        let stream = self
-            .backend
-            .0
-            .start(processor, self.requested_buffer_frames)?;
+        let stream = self.backend.0.start(processor, request)?;
         self.session = Some(Session {
             block_size,
             channels,
@@ -537,23 +610,43 @@ impl<B: AudioBackend> Controller<B> {
             None => (None, None, 0.0),
         };
         let next = EngineState {
-            status: self.effective_status(),
             bypass: self.bypass,
-            gain_db: self.gain_db,
             correction: self.correction.as_ref().map(CorrectionConfig::descriptor),
-            stream,
-            latency_ms,
+            gain_db: self.gain_db,
             input_peak,
+            latency_ms,
+            status: self.effective_status(),
+            stream,
         };
-        if next == *self.published {
+        if effectively_equal(&next, &self.published) {
             return;
         }
         let next = Arc::new(next);
         self.state.store(Arc::clone(&next));
         self.published = Arc::clone(&next);
         let mut subscribers = self.subscribers.lock().expect("subscriber list lock");
-        subscribers.retain(|tx| tx.send(Arc::clone(&next)).is_ok());
+        subscribers.retain(|tx| match tx.try_send(Arc::clone(&next)) {
+            // Full: the subscriber stopped reading -- drop THIS update (it
+            // can always read the latest via `state()`), keep the channel.
+            Ok(()) | Err(TrySendError::Full(_)) => true,
+            Err(TrySendError::Disconnected(_)) => false,
+        });
     }
+}
+
+/// Change detection for `publish`, with the jittery telemetry quantized:
+/// `latency_ms` compares at 0.1 ms and `input_peak` at 1e-3 resolution, so
+/// HAL sample-time jitter does not publish a fresh snapshot every tick.
+fn effectively_equal(a: &EngineState, b: &EngineState) -> bool {
+    let q_latency = |l: Option<f64>| l.map(|v| (v * 10.0).round() as i64);
+    let q_peak = |p: f32| (f64::from(p) * 1000.0).round() as i64;
+    a.bypass == b.bypass
+        && a.correction == b.correction
+        && a.gain_db == b.gain_db
+        && q_peak(a.input_peak) == q_peak(b.input_peak)
+        && q_latency(a.latency_ms) == q_latency(b.latency_ms)
+        && a.status == b.status
+        && a.stream == b.stream
 }
 
 /// dB -> linear amplitude (f64 math, f32 at the atomics boundary).

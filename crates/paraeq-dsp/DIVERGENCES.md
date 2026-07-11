@@ -74,7 +74,13 @@ differs from `prototype/paraeq/`, so a red parity test is always actionable.
     scipy CubicSpline; Rust rejects them at parse with `DspError::Parse`.
     Same inputs fail in both worlds — different layer and mechanism.
 13. **`fr::compute_frequency_response` and `fr::average_measurements` return
-    `Result`.** The Python equivalents raise (ValueError / IndexError) on
-    n_fft=0, empty input, or ragged measurement lists.
+    `Result`.** For `compute_frequency_response` the Python equivalent
+    raises (ValueError / IndexError) on n_fft=0 or empty input — same
+    inputs fail in both worlds, different mechanism. For
+    `average_measurements([])` this is a **real behavioral divergence**:
+    the oracle does NOT raise — `np.mean([], axis=0)` returns NaN (with a
+    RuntimeWarning) — whereas Rust returns `DspError::InvalidInput` instead
+    of yielding NaN. Ragged measurement lists raise in numpy (shape error)
+    and error in Rust.
 
 (add entries here as they are discovered during implementation)

@@ -86,16 +86,23 @@ pub fn parse_target_csv(content: &str, fallback_name: &str) -> Result<TargetCurv
         let (f, g) = t
             .split_once(',')
             .ok_or_else(|| DspError::Parse(format!("bad target row: {t}")))?;
-        curve.frequencies.push(
-            f.trim()
-                .parse()
-                .map_err(|e| DspError::Parse(format!("{t}: {e}")))?,
-        );
-        curve.gains_db.push(
-            g.trim()
-                .parse()
-                .map_err(|e| DspError::Parse(format!("{t}: {e}")))?,
-        );
+        let freq: f64 = f
+            .trim()
+            .parse()
+            .map_err(|e| DspError::Parse(format!("{t}: {e}")))?;
+        let gain: f64 = g
+            .trim()
+            .parse()
+            .map_err(|e| DspError::Parse(format!("{t}: {e}")))?;
+        // f64::parse accepts "NaN"/"inf", and NaN would slip through the
+        // strictly-increasing check below (NaN comparisons are all false).
+        if !freq.is_finite() || !gain.is_finite() {
+            return Err(DspError::Parse(format!(
+                "non-finite value in target row: {t}"
+            )));
+        }
+        curve.frequencies.push(freq);
+        curve.gains_db.push(gain);
     }
     // Validate at parse time so a parsed curve can never panic later inside
     // `interpolate` (the spline requires >= 2 strictly increasing knots).

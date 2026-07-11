@@ -200,6 +200,43 @@ fn bypass_passes_through_and_edge_resets_state() {
 }
 
 #[test]
+fn mono_iir_config_broadcasts_to_both_channels() {
+    // ONE SOS set on a 2-channel chain: the last (only) set is broadcast,
+    // so both channels are corrected identically.
+    let mut chain = RealtimeChain::new(2, BLOCK);
+    chain.set_correction(Some(build_iir(vec![vec![SOS]], 2, BLOCK)));
+
+    let mut direct = IIRProcessor::new();
+    direct.set_sos(0, vec![SOS]);
+    direct.set_sos(1, vec![SOS]);
+
+    for b in 0..3 {
+        let input = make_block(b, 2, BLOCK);
+        let (out, outcome) = chain_process(&mut chain, &input, false, 1.0);
+        assert!(outcome.corrected);
+
+        let in64: Vec<Vec<f64>> = input
+            .iter()
+            .map(|v| v.iter().map(|&s| s as f64).collect())
+            .collect();
+        let views: Vec<&[f64]> = in64.iter().map(|v| v.as_slice()).collect();
+        let mut out64 = vec![vec![0.0f64; BLOCK]; 2];
+        direct.process(&views, &mut out64);
+
+        for ch in 0..2 {
+            for i in 0..BLOCK {
+                let expected = downcast_gain_clamp(out64[ch][i], 1.0);
+                assert_eq!(
+                    out[ch][i].to_bits(),
+                    expected.to_bits(),
+                    "block {b} ch {ch} sample {i}: mono SOS not broadcast"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn fir_frame_mismatch_passes_through() {
     let mut chain = RealtimeChain::new(2, BLOCK);
     chain.set_correction(Some(build_fir(vec![vec![0.5f64, 0.25]], 2, BLOCK)));
@@ -214,6 +251,53 @@ fn fir_frame_mismatch_passes_through() {
         assert_eq!(ch.len(), BLOCK / 2);
         for &s in ch {
             assert_eq!(s, 0.3, "pass-through must still apply gain");
+        }
+    }
+}
+
+#[test]
+fn frame_mismatch_resets_correction_state() {
+    let fir = vec![0.5f64, 0.25, -0.125];
+    let gain = 1.0f32;
+    let mut chain = RealtimeChain::new(2, BLOCK);
+    chain.set_correction(Some(build_fir(vec![fir.clone(), fir.clone()], 2, BLOCK)));
+
+    // Block 0: conforming -- builds overlap state in the convolver.
+    let (_, outcome) = chain_process(&mut chain, &make_block(0, 2, BLOCK), false, gain);
+    assert!(outcome.corrected);
+
+    // Mismatch block (half size): passes through AND clears the stale
+    // correction state (the correction never saw these samples, so its
+    // overlap tail no longer describes the stream).
+    let short = vec![vec![0.3f32; BLOCK / 2]; 2];
+    let (_, outcome) = chain_process(&mut chain, &short, false, gain);
+    assert!(outcome.frame_mismatch);
+
+    // Resumed conforming blocks must equal a FRESH convolver fed ONLY the
+    // resumed blocks -- no stale tail from block 0.
+    let mut fresh = OverlapAddConvolver::new(vec![fir.clone(), fir], BLOCK);
+    for b in 2..4 {
+        let input = make_block(b, 2, BLOCK);
+        let (out, outcome) = chain_process(&mut chain, &input, false, gain);
+        assert!(outcome.corrected);
+
+        let in64: Vec<Vec<f64>> = input
+            .iter()
+            .map(|v| v.iter().map(|&s| s as f64).collect())
+            .collect();
+        let views: Vec<&[f64]> = in64.iter().map(|v| v.as_slice()).collect();
+        let mut out64 = vec![vec![0.0f64; BLOCK]; 2];
+        fresh.process(&views, &mut out64);
+
+        for ch in 0..2 {
+            for i in 0..BLOCK {
+                let expected = downcast_gain_clamp(out64[ch][i], gain);
+                assert_eq!(
+                    out[ch][i].to_bits(),
+                    expected.to_bits(),
+                    "block {b} ch {ch} sample {i}: stale tail after mismatch"
+                );
+            }
         }
     }
 }
