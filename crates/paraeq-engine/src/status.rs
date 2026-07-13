@@ -28,6 +28,18 @@ pub enum EngineStatus {
     NoInputDetected {
         since_ms: u64,
     },
+    /// The controller failed open: `NoInputDetected` (no nonzero sample
+    /// EVER captured since start -- the TCC silent-failure signature)
+    /// persisted for the configured `fail_open_after_ms`, so the engine
+    /// auto-disabled itself -- backend stopped, tap destroyed, device
+    /// unmuted -- instead of holding the user's system muted with silence.
+    /// `after_ms` is how long it waited in `NoInputDetected` before
+    /// disabling. Controller-owned (never produced in here) and sticky:
+    /// there is no auto-retry (re-engaging would re-mute the system);
+    /// an explicit `EngineCommand::Enable` starts again.
+    AutoDisabledNoInput {
+        after_ms: u64,
+    },
     Running,
     InputSilent {
         since_ms: u64,

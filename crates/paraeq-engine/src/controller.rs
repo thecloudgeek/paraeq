@@ -146,6 +146,19 @@ pub struct EngineState {
 /// suite runs in real time without real waits.
 #[derive(Clone, Copy, Debug)]
 pub struct EngineConfig {
+    /// Fail-open window: how long [`EngineStatus::NoInputDetected`] may
+    /// persist before the controller auto-disables (same path as
+    /// [`EngineCommand::Disable`]: backend stopped, tap destroyed, device
+    /// unmuted) and publishes [`EngineStatus::AutoDisabledNoInput`].
+    /// `NoInputDetected` only occurs before the FIRST nonzero input since
+    /// start -- the TCC silent-failure signature (the tap mutes the device
+    /// but delivers zeros) -- so failing open restores the user's un-EQ'd
+    /// audio instead of holding the system muted with silence indefinitely.
+    /// Post-`Running` states (`Idle`, `InputSilent`) never fail open:
+    /// pausing music must never disable the EQ. Measured engage worst case
+    /// is ~4-5 s, so the 15 s default is comfortably conservative. `None`
+    /// disables the behavior.
+    pub fail_open_after_ms: Option<u64>,
     /// Buffer-frame-size hint passed to the backend (user-settable via
     /// [`EngineCommand::SetBufferFrames`]).
     pub requested_buffer_frames: Option<usize>,
@@ -160,6 +173,7 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
+            fail_open_after_ms: Some(15_000),
             requested_buffer_frames: None,
             ring_capacity: 4,
             tick_ms: 250,
@@ -203,6 +217,7 @@ impl EngineHandle {
             .name("paraeq-engine-controller".into())
             .spawn(move || {
                 Controller {
+                    auto_disabled: None,
                     backend: StopGuard(backend),
                     bypass: false,
                     cmd_rx,
@@ -210,6 +225,7 @@ impl EngineHandle {
                     correction: None,
                     enabled: true,
                     epoch: Instant::now(),
+                    fail_open_after_ms: config.fail_open_after_ms,
                     failed: None,
                     gain_db: 0.0,
                     last_tick: Instant::now(),
@@ -296,6 +312,11 @@ struct Session {
 }
 
 struct Controller<B: AudioBackend> {
+    /// `Some(after_ms)` after a fail-open auto-disable. Like `failed`, a
+    /// controller-owned status override: `effective_status` keeps
+    /// publishing `AutoDisabledNoInput` (not the watchdog's `Stopped`)
+    /// until an explicit Enable/Disable clears it.
+    auto_disabled: Option<u64>,
     backend: StopGuard<B>,
     bypass: bool,
     cmd_rx: Receiver<EngineCommand>,
@@ -305,6 +326,9 @@ struct Controller<B: AudioBackend> {
     correction: Option<CorrectionConfig>,
     enabled: bool,
     epoch: Instant,
+    /// Fail-open window from [`EngineConfig::fail_open_after_ms`]
+    /// (`None` = behavior disabled).
+    fail_open_after_ms: Option<u64>,
     failed: Option<String>,
     gain_db: f32,
     /// When `on_tick` last ran. A command flood keeps `recv_timeout`
@@ -365,11 +389,15 @@ impl<B: AudioBackend> Controller<B> {
             }
             EngineCommand::Disable => {
                 // Full disable: tap destroyed, device unmuted -- "system
-                // exactly as if ParaEQ never ran".
+                // exactly as if ParaEQ never ran". An explicit Disable also
+                // supersedes a fail-open latch: the honest status is now
+                // plain Stopped.
+                self.auto_disabled = None;
                 self.enabled = false;
                 self.stop_session();
             }
             EngineCommand::Enable => {
+                self.auto_disabled = None;
                 self.enabled = true;
                 self.failed = None;
                 self.consecutive_start_failures = 0;
@@ -428,6 +456,34 @@ impl<B: AudioBackend> Controller<B> {
             self.watchdog.observe(now, callbacks, nonzero);
             // Free retired corrections on the control thread.
             s.control.drain_retired();
+        }
+
+        // Fail-open (spec: fail-safe ordering / TCC silent failure).
+        // `NoInputDetected` means the tap has NEVER captured a nonzero
+        // sample since start: either nothing is playing, or the TCC grant
+        // is missing and the tap mutes the device while delivering zeros.
+        // Holding that state forever risks a silent system, so past the
+        // window the controller takes the same path as Disable -- backend
+        // stopped, tap destroyed, device unmuted -- and latches
+        // `AutoDisabledNoInput`. This can only fire from `NoInputDetected`
+        // (pre-first-input by construction); post-`Running` states (`Idle`,
+        // `InputSilent`) never reach here -- pausing music must never
+        // disable the EQ. It does not touch the start-failure counter, and
+        // there is no auto-retry (re-engaging would re-mute the system);
+        // an explicit Enable starts again.
+        if let (Some(window), &EngineStatus::NoInputDetected { since_ms }) =
+            (self.fail_open_after_ms, self.watchdog.status())
+        {
+            let waited = self.now_ms().saturating_sub(since_ms);
+            if waited >= window {
+                log::warn!(
+                    "fail-open: no input captured for {waited} ms -- auto-disabling \
+                     (tap destroyed, un-EQ'd audio restored); send Enable to retry"
+                );
+                self.enabled = false;
+                self.stop_session();
+                self.auto_disabled = Some(waited);
+            }
         }
 
         // Rebuilds trigger ONLY on backend events (drain them all -> one
@@ -589,13 +645,20 @@ impl<B: AudioBackend> Controller<B> {
         self.failed = Some(reason);
     }
 
+    /// Controller-owned overrides first (`Failed`, then the fail-open
+    /// `AutoDisabledNoInput` latch -- which must NOT be overwritten by the
+    /// watchdog's `Stopped` after the auto-disable), else the watchdog's
+    /// status.
     fn effective_status(&self) -> EngineStatus {
-        match &self.failed {
-            Some(reason) => EngineStatus::Failed {
+        if let Some(reason) = &self.failed {
+            return EngineStatus::Failed {
                 reason: reason.clone(),
-            },
-            None => self.watchdog.status().clone(),
+            };
         }
+        if let Some(after_ms) = self.auto_disabled {
+            return EngineStatus::AutoDisabledNoInput { after_ms };
+        }
+        self.watchdog.status().clone()
     }
 
     /// Publish a snapshot iff it differs from the last published one.

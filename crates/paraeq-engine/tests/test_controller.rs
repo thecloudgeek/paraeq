@@ -14,6 +14,7 @@ use paraeq_engine::controller::{CorrectionConfig, EngineCommand, EngineConfig, E
 use paraeq_engine::status::{EngineStatus, WatchdogConfig};
 
 const ENGAGE_MS: u64 = 200;
+const FAIL_OPEN_MS: u64 = 300;
 const IDLE_MS: u64 = 150;
 const SILENCE_MS: u64 = 150;
 const TICK_MS: u64 = 10;
@@ -21,8 +22,13 @@ const TICK_MS: u64 = 10;
 /// Generous per-wait budget; each wait normally completes in tens of ms.
 const WAIT: Duration = Duration::from_secs(5);
 
+/// Baseline config: fail-open disabled so the pre-existing lifecycle tests
+/// keep their timing semantics (several deliberately sit in
+/// `NoInputDetected` longer than a shortened fail-open window). The
+/// `fail_open_*` tests opt in via [`fail_open_config`].
 fn fast_config() -> EngineConfig {
     EngineConfig {
+        fail_open_after_ms: None,
         requested_buffer_frames: None,
         ring_capacity: 4,
         tick_ms: TICK_MS,
@@ -31,6 +37,13 @@ fn fast_config() -> EngineConfig {
             idle_window_ms: IDLE_MS,
             silence_window_ms: SILENCE_MS,
         },
+    }
+}
+
+fn fail_open_config() -> EngineConfig {
+    EngineConfig {
+        fail_open_after_ms: Some(FAIL_OPEN_MS),
+        ..fast_config()
     }
 }
 
@@ -465,4 +478,158 @@ fn disable_enable_roundtrip() {
     assert!(wait_until(WAIT, || backend.start_count() == 2));
     // Stored correction re-applied to the fresh chain after Enable.
     assert!(wait_until(WAIT, || pump_matches(&backend, 512, 0.2, 0.4)));
+}
+
+#[test]
+fn fail_open_auto_disables_when_input_never_arrives() {
+    let backend = MockBackend::new();
+    let handle = EngineHandle::spawn(backend.clone(), fail_open_config());
+
+    // Zeros only (the TCC silent-failure signature): Starting ->
+    // NoInputDetected -> past the fail-open window -> AutoDisabledNoInput.
+    assert!(wait_until(WAIT, || {
+        backend.pump(512, 0.0);
+        matches!(
+            handle.state().status,
+            EngineStatus::AutoDisabledNoInput { .. }
+        )
+    }));
+
+    // The auto-disable took the Disable path: backend stopped (tap
+    // destroyed -> device unmuted) after waiting out the full window.
+    assert!(!backend.is_running(), "auto-disable must stop the backend");
+    assert!(backend.stop_count() >= 1);
+    match handle.state().status {
+        EngineStatus::AutoDisabledNoInput { after_ms } => assert!(
+            after_ms >= FAIL_OPEN_MS,
+            "after_ms {after_ms} < window {FAIL_OPEN_MS}"
+        ),
+        ref other => panic!("expected AutoDisabledNoInput, got {other:?}"),
+    }
+
+    // Sticky: the status must not be overwritten by the watchdog's
+    // post-stop `Stopped` on later ticks, and there is no auto-retry
+    // (exactly one start total -- re-engaging would re-mute the system).
+    assert!(
+        !wait_until(Duration::from_millis(TICK_MS * 20), || {
+            !matches!(
+                handle.state().status,
+                EngineStatus::AutoDisabledNoInput { .. }
+            )
+        }),
+        "AutoDisabledNoInput was overwritten after the auto-disable"
+    );
+    assert_eq!(backend.start_count(), 1, "auto-disable must never retry");
+}
+
+#[test]
+fn fail_open_never_fires_after_running() {
+    let backend = MockBackend::new();
+    let handle = EngineHandle::spawn(backend.clone(), fail_open_config());
+
+    // Real input engages the engine: fail-open is now off the table for
+    // this session (NoInputDetected can only precede the first nonzero
+    // input; the post-Running states are Idle / InputSilent).
+    assert!(wait_until(WAIT, || {
+        backend.pump(512, 0.5);
+        handle.state().status == EngineStatus::Running
+    }));
+
+    // Playback pauses: callbacks freeze -> Idle. Sitting there well past
+    // the fail-open window must NOT disable anything -- pausing music must
+    // never disable the EQ.
+    assert!(wait_until(WAIT, || matches!(
+        handle.state().status,
+        EngineStatus::Idle { .. }
+    )));
+    assert!(!wait_until(Duration::from_millis(FAIL_OPEN_MS * 2), || {
+        matches!(
+            handle.state().status,
+            EngineStatus::AutoDisabledNoInput { .. }
+        )
+    }));
+    assert!(backend.is_running());
+
+    // Rendering resumes with silent zeros -> InputSilent; same rule, again
+    // well past the fail-open window.
+    let deadline = Instant::now() + Duration::from_millis(FAIL_OPEN_MS * 2);
+    let mut saw_input_silent = false;
+    while Instant::now() < deadline {
+        backend.pump(512, 0.0);
+        let status = handle.state().status.clone();
+        assert!(
+            !matches!(status, EngineStatus::AutoDisabledNoInput { .. }),
+            "fail-open fired from a post-Running state: {status:?}"
+        );
+        saw_input_silent |= matches!(status, EngineStatus::InputSilent { .. });
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        saw_input_silent,
+        "zeros after Idle should report InputSilent"
+    );
+    assert!(backend.is_running());
+    assert_eq!(backend.stop_count(), 0);
+    assert_eq!(
+        backend.start_count(),
+        1,
+        "fail-open must never fire after Running"
+    );
+}
+
+#[test]
+fn enable_after_fail_open_restarts() {
+    let backend = MockBackend::new();
+    let handle = EngineHandle::spawn(backend.clone(), fail_open_config());
+
+    // No pumping at all also reaches NoInputDetected (the slow-engage
+    // path: callbacks frozen at 0) and then the fail-open latch.
+    assert!(wait_until(WAIT, || matches!(
+        handle.state().status,
+        EngineStatus::AutoDisabledNoInput { .. }
+    )));
+    assert_eq!(backend.start_count(), 1);
+
+    // Explicit Enable clears the latch and starts again, exactly like
+    // Enable-after-Disable. The auto-disable did NOT count toward the
+    // 2-consecutive-start-failure Failed latch, so this start proceeds.
+    handle.send(EngineCommand::Enable);
+    assert!(wait_until(WAIT, || backend.start_count() == 2));
+    assert!(wait_until(WAIT, || {
+        backend.pump(512, 0.5);
+        handle.state().status == EngineStatus::Running
+    }));
+}
+
+#[test]
+fn fail_open_none_disables_the_behavior() {
+    // fast_config: fail_open_after_ms = None.
+    let (backend, handle) = spawn_engine();
+
+    assert!(wait_until(WAIT, || {
+        backend.pump(512, 0.0);
+        matches!(handle.state().status, EngineStatus::NoInputDetected { .. })
+    }));
+
+    // Zeros forever, far past the window that WOULD have fired: the engine
+    // stays in the informational NoInputDetected state and never stops.
+    let deadline = Instant::now() + Duration::from_millis(FAIL_OPEN_MS * 3);
+    while Instant::now() < deadline {
+        backend.pump(512, 0.0);
+        assert!(
+            !matches!(
+                handle.state().status,
+                EngineStatus::AutoDisabledNoInput { .. }
+            ),
+            "fail-open fired despite fail_open_after_ms = None"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(matches!(
+        handle.state().status,
+        EngineStatus::NoInputDetected { .. }
+    ));
+    assert_eq!(backend.stop_count(), 0, "None must mean no auto-disable");
+    assert_eq!(backend.start_count(), 1);
+    assert!(backend.is_running());
 }

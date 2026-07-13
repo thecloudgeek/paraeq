@@ -52,6 +52,7 @@ use paraeq_dsp::fir::{design_fir_correction, FirPhase};
 use paraeq_engine::controller::{
     CorrectionConfig, EngineCommand, EngineConfig, EngineHandle, EngineState,
 };
+use paraeq_engine::status::EngineStatus;
 
 /// Points on the linear 0..Nyquist grid the peaking response is sampled
 /// onto before FIR frequency-sampling design.
@@ -222,7 +223,18 @@ fn main() {
 
         // Print every published snapshot change.
         match snapshots.recv_timeout(Duration::from_millis(100)) {
-            Ok(snap) => println!("[change] {}", snapshot_line(&snap)),
+            Ok(snap) => {
+                println!("[change] {}", snapshot_line(&snap));
+                if let EngineStatus::AutoDisabledNoInput { after_ms } = snap.status {
+                    println!(
+                        "[hint] no system audio captured in {:.0}s -- engine disabled itself \
+                         (audio restored). If music WAS playing, grant System Audio Recording \
+                         to this terminal (System Settings -> Privacy & Security -> Screen & \
+                         System Audio Recording), fully relaunch it, and re-run.",
+                        after_ms as f64 / 1000.0,
+                    );
+                }
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
