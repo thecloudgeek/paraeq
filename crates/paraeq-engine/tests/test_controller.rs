@@ -678,13 +678,28 @@ fn enabled_flip_alone_publishes() {
     // compared field is unchanged -- only `enabled` flips to true. If the
     // comparison omits `enabled`, publish() returns early and no subscriber
     // ever sees the flip.
+    //
+    // The tick is set far beyond the test's runtime on purpose. The
+    // Enable-time start is only DEFERRED by `fail_next_starts(1)`: the next
+    // `on_tick` retries it and, on success, advances Stopped -> Starting.
+    // `run`'s tick-starvation guard runs `on_tick` in the SAME loop iteration
+    // as `handle(Enable)` -- before the flip's `publish` -- whenever
+    // `last_tick.elapsed() >= tick`, which would coalesce the transient
+    // {enabled: true, status: Stopped} frame this test waits for into a
+    // {enabled: true, status: Starting} one. A tick that cannot elapse before
+    // Enable arrives keeps the guard from ever firing here, so the
+    // lone-`enabled` publish is emitted deterministically. (The deferred
+    // start's retry is pushed past teardown; the handle's Shutdown wakes the
+    // blocked `recv_timeout` immediately, so the long tick never delays
+    // anything.)
     let backend = MockBackend::default();
     let probe = backend.clone();
     let handle = EngineHandle::spawn(
         backend,
         EngineConfig {
             enabled: false,
-            tick_ms: TICK_MS,
+            // Far larger than the whole test; see the note above.
+            tick_ms: 600_000,
             ..fast_config()
         },
     );
