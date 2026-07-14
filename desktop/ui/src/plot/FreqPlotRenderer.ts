@@ -82,6 +82,25 @@ export function logspace(fMin: number, fMax: number, n: number): number[] {
   return out;
 }
 
+// Q clamp for the handle-wheel gesture (Task 15). Deliberately narrower than
+// the engine's Q_MAX=100: the wheel is a coarse sculpting gesture, and the
+// table still accepts up to 100 by typing. Mirrors the plot's own gain clamp,
+// which likewise bounds to the display range while the table allows ±30.
+export const Q_WHEEL_MIN = 0.1;
+export const Q_WHEEL_MAX = 20;
+
+/**
+ * One wheel notch over a band handle → the band's new Q (decision 13).
+ * `q *= 1.05^-sign(deltaY)`: scroll up (deltaY < 0) narrows (Q up), scroll down
+ * widens (Q down); clamped to [Q_WHEEL_MIN, Q_WHEEL_MAX] and rounded to 3
+ * decimals (the table's Q display precision). Pure — unit-tested.
+ */
+export function qWheelStep(q: number, deltaY: number): number {
+  const next = q * Math.pow(1.05, -Math.sign(deltaY));
+  const clamped = Math.min(Q_WHEEL_MAX, Math.max(Q_WHEEL_MIN, next));
+  return Math.round(clamped * 1000) / 1000;
+}
+
 export class FreqPlotRenderer {
   private range: PlotRange;
   private logFMin: number;

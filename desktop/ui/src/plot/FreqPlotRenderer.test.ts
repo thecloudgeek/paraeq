@@ -4,7 +4,10 @@ import {
   BAND_PALETTE,
   EQ_PLOT_RANGE,
   FreqPlotRenderer,
+  Q_WHEEL_MAX,
+  Q_WHEEL_MIN,
   logspace,
+  qWheelStep,
   type PlotHandle,
 } from "./FreqPlotRenderer";
 
@@ -145,6 +148,38 @@ describe("hitTest", () => {
     const px = r.xForFreq(1000);
     const py = r.yForDb(0); // nearer to id 5 (db 0) than id 6 (db 0.2)
     expect(r.hitTest(px, py, overlap)).toBe(5);
+  });
+});
+
+describe("qWheelStep", () => {
+  it("scroll down (deltaY > 0) widens: Q decreases by 1/1.05", () => {
+    // 1 / 1.05 = 0.95238… → 0.952 at the 3-decimal display precision.
+    expect(qWheelStep(1, 120)).toBe(0.952);
+  });
+
+  it("scroll up (deltaY < 0) narrows: Q increases by 1.05", () => {
+    expect(qWheelStep(1, -120)).toBe(1.05);
+  });
+
+  it("only the sign of deltaY matters (magnitude ignored)", () => {
+    expect(qWheelStep(2, 1)).toBe(qWheelStep(2, 999));
+    expect(qWheelStep(2, -1)).toBe(qWheelStep(2, -999));
+  });
+
+  it("zero deltaY leaves Q unchanged (rounded)", () => {
+    expect(qWheelStep(1.234, 0)).toBe(1.234);
+  });
+
+  it("clamps to [Q_WHEEL_MIN, Q_WHEEL_MAX]", () => {
+    expect(qWheelStep(Q_WHEEL_MIN, 1)).toBe(Q_WHEEL_MIN);
+    expect(qWheelStep(Q_WHEEL_MAX, -1)).toBe(Q_WHEEL_MAX);
+    expect(qWheelStep(1000, -1)).toBe(Q_WHEEL_MAX);
+    expect(qWheelStep(0.001, 1)).toBe(Q_WHEEL_MIN);
+  });
+
+  it("rounds to 3 decimals (the table's Q precision)", () => {
+    // 1.41 * 1.05 = 1.4805 → 1.481 (3-decimal round, not 1.4805)
+    expect(qWheelStep(1.41, -1)).toBe(1.481);
   });
 });
 

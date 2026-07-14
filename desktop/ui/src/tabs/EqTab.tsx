@@ -7,10 +7,16 @@
 // prototype contract: no Apply button).
 //
 // Layout, top to bottom (prototype parity, manual_eq_editor.py): toolbar, band
-// table, preamp row, frequency plot (read-only curve here; drag handles arrive
-// in Task 15), status strip.
+// table, preamp row, frequency plot (curve + one draggable handle per band),
+// status strip.
+//
+// Drag (Task 15): the plot and table are two views of the SAME Rust-owned
+// bands. During a pointer drag we hold ONE ephemeral fork (`draggingBands`, the
+// spec-sanctioned in-flight state) so handles + table update at frame rate;
+// engine application is throttled to ~10 Hz and finalized authoritatively on
+// pointer-up, after which the AppState snapshot is the sole truth again.
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { JSX } from "react";
 import { open, save } from "@tauri-apps/plugin-dialog";
 
@@ -53,8 +59,8 @@ import {
   profilesSave,
 } from "@/ipc/commands";
 import type { AppState, EQBand, EngineState, FilterType } from "@/ipc/types";
-import { BAND_PALETTE, EQ_PLOT_RANGE, logspace } from "@/plot/FreqPlotRenderer";
-import type { Trace } from "@/plot/FreqPlotRenderer";
+import { BAND_PALETTE, EQ_PLOT_RANGE, logspace, qWheelStep } from "@/plot/FreqPlotRenderer";
+import type { PlotHandle, Trace } from "@/plot/FreqPlotRenderer";
 
 // The plot's frequency grid (prototype parity: 512 log-spaced points 20..20k).
 const PLOT_FREQS = logspace(20, 20000, 512);
@@ -86,6 +92,25 @@ export function EqTab({ state }: EqTabProps): JSX.Element {
   const [traces, setTraces] = useState<Trace[]>([]);
   const [saveOpen, setSaveOpen] = useState(false);
   const [profileName, setProfileName] = useState("");
+  // The ONE sanctioned ephemeral fork: the in-flight band list while a plot
+  // handle is being dragged (null when not dragging). `dragBandsRef` mirrors it
+  // for synchronous reads inside the (non-React) drag handlers; `lastApplyRef`
+  // throttles engine writes during the drag.
+  const [draggingBands, setDraggingBands] = useState<EQBand[] | null>(null);
+  const dragBandsRef = useRef<EQBand[] | null>(null);
+  const lastApplyRef = useRef(0);
+
+  // What the table + handles render from: the in-flight fork during a drag,
+  // otherwise the authoritative AppState bands. The plot traces stay keyed on
+  // AppState (they refresh through the throttled commit round-trip — decision
+  // 12: curve math stays in Rust).
+  const displayBands = draggingBands ?? bands;
+  const handles: PlotHandle[] = displayBands.map((b, i) => ({
+    color: BAND_PALETTE[i % BAND_PALETTE.length],
+    db: b.gain_db,
+    f: b.fc,
+    id: i,
+  }));
 
   const sampleRate = engine.stream?.sample_rate ?? 48000;
   const bandsSig = JSON.stringify(bands);
@@ -160,6 +185,69 @@ export function EqTab({ state }: EqTabProps): JSX.Element {
     } catch (e) {
       fail(e);
     }
+  };
+
+  // Apply a band list to Rust. Shared by the drag/wheel gestures; the values
+  // they pass are pre-clamped to the plot range (well inside the eq.rs limits),
+  // so validation never rejects — a genuine failure still surfaces.
+  const applyBands = async (next: EQBand[]) => {
+    try {
+      await eqSetBands(next);
+    } catch (e) {
+      fail(e);
+    }
+  };
+
+  // Pointer drag of a band handle. The wrapper pre-clamps f/db to the plot
+  // range and rAF-throttles "move". We fork into `draggingBands` for frame-rate
+  // table + handle feedback, throttle the engine write to ~10 Hz, and do the
+  // authoritative set on "end" (then drop the fork — AppState is truth again).
+  const onHandleDrag = (
+    id: number,
+    f: number,
+    db: number,
+    phase: "move" | "end" | "start",
+  ) => {
+    if (phase === "start") {
+      const snap = bands.map((b) => ({ ...b }));
+      dragBandsRef.current = snap;
+      lastApplyRef.current = 0;
+      setDraggingBands(snap);
+      return;
+    }
+    const base = dragBandsRef.current ?? bands;
+    const next: EQBand[] = base.map((b, i) =>
+      i === id
+        ? { ...b, fc: Math.round(f * 100) / 100, gain_db: Math.round(db * 10) / 10 }
+        : b,
+    );
+    if (phase === "end") {
+      dragBandsRef.current = null;
+      setDraggingBands(null);
+      void applyBands(next);
+      return;
+    }
+    dragBandsRef.current = next;
+    setDraggingBands(next);
+    const now = performance.now();
+    if (now - lastApplyRef.current >= 100) {
+      lastApplyRef.current = now;
+      void applyBands(next);
+    }
+  };
+
+  // Wheel over a handle adjusts that band's Q multiplicatively (discrete → one
+  // commit per event). Honors an in-flight drag fork if one is live.
+  const onHandleWheel = (id: number, deltaY: number) => {
+    const base = dragBandsRef.current ?? bands;
+    const next: EQBand[] = base.map((b, i) =>
+      i === id ? { ...b, q: qWheelStep(b.q, deltaY) } : b,
+    );
+    if (dragBandsRef.current) {
+      dragBandsRef.current = next;
+      setDraggingBands(next);
+    }
+    void applyBands(next);
   };
 
   const commitPreamp = async (raw: string) => {
@@ -310,14 +398,14 @@ export function EqTab({ state }: EqTabProps): JSX.Element {
           </TableRow>
         </TableHeader>
         <TableBody>
-          {bands.length === 0 ? (
+          {displayBands.length === 0 ? (
             <TableRow>
               <TableCell className="text-muted-foreground" colSpan={4}>
                 No bands — flat passthrough. Add a band to begin.
               </TableCell>
             </TableRow>
           ) : (
-            bands.map((band, i) => {
+            displayBands.map((band, i) => {
               const sig = `${band.filter_type}:${band.fc}:${band.gain_db}:${band.q}:${errNonce}`;
               const isNotch = band.filter_type === "notch";
               return (
@@ -422,9 +510,16 @@ export function EqTab({ state }: EqTabProps): JSX.Element {
         />
       </div>
 
-      {/* Frequency plot (read-only curve; drag handles land in Task 15) */}
+      {/* Frequency plot: curve + one draggable handle per band */}
       <div className="min-h-48 flex-1">
-        <FrequencyPlot range={EQ_PLOT_RANGE} traces={traces} title={`${(sampleRate / 1000).toFixed(1)} kHz`} />
+        <FrequencyPlot
+          handles={handles}
+          onHandleDrag={onHandleDrag}
+          onHandleWheel={onHandleWheel}
+          range={EQ_PLOT_RANGE}
+          traces={traces}
+          title={`${(sampleRate / 1000).toFixed(1)} kHz`}
+        />
       </div>
 
       {/* Status strip */}
