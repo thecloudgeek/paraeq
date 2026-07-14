@@ -19,6 +19,7 @@ import type {
   IndexEntry,
   OutputDeviceInfo,
   ParsedPresetDto,
+  ProbeVerdict,
   ResponseData,
 } from "./types";
 
@@ -83,3 +84,19 @@ export const profilesList = () => invoke<string[]>("profiles_list");
 
 export const profilesSave = (name: string) =>
   invoke<void>("profiles_save", { name });
+
+// --- Setup wizard ---------------------------------------------------------
+
+export const setupComplete = () => invoke<void>("setup_complete");
+
+export const setupOpenPrivacySettings = () =>
+  invoke<void>("setup_open_privacy_settings");
+
+export const setupProbeStart = () => invoke<void>("setup_probe_start");
+
+export const setupProbeStop = () => invoke<void>("setup_probe_stop");
+
+// `elapsed_ms` is multi-word → camelCase key on this side (Tauri maps it to the
+// Rust `elapsed_ms` param).
+export const setupProbeVerdict = (elapsedMs: number) =>
+  invoke<ProbeVerdict>("setup_probe_verdict", { elapsedMs });

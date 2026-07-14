@@ -63,6 +63,11 @@ pub struct AppShared {
     /// held only across the compare-and-save inside `publish`, never nested with
     /// `data`/`engine`.
     pub persisted: Mutex<Settings>,
+    /// The first-launch chime probe (child process + loop thread bookkeeping).
+    /// Owns its own synchronization; never nested with `data`/`engine`. `stop`
+    /// is called on wizard completion/cancel and on app exit so no `afplay`
+    /// helper ever outlives its purpose.
+    pub probe: crate::setup::ProbeState,
     pub profiles_dir: PathBuf,
     pub settings_path: PathBuf,
 }

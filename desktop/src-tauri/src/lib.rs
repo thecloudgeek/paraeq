@@ -4,6 +4,7 @@ mod engine_bridge;
 mod eq;
 mod profiles;
 mod settings;
+mod setup;
 mod state;
 mod tray;
 
@@ -74,6 +75,7 @@ pub fn run() {
                 // publish then still corrects an out-of-range on-disk preamp,
                 // exactly as the previous re-read-from-disk path did.
                 persisted: Mutex::new(settings.clone()),
+                probe: setup::ProbeState::new(),
                 profiles_dir,
                 settings_path,
             });
@@ -125,6 +127,11 @@ pub fn run() {
             commands::profiles_activate,
             commands::profiles_list,
             commands::profiles_save,
+            commands::setup_complete,
+            commands::setup_open_privacy_settings,
+            commands::setup_probe_start,
+            commands::setup_probe_stop,
+            commands::setup_probe_verdict,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -141,6 +148,9 @@ pub fn run() {
             // the controller thread) BEFORE the process exits.
             tauri::RunEvent::Exit => {
                 let shared = app_handle.state::<AppShared>();
+                // Stop the chime probe first: kill any live afplay child and
+                // join its loop so no helper process outlives the app.
+                shared.probe.stop();
                 let handle = shared.engine.lock().unwrap().take();
                 if let Some(h) = handle {
                     h.send(paraeq_engine::controller::EngineCommand::Disable);

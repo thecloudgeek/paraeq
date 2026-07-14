@@ -80,6 +80,11 @@ export interface AppState {
   setup_complete: boolean;
 }
 
+/** The setup wizard's three-way probe read (setup::ProbeVerdict, serialized
+ *  snake_case as a bare string). `running` = capture works; `timed_out` = the
+ *  TCC grant is likely missing; `still_probing` = keep waiting. */
+export type ProbeVerdict = "running" | "still_probing" | "timed_out";
+
 /** An AutoEq index row (autoeq::IndexEntry). */
 export interface IndexEntry {
   name: string;

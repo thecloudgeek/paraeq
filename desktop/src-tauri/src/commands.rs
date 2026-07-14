@@ -12,6 +12,7 @@ use crate::autoeq::{self, AutoEqClient, IndexEntry, ParsedPresetDto, ReqwestFetc
 use crate::engine_bridge;
 use crate::eq::{self, ImportResult, ResponseData};
 use crate::profiles;
+use crate::setup::{self, ProbeVerdict};
 use crate::state::{AppShared, AppState, OutputDeviceInfo};
 use paraeq_dsp::peq::{EQBand, FilterType, ParametricEQ};
 use paraeq_engine::controller::EngineCommand;
@@ -364,4 +365,74 @@ pub async fn autoeq_fetch_preset(
         return Err("Preset contains no parametric EQ filters".to_string());
     }
     Ok(parsed)
+}
+
+// --- Setup wizard + chime probe -------------------------------------------
+//
+// The probe verifies audio CAPTURE (tap + TCC grant), which is otherwise
+// unobservable: a missing grant is indistinguishable from silence. See
+// `setup.rs` for the full rationale and the never-orphan-a-child safety story.
+
+/// Start the deterministic chime probe: ensure the engine is enabled (so a tap
+/// engages) and spawn the looping `afplay` helper. Enabling here is idempotent
+/// and also clears any fail-open latch, so a fresh "Enable EQ" click and a
+/// "Re-test" both funnel through the same path. `ProbeState::start` is itself
+/// idempotent (it stops any prior probe first), so repeated calls never stack
+/// helper loops.
+#[tauri::command]
+pub fn setup_probe_start(app: tauri::AppHandle) -> Result<(), String> {
+    let shared = app.state::<AppShared>();
+    engine_bridge::send_cmd(&shared, EngineCommand::Enable);
+    shared.data.lock().unwrap().engine_enabled = true;
+    shared.probe.start();
+    engine_bridge::publish_current(&app);
+    Ok(())
+}
+
+/// Stop the chime probe: kill any live `afplay` child and join the loop thread.
+/// Safe to call when no probe is running.
+#[tauri::command]
+pub fn setup_probe_stop(app: tauri::AppHandle) -> Result<(), String> {
+    let shared = app.state::<AppShared>();
+    shared.probe.stop();
+    Ok(())
+}
+
+/// Compute the probe verdict from the LIVE engine status plus the client's
+/// `elapsed_ms` since the probe started. The timing logic lives in Rust
+/// ([`setup::probe_verdict`], unit-tested) so the wizard renders from a single
+/// source of truth rather than re-implementing the 10 s window in TS.
+#[tauri::command]
+pub fn setup_probe_verdict(app: tauri::AppHandle, elapsed_ms: u64) -> ProbeVerdict {
+    let shared = app.state::<AppShared>();
+    let status = engine_bridge::current_engine_state(&shared).status;
+    setup::probe_verdict(
+        &status,
+        std::time::Duration::from_millis(elapsed_ms),
+        setup::PROBE_TIMEOUT,
+    )
+}
+
+/// Open System Settings at the Screen & System Audio Recording pane so the user
+/// can grant the permission a process tap needs.
+#[tauri::command]
+pub fn setup_open_privacy_settings() -> Result<(), String> {
+    std::process::Command::new("open")
+        .arg(setup::PRIVACY_URL)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("failed to open privacy settings: {e}"))
+}
+
+/// Mark setup complete (persisted) and stop the probe. Leaves the engine in
+/// whatever enabled state the wizard reached -- a successful step 3 left it
+/// enabled, so the next launch auto-enables (decision 1). Stopping the probe
+/// here guarantees the wizard never leaves an `afplay` helper running.
+#[tauri::command]
+pub fn setup_complete(app: tauri::AppHandle) -> Result<(), String> {
+    let shared = app.state::<AppShared>();
+    shared.probe.stop();
+    shared.data.lock().unwrap().setup_complete = true;
+    engine_bridge::publish_current(&app);
+    Ok(())
 }

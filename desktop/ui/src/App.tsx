@@ -8,9 +8,22 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useAppState } from "@/ipc/useAppState";
 import { EqTab } from "@/tabs/EqTab";
 import { PlaceholderTab } from "@/tabs/PlaceholderTab";
+import { SetupWizard } from "@/wizard/SetupWizard";
 
 function App() {
   const state = useAppState();
+
+  // First-launch gate: until setup is marked complete, the wizard is the ONLY
+  // surface — it is the sole gateway to audible audio (the engine stays disabled
+  // until the wizard enables it). Closing the window mid-wizard just hides it;
+  // re-showing resumes here because `setup_complete` is still false.
+  if (state && !state.setup_complete) {
+    return (
+      <div className="flex h-screen flex-col">
+        <SetupWizard state={state} />
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-screen flex-col p-4">
