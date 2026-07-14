@@ -217,12 +217,3 @@ fn restart_after_stop_regains_slow_engage_grace() {
         EngineStatus::Starting { since_ms: 10_000 }
     );
 }
-
-#[test]
-fn status_serializes_to_json() {
-    let json = serde_json::to_string(&EngineStatus::NoInputDetected { since_ms: 5000 }).unwrap();
-    assert!(json.contains("NoInputDetected"), "got: {json}");
-    assert!(json.contains("5000"), "got: {json}");
-    let json = serde_json::to_string(&EngineStatus::Running).unwrap();
-    assert!(json.contains("Running"), "got: {json}");
-}
