@@ -45,6 +45,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { FrequencyPlot } from "@/components/FrequencyPlot";
+import { AutoEqBrowser } from "@/dialogs/AutoEqBrowser";
 import {
   eqAddBand,
   eqExportAutoeq,
@@ -92,6 +93,7 @@ export function EqTab({ state }: EqTabProps): JSX.Element {
   const [traces, setTraces] = useState<Trace[]>([]);
   const [saveOpen, setSaveOpen] = useState(false);
   const [profileName, setProfileName] = useState("");
+  const [browseOpen, setBrowseOpen] = useState(false);
   // The ONE sanctioned ephemeral fork: the in-flight band list while a plot
   // handle is being dragged (null when not dragging). `dragBandsRef` mirrors it
   // for synchronous reads inside the (non-React) drag handlers; `lastApplyRef`
@@ -356,7 +358,7 @@ export function EqTab({ state }: EqTabProps): JSX.Element {
         <Button size="sm" variant="outline" onClick={() => setSaveOpen(true)}>
           Save Profile…
         </Button>
-        <Button size="sm" variant="outline" disabled title="Coming in Task 16">
+        <Button size="sm" variant="outline" onClick={() => setBrowseOpen(true)}>
           Browse AutoEQ DB…
         </Button>
         <Button size="sm" variant="outline" onClick={importPreset}>
@@ -550,6 +552,9 @@ export function EqTab({ state }: EqTabProps): JSX.Element {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* Browse AutoEQ DB dialog */}
+      <AutoEqBrowser open={browseOpen} onOpenChange={setBrowseOpen} onApplied={succeed} />
     </div>
   );
 }
