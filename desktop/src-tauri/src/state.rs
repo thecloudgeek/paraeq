@@ -104,6 +104,23 @@ impl AppData {
         }
     }
 
+    /// Apply the setup wizard's terminal choice, factored out pure so it is
+    /// unit-testable without a Tauri app. `enable` is the user's ACTUAL decision,
+    /// decoupled from the probe's *temporary* enable (`setup_probe_start` flips
+    /// `engine_enabled` on the moment the diagnostic runs, before any grant is
+    /// verified): the opt-in path (a verified-`Running` probe, then Finish)
+    /// passes `true`; "Skip for now" / completing without a successful enable
+    /// passes `false`. Records `enable` as the persisted `engine_enabled` intent
+    /// (which survives fail-open across launches -- decision 1) and marks setup
+    /// complete. Returns `true` when the engine must be told to `Disable` to
+    /// revert a probe's temporary enable -- i.e. exactly when the user declined,
+    /// so a skipping user is never re-muted on future launches.
+    pub fn complete_setup(&mut self, enable: bool) -> bool {
+        self.engine_enabled = enable;
+        self.setup_complete = true;
+        !enable
+    }
+
     /// Project the persisted subset back out for saving.
     pub fn to_settings(&self) -> Settings {
         Settings {
@@ -159,6 +176,47 @@ mod tests {
         let settings = sample_settings();
         let data = AppData::from_settings(&settings);
         assert_eq!(data.to_settings(), settings);
+    }
+
+    /// "Skip for now" / finishing without a verified enable: the terminal
+    /// choice must persist `engine_enabled = false` (so future launches do NOT
+    /// re-engage the tap and mute audio while the grant is still missing) AND
+    /// request an engine `Disable` to revert the probe's temporary enable.
+    #[test]
+    fn complete_setup_skip_persists_disabled_and_requests_disable() {
+        // Model the mid-wizard state a skip hits: the probe left the engine
+        // enabled, setup is not yet complete.
+        let mut data = AppData::from_settings(&sample_settings());
+        data.engine_enabled = true;
+        data.setup_complete = false;
+
+        let must_disable = data.complete_setup(false);
+
+        assert!(must_disable, "skip must request an engine Disable");
+        assert!(
+            !data.engine_enabled,
+            "skip must persist engine_enabled = false"
+        );
+        assert!(data.setup_complete, "setup must be marked complete");
+    }
+
+    /// Explicit opt-in (a verified-`Running` probe, then Finish): persist
+    /// `engine_enabled = true` and do NOT request a Disable. This is the intent
+    /// that survives fail-open across launches (decision 1).
+    #[test]
+    fn complete_setup_opt_in_persists_enabled_and_no_disable() {
+        let mut data = AppData::from_settings(&sample_settings());
+        data.engine_enabled = true;
+        data.setup_complete = false;
+
+        let must_disable = data.complete_setup(true);
+
+        assert!(!must_disable, "opt-in must NOT request a Disable");
+        assert!(
+            data.engine_enabled,
+            "opt-in must persist engine_enabled = true"
+        );
+        assert!(data.setup_complete, "setup must be marked complete");
     }
 
     #[test]

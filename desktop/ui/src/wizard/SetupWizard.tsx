@@ -5,9 +5,13 @@
 //
 // Four steps: (1) explain; (2) confirm the output device; (3) enable + verify
 // capture via the deterministic chime probe (with a live readout, Re-test, and
-// a TCC guidance panel); (4) done → mark setup complete. A "Skip for now" link
-// on step 3 completes setup without a verified probe (engine stays disabled),
-// per the prototype's tolerant wizard.
+// a TCC guidance panel); (4) done → mark setup complete, opting in
+// (`setupComplete(true)`). A "Skip for now" link on step 3 completes setup
+// WITHOUT opting in (`setupComplete(false)`): Rust reverts the probe's temporary
+// enable and persists engine_enabled=false, so a skipping user is left genuinely
+// disabled and is never re-muted on future launches (per the prototype's
+// tolerant wizard). Finish is only reachable after a verified-Running probe, so
+// it always represents an explicit opt-in.
 //
 // SAFETY: the probe spawns a looping `afplay` child in Rust. We stop it on every
 // exit path — leaving the verify step, unmounting, completing, and skipping —
@@ -277,9 +281,13 @@ function VerifyStep({
     };
   }, []);
 
+  // "Skip for now" is a decline, NOT an opt-in: pass enable=false so Rust
+  // reverts the probe's temporary enable (Disable) and persists
+  // engine_enabled=false. Otherwise a skip after a failed/timed-out probe would
+  // leave the tap re-engaging and muting audio for ~15 s every launch.
   const skip = async () => {
     try {
-      await setupComplete();
+      await setupComplete(false);
     } catch (e) {
       setError(String(e));
     }
@@ -379,11 +387,14 @@ function DoneStep({ onBack }: { onBack: () => void }): JSX.Element {
   const [error, setError] = useState<string | null>(null);
   const finishing = useRef(false);
 
+  // Finish is only reachable after a verified-Running probe, so it is always an
+  // explicit opt-in: pass enable=true to persist engine_enabled=true (the intent
+  // that survives fail-open across launches — decision 1).
   const finish = async () => {
     if (finishing.current) return;
     finishing.current = true;
     try {
-      await setupComplete();
+      await setupComplete(true);
     } catch (e) {
       finishing.current = false;
       setError(String(e));

@@ -87,7 +87,12 @@ export const profilesSave = (name: string) =>
 
 // --- Setup wizard ---------------------------------------------------------
 
-export const setupComplete = () => invoke<void>("setup_complete");
+// `enable` records the user's ACTUAL terminal choice, decoupled from the probe's
+// temporary enable: `true` on explicit opt-in (a verified-Running probe → Finish),
+// `false` on "Skip for now" / declining (Rust then reverts the probe's enable and
+// persists engine_enabled=false, so a skipping user is not re-muted next launch).
+export const setupComplete = (enable: boolean) =>
+  invoke<void>("setup_complete", { enable });
 
 export const setupOpenPrivacySettings = () =>
   invoke<void>("setup_open_privacy_settings");

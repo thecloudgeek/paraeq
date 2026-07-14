@@ -424,15 +424,33 @@ pub fn setup_open_privacy_settings() -> Result<(), String> {
         .map_err(|e| format!("failed to open privacy settings: {e}"))
 }
 
-/// Mark setup complete (persisted) and stop the probe. Leaves the engine in
-/// whatever enabled state the wizard reached -- a successful step 3 left it
-/// enabled, so the next launch auto-enables (decision 1). Stopping the probe
-/// here guarantees the wizard never leaves an `afplay` helper running.
+/// Mark setup complete (persisted) and stop the probe, recording the user's
+/// ACTUAL terminal choice via `enable` -- decoupled from the probe's *temporary*
+/// enable ([`setup_probe_start`] flips `engine_enabled` on the instant the
+/// diagnostic runs, before any grant is verified):
+///
+/// - `enable == true` -- the user opted in (a verified-`Running` probe, then
+///   Finish). `engine_enabled` persists `true`, so the next launch auto-enables;
+///   this holds even if the engine later fails open, because the persisted
+///   intent is the user's, not the tap's (decision 1). No engine command is
+///   sent -- the probe already engaged it.
+/// - `enable == false` -- the user skipped / declined without a successful
+///   enable. Any temporary enable the probe left on is reverted with `Disable`
+///   (full teardown: session stopped, tap destroyed, device unmuted) and
+///   `engine_enabled` persists `false`, so future launches do NOT re-engage the
+///   tap and mute audio for ~15 s while the grant is still missing.
+///
+/// Stopping the probe here guarantees the wizard never leaves an `afplay` helper
+/// running. Lock discipline: the `data` guard is dropped before the `Disable`
+/// send and before `publish_current` -- no lock spans a send or emit.
 #[tauri::command]
-pub fn setup_complete(app: tauri::AppHandle) -> Result<(), String> {
+pub fn setup_complete(app: tauri::AppHandle, enable: bool) -> Result<(), String> {
     let shared = app.state::<AppShared>();
     shared.probe.stop();
-    shared.data.lock().unwrap().setup_complete = true;
+    let must_disable = { shared.data.lock().unwrap().complete_setup(enable) };
+    if must_disable {
+        engine_bridge::send_cmd(&shared, EngineCommand::Disable);
+    }
     engine_bridge::publish_current(&app);
     Ok(())
 }
