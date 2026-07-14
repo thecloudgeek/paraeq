@@ -55,6 +55,9 @@ pub struct AppState {
 pub struct AppShared {
     pub data: Mutex<AppData>,
     pub engine: Mutex<Option<EngineHandle>>,
+    // Consumed by the profile store in Task 8; wired into AppShared now so the
+    // bootstrap in lib.rs constructs the final shape.
+    #[allow(dead_code)]
     pub profiles_dir: PathBuf,
     pub settings_path: PathBuf,
 }

@@ -133,6 +133,10 @@ pub fn resend_decision(
 /// `composite` is all bands cascaded (its dB values equal the per-band dB sum
 /// to within floating-point floor error). `sample_rate` is the rate the curves
 /// were computed at, echoed back so the caller can label the plot.
+///
+/// Serialized as the `eq_response` command result (Task 7); `desktop/ui`
+/// mirrors this shape by hand.
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct ResponseData {
     pub composite: Vec<f64>,
     pub per_band: Vec<Vec<f64>>,
