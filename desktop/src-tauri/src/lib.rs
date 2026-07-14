@@ -110,6 +110,8 @@ pub fn run() {
             commands::autoeq_search,
             commands::autoeq_sync_index,
             commands::eq_add_band,
+            commands::eq_export_autoeq,
+            commands::eq_import_autoeq,
             commands::eq_remove_band,
             commands::eq_response,
             commands::eq_set_bands,

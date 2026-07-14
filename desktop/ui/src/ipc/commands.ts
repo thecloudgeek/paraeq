@@ -15,6 +15,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AppState,
   EQBand,
+  ImportResult,
   IndexEntry,
   OutputDeviceInfo,
   ParsedPresetDto,
@@ -53,6 +54,12 @@ export const engineSetPreampDb = (db: number) =>
 // --- EQ -------------------------------------------------------------------
 
 export const eqAddBand = () => invoke<void>("eq_add_band");
+
+export const eqExportAutoeq = (path: string) =>
+  invoke<void>("eq_export_autoeq", { path });
+
+export const eqImportAutoeq = (path: string) =>
+  invoke<ImportResult>("eq_import_autoeq", { path });
 
 export const eqRemoveBand = (index?: number) =>
   invoke<void>("eq_remove_band", { index: index ?? null });

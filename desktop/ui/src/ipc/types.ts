@@ -100,3 +100,12 @@ export interface ParsedPresetDto {
   bands: EQBand[];
   preamp_db: number;
 }
+
+/** The outcome of an AutoEQ file import (eq::ImportResult). `preamp_db` is the
+ *  value actually applied (clamped into [-30, +10]); `preamp_clamped` says
+ *  whether the clamp changed the file's value. */
+export interface ImportResult {
+  band_count: number;
+  preamp_clamped: boolean;
+  preamp_db: number;
+}

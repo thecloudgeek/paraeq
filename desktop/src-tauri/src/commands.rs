@@ -10,10 +10,10 @@
 
 use crate::autoeq::{self, AutoEqClient, IndexEntry, ParsedPresetDto, ReqwestFetch};
 use crate::engine_bridge;
-use crate::eq::{self, ResponseData};
+use crate::eq::{self, ImportResult, ResponseData};
 use crate::profiles;
 use crate::state::{AppShared, AppState, OutputDeviceInfo};
-use paraeq_dsp::peq::{EQBand, FilterType};
+use paraeq_dsp::peq::{EQBand, FilterType, ParametricEQ};
 use paraeq_engine::controller::EngineCommand;
 use tauri::Manager;
 
@@ -202,6 +202,47 @@ pub fn eq_response(app: tauri::AppHandle, freqs: Vec<f64>) -> Result<ResponseDat
     let rate = live_rate(&shared);
     let bands = shared.data.lock().unwrap().bands.clone();
     Ok(eq::response(&bands, &freqs, rate))
+}
+
+/// Export the current bands + preamp to an AutoEQ ParametricEq text file. The
+/// path comes from the native save dialog (capability-safe). Format is the
+/// DSP-owned `export_autoeq_format`; the sample rate is irrelevant to export.
+#[tauri::command]
+pub fn eq_export_autoeq(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    let shared = app.state::<AppShared>();
+    let (bands, preamp_db) = {
+        let data = shared.data.lock().unwrap();
+        (data.bands.clone(), data.preamp_db)
+    };
+    let rate = live_rate(&shared);
+    let text = ParametricEQ {
+        bands,
+        sample_rate: rate,
+    }
+    .export_autoeq_format(preamp_db);
+    std::fs::write(&path, text).map_err(|e| format!("failed to write {path}: {e}"))
+}
+
+/// Import an AutoEQ ParametricEq text file (path from the native open dialog).
+/// Zero filter lines is an error carrying the prototype's exact message. Else
+/// the bands REPLACE the current set through the validating apply path, and the
+/// file's preamp -- clamped into the accepted range -- is applied through the
+/// preamp path. Bands are applied first, so an invalid band set errors before
+/// the preamp is touched (no partial apply). Returns the [`ImportResult`] so the
+/// UI can report the band count and whether the preamp was clamped.
+#[tauri::command]
+pub fn eq_import_autoeq(app: tauri::AppHandle, path: String) -> Result<ImportResult, String> {
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("failed to read {path}: {e}"))?;
+    let (bands, result) = eq::prepare_import(&text)?;
+    // Bands first: apply_bands validates at the live rate and returns Err
+    // WITHOUT mutating anything, so an invalid file never applies a partial
+    // (preamp-only) change.
+    apply_bands(&app, bands)?;
+    let shared = app.state::<AppShared>();
+    engine_bridge::send_cmd(&shared, EngineCommand::SetGainDb(result.preamp_db as f32));
+    shared.data.lock().unwrap().preamp_db = result.preamp_db;
+    engine_bridge::publish_current(&app);
+    Ok(result)
 }
 
 /// Save the current bands + preamp as a named profile, refresh the cached

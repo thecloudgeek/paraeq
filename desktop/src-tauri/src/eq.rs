@@ -13,7 +13,7 @@
 //! No Tauri types live here: it is pure functions over dsp/engine types, fully
 //! unit-tested.
 
-use paraeq_dsp::peq::{EQBand, ParametricEQ};
+use paraeq_dsp::peq::{parse_autoeq, EQBand, ParametricEQ};
 use paraeq_engine::controller::{CorrectionConfig, EngineState};
 
 /// Maximum absolute per-band gain, in dB. `|gain_db|` above this is rejected.
@@ -131,6 +131,40 @@ pub fn resend_decision(
     } else {
         Some(rate)
     }
+}
+
+/// The outcome of a successful AutoEQ file import, returned to the UI so it can
+/// report how many bands were applied and whether the file's preamp had to be
+/// clamped into the accepted range (decision 2: a wild file preamp is clamped,
+/// not rejected, so bands + preamp always apply together).
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ImportResult {
+    pub band_count: usize,
+    pub preamp_clamped: bool,
+    pub preamp_db: f64,
+}
+
+/// Parse AutoEQ preset text into the bands to apply plus an [`ImportResult`].
+///
+/// A file with no `ON` filter lines is an error carrying the prototype's exact
+/// message. Otherwise the parsed preamp is CLAMPED into
+/// `[PREAMP_MIN_DB, PREAMP_MAX_DB]` (so it always passes [`validate_preamp`] and
+/// a wild file value never turns into a rejected-after-bands partial apply), and
+/// `preamp_clamped` records whether the clamp changed the value. The bands are
+/// NOT validated here -- the caller applies them through the validating apply
+/// path at the live rate.
+pub fn prepare_import(text: &str) -> Result<(Vec<EQBand>, ImportResult), String> {
+    let parsed = parse_autoeq(text);
+    if parsed.bands.is_empty() {
+        return Err("No AutoEQ filter lines found in the file.".to_string());
+    }
+    let clamped = parsed.preamp_db.clamp(PREAMP_MIN_DB, PREAMP_MAX_DB);
+    let result = ImportResult {
+        band_count: parsed.bands.len(),
+        preamp_clamped: clamped != parsed.preamp_db,
+        preamp_db: clamped,
+    };
+    Ok((parsed.bands, result))
 }
 
 /// The magnitude response the plot draws: the composite curve over `freqs`
@@ -354,6 +388,40 @@ mod tests {
         assert!(validate_preamp(PREAMP_MAX_DB + 0.1).is_err());
         assert!(validate_preamp(f64::NAN).is_err());
         assert!(validate_preamp(f64::INFINITY).is_err());
+    }
+
+    // ---- prepare_import ----
+
+    #[test]
+    fn import_zero_bands_is_error_with_prototype_message() {
+        let err = prepare_import("Preamp: -3.0 dB\nnot a filter line\n").unwrap_err();
+        assert_eq!(err, "No AutoEQ filter lines found in the file.");
+    }
+
+    #[test]
+    fn import_clamps_out_of_range_preamp() {
+        let text = "Preamp: -50.0 dB\nFilter 1: ON PK Fc 1000 Hz Gain 3.0 dB Q 1.000\n";
+        let (bands, result) = prepare_import(text).unwrap();
+        assert_eq!(bands.len(), 1);
+        assert_eq!(result.band_count, 1);
+        assert_eq!(result.preamp_db, PREAMP_MIN_DB);
+        assert!(result.preamp_clamped);
+    }
+
+    #[test]
+    fn import_clamps_high_out_of_range_preamp() {
+        let text = "Preamp: 25.0 dB\nFilter 1: ON PK Fc 1000 Hz Gain 3.0 dB Q 1.000\n";
+        let (_, result) = prepare_import(text).unwrap();
+        assert_eq!(result.preamp_db, PREAMP_MAX_DB);
+        assert!(result.preamp_clamped);
+    }
+
+    #[test]
+    fn import_in_range_preamp_is_not_clamped() {
+        let text = "Preamp: -5.0 dB\nFilter 1: ON PK Fc 1000 Hz Gain 3.0 dB Q 1.000\n";
+        let (_, result) = prepare_import(text).unwrap();
+        assert_eq!(result.preamp_db, -5.0);
+        assert!(!result.preamp_clamped);
     }
 
     // ---- design_correction ----

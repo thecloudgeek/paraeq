@@ -6,6 +6,7 @@
 
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useAppState } from "@/ipc/useAppState";
+import { EqTab } from "@/tabs/EqTab";
 import { PlaceholderTab } from "@/tabs/PlaceholderTab";
 
 function App() {
@@ -28,15 +29,12 @@ function App() {
         <TabsContent value="target">
           <PlaceholderTab stage="stage 5" title="Target" />
         </TabsContent>
-        <TabsContent value="eq">
-          {/* Stub until Task 14. The state dump is a temporary dev aid for the
-              manual smoke (verify `app-state` events update the render live). */}
-          <div className="flex h-full flex-col gap-2 p-4">
-            <h2 className="text-lg font-medium">EQ</h2>
-            <pre className="overflow-auto rounded-md bg-muted p-3 text-xs">
-              {state ? JSON.stringify(state, null, 2) : "loading app state…"}
-            </pre>
-          </div>
+        <TabsContent value="eq" className="min-h-0 flex-1">
+          {state ? (
+            <EqTab state={state} />
+          ) : (
+            <div className="p-4 text-sm text-muted-foreground">loading app state…</div>
+          )}
         </TabsContent>
         <TabsContent value="analyzer">
           <PlaceholderTab stage="stage 6" title="Analyzer" />
