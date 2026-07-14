@@ -48,20 +48,34 @@ pub fn spawn_engine(settings: &Settings) -> EngineHandle {
 /// THE choke point every command and the forwarder call after a mutation:
 /// compose [`AppState`](crate::state::AppState) from `AppShared::data` plus the
 /// given engine snapshot, persist the durable `Settings` subset if it changed
-/// on disk, and emit the `app-state` event. The data guard is dropped before
-/// any disk I/O or emit.
+/// since the last write, and emit the `app-state` event. The data guard is
+/// dropped before any disk I/O or emit; no lock is held across the emit.
 pub fn publish(app: &tauri::AppHandle, engine: &EngineState) {
     let shared = app.state::<AppShared>();
     let (app_state, durable) = {
         let data = shared.data.lock().unwrap();
         (data.app_state(engine), data.to_settings())
     };
-    // Persist only when the durable subset actually changed -- engine-only
-    // snapshot changes (status, peak, latency) never touch Settings, so this
-    // keeps engine ticks off the disk.
-    if settings::load(&shared.settings_path) != durable {
-        if let Err(e) = settings::save(&shared.settings_path, &durable) {
-            log::warn!("failed to persist settings: {e}");
+    // Persist only when the durable subset actually changed. Compare against the
+    // in-memory mirror of what is on disk (`AppShared::persisted`, seeded from
+    // the file at setup) instead of re-reading settings.json -- the forwarder
+    // publishes on every input_peak change during playback (tens/sec), and none
+    // of those engine-only deltas (status, peak, latency) touch the durable
+    // subset, so this keeps engine ticks off the disk entirely, reads included.
+    //
+    // The `persisted` mutex is held across the compare AND the save so the
+    // check-and-write is atomic and the mirror only advances on a *successful*
+    // write (a failed save leaves it stale so the next publish retries, matching
+    // the old re-read-from-disk semantics). It is acquired after the `data`
+    // guard is dropped and released before the emit below -- the data/engine
+    // lock is never held here, and no lock spans the emit.
+    {
+        let mut persisted = shared.persisted.lock().unwrap();
+        if *persisted != durable {
+            match settings::save(&shared.settings_path, &durable) {
+                Ok(()) => *persisted = durable,
+                Err(e) => log::warn!("failed to persist settings: {e}"),
+            }
         }
     }
     // Sync the tray (toggle text, bypass checkmark, tooltip, profile submenu)

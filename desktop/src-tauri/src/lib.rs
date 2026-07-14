@@ -69,6 +69,11 @@ pub fn run() {
             app.manage(AppShared {
                 data: Mutex::new(data),
                 engine: Mutex::new(Some(handle)),
+                // Seed the persisted-settings cache with the file as read from
+                // disk (NOT the possibly-clamped in-memory model): the first
+                // publish then still corrects an out-of-range on-disk preamp,
+                // exactly as the previous re-read-from-disk path did.
+                persisted: Mutex::new(settings.clone()),
                 profiles_dir,
                 settings_path,
             });

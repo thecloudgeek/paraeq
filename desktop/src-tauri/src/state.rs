@@ -55,6 +55,14 @@ pub struct AppState {
 pub struct AppShared {
     pub data: Mutex<AppData>,
     pub engine: Mutex<Option<EngineHandle>>,
+    /// In-memory mirror of the durable [`Settings`] currently on disk, seeded at
+    /// setup from the loaded file. `publish` compares the freshly-composed
+    /// durable subset against this to decide whether to write, so a snapshot
+    /// that leaves the durable subset unchanged (engine-only ticks: status,
+    /// peak, latency) never touches the disk -- not even to read. Its own lock,
+    /// held only across the compare-and-save inside `publish`, never nested with
+    /// `data`/`engine`.
+    pub persisted: Mutex<Settings>,
     pub profiles_dir: PathBuf,
     pub settings_path: PathBuf,
 }
