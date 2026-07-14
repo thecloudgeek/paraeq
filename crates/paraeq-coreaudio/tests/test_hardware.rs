@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use objc2_core_audio::{kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectSystemObject};
 use paraeq_coreaudio::backend::TapBackend;
+use paraeq_coreaudio::devices;
 use paraeq_coreaudio::ioproc::{IoCallback, IoProcHandle};
 use paraeq_coreaudio::listeners::PropertyListener;
 use paraeq_coreaudio::properties;
@@ -101,6 +102,41 @@ fn buffer_frame_size_set_and_restore_roundtrip() {
     assert_eq!(
         restored, original,
         "original buffer frame size not restored"
+    );
+}
+
+/// Enumeration must include the current default output and every entry must
+/// carry a non-empty name and uid. Needs no TCC grant (property reads are not
+/// capture); `#[ignore]` for CI-safety (no HAL there).
+#[test]
+#[ignore = "requires audio hardware"]
+fn output_enumeration_includes_default() {
+    let outputs = devices::list_output_devices().expect("list_output_devices");
+    assert!(!outputs.is_empty(), "at least one output device expected");
+    for d in &outputs {
+        assert!(!d.name.is_empty(), "device name must be non-empty: {d:?}");
+        assert!(!d.uid.is_empty(), "device uid must be non-empty: {d:?}");
+    }
+    let default = properties::default_output_device().expect("default_output_device");
+    let default_uid = properties::device_uid(default).expect("device_uid");
+    assert!(
+        outputs.iter().any(|d| d.uid == default_uid),
+        "default output {default_uid:?} not in enumeration {outputs:?}"
+    );
+}
+
+/// Setting the default output to the CURRENT default is a no-op switch that
+/// never disrupts the dev machine's audio; an unknown uid must be rejected
+/// before any HAL call. Needs no TCC grant; `#[ignore]` for CI-safety.
+#[test]
+#[ignore = "requires audio hardware"]
+fn set_default_output_roundtrip_noop() {
+    let default = properties::default_output_device().expect("default_output_device");
+    let uid = properties::device_uid(default).expect("device_uid");
+    devices::set_default_output_device(&uid).expect("set default to the same uid must Ok");
+    assert!(
+        devices::set_default_output_device("bogus-uid-nope").is_err(),
+        "unknown uid must Err"
     );
 }
 
