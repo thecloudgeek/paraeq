@@ -1,6 +1,7 @@
 mod commands;
 mod engine_bridge;
 mod eq;
+mod profiles;
 mod settings;
 mod state;
 
@@ -44,6 +45,11 @@ pub fn run() {
 
             let mut data = AppData::from_settings(&settings);
             data.preamp_db = clamped;
+            // Populate the profile list from disk BEFORE the first publish --
+            // Settings carries no profile list (only active_profile), so
+            // without this the tray/UI would show no profiles at relaunch
+            // even though `active_profile` was restored.
+            data.profiles = profiles::list_profiles(&profiles_dir);
             app.manage(AppShared {
                 data: Mutex::new(data),
                 engine: Mutex::new(Some(handle)),
@@ -68,6 +74,9 @@ pub fn run() {
             commands::engine_set_default_output,
             commands::engine_set_preamp_db,
             commands::get_app_state,
+            commands::profiles_activate,
+            commands::profiles_list,
+            commands::profiles_save,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

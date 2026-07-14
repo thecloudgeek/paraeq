@@ -10,6 +10,7 @@
 
 use crate::engine_bridge;
 use crate::eq::{self, ResponseData};
+use crate::profiles;
 use crate::state::{AppShared, AppState, OutputDeviceInfo};
 use paraeq_dsp::peq::{EQBand, FilterType};
 use paraeq_engine::controller::EngineCommand;
@@ -179,4 +180,68 @@ pub fn eq_response(app: tauri::AppHandle, freqs: Vec<f64>) -> Result<ResponseDat
     let rate = live_rate(&shared);
     let bands = shared.data.lock().unwrap().bands.clone();
     Ok(eq::response(&bands, &freqs, rate))
+}
+
+/// Save the current bands + preamp as a named profile, refresh the cached
+/// profile list, mark it active, then publish. Rejects an empty/whitespace-only
+/// name (would slugify to a useless filename).
+#[tauri::command]
+pub fn profiles_save(app: tauri::AppHandle, name: String) -> Result<(), String> {
+    if name.trim().is_empty() {
+        return Err("profile name must not be empty".to_string());
+    }
+    let shared = app.state::<AppShared>();
+    let (bands, preamp_db) = {
+        let data = shared.data.lock().unwrap();
+        (data.bands.clone(), data.preamp_db)
+    };
+    let profile = profiles::Profile {
+        bands,
+        name: name.clone(),
+        preamp_db,
+    };
+    profiles::save_profile(&shared.profiles_dir, &profile).map_err(|e| e.to_string())?;
+    {
+        let mut data = shared.data.lock().unwrap();
+        data.profiles = profiles::list_profiles(&shared.profiles_dir);
+        data.active_profile = Some(name);
+    }
+    engine_bridge::publish_current(&app);
+    Ok(())
+}
+
+/// Activate a saved profile: load it, apply its bands through EXACTLY the
+/// `eq_set_bands` path (validate at the live rate, then `SetCorrection`/
+/// `ClearCorrection`) and its preamp through the `engine_set_preamp_db` path,
+/// mark it active, then publish once. Errors if no profile matches `name`.
+#[tauri::command]
+pub fn profiles_activate(app: tauri::AppHandle, name: String) -> Result<(), String> {
+    let shared = app.state::<AppShared>();
+    let profile = profiles::load_profile(&shared.profiles_dir, &name)
+        .ok_or_else(|| format!("no profile named {name:?}"))?;
+    let rate = live_rate(&shared);
+    eq::validate_bands(&profile.bands, rate)?;
+    eq::validate_preamp(profile.preamp_db)?;
+    match eq::design_correction(&profile.bands, rate) {
+        Some(cfg) => engine_bridge::send_cmd(&shared, EngineCommand::SetCorrection(cfg)),
+        None => engine_bridge::send_cmd(&shared, EngineCommand::ClearCorrection),
+    }
+    engine_bridge::send_cmd(&shared, EngineCommand::SetGainDb(profile.preamp_db as f32));
+    {
+        let mut data = shared.data.lock().unwrap();
+        data.bands = profile.bands;
+        data.preamp_db = profile.preamp_db;
+        data.active_profile = Some(name);
+    }
+    engine_bridge::publish_current(&app);
+    Ok(())
+}
+
+/// The cached list of saved profile display names (populated at startup from
+/// disk and refreshed on every save).
+#[tauri::command]
+pub fn profiles_list(app: tauri::AppHandle) -> Result<Vec<String>, String> {
+    let shared = app.state::<AppShared>();
+    let profiles = shared.data.lock().unwrap().profiles.clone();
+    Ok(profiles)
 }
