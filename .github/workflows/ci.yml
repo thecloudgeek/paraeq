@@ -33,6 +33,7 @@ jobs:
       - run: npm ci
       - run: npx tsc -b
       - run: npm run build
+      - run: npx vitest run
 
   prototype-oracle:
     runs-on: macos-15
