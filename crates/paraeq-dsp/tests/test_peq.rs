@@ -1,6 +1,7 @@
 mod common;
 use common::{assert_allclose, Case};
 use paraeq_dsp::peq::{EQBand, FilterType, ParametricEQ};
+use serde_json::json;
 
 fn bands_from_scalars(c: &Case) -> Vec<EQBand> {
     c.scalar("bands")
@@ -42,9 +43,36 @@ fn autoeq_export_matches_oracle_exactly() {
         sample_rate: c.param_f64("sample_rate"),
     };
     assert_eq!(
-        peq.export_autoeq_format(),
+        peq.export_autoeq_format(0.0),
         c.scalar("autoeq_export").as_str().unwrap()
     );
+}
+
+#[test]
+fn band_serde_roundtrip_and_golden_json() {
+    let band = EQBand {
+        filter_type: FilterType::Peaking,
+        fc: 1000.0,
+        gain_db: 3.0,
+        q: 1.41,
+    };
+    assert_eq!(
+        serde_json::to_value(&band).unwrap(),
+        json!({"filter_type": "peaking", "fc": 1000.0, "gain_db": 3.0, "q": 1.41})
+    );
+    let round_tripped: EQBand =
+        serde_json::from_value(serde_json::to_value(&band).unwrap()).unwrap();
+    assert_eq!(round_tripped, band);
+}
+
+#[test]
+fn export_writes_actual_preamp() {
+    let peq = ParametricEQ {
+        bands: Vec::new(),
+        sample_rate: 48000.0,
+    };
+    let exported = peq.export_autoeq_format(-6.5);
+    assert_eq!(exported.lines().next().unwrap(), "Preamp: -6.5 dB");
 }
 
 #[test]

@@ -4,7 +4,8 @@
 use crate::biquad;
 use crate::DspError;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FilterType {
     HighShelf,
     LowShelf,
@@ -44,7 +45,7 @@ impl FilterType {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct EQBand {
     pub filter_type: FilterType,
     pub fc: f64,
@@ -105,11 +106,13 @@ impl ParametricEQ {
     ///       )
     ///   text = "\n".join(lines)
     ///   return text
-    /// Preamp is a fixed literal (not computed). Each filter line: 1-based
-    /// index, AutoEQ tag, Fc rounded to 0 decimals, Gain to 1 decimal, Q to 3
-    /// decimals. Lines are joined with "\n" and there is no trailing newline.
-    pub fn export_autoeq_format(&self) -> String {
-        let mut lines = vec!["Preamp: 0.0 dB".to_string()];
+    /// DIVERGENCE (see DIVERGENCES.md): the prototype hardcodes the preamp
+    /// line as a fixed literal ("Preamp: 0.0 dB"); Rust takes the real
+    /// preamp value and writes it. Each filter line: 1-based index, AutoEQ
+    /// tag, Fc rounded to 0 decimals, Gain to 1 decimal, Q to 3 decimals.
+    /// Lines are joined with "\n" and there is no trailing newline.
+    pub fn export_autoeq_format(&self, preamp_db: f64) -> String {
+        let mut lines = vec![format!("Preamp: {:.1} dB", preamp_db)];
         for (i, band) in self.bands.iter().enumerate() {
             lines.push(format!(
                 "Filter {}: ON {} Fc {:.0} Hz Gain {:.1} dB Q {:.3}",

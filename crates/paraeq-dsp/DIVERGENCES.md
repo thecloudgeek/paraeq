@@ -83,4 +83,10 @@ differs from `prototype/paraeq/`, so a red parity test is always actionable.
     of yielding NaN. Ragged measurement lists raise in numpy (shape error)
     and error in Rust.
 
+14. **`export_autoeq_format` takes and writes the real preamp.** The prototype
+    exporter hardcodes `Preamp: 0.0 dB` (parametric_eq.py:92-106) and never
+    round-trips preamp. Rust takes `preamp_db: f64` and writes it (`{:.1}`).
+    The parser accepts both, so cross-imports still work. Deliberate UX fix,
+    owner-approved 2026-07-13.
+
 (add entries here as they are discovered during implementation)
