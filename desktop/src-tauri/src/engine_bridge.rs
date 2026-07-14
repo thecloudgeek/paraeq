@@ -64,6 +64,10 @@ pub fn publish(app: &tauri::AppHandle, engine: &EngineState) {
             log::warn!("failed to persist settings: {e}");
         }
     }
+    // Sync the tray (toggle text, bypass checkmark, tooltip, profile submenu)
+    // BEFORE the emit consumes `app_state`. sync_tray only schedules the
+    // main-thread mutation, so it never blocks the emit.
+    crate::tray::sync_tray(app, &app_state);
     if let Err(e) = app.emit("app-state", app_state) {
         log::warn!("failed to emit app-state: {e}");
     }
@@ -157,7 +161,8 @@ pub fn start_forwarder(app: tauri::AppHandle, rx: Receiver<Arc<EngineState>>) {
                             last_device_uid = device_uid;
                         }
 
-                        // 3. Publish. (tray::sync_tray is a no-op until Task 10.)
+                        // 3. Publish (emits app-state, persists the durable
+                        //    subset, and syncs the tray inside publish()).
                         publish(&app, &snapshot);
                     }
                     Err(RecvTimeoutError::Timeout) => continue,

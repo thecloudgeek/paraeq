@@ -5,6 +5,7 @@ mod eq;
 mod profiles;
 mod settings;
 mod state;
+mod tray;
 
 use state::{AppData, AppShared};
 use std::sync::Mutex;
@@ -13,6 +14,20 @@ use tauri::Manager;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Single-instance MUST be the FIRST plugin: two ParaEQ instances would
+        // mean two taps fighting over the same output device. A second launch
+        // re-focuses the existing window instead of starting a rival process.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
+        // Dialog plugin: registration only here (JS usage -- AutoEq import/export
+        // pickers -- lands in a later UI batch; the `dialog:default` capability
+        // is granted in capabilities/default.json).
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // Resolve persistence paths, then load persisted state BEFORE
             // spawning the engine -- spawning enabled pre-wizard would mute
@@ -58,10 +73,32 @@ pub fn run() {
                 settings_path,
             });
 
+            // Build the tray from the initial snapshot and manage it BEFORE the
+            // forwarder starts -- the forwarder's `sync_tray` (via `publish`)
+            // needs `TrayHandles` present to have anything to update.
+            let initial_state = {
+                let shared = app.state::<AppShared>();
+                let engine = engine_bridge::current_engine_state(&shared);
+                let data = shared.data.lock().unwrap();
+                data.app_state(&engine)
+            };
+            let handles = tray::build_tray(app.handle(), &initial_state)?;
+            app.manage(handles);
+
             // Start the forwarder AFTER the state is managed (it reads
             // AppShared through the AppHandle).
             engine_bridge::start_forwarder(app.handle().clone(), rx);
             Ok(())
+        })
+        // Closing the window HIDES it and keeps the app (and tap) alive -- the
+        // tray is the persistent surface. Only genuine quit paths tear down.
+        // `WindowEvent` is #[non_exhaustive]; the if-let handles just the one
+        // variant we care about.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let _ = window.hide();
+                api.prevent_close();
+            }
         })
         .invoke_handler(tauri::generate_handler![
             commands::autoeq_fetch_preset,
@@ -84,11 +121,18 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app_handle, event| {
+        .run(|app_handle, event| match event {
+            // A window close never reaches here (it is intercepted and turned
+            // into a hide). Only genuine quit paths -- tray Quit (`app.exit(0)`)
+            // and Cmd-Q -- raise ExitRequested; we do NOT prevent it, so the
+            // app proceeds to RunEvent::Exit and the teardown below.
+            tauri::RunEvent::ExitRequested { .. } => {
+                log::debug!("exit requested; proceeding to engine teardown");
+            }
             // Never leave the system muted: on exit, take the handle out of
             // managed state, send Disable (full teardown), and drop it (joins
             // the controller thread) BEFORE the process exits.
-            if let tauri::RunEvent::Exit = event {
+            tauri::RunEvent::Exit => {
                 let shared = app_handle.state::<AppShared>();
                 let handle = shared.engine.lock().unwrap().take();
                 if let Some(h) = handle {
@@ -96,5 +140,6 @@ pub fn run() {
                     drop(h);
                 }
             }
+            _ => {}
         });
 }
