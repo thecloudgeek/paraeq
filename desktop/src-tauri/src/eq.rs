@@ -22,13 +22,18 @@ pub const GAIN_LIMIT_DB: f64 = 30.0;
 pub const PREAMP_MAX_DB: f64 = 10.0;
 /// Lower bound of the accepted preamp range, in dB.
 pub const PREAMP_MIN_DB: f64 = -30.0;
-/// Maximum band Q. Q above this (or `<= 0`) is rejected.
+/// Minimum band Q. Q below this is rejected. Set far above the subnormal
+/// overflow floor (~1e-309, where `alpha = sin(w0)/(2*q)` overflows to +inf and
+/// yields NaN SOS coefficients) while still admitting the full realistic audio
+/// Q range (~0.1-100). NOTE: the UI clamp list (later batch) must mirror this.
+pub const Q_MIN: f64 = 0.1;
+/// Maximum band Q. Q above this (or `< Q_MIN`) is rejected.
 pub const Q_MAX: f64 = 100.0;
 
 /// Reject a band set before ANY coefficient design. A band is invalid when:
 /// its `fc` is not finite or lies outside the open interval
 /// `(0, sample_rate / 2)` (both ends exclusive -- `fc = 0` and `fc = Nyquist`
-/// are rejected); its `q` is not finite, `<= 0`, or `> Q_MAX`; or its
+/// are rejected); its `q` is not finite, `< Q_MIN`, or `> Q_MAX`; or its
 /// `gain_db` is not finite or `|gain_db| > GAIN_LIMIT_DB`. Error strings name
 /// the offending band index and field -- they surface verbatim in the UI.
 ///
@@ -48,9 +53,9 @@ pub fn validate_bands(bands: &[EQBand], sample_rate: f64) -> Result<(), String> 
         if !band.q.is_finite() {
             return Err(format!("band {i}: q must be a finite number"));
         }
-        if band.q <= 0.0 || band.q > Q_MAX {
+        if band.q < Q_MIN || band.q > Q_MAX {
             return Err(format!(
-                "band {i}: q {} must be greater than 0 and at most {Q_MAX}",
+                "band {i}: q {} must be between {Q_MIN} and {Q_MAX}",
                 band.q
             ));
         }
@@ -282,6 +287,22 @@ mod tests {
     #[test]
     fn q_at_max_is_accepted() {
         assert!(validate_bands(&[peaking(1_000.0, 3.0, Q_MAX)], 48_000.0).is_ok());
+    }
+
+    #[test]
+    fn q_below_min_is_rejected() {
+        // A finite, positive q just under Q_MIN is rejected before design.
+        assert!(validate_bands(&[peaking(1_000.0, 3.0, Q_MIN - 0.01)], 48_000.0).is_err());
+        // A subnormal q would overflow alpha = sin(w0)/(2*q) to +inf and design
+        // NaN SOS coefficients -- exactly what this lower bound exists to stop.
+        assert!(validate_bands(&[peaking(1_000.0, 3.0, 1e-310)], 48_000.0).is_err());
+    }
+
+    #[test]
+    fn q_at_min_and_normal_small_q_are_accepted() {
+        assert!(validate_bands(&[peaking(1_000.0, 3.0, Q_MIN)], 48_000.0).is_ok());
+        // A realistically-low shelf/wide-band Q well above Q_MIN.
+        assert!(validate_bands(&[peaking(1_000.0, 3.0, 0.7)], 48_000.0).is_ok());
     }
 
     #[test]
