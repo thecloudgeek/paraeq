@@ -2350,6 +2350,7 @@ dependencies = [
  "biquad",
  "proptest",
  "realfft",
+ "regex",
  "rustfft",
  "serde",
  "serde_json",
