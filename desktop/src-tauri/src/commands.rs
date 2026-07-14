@@ -8,6 +8,7 @@
 //! without passing [`eq::validate_bands`] / [`eq::validate_preamp`] at the live
 //! stream rate first.
 
+use crate::autoeq::{self, AutoEqClient, IndexEntry, ParsedPresetDto, ReqwestFetch};
 use crate::engine_bridge;
 use crate::eq::{self, ResponseData};
 use crate::profiles;
@@ -15,6 +16,27 @@ use crate::state::{AppShared, AppState, OutputDeviceInfo};
 use paraeq_dsp::peq::{EQBand, FilterType};
 use paraeq_engine::controller::EngineCommand;
 use tauri::Manager;
+
+/// Max search results returned to the browse dialog (the same model recurs
+/// under many sources/rigs; the dialog disambiguates but stays bounded).
+const AUTOEQ_SEARCH_CAP: usize = 200;
+
+/// Build a Tauri-free [`AutoEqClient`] pointed at `app_data_dir()/autoeq/`.
+/// This is the ONLY place that couples the client to Tauri (path resolution);
+/// the client itself holds no Tauri types.
+fn autoeq_client(app: &tauri::AppHandle) -> Result<AutoEqClient<ReqwestFetch>, String> {
+    let cache_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("autoeq");
+    Ok(AutoEqClient::new(
+        ReqwestFetch::new()?,
+        cache_dir,
+        None,
+        None,
+    ))
+}
 
 /// The live stream sample rate, or the 48 kHz fallback when no stream is up.
 /// Bands are validated and designed at this rate.
@@ -244,4 +266,61 @@ pub fn profiles_list(app: tauri::AppHandle) -> Result<Vec<String>, String> {
     let shared = app.state::<AppShared>();
     let profiles = shared.data.lock().unwrap().profiles.clone();
     Ok(profiles)
+}
+
+// --- AutoEq DB (async: network must not block a sync command) --------------
+//
+// The AutoEq index is NOT kept in `AppShared`; each command re-reads it from
+// the on-disk cache via `sync_index(false)` (a zero-fetch cache hit once
+// synced). This keeps `AppShared` free of AutoEq state and the client
+// stateless per call, at the cost of one small cache read per browse action --
+// negligible for a user-driven dialog.
+
+/// Sync the model index (cache-first; `force` refetches). Returns the entry
+/// count for the dialog's "N models" affordance.
+#[tauri::command]
+pub async fn autoeq_sync_index(app: tauri::AppHandle, force: bool) -> Result<usize, String> {
+    let client = autoeq_client(&app)?;
+    Ok(client.sync_index(force).await?.len())
+}
+
+/// Case-insensitive substring search on model name over the synced index
+/// (prototype parity), returning full entries (so the dialog can disambiguate
+/// duplicates) capped at [`AUTOEQ_SEARCH_CAP`].
+#[tauri::command]
+pub async fn autoeq_search(
+    app: tauri::AppHandle,
+    query: String,
+) -> Result<Vec<IndexEntry>, String> {
+    let client = autoeq_client(&app)?;
+    let entries = client.sync_index(false).await?;
+    Ok(AutoEqClient::<ReqwestFetch>::search(&entries, &query)
+        .into_iter()
+        .take(AUTOEQ_SEARCH_CAP)
+        .cloned()
+        .collect())
+}
+
+/// Fetch + parse a preset, keyed by the entry `path` (resolved against the
+/// synced index; unknown paths error). Fetch/parse ONLY -- applying the bands
+/// and preamp is the UI's explicit second step (Task 16). A preset with no
+/// parametric filters is an error.
+#[tauri::command]
+pub async fn autoeq_fetch_preset(
+    app: tauri::AppHandle,
+    path: String,
+) -> Result<ParsedPresetDto, String> {
+    let client = autoeq_client(&app)?;
+    let entry = client
+        .sync_index(false)
+        .await?
+        .into_iter()
+        .find(|e| e.path == path)
+        .ok_or_else(|| format!("no AutoEq entry for path {path:?}"))?;
+    let text = client.fetch_preset(&entry).await?;
+    let parsed = autoeq::parse_preset(&text);
+    if parsed.bands.is_empty() {
+        return Err("Preset contains no parametric EQ filters".to_string());
+    }
+    Ok(parsed)
 }

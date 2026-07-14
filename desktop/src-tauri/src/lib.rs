@@ -1,3 +1,4 @@
+mod autoeq;
 mod commands;
 mod engine_bridge;
 mod eq;
@@ -63,6 +64,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::autoeq_fetch_preset,
+            commands::autoeq_search,
+            commands::autoeq_sync_index,
             commands::eq_add_band,
             commands::eq_remove_band,
             commands::eq_response,
