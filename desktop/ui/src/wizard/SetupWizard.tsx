@@ -21,14 +21,8 @@
 import { useEffect, useRef, useState } from "react";
 import type { JSX } from "react";
 
+import { OutputPicker } from "@/components/OutputPicker";
 import { Button } from "@/components/ui/button";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import {
   engineListOutputs,
   engineSetDefaultOutput,
@@ -148,8 +142,6 @@ function DeviceStep({
     void engineListOutputs().catch((e) => setError(String(e)));
   }, []);
 
-  const current = state.devices.find((d) => d.uid === state.default_output_uid);
-
   const pick = async (uid: string) => {
     setError(null);
     try {
@@ -164,27 +156,20 @@ function DeviceStep({
       <h1 className="text-2xl font-semibold">Output device</h1>
       <p className="text-sm text-muted-foreground">
         Confirm which output ParaEQ should correct. This is your Mac’s current system output; change
-        it here or later in the EQ tab.
+        it here or anytime later from the main window.
       </p>
       <div className="flex flex-col gap-2">
         <label className="text-sm font-medium" htmlFor="wizard-device">
           System output
         </label>
-        <Select value={state.default_output_uid ?? undefined} onValueChange={(v) => void pick(v)}>
-          <SelectTrigger id="wizard-device" className="w-full max-w-md">
-            <SelectValue placeholder={current ? current.name : "Select an output device…"} />
-          </SelectTrigger>
-          <SelectContent>
-            {state.devices.map((d) => (
-              <SelectItem key={d.uid} value={d.uid}>
-                {d.name}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        {state.devices.length === 0 ? (
-          <p className="text-xs text-muted-foreground">No output devices found yet.</p>
-        ) : null}
+        <OutputPicker
+          currentUid={state.default_output_uid}
+          devices={state.devices}
+          emptyMessage="No output devices found yet."
+          id="wizard-device"
+          onSelect={(uid) => void pick(uid)}
+          triggerClassName="w-full max-w-md"
+        />
       </div>
       {error ? <p className="text-sm text-destructive">{error}</p> : null}
       <div className="flex justify-between">
