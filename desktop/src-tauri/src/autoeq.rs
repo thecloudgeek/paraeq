@@ -243,9 +243,12 @@ fn encode_path(path: &str) -> String {
 
 /// Parse an AutoEq `results/INDEX.md` into entries. Each recognised line is
 /// `- [name](./source/rig/name) by source on rig`; the leading `./` is
-/// stripped from the path and non-matching lines (headings, prose, blanks) are
-/// skipped. Duplicates (same model, different source/rig) are kept distinct.
-/// Oracle: autoeq_db.py:54-79 (regex `_INDEX_LINE`).
+/// stripped and the href is percent-DECODED (real hrefs encode spaces as
+/// `%20`), so `IndexEntry::path` holds the literal path and the fetch layer
+/// encodes it exactly once. Non-matching lines (headings, prose, blanks) are
+/// skipped; duplicates (same model, different source/rig) are kept distinct.
+/// Oracle: autoeq_db.py:54-79 (regex `_INDEX_LINE`) — but the oracle does NOT
+/// decode (it re-quotes at fetch, double-encoding); see DIVERGENCES.md.
 pub fn parse_index(md: &str) -> Vec<IndexEntry> {
     md.lines().filter_map(parse_index_line).collect()
 }
@@ -260,7 +263,16 @@ fn parse_index_line(line: &str) -> Option<IndexEntry> {
     let rest = rest[name_end + 1..].trim_start().strip_prefix('(')?;
     let path_end = rest.find(')')?;
     let raw_path = rest[..path_end].trim();
-    let path = raw_path.strip_prefix("./").unwrap_or(raw_path).to_string();
+    let stripped = raw_path.strip_prefix("./").unwrap_or(raw_path);
+    // AutoEq's INDEX.md hrefs are percent-encoded (spaces as `%20`, `#` as
+    // `%23`, …). Decode to the real path so the fetch layer encodes it exactly
+    // ONCE; feeding an already-encoded path back through `encode_path` produces
+    // `%2520` and 404s every preset. (Divergence from the oracle, which stores
+    // the raw href and re-quotes it — a latent double-encode masked by its
+    // mocked-network tests. See DIVERGENCES.md.)
+    let path = percent_encoding::percent_decode_str(stripped)
+        .decode_utf8_lossy()
+        .into_owned();
     // by <source> on <rig>
     let rest = strip_keyword(rest[path_end + 1..].trim_start(), "by")?;
     let (source, rig) = split_at_keyword(rest, "on")?;
@@ -403,7 +415,7 @@ mod tests {
     fn parse_index_extracts_name_source_rig_path() {
         let entries = parse_index(SAMPLE_INDEX);
         assert_eq!(entries[0], hd650_first());
-        // Leading "./" stripped; spaces preserved in path.
+        // Leading "./" stripped; href percent-decoded (so `path` has literal spaces).
         assert!(entries
             .iter()
             .all(|e| !e.path.starts_with("./") && !e.path.is_empty()));
@@ -577,6 +589,42 @@ mod tests {
 
         block_on(c.fetch_preset(&entry)).unwrap();
         assert!(urls[0].contains("Test%20Model%20%231%2B2"));
+    }
+
+    /// Regression: real AutoEq INDEX.md hrefs are percent-encoded, so a preset
+    /// fetched for an entry parsed from the live index must be encoded EXACTLY
+    /// once. Before the `parse_index` decode fix the path went in already
+    /// encoded and `encode_path` re-encoded it (`%20` -> `%2520`), 404ing every
+    /// preset (the user-visible "git error" from the raw.githubusercontent
+    /// fallback URL).
+    #[test]
+    fn preset_url_from_encoded_index_href_is_single_encoded() {
+        let dir = tempfile::tempdir().unwrap();
+        let index =
+            "- [Sennheiser HD 650](./crinacle/GRAS%2043AG-7%20over-ear/Sennheiser%20HD%20650) \
+             by crinacle on GRAS 43AG-7\n";
+        let entry = parse_index(index).into_iter().next().unwrap();
+        // The href is decoded on parse: `path` holds literal spaces.
+        assert_eq!(
+            entry.path,
+            "crinacle/GRAS 43AG-7 over-ear/Sennheiser HD 650"
+        );
+
+        let urls = preset_urls(&entry);
+        // The fetch URL is encoded once — matches the real 200-OK URL shape…
+        assert!(urls[0].contains(
+            "/results/crinacle/GRAS%2043AG-7%20over-ear/Sennheiser%20HD%20650/\
+             Sennheiser%20HD%20650%20ParametricEq.txt"
+        ));
+        // …and is NOT double-encoded.
+        assert!(
+            !urls.iter().any(|u| u.contains("%2520")),
+            "path must not be double percent-encoded"
+        );
+
+        let fetch = MockFetch::new(responses(&[(&urls[0], Ok(SAMPLE_PRESET))]));
+        let c = client(fetch, dir.path().to_path_buf());
+        assert_eq!(block_on(c.fetch_preset(&entry)).unwrap(), SAMPLE_PRESET);
     }
 
     #[test]

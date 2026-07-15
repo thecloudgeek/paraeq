@@ -89,4 +89,15 @@ differs from `prototype/paraeq/`, so a red parity test is always actionable.
     The parser accepts both, so cross-imports still work. Deliberate UX fix,
     owner-approved 2026-07-13.
 
+15. **AutoEq INDEX.md hrefs are percent-DECODED on parse** (`desktop/src-tauri/src/autoeq.rs::parse_index`).
+    The oracle (`autoeq_db.py`) stores the raw href verbatim and then
+    `urllib.parse.quote`s it again at fetch time — so a real href like
+    `Sennheiser%20HD%20650` becomes `Sennheiser%2520HD%2520650` and 404s every
+    preset. The oracle's tests never caught it (network is mocked). The Rust
+    port decodes the href on parse so `IndexEntry::path` is the literal path and
+    the fetch layer (`encode_path`) encodes exactly once. Deliberate bug fix;
+    the surfaced fallback URL (`raw.githubusercontent.com/...`) is what read as a
+    "git error" to the owner. Regression test:
+    `preset_url_from_encoded_index_href_is_single_encoded`.
+
 (add entries here as they are discovered during implementation)
