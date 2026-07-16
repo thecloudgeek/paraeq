@@ -17,6 +17,21 @@ pub enum Correction {
 }
 
 impl Correction {
+    /// Transplant filter state from the outgoing correction on a
+    /// coefficient swap so the swap is click-free (spec R1-7a). Kind-aware:
+    /// IIR delay lines are copied over ([`IIRProcessor::adopt_state_from`]);
+    /// a no-op across kinds (a FIR overlap tail is `x_prev (*) h_old` and
+    /// cannot be transplanted -- R1-7b's crossfade covers that arm) and
+    /// across a channel-count change. Realtime-safe: a bounded memcpy over
+    /// already-sized state, no allocation.
+    pub fn adopt_state_from(&mut self, old: &Correction) {
+        if let (Correction::Iir(new), Correction::Iir(old)) = (self, old) {
+            if new.channels() == old.channels() {
+                new.adopt_state_from(old);
+            }
+        }
+    }
+
     /// Clear filter state (overlap tails / biquad delay lines). Does not
     /// deallocate; realtime-safe.
     pub fn reset(&mut self) {
@@ -85,7 +100,17 @@ impl RealtimeChain {
     /// Plain move -- realtime-safe. Used by the ring poll (Task 5): the old
     /// value must be shipped back to the control plane for deallocation,
     /// never dropped here.
-    pub fn set_correction(&mut self, c: Option<Correction>) -> Option<Correction> {
+    ///
+    /// On a swap (old and new both present) the incoming correction adopts
+    /// the outgoing one's filter state ([`Correction::adopt_state_from`])
+    /// so a coefficient edit does not restart the filters from zero -- an
+    /// audible step on every band drag otherwise (spec R1-7a). The
+    /// transplant happens here, on the realtime thread, because this is
+    /// the only place the old processor still lives.
+    pub fn set_correction(&mut self, mut c: Option<Correction>) -> Option<Correction> {
+        if let (Some(new), Some(old)) = (c.as_mut(), self.correction.as_ref()) {
+            new.adopt_state_from(old);
+        }
         std::mem::replace(&mut self.correction, c)
     }
 

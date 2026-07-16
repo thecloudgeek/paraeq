@@ -1,6 +1,9 @@
 //! Synthetic-block tests for the realtime chain:
 //! bypass? -> correction -> trim gain -> safety clamp(+-1.0).
 
+use std::f64::consts::PI;
+
+use paraeq_dsp::biquad::peaking;
 use paraeq_engine::chain::{build_fir, build_iir, ChainOutcome, RealtimeChain};
 use paraeq_engine::convolver::OverlapAddConvolver;
 use paraeq_engine::iir::IIRProcessor;
@@ -298,6 +301,217 @@ fn frame_mismatch_resets_correction_state() {
                     "block {b} ch {ch} sample {i}: stale tail after mismatch"
                 );
             }
+        }
+    }
+}
+
+// --- swap state transplant (spec R1-7a: click-free coefficient swaps) ---
+
+/// Phase-continuous 100 Hz sine at 48 kHz. 0.1 amplitude keeps the +12 dB
+/// Q=10 correction's output well inside the safety clamp.
+fn sine100(start_sample: usize, frames: usize, channels: usize) -> Vec<Vec<f32>> {
+    (0..channels)
+        .map(|_| {
+            (start_sample..start_sample + frames)
+                .map(|n| ((n as f64 * 2.0 * PI * 100.0 / 48000.0).sin() * 0.1) as f32)
+                .collect()
+        })
+        .collect()
+}
+
+fn max_first_diff(y: &[f32]) -> f32 {
+    y.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f32::max)
+}
+
+#[test]
+fn identical_coefficient_swap_is_bit_exact_noop() {
+    // The spec's sharpest test: swapping to identical coefficients at a
+    // block boundary must be sample-for-sample identical to never swapping.
+    let sos = peaking(100.0, 12.0, 10.0, 48000.0);
+    let mut swapped = RealtimeChain::new(2, BLOCK);
+    swapped.set_correction(Some(build_iir(vec![vec![sos]], 2, BLOCK)));
+    let mut unswapped = RealtimeChain::new(2, BLOCK);
+    unswapped.set_correction(Some(build_iir(vec![vec![sos]], 2, BLOCK)));
+    for b in 0..64 {
+        if b == 32 {
+            swapped.set_correction(Some(build_iir(vec![vec![sos]], 2, BLOCK)));
+        }
+        let input = sine100(b * BLOCK, BLOCK, 2);
+        let (out_s, outcome) = chain_process(&mut swapped, &input, false, 1.0);
+        assert!(outcome.corrected);
+        let (out_u, _) = chain_process(&mut unswapped, &input, false, 1.0);
+        for ch in 0..2 {
+            for i in 0..BLOCK {
+                assert_eq!(
+                    out_s[ch][i].to_bits(),
+                    out_u[ch][i].to_bits(),
+                    "block {b} ch {ch} sample {i}: a no-op swap must be a no-op"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn gain_only_swap_with_transplant_has_no_step() {
+    // Gain-only coefficient change (+12 dB -> +11 dB, Q=10 @ 100 Hz): with
+    // the transplant, the max first-difference across the swap boundary
+    // stays within 1.1x the surrounding steady state's (spec bound). The
+    // zero-state control below shows the same swap WITHOUT state is a
+    // click, so the bound is discriminating.
+    const WARM: usize = 96; // ~4 decay constants of the Q=10 resonance
+    const TAIL: usize = 32;
+    let sos_a = peaking(100.0, 12.0, 10.0, 48000.0);
+    let sos_b = peaking(100.0, 11.0, 10.0, 48000.0);
+
+    let mut chain = RealtimeChain::new(2, BLOCK);
+    chain.set_correction(Some(build_iir(vec![vec![sos_a]], 2, BLOCK)));
+    let mut y = Vec::new();
+    for b in 0..WARM {
+        let input = sine100(b * BLOCK, BLOCK, 2);
+        let (out, _) = chain_process(&mut chain, &input, false, 1.0);
+        y.extend_from_slice(&out[0]);
+    }
+    chain.set_correction(Some(build_iir(vec![vec![sos_b]], 2, BLOCK)));
+
+    // Zero-state control: the same continuation through a fresh chain --
+    // exactly what every swap sounded like before the transplant existed.
+    let mut fresh = RealtimeChain::new(2, BLOCK);
+    fresh.set_correction(Some(build_iir(vec![vec![sos_b]], 2, BLOCK)));
+    let mut y_zero_state = y.clone();
+    for b in WARM..WARM + TAIL {
+        let input = sine100(b * BLOCK, BLOCK, 2);
+        let (out, _) = chain_process(&mut chain, &input, false, 1.0);
+        y.extend_from_slice(&out[0]);
+        let (out_f, _) = chain_process(&mut fresh, &input, false, 1.0);
+        y_zero_state.extend_from_slice(&out_f[0]);
+    }
+
+    let boundary = WARM * BLOCK;
+    let steady = max_first_diff(&y[boundary - 16 * BLOCK..boundary]);
+    let across = max_first_diff(&y[boundary - 1..boundary + 4 * BLOCK]);
+    assert!(
+        across <= 1.1 * steady,
+        "transplanted swap stepped: boundary diff {across} > 1.1 x steady {steady}"
+    );
+    let across_zero = max_first_diff(&y_zero_state[boundary - 1..boundary + 4 * BLOCK]);
+    assert!(
+        across_zero > 1.1 * steady,
+        "zero-state control shows no click ({across_zero} <= 1.1 x {steady}); the bound is not discriminating"
+    );
+}
+
+#[test]
+fn iir_to_fir_swap_is_safe_noop() {
+    // Cross-kind swap: no state can carry over (a FIR overlap tail cannot
+    // be transplanted). Must not panic; the FIR behaves exactly as fresh.
+    let mut chain = RealtimeChain::new(2, BLOCK);
+    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK)));
+    for b in 0..2 {
+        chain_process(&mut chain, &make_block(b, 2, BLOCK), false, 1.0);
+    }
+    let fir = vec![0.5f64, 0.25, -0.125];
+    chain.set_correction(Some(build_fir(vec![fir.clone(), fir.clone()], 2, BLOCK)));
+
+    let mut direct = OverlapAddConvolver::new(vec![fir.clone(), fir], BLOCK);
+    for b in 2..4 {
+        let input = make_block(b, 2, BLOCK);
+        let (out, outcome) = chain_process(&mut chain, &input, false, 1.0);
+        assert!(outcome.corrected);
+        let in64: Vec<Vec<f64>> = input
+            .iter()
+            .map(|v| v.iter().map(|&s| s as f64).collect())
+            .collect();
+        let views: Vec<&[f64]> = in64.iter().map(|v| v.as_slice()).collect();
+        let mut out64 = vec![vec![0.0f64; BLOCK]; 2];
+        direct.process(&views, &mut out64);
+        for ch in 0..2 {
+            for i in 0..BLOCK {
+                let expected = downcast_gain_clamp(out64[ch][i], 1.0);
+                assert_eq!(
+                    out[ch][i].to_bits(),
+                    expected.to_bits(),
+                    "block {b} ch {ch} sample {i}: FIR after cross-kind swap not fresh"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn fir_to_iir_swap_starts_fresh() {
+    // Cross-kind swap the other way: the incoming IIR must start from zero
+    // state (fresh), not from anything scavenged off the FIR.
+    let fir = vec![0.5f64, 0.25, -0.125];
+    let mut chain = RealtimeChain::new(2, BLOCK);
+    chain.set_correction(Some(build_fir(vec![fir.clone(), fir], 2, BLOCK)));
+    for b in 0..2 {
+        chain_process(&mut chain, &make_block(b, 2, BLOCK), false, 1.0);
+    }
+    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK)));
+
+    let mut fresh = IIRProcessor::new();
+    fresh.set_sos(0, vec![SOS]);
+    fresh.set_sos(1, vec![SOS]);
+    for b in 2..4 {
+        let input = make_block(b, 2, BLOCK);
+        let (out, outcome) = chain_process(&mut chain, &input, false, 1.0);
+        assert!(outcome.corrected);
+        let in64: Vec<Vec<f64>> = input
+            .iter()
+            .map(|v| v.iter().map(|&s| s as f64).collect())
+            .collect();
+        let views: Vec<&[f64]> = in64.iter().map(|v| v.as_slice()).collect();
+        let mut out64 = vec![vec![0.0f64; BLOCK]; 2];
+        fresh.process(&views, &mut out64);
+        for ch in 0..2 {
+            for i in 0..BLOCK {
+                let expected = downcast_gain_clamp(out64[ch][i], 1.0);
+                assert_eq!(
+                    out[ch][i].to_bits(),
+                    expected.to_bits(),
+                    "block {b} ch {ch} sample {i}: IIR after cross-kind swap not fresh"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn channel_count_change_swap_starts_fresh() {
+    // Stereo correction -> mono-built correction: the transplant is a
+    // no-op across a channel-count change (spec R1-7a), so the incoming
+    // processor behaves exactly as fresh and nothing panics.
+    let mut chain = RealtimeChain::new(2, BLOCK);
+    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK)));
+    for b in 0..2 {
+        chain_process(&mut chain, &make_block(b, 2, BLOCK), false, 1.0);
+    }
+    chain.set_correction(Some(build_iir(vec![vec![SOS]], 1, BLOCK)));
+
+    let mut fresh = IIRProcessor::new();
+    fresh.set_sos(0, vec![SOS]);
+    for b in 2..4 {
+        let input = make_block(b, 2, BLOCK);
+        let (out, outcome) = chain_process(&mut chain, &input, false, 1.0);
+        assert!(outcome.corrected);
+        let in64: Vec<f64> = input[0].iter().map(|&s| f64::from(s)).collect();
+        let mut out64 = vec![vec![0.0f64; BLOCK]];
+        fresh.process(&[&in64], &mut out64);
+        for i in 0..BLOCK {
+            let expected = downcast_gain_clamp(out64[0][i], 1.0);
+            assert_eq!(
+                out[0][i].to_bits(),
+                expected.to_bits(),
+                "block {b} ch 0 sample {i}: transplant crossed a channel-count change"
+            );
+            // The mono processor has no ch1 state: pass-through (the f64
+            // round-trip is exact, gain 1.0, well inside the clamp).
+            assert_eq!(
+                out[1][i].to_bits(),
+                input[1][i].to_bits(),
+                "block {b} ch 1 sample {i}: expected pass-through"
+            );
         }
     }
 }
