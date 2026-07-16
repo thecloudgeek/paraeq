@@ -9,5 +9,6 @@ pub mod ioproc;
 pub mod listeners;
 pub mod properties;
 pub mod tap;
+pub mod volume;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

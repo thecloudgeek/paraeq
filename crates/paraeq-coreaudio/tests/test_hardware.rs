@@ -12,6 +12,7 @@ use paraeq_coreaudio::ioproc::{IoCallback, IoProcHandle};
 use paraeq_coreaudio::listeners::PropertyListener;
 use paraeq_coreaudio::properties;
 use paraeq_coreaudio::tap::TapSystem;
+use paraeq_coreaudio::volume;
 use paraeq_engine::controller::{EngineCommand, EngineConfig, EngineHandle, EngineState};
 use paraeq_engine::status::EngineStatus;
 
@@ -102,6 +103,96 @@ fn buffer_frame_size_set_and_restore_roundtrip() {
         restored, original,
         "original buffer frame size not restored"
     );
+}
+
+/// MS-5: the level ladder reads back the actual hardware gain before it solves
+/// a sweep level. A device exposing no volume control at all (HDMI, many USB
+/// DACs, aggregates) is legal and common, so this asserts the API is HONEST
+/// either way — it does not assert a control exists.
+#[test]
+#[ignore = "requires audio hardware"]
+fn output_volume_reports_a_control_or_honestly_reports_none() {
+    let dev = properties::default_output_device().expect("default_output_device");
+    match volume::output_volume(dev).expect("output_volume") {
+        Some(vol) => {
+            eprintln!(
+                "VOLUME: scalar {:.3}, master={}, settable={}, elements={:?}",
+                vol.scalar(),
+                vol.is_master(),
+                vol.is_settable(),
+                vol.elements()
+            );
+            assert!(
+                !vol.elements().is_empty(),
+                "Some(_) must carry at least one element"
+            );
+            assert!(
+                (0.0..=1.0).contains(&vol.scalar()),
+                "HAL volume scalar must be 0.0..=1.0, got {}",
+                vol.scalar()
+            );
+        }
+        None => eprintln!("VOLUME: default output exposes no volume control (ladder must refuse)"),
+    }
+}
+
+/// Set + restore round-trip. Skips rather than fails on a device with no
+/// settable control, because that is a legal device (the `FixedMaxVolume`
+/// case). Restores BEFORE asserting so a failed assert cannot leave the system
+/// at the test's volume — the same shape as
+/// `buffer_frame_size_set_and_restore_roundtrip`, and the same invariant the
+/// measurement session's restore path needs.
+#[test]
+#[ignore = "requires audio hardware; briefly changes system volume"]
+fn output_volume_set_and_restore_roundtrip() {
+    let dev = properties::default_output_device().expect("default_output_device");
+    let Some(original) = volume::output_volume(dev).expect("output_volume") else {
+        eprintln!("SKIP: default output exposes no volume control");
+        return;
+    };
+    if !original.is_settable() {
+        eprintln!("SKIP: default output's volume control is read-only (FixedMaxVolume case)");
+        return;
+    }
+
+    let target = if original.scalar() > 0.5 { 0.25 } else { 0.75 };
+    volume::set_output_volume(dev, target).expect("set target");
+    let after_set = volume::output_volume(dev)
+        .expect("read back target")
+        .expect("control still present");
+
+    let errors = volume::restore_output_volume(dev, &original);
+    let restored = volume::output_volume(dev)
+        .expect("read back original")
+        .expect("control still present");
+
+    assert!(errors.is_empty(), "restore errored: {errors:?}");
+    // Devices quantize the scalar, so the set lands within a step, not exactly.
+    assert!(
+        (after_set.scalar() - target).abs() < 0.1,
+        "set_output_volume did not take effect: wanted {target}, read {}",
+        after_set.scalar()
+    );
+    assert!(
+        (restored.scalar() - original.scalar()).abs() < 0.01,
+        "original volume not restored: was {}, now {}",
+        original.scalar(),
+        restored.scalar()
+    );
+}
+
+/// The scalar guard must fire on a REAL device too (the unit tests reach no
+/// HAL): a NaN volume is a safety issue, not a numerics nit (spec § Non-Finite).
+#[test]
+#[ignore = "requires audio hardware"]
+fn set_output_volume_refuses_bad_scalars_on_a_real_device() {
+    let dev = properties::default_output_device().expect("default_output_device");
+    for bad in [f32::NAN, f32::INFINITY, -0.5, 1.5] {
+        assert!(
+            volume::set_output_volume(dev, bad).is_err(),
+            "accepted out-of-range scalar {bad}"
+        );
+    }
 }
 
 /// Lifecycle roundtrip for the tap + private aggregate. Briefly mutes system
