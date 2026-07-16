@@ -4,10 +4,18 @@ prototype (the numerical oracle) for the Rust port's parity tests.
 
 Run:  source .venv/bin/activate && python prototype/tools/generate_fixtures.py
 Deterministic: seeded RNG, no timestamps. Rerunning must be byte-identical.
+
+Toolchain pinned: numpy/scipy must match PINNED_VERSIONS (declared as the
+`fixtures` extra in prototype/pyproject.toml) or generation is refused —
+a drifted scipy/numpy could silently rewrite the goldens. Override with
+--allow-version-drift, which stamps "drift": true into fixtures/manifest.json.
+The manifest is a provenance record of what ran, never the pin.
 """
+import argparse
 import json
 import platform
 import shutil
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -43,6 +51,10 @@ from paraeq.measurement.sweep import generate_inverse_sweep, generate_sweep
 
 ROOT = Path(__file__).resolve().parent.parent.parent  # repo root
 OUT = ROOT / "fixtures"
+# Must equal the `fixtures` extra in prototype/pyproject.toml — that extra is
+# the declaration, this dict is the enforcement, and fixtures/manifest.json is
+# only the record of what actually ran.
+PINNED_VERSIONS = {"numpy": "2.5.0", "scipy": "1.18.0"}
 SR = 48000
 
 
@@ -218,7 +230,37 @@ def gen_iir():
               {"sos": sos, "input": blocks_in, "output": out})
 
 
+def check_pinned_versions(allow_drift: bool) -> bool:
+    """Refuse to touch fixtures/ under a drifted toolchain unless overridden.
+
+    Returns True when generation proceeds under drifted versions (the caller
+    must then stamp "drift": true into the manifest).
+    """
+    installed = {"numpy": np.__version__, "scipy": scipy.__version__}
+    drifted = sorted(name for name in PINNED_VERSIONS if installed[name] != PINNED_VERSIONS[name])
+    if not drifted:
+        return False
+    for name in drifted:
+        print(f"ERROR: {name} {installed[name]} != pinned {name}=={PINNED_VERSIONS[name]} "
+              "(prototype/pyproject.toml, `fixtures` extra)", file=sys.stderr)
+    if not allow_drift:
+        print("Refusing to regenerate: a drifted numpy/scipy could silently rewrite the "
+              "goldens. Install the pins (.venv/bin/pip install -e './prototype[fixtures]') "
+              "or rerun with --allow-version-drift to proceed anyway.", file=sys.stderr)
+        sys.exit(1)
+    print('WARNING: --allow-version-drift: generating anyway; stamping "drift": true '
+          "into fixtures/manifest.json", file=sys.stderr)
+    return True
+
+
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--allow-version-drift", action="store_true",
+        help='generate despite numpy/scipy not matching the pins; stamps "drift": true '
+             "into fixtures/manifest.json")
+    args = parser.parse_args()
+    drift = check_pinned_versions(args.allow_version_drift)
     if OUT.exists():
         shutil.rmtree(OUT)
     OUT.mkdir()
@@ -232,12 +274,15 @@ def main():
     gen_peq_autofit()
     gen_convolver()
     gen_iir()
-    (OUT / "manifest.json").write_text(json.dumps({
+    manifest = {
         "dtype": "<f8",
         "numpy": np.__version__,
         "python": platform.python_version(),
         "scipy": scipy.__version__,
-    }, indent=1, sort_keys=True) + "\n")
+    }
+    if drift:
+        manifest["drift"] = True
+    (OUT / "manifest.json").write_text(json.dumps(manifest, indent=1, sort_keys=True) + "\n")
     n = sum(1 for _ in OUT.rglob("*"))
     print(f"wrote {n} files under {OUT}")
 

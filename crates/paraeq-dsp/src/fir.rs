@@ -1,7 +1,9 @@
 //! FIR correction design: frequency sampling (linear phase) + homomorphic
 //! minimum phase. Oracles: prototype/paraeq/correction/fir_filter.py and
-//! scipy.signal.minimum_phase (homomorphic, half=True), scipy 1.18.0 (the
-//! version that generated fixtures/, see fixtures/manifest.json).
+//! scipy.signal.minimum_phase (homomorphic, half=True), pinned to scipy
+//! 1.18.0 by prototype/pyproject.toml's `fixtures` extra and enforced by
+//! generate_fixtures.py at startup (fixtures/manifest.json only records
+//! what actually ran — it is provenance, not the pin).
 
 use realfft::RealFftPlanner;
 use rustfft::{num_complex::Complex, FftPlanner};

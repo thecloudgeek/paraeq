@@ -7,12 +7,19 @@ Instructions for Claude when working in this repo.
 ParaEQ — open-source headphone measurement and correction EQ for macOS.
 **The product is the Rust port**: a Cargo workspace (`crates/`) + Tauri 2/React
 app (`desktop/`), built on Core Audio process taps. The old Python/PyQt6
-prototype lives in `prototype/` as the **numerical oracle** — it generates the
-golden fixtures in `fixtures/` that the Rust DSP core must match. Don't add
-features to the prototype.
+prototype lives in `prototype/` as the **numerical oracle** for the ten DSP
+modules ported from it — it generates the golden fixtures in `fixtures/` that
+those modules must match, and that parity is frozen. Don't add features to the
+prototype (this retires the PyQt6 *product* under `prototype/app/`; adding a
+`gen_*()` case to `prototype/tools/generate_fixtures.py` is the prescribed
+fixture workflow, not a feature). **DSP written for the measurement suite has
+no prototype oracle; see the four-tier strategy in
+`docs/specs/2026-07-15-measurement-suite-design.md`.**
 
-Read **`docs/CONTEXT.md`** before making changes. Design spec:
-**`docs/specs/2026-07-02-rust-port-design.md`**. Current plan:
+Read **`docs/CONTEXT.md`** before making changes. Current design spec:
+**`docs/specs/2026-07-15-measurement-suite-design.md`** (and its companion
+specs); **`docs/specs/2026-07-02-rust-port-design.md`** remains authoritative
+for the engine, the tap architecture and packaging. Current plan:
 **`docs/plans/2026-07-02-rust-port-foundation.md`**.
 
 ## Commands
@@ -40,8 +47,13 @@ python prototype/tools/generate_fixtures.py   # regenerates fixtures/ — commit
 
 ## Project Conventions
 
-- **TDD**: Rust DSP modules are written against failing golden-fixture tests
-  first (`crates/paraeq-dsp/tests/`). Engine code gets synthetic-block unit
+- **TDD**: Rust DSP modules are written against failing tests first
+  (`crates/paraeq-dsp/tests/`). The oracle depends on the tier — golden
+  fixtures for prototype-ported modules, scipy-direct fixtures for new
+  primitives with a library delegate, analytic-physics invariants where there is
+  none, REW characterization at 0.1–0.5 dB for the end-to-end pipeline. Pick the
+  tier before writing the module and state it in the module header comment, as
+  `spline.rs:1-5` does. Engine code gets synthetic-block unit
   tests. GUI (`desktop/ui`) is typecheck + manual smoke.
 - **Fixtures are sacred**: `fixtures/` is generated ONLY by
   `prototype/tools/generate_fixtures.py` (deterministic, seeded). Never edit

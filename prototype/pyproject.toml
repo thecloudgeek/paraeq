@@ -18,13 +18,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-gui = [
-    "PyQt6>=6.5",
-    "pyqtgraph>=0.13",
-]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
+]
+# Exact pins for the fixture generator ONLY (tools/generate_fixtures.py asserts
+# them at startup). The loose floors above stay for the prototype's own use.
+fixtures = [
+    "numpy==2.5.0",
+    "scipy==1.18.0",
+]
+gui = [
+    "PyQt6>=6.5",
+    "pyqtgraph>=0.13",
 ]
 
 [tool.pytest.ini_options]

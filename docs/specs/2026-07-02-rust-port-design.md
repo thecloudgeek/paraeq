@@ -2,11 +2,16 @@
 
 **Date:** 2026-07-02
 **Status:** Approved (brainstormed section-by-section with project owner)
+**Amended by:** `docs/specs/2026-07-15-measurement-suite-design.md` (2026-07-15
+rescope). The crate map, the tap-architecture decision, the realtime invariants
+and the packaging plan remain authoritative here; the parity *milestone* does
+not, and the passages marked **Superseded (2026-07-15)** below are retired or
+corrected in place. See that spec's **Spec Delta** for the clause-by-clause list.
 **Supersedes:** the "Phase 2: Tauri + Rust (Future)" sketch in `docs/specs/2026-04-22-paraeq-design.md`
 
 ## Summary
 
-Port ParaEQ from the Python/PyQt6 prototype to its final form: a Rust Cargo workspace with a Tauri 2 + React desktop app, macOS-only, built on **Core Audio process taps** instead of BlackHole or a custom HAL driver. The milestone is **full functionality parity** with the prototype plus two fixes the prototype could not deliver: native hardware volume keys and an explicit output-device picker. The visual redesign comes after parity, on top of a working app.
+Port ParaEQ from the Python/PyQt6 prototype to its final form: a Rust Cargo workspace with a Tauri 2 + React desktop app, macOS-only, built on **Core Audio process taps** instead of BlackHole or a custom HAL driver. ~~The milestone is **full functionality parity** with the prototype~~ **Superseded (2026-07-15):** the milestone is no longer prototype parity — see the Product-scope decision in `docs/specs/2026-07-15-measurement-suite-design.md`. The two fixes the prototype could not deliver — native hardware volume keys and an explicit output-device picker — remain in scope, and the visual redesign still comes last, on top of a working app.
 
 The Python prototype is retained in-repo as the **numerical oracle**: a fixture-generation script dumps input→output pairs for every DSP stage, and the Rust DSP core is TDD'd against those golden fixtures.
 
@@ -21,11 +26,11 @@ Settled with the project owner during brainstorming on 2026-07-02:
 | Platform scope | macOS-only, OS-specific code isolated in one crate | Windows/Linux in this port |
 | Python fate | Reference implementation + golden-fixture oracle; no PyO3 bindings | pip-installable wrapper via PyO3; deleting Python now |
 | Repo layout | Same repo; Python moves to `prototype/`; Rust workspace takes top level | `rust/` subdirectory; fresh repo |
-| Parity scope | Everything the prototype does + volume keys + output picker | Core-EQ-first subset; feature-set rethink |
+| Parity scope | ~~Everything the prototype does + volume keys + output picker~~ **Superseded (2026-07-15)** by the Product-scope row in `docs/specs/2026-07-15-measurement-suite-design.md`'s Decisions Log: the milestone is no longer parity | Core-EQ-first subset; feature-set rethink |
 | Process topology | Multi-crate workspace, engine in-process with Tauri, **daemon-ready seams** (owner: "1 now, 2 later") | Headless daemon + UI client now; single-crate monolith |
 | Signing | Owner has a paid Apple Developer account; Developer ID + notarization used from the start | — |
 
-**Why taps, not a custom driver.** The driver-from-day-one decision was reversed after ecosystem research (2026-07-02): `AudioHardwareCreateProcessTap` (macOS 14.4+) captures the system mix, mutes it at the device, and lets the app play processed audio to the physical output — which **stays the system default**, so hardware volume keys and the volume HUD work natively with zero extra code. No driver install, no admin prompt, no reboot (macOS 14.4 removed installers' ability to restart `coreaudiod`), single notarized .app, one "System Audio Recording" TCC prompt. Validation: Rogue Amoeba deprecated their ACE driver engine for taps (Audio Hijack 4.5.9, May 2026, supports macOS 14.4–26); iQualize ships as an open-source tap-based system EQ; Rust bindings exist in `objc2-core-audio`. The custom-driver path additionally turned out to have no Rust ecosystem (it would be a separate C++ codebase via libASPL), and eqMac's issue tracker documents years of driver-exposed-volume fragility. Taps deliver the driver's entire promised UX at a fraction of the effort.
+**Why taps, not a custom driver.** *(Rationale corrected 2026-07-15 — see the Spec Delta in `docs/specs/2026-07-15-measurement-suite-design.md`; the decision itself is unchanged and still authoritative.)* The driver-from-day-one decision was reversed after ecosystem research (2026-07-02): `AudioHardwareCreateProcessTap` (macOS 14.4+) captures the system mix, mutes it at the device, and lets the app play processed audio to the physical output — which **stays the system default**, so hardware volume keys and the volume HUD work natively with zero extra code. To be honest about the alternative: drivers **can** expose native volume controls (`equaliser` sets `kEnableVolumeControl`; `radioform` uses `AddStreamWithControlsAsync`) — the real cost of the driver path is the host-side forwarding plumbing (the driver's volume control must be wired to the physical device's), not broken volume keys. The decision rests on what actually justifies it: no driver install, no admin prompt, no reboot (macOS 14.4 removed installers' ability to restart `coreaudiod`), no root LaunchDaemon, a single notarized .app, one "System Audio Recording" TCC prompt, and no uninstaller problem. Validation: Rogue Amoeba deprecated their ACE driver engine for taps (Audio Hijack 4.5.9, May 2026, supports macOS 14.4–26); iQualize ships as an open-source tap-based system EQ; Rust bindings exist in `objc2-core-audio`. The custom-driver path additionally turned out to have no Rust ecosystem (it would be a separate C++ codebase via libASPL). Taps deliver the driver's entire promised UX at a fraction of the effort.
 
 ## Architecture
 
@@ -77,17 +82,16 @@ Constraints that define the shape:
 
 ## Realtime Audio Pipeline
 
-**Threads and data flow:**
+**Threads and data flow** *(corrected 2026-07-15 to what stage 3 actually shipped — see the Spec Delta in `docs/specs/2026-07-15-measurement-suite-design.md`)*:
 
-- **Tap IOProc** (CoreAudio realtime thread): receives system-mix blocks from the muted tap; pushes into a lock-free SPSC ring buffer.
-- **Output IOProc** (CoreAudio realtime thread): pulls a block from the ring, runs the DSP chain, writes to the physical device. Chain per block: `bypass? → correction (FIR convolver | biquad cascade) → trim gain → safety clamp`. The safety clamp is a hard limit to ±1.0 full scale — a last-resort protection against filter overshoot beyond the preamp headroom, not a mastering limiter (the AutoEQ preamp convention remains the real headroom mechanism, as in the prototype).
-- **Analyzer feed**: pre- and post-EQ copies pushed to a second ring; consumed off-thread; frames are dropped when the ring is full — the UI can never backpressure audio.
-- **Control plane** (normal threads): engine controller owns tap/stream lifecycle and applies commands; a config builder designs FIR/biquad coefficients via `paraeq-dsp` off-thread and hands ready-to-run processors to an atomic pointer swap (`arc-swap`); retired configs are freed off-thread. **No locks, no allocation, ever, on the realtime lane.**
+- **One IOProc** (CoreAudio realtime thread) on a **private aggregate** containing both the tap and the output device: it receives system-mix blocks from the muted tap and writes processed blocks to the physical device in the same callback. There is no tap→output ring and no second IOProc. Chain per block: `bypass? → correction (FIR convolver | biquad cascade) → trim gain → safety clamp`. The safety clamp is a hard limit to ±1.0 full scale — a last-resort protection against filter overshoot beyond the preamp headroom, not a mastering limiter (the AutoEQ preamp convention remains the real headroom mechanism, as in the prototype).
+- **Analyzer feed**: pre- and post-EQ copies pushed to a ring; consumed off-thread; frames are dropped when the ring is full — the UI can never backpressure audio.
+- **Control plane** (normal threads): engine controller owns tap/stream lifecycle and applies commands; a config builder designs FIR/biquad coefficients via `paraeq-dsp` off-thread. **`rtrb` SPSC rings carry commands and processor swaps inbound** (control → rt) and retired configs back (rt → control, so deallocation always happens off the realtime thread); **`ArcSwap` publishes `EngineState` outbound** (rt telemetry → UI). See `crates/paraeq-engine/src/shared.rs`. **No locks, no allocation, ever, on the realtime lane.**
 
 **Key decisions:**
 
-- **One clock domain.** The tap captures the system default output device, and ParaEQ plays to that same device — both IOProcs run on one hardware clock, so there is no drift and no resampler at parity. The **output picker works by setting the system default output** (tap and output stream follow it), not by cross-routing to a second device. Cross-device redirect (à la SoundSource) is a post-parity feature that would add rubato rate-matching.
-- **Latency budget:** stage-3 hardware measurements: 62.3 ms added at 512-frame buffers / 51.6 ms at 256 / 46.3 ms at 128 (48 kHz), over a ~41 ms fixed tap-path floor the buffer size cannot buy back. Fine for music; still near the ~45 ms lip-sync threshold even at 128 frames. The number is exposed honestly in `EngineState.latency_ms`. Block size becomes a setting post-parity.
+- **One clock domain.** The tap captures the system default output device, and ParaEQ plays to that same device — the tap and output sides run on one hardware clock, so there is no drift and no resampler at parity. The **output picker works by setting the system default output** (tap and output stream follow it), not by cross-routing to a second device. Cross-device redirect (à la SoundSource) is a post-parity feature that would add rubato rate-matching.
+- **Latency budget:** stage-3 hardware measurements: 62.3 ms at 512-frame buffers / 51.6 ms at 256 / 46.3 ms at 128 (48 kHz), over a ~41 ms fixed tap-path floor the buffer size cannot buy back. *(Corrected 2026-07-15: these are measured **end-to-end tap-to-output deltas** — `out_sample_time − in_sample_time` includes the output device's own safety offset and DAC latency, which exist with or without ParaEQ, so "ParaEQ adds N ms" is not established and the word "added" must not be used.)* Fine for music; still near the ~45 ms lip-sync threshold even at 128 frames. The number is exposed honestly in `EngineState.latency_ms` as the measured end-to-end delta, and reported as such. Block size becomes a setting post-parity.
 - **Sample formats:** samples stay f32 (CoreAudio native); filter *design* math and biquad *state* are f64 (numerical parity with numpy/scipy; avoids low-frequency biquad quantization).
 - **Two bypass levels.** *DSP bypass*: audio still flows through ParaEQ, correction skipped — instant glitch-free A/B (tray toggle, prototype parity). *Full disable*: destroy the tap, device unmutes, system exactly as if ParaEQ never ran — used on quit and as the panic path.
 - **Rebuild on change.** Property listeners on `kAudioHardwarePropertyDefaultOutputDevice`, device-alive, and stream format: any change tears down and rebuilds tap + output stream (~100 ms mute blip). Covers unplug, AirPods handoff, sample-rate switches — and fixes the prototype's launch-time output lock-in gotcha.
@@ -101,9 +105,9 @@ Constraints that define the shape:
 |---|---|---|
 | `measurement/sweep.py` | `dsp::sweep` | hand-roll (closed-form log sweep + Farina inverse) |
 | `measurement/deconvolution.py` | `dsp::deconvolution` | realfft + ~20 lines Wiener division `conj(S)/(|S|²+ε)`. Gotcha: rustfft does not normalize inverse FFTs — explicit 1/n |
-| `measurement/frequency_response.py` | `dsp::fr` | realfft + hand-rolled fractional-octave smoothing (~25 lines); averaging stays in dB domain |
+| `measurement/frequency_response.py` | `dsp::fr` | realfft + hand-rolled fractional-octave smoothing (~25 lines); averaging stays in dB domain **for the coupler path only — Superseded (2026-07-15) for the room path:** `average_measurements` stays exactly as it is (dB-domain, oracle-documented, fixture-pinned); the room path gets a **new** `average_measurements_rms` plus mandatory Align SPL — see the Spec Delta in `docs/specs/2026-07-15-measurement-suite-design.md` |
 | `measurement/compensation.py` | `dsp::compensation` | CSV parse + linear interp (~10 lines) |
-| `correction/target_curves.py` | `dsp::targets` | hand-rolled **not-a-knot cubic spline** in log-f space (~120 lines; no trustworthy crate); anchor deviation-layer model + `match_closest` ported 1:1; same six bundled CSVs |
+| `correction/target_curves.py` | `dsp::targets` | hand-rolled **not-a-knot cubic spline** in log-f space (~120 lines; no trustworthy crate); anchor deviation-layer model + `match_closest` ported 1:1; ~~same six bundled CSVs~~ **Superseded (2026-07-15):** all six bundled CSVs are coupler targets; the room path adds a room target, and `match_closest_target` must first grow a **required `TransducerClass` argument** (today it iterates every curve with no category filter) — see the Spec Delta in `docs/specs/2026-07-15-measurement-suite-design.md` |
 | `correction/fir_filter.py` | `dsp::fir` | hand-rolled frequency-sampling design + **homomorphic minimum-phase** (~120 lines, ported from scipy's algorithm including the M²/half-magnitude trick documented in CONTEXT.md) |
 | `correction/biquad.py` | `dsp::biquad` | hand-rolled RBJ Audio EQ Cookbook coefficients (~100 lines, exact parity, zero deps) + `sosfreqz` equivalent (~15 lines). The `biquad` crate is used *in tests only* as an independent cross-check |
 | `correction/parametric_eq.py` | `dsp::peq` | EQBand / ParametricEQ / composite response / AutoEQ text export |
@@ -144,7 +148,7 @@ Constraints that define the shape:
 | Setup wizard | First launch: explain → trigger the one-time System Audio Recording permission → confirm output device → done. The BlackHole install step is deleted entirely. |
 | EQ tab | Band table + draggable curve + preamp; AutoEQ text import/export; Browse AutoEQ DB searchable dialog. Same single-processor contract as the prototype: last-applied correction (PEQ or FIR) is what runs. |
 | Target tab | Preset dropdown (same six bundled curves), CSV import/export, 16 draggable anchors with the deviation-layer model, "Match closest", Generate FIR / Generate PEQ, ~70 ms debounced live minimum-phase-FIR preview. |
-| Measure tab | EARS input picker + sweep params + multi-measurement averaging, FR plot with compensation. Tap-era simplification: the global tap excludes ParaEQ's own process, so the sweep plays cleanly on a direct output stream while the EARS records — correction state cannot contaminate the measurement. Play/record run on separate devices; the Farina method tolerates their small clock skew (prototype proved it). |
+| Measure tab | ~~EARS input picker~~ **Superseded (2026-07-15): device-agnostic mic input — EARS is one supported jig, not the framing** + sweep params + multi-measurement averaging, FR plot with compensation. Tap-era simplification (survives, still correct): the global tap excludes ParaEQ's own process, so the sweep plays cleanly on a direct output stream while the mic records — correction state cannot contaminate the measurement. ~~Play/record run on separate devices; the Farina method tolerates their small clock skew (prototype proved it).~~ **Superseded (2026-07-15): proven only for an ungated coupler magnitude measurement; the claim does not transfer to gating, which needs a trustworthy *t = 0* — moved to the two-clock risk row in `docs/specs/2026-07-15-measurement-suite-design.md`.** |
 | Analyzer tab | Live pre/post overlay, octave-smoothing dropdown, dB range — canvas fed by the spectrum channel. |
 | Profiles tab | List / activate / duplicate / rename / delete / import / export. New clean storage format (serde JSON + WAV impulses via hound) in the app-data dir. No compatibility with prototype profiles (prototype is throwaway; re-measure or re-import). |
 | Menubar / tray | Profile switching, bypass toggle, open window, quit. Closing the window keeps audio running (tray-resident app). |
@@ -203,7 +207,7 @@ Each stage gets its own implementation plan (writing-plans → TDD execution). S
 | Risk | Mitigation |
 |---|---|
 | Tap API youth (macOS 14.4+; one zero-stream report on a macOS 26.5 *beta*) | Stage-0 spike is a hard gate; `AudioSource` trait keeps the proven BlackHole+aggregate fallback a contained swap; track macOS 26.x point releases before raising the supported-OS ceiling |
-| Measurement play/record clock skew (two devices, two clocks) | Farina sweep deconvolution tolerates small skew — empirically proven by the prototype with the same topology |
+| Measurement play/record clock skew (two devices, two clocks) | ~~Farina sweep deconvolution tolerates small skew — empirically proven by the prototype with the same topology~~ **Superseded (2026-07-15): void as a mitigation — the evidence covers ungated coupler magnitude only and does not extend to gating. Replaced by the two-clock risk row in `docs/specs/2026-07-15-measurement-suite-design.md`.** |
 | IPC throughput for the analyzer | ~8 KB × 30 fps is far inside Tauri v2 Channel budgets; escape hatch is a custom URI-scheme protocol handler serving binary |
 | Hand-rolled DSP correctness | Golden fixtures + per-class tolerances + proptest invariants + test-only cross-checks against independent crates |
 | eqMac-class lifecycle bugs (hot-plug, sleep/wake, device switch) | Rebuild-on-change listeners are designed in from the start; fail-safe teardown ordering (unmute first) is a stated invariant; these become explicit engine test scenarios |
@@ -216,7 +220,7 @@ Each stage gets its own implementation plan (writing-plans → TDD execution). S
 - PyO3 bindings / pip package.
 - The modern-design UI overhaul (explicitly sequenced after parity).
 - Auto-updater, Homebrew cask (post-parity distribution work).
-- Parameterized targets (baseline + tilt/bass/treble preference adjustments) and newer 5128-era target curves (JM-1, IEF 2025) — noted from research as the direction the measurement community has moved; post-parity backlog.
+- ~~Parameterized targets (baseline + tilt/bass/treble preference adjustments)~~ **Superseded (2026-07-15): a room target *is* a parameterized target (an RBJ low shelf plus a linear tilt), so parameterized targets come in scope with the room path — see the Spec Delta in `docs/specs/2026-07-15-measurement-suite-design.md`.** Newer 5128-era target curves (JM-1, IEF 2025) stay out of scope — they are further from EARS, not closer.
 
 ## Research Basis (2026-07-02)
 
