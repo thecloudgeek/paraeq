@@ -1,0 +1,41 @@
+{
+ "arrays": {
+  "freqs_linear": {
+   "file": "resample_db.freqs_linear.f64",
+   "len": 8193,
+   "shape": [
+    8193
+   ]
+  },
+  "grid_freqs": {
+   "file": "resample_db.grid_freqs.f64",
+   "len": 957,
+   "shape": [
+    957
+   ]
+  },
+  "mag_db": {
+   "file": "resample_db.mag_db.f64",
+   "len": 8193,
+   "shape": [
+    8193
+   ]
+  },
+  "resampled": {
+   "file": "resample_db.resampled.f64",
+   "len": 957,
+   "shape": [
+    957
+   ]
+  }
+ },
+ "params": {
+  "f_max": 20000.0,
+  "f_min": 20.0,
+  "n_fft": 16384,
+  "ppo": 96,
+  "prefilter": "none",
+  "sample_rate": 48000
+ },
+ "scalars": {}
+}

@@ -1,0 +1,33 @@
+{
+ "arrays": {
+  "freqs": {
+   "file": "gaussian_sigma8.freqs.f64",
+   "len": 957,
+   "shape": [
+    957
+   ]
+  },
+  "mag_db": {
+   "file": "gaussian_sigma8.mag_db.f64",
+   "len": 957,
+   "shape": [
+    957
+   ]
+  },
+  "smoothed": {
+   "file": "gaussian_sigma8.smoothed.f64",
+   "len": 957,
+   "shape": [
+    957
+   ]
+  }
+ },
+ "params": {
+  "flat_margin_bins": 200,
+  "mode": "reflect",
+  "ppo": 96,
+  "sigma_bins": 8.0,
+  "truncate": 4.0
+ },
+ "scalars": {}
+}

@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
-"""Golden-fixture generator: dumps input->output pairs from the Python
-prototype (the numerical oracle) for the Rust port's parity tests.
+"""Golden-fixture generator for the Rust port's parity tests.
+
+Two tiers are written from here (docs/specs/2026-07-15-measurement-suite-design.md,
+"The four tiers"):
+
+  Tier 1 -- dumps input->output pairs from the Python prototype, the numerical
+    oracle for the ten modules ported from it. FROZEN: not regenerated for
+    measurement-suite work.
+  Tier 2 -- scipy/numpy-direct cases for new primitives that have a library
+    delegate. These import NOTHING from paraeq, on purpose: the fixture's
+    provenance is the library, not our own ported code, so the Rust module
+    cannot be graded against a transcription of itself. Marked `Tier 2` in each
+    gen_*() docstring.
 
 Run:  source .venv/bin/activate && python prototype/tools/generate_fixtures.py
 Deterministic: seeded RNG, no timestamps. Rerunning must be byte-identical.
@@ -20,6 +31,8 @@ from pathlib import Path
 
 import numpy as np
 import scipy
+from scipy.ndimage import gaussian_filter1d
+from scipy.signal.windows import blackmanharris, boxcar, hann, tukey
 
 from paraeq.correction.auto_fit import auto_fit_parametric_eq
 from paraeq.correction.biquad import (
@@ -70,6 +83,28 @@ def save_case(stage: str, name: str, params: dict, arrays: dict, scalars: dict |
     (d / f"{name}.json").write_text(json.dumps(case, indent=1, sort_keys=True) + "\n")
 
 
+def log_grid(f_min: float = 20.0, f_max: float = 20000.0, ppo: int = 96) -> np.ndarray:
+    """The logf.rs axis: f_i = f_min * 2^(i/ppo) for i in [0, N).
+
+    N = floor(ppo*log2(f_max/f_min)) + 1 -- the largest set of ppo-spaced points
+    that does not EXCEED f_max, so the top bin falls short by under one spacing.
+    Deliberate; see the room-DSP spec's logf.rs section before "fixing" it.
+
+    Two traps, both measured against this pinned toolchain rather than assumed:
+
+    - Not np.logspace. The spec's Tier-2 wording ("np.interp on np.logspace") is
+      loose: logspace's endpoint-based spacing is a DIFFERENT float sequence,
+      here by up to 2.5e-11 Hz -- above the 1e-12 bar these cases are compared
+      at. These are the query points LogGrid::standard() must reproduce, so the
+      formula is the contract and logspace would fail a correct implementation.
+    - The standard grid's top bin is 19897.0 Hz, not the 19910 Hz the spec's
+      prose states -- that figure is an arithmetic slip in the spec, not a
+      different grid. N = 957 and f[0] = 20.0 exactly, both as specified.
+    """
+    n = int(np.floor(ppo * np.log2(f_max / f_min))) + 1
+    return f_min * 2.0 ** (np.arange(n) / ppo)
+
+
 def gen_sweep():
     sweep = generate_sweep(0.25, SR)
     inverse = generate_inverse_sweep(sweep, SR)
@@ -118,6 +153,184 @@ def gen_compensation():
     save_case("compensation", "edge_hold", {},
               {"comp_freqs": comp_freqs, "comp_gains": comp_gains, "grid": grid,
                "mag_db": mag, "compensated": out})
+
+
+def gen_cal():
+    """Cal-file parse cases for REW's leading-numeric rule (Tier 2).
+
+    Constructive, and deliberately so: each file is RENDERED FROM the golden
+    curve, so no parser supplies its own expectation and neither half of the
+    rewrite grades its own homework. `single_header` and `tab_delimited` pin
+    the dropped-first-row bug the old quote-sniff + skiprows=2 parsers shared
+    -- under the old rule they load six rows, not seven. `two_header` and
+    `comma_delimited` are the invariance witnesses: the old rule got those
+    right, which is exactly why the bug survived.
+    """
+    freqs = np.array([20.0, 50.0, 100.0, 1000.0, 5000.0, 10000.0, 20000.0])
+    gains = np.array([0.5, 0.3, 0.0, -0.2, -0.5, -1.0, -2.0])
+    triples = "".join(f"{f:>10.4f} {g:>9.4f} {0.0:>9.4f}\n" for f, g in zip(freqs, gains))
+    cases = {
+        # ParaEQ CSV: # comment, comma-separated pairs.
+        "comma_delimited": "# ParaEQ compensation curve\n"
+                           + "".join(f"{f:.4f},{g:.4f}\n" for f, g in zip(freqs, gains)),
+        # UMIK-1 0-degree: ONE quoted header, 3-column whitespace rows.
+        "single_header": '"Sens Factor =-0.4210dB, SERNO: 7103798"\n' + triples,
+        # UMIK-1 as shipped: one header, tab-separated pairs.
+        "tab_delimited": '"Sens Factor =-0.4210dB, AGain =18dB, SERNO: 7103798"\n'
+                         + "".join(f"{f:.4f}\t{g:.4f}\n" for f, g in zip(freqs, gains)),
+        # miniDSP EARS: TWO quoted headers, * comments, 3-column rows.
+        "two_header": '"Sens Factor =-0.8dB, EARS Serial 999-9999, compensation RAW V1"\n'
+                      '"Use this file on the LEFT channel. Your sensitive side is RIGHT."\n'
+                      "*\n* Freq(Hz) SPL(dB) Phase(degrees)\n*\n" + triples,
+    }
+    for name, text in cases.items():
+        save_case("compensation", name, {"cal_file": f"{name}.cal.txt"},
+                  {"freqs": freqs, "gains": gains})
+        (OUT / "compensation" / f"{name}.cal.txt").write_text(text)
+
+
+def gen_gaussian_smoothing():
+    """scipy.ndimage.gaussian_filter1d on the log-f axis (Tier 2).
+
+    The reference for fr.rs's Alvarez-Mazorra recursion, which is by construction
+    an APPROXIMATION to a true Gaussian -- hence the spec's 1e-3 dB "published
+    accuracy" bar rather than a parity bar.
+
+    Boundary handling is deliberately lifted out of the comparison: the curve is
+    flat over its outer 200 bins, wider than 6*sigma at the widest sigma here, and
+    every sane extension -- scipy's reflect, mirror, nearest, and AM's own --
+    reproduces a constant identically. AM's boundary treatment differs from
+    scipy's and is not the claim under test; the kernel shape is. A case with
+    structure running into the edge would fail on the extension and read as a
+    kernel bug.
+
+    sigma is in BINS on the uniform octave axis, where constant sigma IS
+    constant-Q -- the coordinate trick fdw.rs shares. At 96 ppo: 2 bins = 1/48
+    oct, 8 = 1/12, 32 = 1/3, spanning what fr.rs's Variable profile drives. The
+    fraction->sigma mapping is fr.rs's own design decision and is NOT pinned here.
+    """
+    rng = np.random.default_rng(48)
+    freqs = log_grid()
+    flat = 200
+    interior = np.cumsum(rng.standard_normal(freqs.shape[0] - 2 * flat)) * 0.3
+    interior = np.clip(interior - interior.mean(), -12.0, 12.0)
+    mag_db = np.concatenate([np.full(flat, interior[0]), interior, np.full(flat, interior[-1])])
+    for sigma in (2.0, 8.0, 32.0):
+        save_case("fr", f"gaussian_sigma{int(sigma)}",
+                  {"flat_margin_bins": flat, "mode": "reflect", "ppo": 96,
+                   "sigma_bins": sigma, "truncate": 4.0},
+                  {"freqs": freqs, "mag_db": mag_db,
+                   "smoothed": gaussian_filter1d(mag_db, sigma, mode="reflect", truncate=4.0)})
+
+
+def gen_logf():
+    """resample_db_to_log_grid at Prefilter::None == np.interp (Tier 2).
+
+    np.interp is the entire contract at this setting: linear interpolation in f
+    (NOT in log f) from the linear FFT axis onto the log grid, carrying
+    np.interp's edge-hold outside the source range -- which a real n_fft axis
+    spanning 0..sr/2 never reaches, and which this case therefore does not
+    manufacture.
+
+    The AntiComb prefilter is NOT pinned here. It is Tier 3, asserted as the
+    aliasing DIFFERENCE it exists to remove, which is the only form of the claim
+    that means anything.
+    """
+    rng = np.random.default_rng(49)
+    n_fft = 16384
+    freqs_linear = np.arange(n_fft // 2 + 1) * (SR / n_fft)
+    mag_db = np.cumsum(rng.standard_normal(freqs_linear.shape[0])) * 0.08
+    mag_db = np.clip(mag_db - mag_db.mean(), -18.0, 18.0)
+    grid_freqs = log_grid()
+    save_case("logf", "resample_db",
+              {"f_max": 20000.0, "f_min": 20.0, "n_fft": n_fft, "ppo": 96,
+               "prefilter": "none", "sample_rate": SR},
+              {"freqs_linear": freqs_linear, "grid_freqs": grid_freqs, "mag_db": mag_db,
+               "resampled": np.interp(grid_freqs, freqs_linear, mag_db)})
+
+
+def gen_rms_average():
+    """Power/RMS spatial average and sigma(f) vs numpy (Tier 2).
+
+    The five curves are pre-aligned in the 200-2000 Hz band -- their band means
+    agree to float precision -- so align_spl is a no-op on them (offsets ~1e-15
+    dB) and the set reaches the type-gated estimators without moving this
+    reference off 1e-12. Removing the band offsets SHAPES THE INPUT; the expected
+    outputs are numpy's alone, which is what keeps the tier honest.
+
+    align_spl itself, and the pinned -30 dB-null numbers (dB-avg = -6.0 vs
+    power-avg = -0.97), are Tier 3: those assert the two estimators' divergence,
+    a claim about physics rather than about numpy.
+    """
+    rng = np.random.default_rng(50)
+    freqs = log_grid()
+    n_positions = 5
+    walk = np.cumsum(rng.standard_normal((n_positions, freqs.shape[0])), axis=1) * 0.15
+    meas = -0.9 * np.log2(freqs / freqs[0]) + np.clip(
+        walk - walk.mean(axis=1, keepdims=True), -12.0, 12.0)
+    band = (freqs >= 200.0) & (freqs <= 2000.0)
+    band_means = meas[:, band].mean(axis=1)
+    meas = meas - (band_means - band_means.mean())[:, None]
+    save_case("fr", "rms_average",
+              {"axis_order": "position_bin", "band_hz": [200.0, 2000.0], "ddof": 0,
+               "n_positions": n_positions, "ppo": 96},
+              {"freqs": freqs, "measurements": meas,
+               "rms_db": 10.0 * np.log10(np.mean(10.0 ** (meas / 10.0), axis=0)),
+               "sigma_db": np.std(meas, axis=0, ddof=0)})
+
+
+def gen_schroeder():
+    """Schroeder backward integration vs a numpy reverse cumsum (Tier 2).
+
+    E(t) = integral_t^inf h^2(tau) dtau, reported as 10*log10(E(t)/E(0)). E(0) is
+    the total energy and therefore the maximum, h^2 being non-negative -- so
+    normalizing to E[0] and to E.max() are the same operation here. Pinned as one
+    array so a reimplementation cannot quietly normalize to something else.
+
+    The IR is exponentially-decayed noise with a KNOWN T60 of 0.12 s: the envelope
+    is exp(-t*ln(1000)/T60), since -60 dB is a factor of 1e-3 in amplitude.
+    Recovering that T60 from a -5..-25 dB fit is Tier 3, analytic, in room.rs --
+    this case pins the integration and nothing else. The curve runs 0 -> -107.6 dB
+    and is finite throughout (no sample is exactly zero, so no log10(0)).
+    """
+    rng = np.random.default_rng(51)
+    n, t60_s = 8192, 0.12
+    ir = rng.standard_normal(n) * np.exp(-(np.arange(n) / SR) * np.log(1000.0) / t60_s)
+    energy = np.cumsum(ir[::-1] ** 2)[::-1]
+    save_case("room", "schroeder_decay", {"n": n, "sample_rate": SR, "t60_s": t60_s},
+              {"decay_db": 10.0 * np.log10(energy / energy[0]), "ir": ir})
+
+
+def gen_windows():
+    """scipy.signal.windows at sym=True, the convention window.rs adopts (Tier 2).
+
+    Both length parities: the sym denominator is n-1, which is where off-by-ones
+    live. Tukey rides its shipping alpha=0.25, which at n=9 degenerates to a
+    taper exactly one sample wide -- the endpoints alone, [0,1,1,1,1,1,1,1,0] --
+    the case a half-open taper loop gets wrong.
+
+    Compare on an ABSOLUTE tolerance. The spec's "1e-12" is not safe read as
+    relative: blackmanharris's 4-term cosine sum cancels to ~6e-5 at the edges,
+    so scipy's summation order and any reimplementation's diverge by up to
+    5.8e-13 RELATIVE at n=4096 while sitting at 1e-16 absolute (measured, not
+    assumed). Windows are bounded in [0, 1]; absolute is the meaningful measure.
+
+    Tukey's alpha=0 -> Rect and alpha=1 -> Hann identities are NOT pinned here.
+    They hold exactly in scipy (verified via np.array_equal) and the spec assigns
+    them to Tier 3; with Rect and Hann pinned below, a Rust identity assertion
+    implies them against scipy anyway, so a fixture would only duplicate it.
+    """
+    fns = {"blackmanharris": blackmanharris, "boxcar": boxcar, "hann": hann, "tukey": tukey}
+    for kind, scipy_window, kwargs in (
+        ("blackmanharris", "blackmanharris", {}),
+        ("hann", "hann", {}),
+        ("rect", "boxcar", {}),
+        ("tukey", "tukey", {"alpha": 0.25}),
+    ):
+        for n in (8, 9, 64, 4096):
+            save_case("window", f"{kind}_{n}",
+                      {"kind": kind, "n": n, "scipy_window": scipy_window, "sym": True, **kwargs},
+                      {"window": fns[scipy_window](n, sym=True, **kwargs)})
 
 
 def gen_targets():
@@ -267,6 +480,7 @@ def main():
     gen_sweep()
     gen_deconvolution()
     gen_frequency_response()
+    gen_cal()
     gen_compensation()
     gen_targets()
     gen_fir()
@@ -274,6 +488,13 @@ def main():
     gen_peq_autofit()
     gen_convolver()
     gen_iir()
+    # Tier 2 -- scipy/numpy-direct, no paraeq import. Their Rust consumers land
+    # in stages 3-4; the fixtures come first, which is the point of the tier.
+    gen_gaussian_smoothing()
+    gen_logf()
+    gen_rms_average()
+    gen_schroeder()
+    gen_windows()
     manifest = {
         "dtype": "<f8",
         "numpy": np.__version__,

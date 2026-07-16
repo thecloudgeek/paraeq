@@ -1,0 +1,18 @@
+{
+ "arrays": {
+  "window": {
+   "file": "rect_9.window.f64",
+   "len": 9,
+   "shape": [
+    9
+   ]
+  }
+ },
+ "params": {
+  "kind": "rect",
+  "n": 9,
+  "scipy_window": "boxcar",
+  "sym": true
+ },
+ "scalars": {}
+}
