@@ -205,6 +205,61 @@ fn ioproc_on_tap_aggregate_delivers_callbacks() {
     assert!(errors.is_empty(), "teardown errored: {errors:?}");
 }
 
+/// R1-5 regression: the aggregate composes its sub-device with
+/// `kAudioSubDeviceInputChannelsKey: 0` (tap.rs::create_aggregate), so the
+/// IOProc's input buffer list must carry the tap's channels and nothing
+/// else — no mic buffers from the physical output's own input streams.
+/// Trivially green on a mic-less output; the meaningful run needs a
+/// mic-capable default output selected (AirPods, USB headset). Does not
+/// need the TCC capture grant (buffer layout flows in silent-zeros mode).
+#[test]
+#[ignore = "requires audio hardware; meaningful only with a mic-capable default output"]
+fn aggregate_input_carries_only_tap_channels() {
+    let mut sys = TapSystem::create().expect("TapSystem::create");
+    let tap_channels = sys.format.mChannelsPerFrame as u64;
+
+    let count = Arc::new(AtomicU64::new(0));
+    let max_in_channels = Arc::new(AtomicU64::new(0));
+    let cb_count = Arc::clone(&count);
+    let cb_max = Arc::clone(&max_in_channels);
+    let cb: IoCallback = Box::new(move |block| {
+        let mut total: u64 = 0;
+        for (_, buf_channels) in block.input.buffers() {
+            total += buf_channels.max(1) as u64;
+        }
+        cb_max.fetch_max(total, Ordering::Relaxed);
+        cb_count.fetch_add(1, Ordering::Relaxed);
+    });
+
+    let mut io = IoProcHandle::register(sys.aggregate, cb).expect("IoProcHandle::register");
+    io.start().expect("IoProcHandle::start");
+    let playback = Playback::start();
+
+    // Same engage tolerance as the callback-rate test: up to 10 s for the
+    // first callback, then 1 s of steady-state layout observation.
+    let engage_deadline = Instant::now() + Duration::from_secs(10);
+    while count.load(Ordering::Relaxed) == 0 && Instant::now() < engage_deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let engaged = count.load(Ordering::Relaxed);
+    std::thread::sleep(Duration::from_secs(1));
+
+    io.stop();
+    drop(playback);
+
+    assert!(engaged > 0, "IOProc never engaged within 10 s");
+    let max_seen = max_in_channels.load(Ordering::Relaxed);
+    eprintln!("input layout: max {max_seen} channels/callback (tap format: {tap_channels})");
+    assert!(
+        max_seen <= tap_channels,
+        "aggregate delivered {max_seen} input channels but the tap format has only \
+         {tap_channels} — the sub-device's input streams leaked into the aggregate"
+    );
+
+    let errors = sys.teardown();
+    assert!(errors.is_empty(), "teardown errored: {errors:?}");
+}
+
 /// Registration/removal round-trip on the system object. Does not need the
 /// TCC grant (property listeners are not capture); `#[ignore]` anyway for
 /// CI-safety and parity with the suite — CI has no HAL at all.

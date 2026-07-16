@@ -148,16 +148,11 @@ impl TapBackend {
         // 4. The realtime closure. REALTIME LANE: no allocation, no locks,
         // no logging, and NEVER a panic on HAL-supplied values.
         //
-        // KNOWN LIMITATION — input-stream identification: the deinterleave
-        // below assumes the tap's stream(s) are the only (or first) buffers
-        // in the aggregate's input list. A default output device that ALSO
-        // exposes input streams (AirPods, USB headsets with mics) may
-        // contribute mic buffers whose position in the input buffer list is
-        // undocumented; if such a buffer preceded the tap stream, mic
-        // samples would be treated as tap input. Validation needed: an
-        // owner hardware test with a mic-capable default output (see the
-        // manual checklist in docs/CONTEXT.md). No stream-identification
-        // heuristic is attempted until that test says one is needed.
+        // Input-stream identity: the aggregate composes its sub-device with
+        // kAudioSubDeviceInputChannelsKey: 0 (tap.rs::create_aggregate), so
+        // the input buffer list below carries the tap's stream(s) only — a
+        // mic-capable default output (AirPods, USB headset) contributes no
+        // mic buffers and no stream-identification logic is needed.
         let mut processor = processor;
         let cb: IoCallback = Box::new(move |mut block: IoBlock<'_>| {
             // Zero ALL output buffers first (spike order, main.rs:56-60):

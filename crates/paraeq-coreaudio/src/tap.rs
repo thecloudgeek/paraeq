@@ -9,13 +9,16 @@ use objc2_core_audio::{
     kAudioAggregateDeviceIsPrivateKey, kAudioAggregateDeviceIsStackedKey,
     kAudioAggregateDeviceMainSubDeviceKey, kAudioAggregateDeviceNameKey,
     kAudioAggregateDeviceSubDeviceListKey, kAudioAggregateDeviceTapAutoStartKey,
-    kAudioAggregateDeviceTapListKey, kAudioAggregateDeviceUIDKey, kAudioSubDeviceUIDKey,
-    kAudioSubTapDriftCompensationKey, kAudioSubTapUIDKey, AudioHardwareCreateAggregateDevice,
-    AudioHardwareCreateProcessTap, AudioHardwareDestroyAggregateDevice,
-    AudioHardwareDestroyProcessTap, AudioObjectID, CATapDescription, CATapMuteBehavior,
+    kAudioAggregateDeviceTapListKey, kAudioAggregateDeviceUIDKey, kAudioSubDeviceInputChannelsKey,
+    kAudioSubDeviceUIDKey, kAudioSubTapDriftCompensationKey, kAudioSubTapUIDKey,
+    AudioHardwareCreateAggregateDevice, AudioHardwareCreateProcessTap,
+    AudioHardwareDestroyAggregateDevice, AudioHardwareDestroyProcessTap, AudioObjectID,
+    CATapDescription, CATapMuteBehavior,
 };
 use objc2_core_audio_types::AudioStreamBasicDescription;
-use objc2_core_foundation::{CFArray, CFBoolean, CFDictionary, CFRetained, CFString, CFType};
+use objc2_core_foundation::{
+    CFArray, CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType,
+};
 use objc2_foundation::{NSArray, NSNumber, NSString};
 
 use crate::error::{check, CaError};
@@ -54,10 +57,21 @@ pub fn create_tap(
 pub fn create_aggregate(out_uid: &CFString, tap_uuid: &NSString) -> Result<AudioObjectID, CaError> {
     let key = |c: &std::ffi::CStr| CFString::from_str(c.to_str().unwrap());
 
-    // sub-device entry: { uid: <output device UID> }
+    // sub-device entry: { channels-in: 0, uid: <output device UID> }.
+    // input-channels 0 excludes the physical output's own input streams
+    // (AirPods / USB-headset mics) from the aggregate: without it, mic
+    // buffers of undocumented position share the IOProc's input list with
+    // the tap stream, and running the IOProc counts as microphone access
+    // (spurious TCC mic prompt at engine start — the OnlyEQ gotcha).
     let sub_dev: CFRetained<CFDictionary<CFString, CFType>> = CFDictionary::from_slices(
-        &[&*key(kAudioSubDeviceUIDKey)],
-        &[out_uid.as_ref() as &CFType],
+        &[
+            &*key(kAudioSubDeviceInputChannelsKey),
+            &*key(kAudioSubDeviceUIDKey),
+        ],
+        &[
+            CFNumber::new_i32(0).as_ref() as &CFType, // CFNumber, NOT CFBoolean
+            out_uid.as_ref() as &CFType,
+        ],
     );
     // sub-tap entry: { uid: <CATapDescription UUID string>, drift: true }
     let tap_uid_cf = CFString::from_str(&tap_uuid.to_string());
