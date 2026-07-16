@@ -10,12 +10,28 @@ from scipy.interpolate import interp1d
 logger = logging.getLogger(__name__)
 
 
+# This module and crates/paraeq-dsp/src/compensation.rs must agree row for row
+# (see load_compensation), so the file grammar is pinned to the Rust parser's
+# rather than inherited from CPython, which is the looser of the two. Unicode is
+# the tie-breaker, so it is CPython that gives way in both cases below.
+_C0_SEPARATORS = frozenset("\x1c\x1d\x1e\x1f")
+_FLOAT_CHARS = frozenset("+-.0123456789Ee")
+
+
 def _parse_number(token: str) -> float | None:
     """Return the token's value, or None if it is not a number.
 
-    float() accepts "nan"/"inf"/"Infinity", so a prose line could otherwise
-    present itself as a data row. Only finite values are numbers here.
+    The grammar is the C-locale float that Rust's ``f64::from_str`` accepts:
+    ASCII only, no ``_`` digit separators. float() also takes ``1_000`` and
+    Arabic-Indic digits and Rust takes neither, so the alphabet is gated first.
+
+    float() accepts "nan"/"inf"/"Infinity" and returns inf on overflow, so a
+    prose line could otherwise present itself as a data row and 1e400 could ride
+    into the curve. Only finite values are numbers here. Rust reaches the same
+    verdict on every one of these by parsing and then filtering on is_finite.
     """
+    if not _FLOAT_CHARS.issuperset(token):
+        return None
     try:
         value = float(token)
     except ValueError:
@@ -23,10 +39,27 @@ def _parse_number(token: str) -> float | None:
     return value if math.isfinite(value) else None
 
 
+def _is_column_separator(char: str) -> bool:
+    """A comma or a Unicode White_Space char -- Rust's ``char::is_whitespace``.
+
+    str.split() also breaks on the C0 information separators (U+001C-U+001F),
+    which Unicode does not give the White_Space property; Rust keeps them inside
+    the token, where they make it fail to parse. Excluded so both agree.
+    """
+    return char == "," or (char.isspace() and char not in _C0_SEPARATORS)
+
+
 def _columns(line: str) -> list[str]:
-    """Split on whitespace or commas: UMIK-1 rows are tab-separated and ParaEQ
-    CSV is comma-separated, and one rule now serves both."""
-    return line.replace(",", " ").split()
+    """Split on a comma or whitespace: UMIK-1 rows are tab-separated and ParaEQ
+    CSV is comma-separated, and one rule now serves both.
+
+    Separators are mapped to U+0020 and split on explicitly, because bare
+    ``.split()`` would break on the C0 separators this rule deliberately keeps.
+    Leading and trailing separators fall out as empty tokens, so the caller owes
+    this no ``strip`` -- which would itself have eaten those C0 chars.
+    """
+    spaced = "".join(" " if _is_column_separator(c) else c for c in line)
+    return [token for token in spaced.split(" ") if token]
 
 
 def load_compensation(filepath: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -44,7 +77,9 @@ def load_compensation(filepath: Path) -> tuple[np.ndarray, np.ndarray]:
     agree row for row, so they change together or not at all.
 
     Columns 0 and 1 are frequency (Hz) and gain (dB); column 2 (phase) is
-    ignored where present.
+    ignored where present. Lines end at ``\\r\\n``, ``\\r`` or ``\\n`` (text mode's
+    universal newlines, which parse_cal reproduces by hand); the tokenizer and
+    number grammar are pinned to Rust's, per the module comment above.
 
     Args:
         filepath: Path to the compensation file.
@@ -58,9 +93,14 @@ def load_compensation(filepath: Path) -> tuple[np.ndarray, np.ndarray]:
     """
     freqs_list: list[float] = []
     gains_list: list[float] = []
-    with open(filepath, "r") as f:
+    # utf-8-sig strips one leading BOM if present. U+FEFF is not whitespace, so
+    # it would otherwise ride into the first token, make a headerless file's
+    # first row parse as a header, and edge-hold the curve from the SECOND row
+    # down -- silently, and worst where correction authority is highest. The
+    # explicit encoding also pins what Rust's read_to_string already assumes.
+    with open(filepath, "r", encoding="utf-8-sig") as f:
         for line in f:
-            columns = _columns(line.strip())
+            columns = _columns(line)
             if not columns:
                 continue
             freq = _parse_number(columns[0])

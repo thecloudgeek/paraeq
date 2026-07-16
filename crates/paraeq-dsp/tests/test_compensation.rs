@@ -279,3 +279,125 @@ fn validator_flags_frequency_order_defects() {
         "{kinds:?}"
     );
 }
+
+/// A UTF-8 BOM is an encoding marker, not content, and U+FEFF is not
+/// White_Space -- so before the strip it rode into the first token, a
+/// headerless file's first row parsed as a header, and the curve edge-held
+/// from the SECOND row down. Silent, and worst below 50 Hz where correction
+/// authority is highest. The oracle reads utf-8-sig for the same reason.
+#[test]
+fn a_utf8_bom_does_not_eat_the_first_data_row() {
+    let body = "20,0.5\n50,0.3\n100,0.0\n1000,-0.2\n20000,-2.0\n";
+    let bare = compensation::parse_cal(body).unwrap();
+    let bommed = compensation::parse_cal(&format!("\u{feff}{body}")).unwrap();
+    assert_eq!(bommed.freqs, bare.freqs, "the BOM must not drop a row");
+    assert_eq!(bommed.freqs[0], 20.0);
+    assert!(bommed.ignored_lines.is_empty());
+
+    // A BOM on a header line was always harmless (the header is ignored
+    // either way) and must stay so.
+    let headered = compensation::parse_cal("\u{feff}\"Sens Factor =-0.421dB\"\n20,0.5\n").unwrap();
+    assert_eq!(headered.freqs, vec![20.0]);
+    assert_eq!(headered.sens_factor_db, Some(-0.421));
+}
+
+/// `\r\n`, `\r` and `\n` all end a line. `str::lines` splits on `\n` only, so
+/// a CR-only file reached `columns` as ONE line and -- `'\r'` being
+/// whitespace -- tokenized into a single silently truncated row, while the
+/// oracle's text-mode read (universal newlines) returned every row.
+#[test]
+fn every_line_ending_ends_a_line() {
+    let rows = vec![20.0, 50.0, 20000.0];
+    for (name, content) in [
+        ("LF", "20,0.5\n50,0.3\n20000,-2.0\n"),
+        ("CRLF", "20,0.5\r\n50,0.3\r\n20000,-2.0\r\n"),
+        ("CR", "20,0.5\r50,0.3\r20000,-2.0\r"),
+    ] {
+        let cal = compensation::parse_cal(content).unwrap();
+        assert_eq!(cal.freqs, rows, "{name}: a row was lost");
+        assert!(
+            cal.ignored_lines.is_empty(),
+            "{name}: {:?}",
+            cal.ignored_lines
+        );
+    }
+}
+
+/// The number grammar is the C-locale float, pinned on both sides: CPython's
+/// `float()` is the looser of the two (it takes `1_000` and Arabic-Indic
+/// digits; Rust takes neither), so the oracle gates on the ASCII float
+/// alphabet before calling it. A token Rust rejects must be a header on both.
+#[test]
+fn the_number_grammar_is_the_c_locale_float() {
+    // Underscored and non-ASCII digits are not numbers -> the line is a header.
+    let cal = compensation::parse_cal("1_000,0.5\n٢٠,0.5\n20,0.5\n20000,-2.0\n").unwrap();
+    assert_eq!(cal.freqs, vec![20.0, 20000.0]);
+    assert_eq!(cal.ignored_lines, vec!["1_000,0.5", "٢٠,0.5"]);
+    // Overflow to inf is not a number either (f64::from_str returns inf).
+    assert!(compensation::parse_cal("1e400,0.5\n").is_err());
+}
+
+/// The validator predicts each point from its neighbours on the LOG-frequency
+/// axis, because cal grids are log-spaced. `neighbour_deviation_db`'s own
+/// comment says a linear-in-f interpolant "would skew every prediction toward
+/// the upper neighbour and manufacture outliers on a smooth curve" -- this
+/// pins that claim. (`apply_compensation` interpolates in linear f, which is
+/// the oracle-pinned Tier-1 behaviour and a separate contract.)
+///
+/// 100/200/400 Hz is a symmetric octave straddle: 200 Hz is the log-f
+/// midpoint, so a curve linear in log-f is predicted EXACTLY and is silent.
+/// A linear-f interpolant puts the midpoint at t = 1/3 instead of 1/2 and
+/// mispredicts by (1/2 - 1/3) x 12 dB = 2.0 dB -- twice DEFAULT_OUTLIER_DB,
+/// so the mutant warns where the real interpolant does not.
+#[test]
+fn the_validator_interpolates_in_log_frequency() {
+    let smooth = compensation::parse_cal("100,0.0\n200,6.0\n400,12.0\n").unwrap();
+    assert_eq!(
+        compensation::validate_cal(&smooth),
+        vec![],
+        "a curve linear in log-f is smooth: a linear-f interpolant would \
+         manufacture a 2.0 dB outlier at 200 Hz"
+    );
+
+    // The mirror image: a curve linear in LINEAR f is genuinely kinked in
+    // log-f, and must be flagged. Pins the direction of the axis, so the test
+    // cannot pass by simply never warning.
+    let kinked = compensation::parse_cal("100,0.0\n200,4.0\n400,12.0\n").unwrap();
+    let warnings = compensation::validate_cal(&kinked);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(warnings[0].freq_hz, 200.0);
+}
+
+/// SuspectZero is the vendor's specific exact-0.0000 signature, and both
+/// neighbour gates are load-bearing: an outlying zero whose neighbour is
+/// itself near 0 dB is a curve crossing zero steeply, not a dropped sample,
+/// and must report as a plain Outlier.
+///
+/// Note both cases must be genuine OUTLIERS: the kind is chosen only inside
+/// an over-threshold run, so a silent curve exercises neither gate and would
+/// pass no matter what they said.
+#[test]
+fn suspect_zero_needs_both_neighbours_far_from_zero() {
+    // Zero between two neighbours far from 0 dB: the vendor defect.
+    let defect = compensation::parse_cal("20,-3.0\n50,-3.0\n100,0.0\n1000,-3.0\n").unwrap();
+    let warnings = compensation::validate_cal(&defect);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(warnings[0].freq_hz, 100.0);
+    assert!(matches!(
+        warnings[0].kind,
+        CalWarningKind::SuspectZero { .. }
+    ));
+
+    // An outlying zero whose LOWER neighbour is only 0.5 dB from zero: still
+    // a defect worth flagging, but not the vendor's signature -- Outlier.
+    let crossing = compensation::parse_cal("100,-0.5\n200,0.0\n400,8.0\n").unwrap();
+    let warnings = compensation::validate_cal(&crossing);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(warnings[0].freq_hz, 200.0);
+    assert!(
+        matches!(warnings[0].kind, CalWarningKind::Outlier { .. }),
+        "a zero beside a near-zero neighbour is a steep crossing, not the \
+         vendor's dropped-sample signature: {:?}",
+        warnings[0].kind
+    );
+}

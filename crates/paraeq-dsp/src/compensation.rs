@@ -6,6 +6,13 @@
 //! golden curve by generate_fixtures.py::gen_cal, so neither parser supplies
 //! its own expectation. 3 — analytic invariants for metadata, `ignored_lines`
 //! and `validate_cal`, which have no oracle at all.
+//!
+//! Agreeing "row for row" means the file grammar is pinned on both sides, not
+//! inherited from whatever each language's stdlib happens to do. Where CPython
+//! is the looser of the two the oracle is narrowed to this crate's rule, since
+//! Unicode -- not CPython -- is the tie-breaker: see `columns` (C0 information
+//! separators are not `White_Space`), `parse_number` (C-locale float alphabet)
+//! and `universal_lines` (a bare `\r` ends a line).
 
 use crate::DspError;
 use std::path::Path;
@@ -55,16 +62,28 @@ pub enum CalWarningKind {
     },
 }
 
-/// Split on whitespace OR commas: UMIK-1 rows are tab-separated and ParaEQ CSV
-/// is comma-separated, and one parser now serves both.
+/// Split on a comma OR a Unicode `White_Space` char: UMIK-1 rows are
+/// tab-separated and ParaEQ CSV is comma-separated, and one parser now serves
+/// both. Leading and trailing separators fall out as empty tokens, so the
+/// caller owes this no `trim`.
+///
+/// CPython's `str.split()` additionally breaks on the C0 information separators
+/// (U+001C-U+001F), which Unicode does NOT give `White_Space`; the oracle's
+/// `_columns` excludes them so the two tokenizers agree.
 fn columns(line: &str) -> impl Iterator<Item = &str> {
     line.split(|c: char| c == ',' || c.is_whitespace())
         .filter(|c| !c.is_empty())
 }
 
 /// A token is a number only if it parses AND is finite. `f64::from_str` accepts
-/// "NaN"/"inf", so without this a prose line could present itself as a data row
-/// and a NaN would ride into the curve. Mirrors the oracle's `_parse_number`.
+/// "NaN"/"inf" and returns `inf` on overflow, so without this a prose line could
+/// present itself as a data row and a NaN -- or `1e400` -- would ride into the
+/// curve.
+///
+/// The agreed grammar is the C-locale float: ASCII only, no `_` digit
+/// separators. Python's `float()` accepts `1_000` and Arabic-Indic digits and
+/// this does not, so the oracle's `_parse_number` gates on the ASCII float
+/// alphabet before calling `float()`.
 fn parse_number(token: &str) -> Option<f64> {
     token.parse::<f64>().ok().filter(|v| v.is_finite())
 }
@@ -87,6 +106,16 @@ fn scan_serial(line: &str) -> Option<String> {
     Some(rest[..end].to_string()).filter(|s| !s.is_empty())
 }
 
+/// `\r\n`, `\r` and `\n` all end a line. The oracle iterates a text-mode file,
+/// whose universal-newline translation ends a line at a bare `\r`; `str::lines`
+/// splits on `\n` only, so a CR-only file would reach `columns` as ONE line and
+/// -- `'\r'` being whitespace -- tokenize into a single silently truncated row.
+/// The empty piece a `\r\n` leaves behind is a blank line, which neither parser
+/// records.
+fn universal_lines(content: &str) -> impl Iterator<Item = &str> {
+    content.split('\n').flat_map(|line| line.split('\r'))
+}
+
 /// Parse a calibration file by REW's own rule: **only lines which begin with a
 /// number are loaded, others are ignored.** That single rule handles EARS (two
 /// quoted headers), UMIK-1 0-degree (one header), UMIK-1 90-degree (two),
@@ -99,12 +128,19 @@ fn scan_serial(line: &str) -> Option<String> {
 /// Errors only on a file with no data rows, or a row whose first column is a
 /// number but whose second is not (malformed data, not a header).
 pub fn parse_cal(content: &str) -> Result<CalFile, DspError> {
+    // A UTF-8 BOM is an encoding marker, not content, and U+FEFF is not
+    // White_Space -- so it rides into the first token, a headerless file's first
+    // row parses as a header, and the curve edge-holds from the SECOND row down.
+    // Silent, and worst exactly where correction authority is highest. Stripped
+    // once, here at the content boundary; the oracle reads utf-8-sig for this.
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+
     let mut freqs = Vec::new();
     let mut gains_db = Vec::new();
     let mut ignored_lines = Vec::new();
 
-    for line in content.lines() {
-        let mut cols = columns(line.trim());
+    for line in universal_lines(content) {
+        let mut cols = columns(line);
         let Some(first) = cols.next() else {
             continue; // blank
         };
