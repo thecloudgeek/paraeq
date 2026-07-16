@@ -97,8 +97,10 @@ pub struct TransducerCaps {
     /// at-tuning excursion with no air spring left.
     ///
     /// The room values are also `paraeq_decide::PathProfile::sweep_f_start_hz`.
-    /// Two tables, one number, by crate-DAG necessity — `test_level.rs` pins
-    /// both sides so they cannot drift apart silently.
+    /// Two tables, one number, by crate-DAG necessity — this table owns it (it
+    /// is a driver-excursion safety limit), and
+    /// `test_level.rs::both_crates_tabulate_the_same_room_sweep_start` compares
+    /// the two through a dev-dependency, so they cannot drift apart silently.
     pub f_start_hz: Option<f64>,
     /// § The Two-Clock Complication. Tabulated rather than derived, and the
     /// same for every class, because the reason is not per-class: the "trade

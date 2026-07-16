@@ -2385,6 +2385,7 @@ dependencies = [
 name = "paraeq-measure"
 version = "0.1.0"
 dependencies = [
+ "paraeq-decide",
  "paraeq-dsp",
  "thiserror 2.0.18",
  "trybuild",

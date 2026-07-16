@@ -13,5 +13,10 @@ version.workspace = true
 paraeq-dsp = { path = "../paraeq-dsp" }
 thiserror = { workspace = true }
 
+# paraeq-decide is a DEV-dependency only: `test_level.rs` cross-checks the one
+# number both crates tabulate (room `f_start_hz` / `PathProfile.sweep_f_start_hz`)
+# so the two tables cannot drift apart silently. It stays out of `cargo tree
+# -e normal`, so MS-1's dependency assertion is unaffected.
 [dev-dependencies]
+paraeq-decide = { path = "../paraeq-decide" }
 trybuild = { workspace = true }

@@ -180,3 +180,24 @@ fn a_sweep_level_carries_the_level_it_was_constructed_with() {
     let copy = level;
     assert_eq!(copy.dbfs_rms(), level.dbfs_rms());
 }
+
+/// The room sweep start is tabulated in two crates: `TransducerCaps.f_start_hz`
+/// here (a driver-excursion safety limit) and `PathProfile.sweep_f_start_hz` in
+/// paraeq-decide. The crate DAG forbids a normal dependency between them, so
+/// nothing links the two numbers at compile time and they can drift apart in
+/// review. This is that link: a dev-dependency, invisible to
+/// `cargo tree -e normal` and therefore to MS-1's dependency assertion.
+///
+/// If this test fails, do not "fix" it by editing one side — decide which
+/// table owns the number (measurement-safety's, since it is a safety limit)
+/// and correct the other.
+#[test]
+fn both_crates_tabulate_the_same_room_sweep_start() {
+    for class in [TransducerClass::Bookshelf, TransducerClass::Floorstander] {
+        assert_eq!(
+            caps_for(class).f_start_hz,
+            Some(paraeq_decide::profile_for(class).sweep_f_start_hz),
+            "{class:?}: the two f_start tables have drifted apart"
+        );
+    }
+}
