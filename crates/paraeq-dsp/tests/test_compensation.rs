@@ -235,8 +235,8 @@ fn a_single_defect_raises_a_single_warning_on_a_dense_grid() {
 
 #[test]
 fn validator_is_silent_on_a_smooth_curve() {
-    let cal = compensation::parse_cal("20,-3.13\n50,-3.11\n100,-3.09\n1000,-2.5\n20000,-1.0\n")
-        .unwrap();
+    let cal =
+        compensation::parse_cal("20,-3.13\n50,-3.11\n100,-3.09\n1000,-2.5\n20000,-1.0\n").unwrap();
     assert_eq!(compensation::validate_cal(&cal), vec![]);
 }
 
@@ -274,5 +274,8 @@ fn validator_flags_frequency_order_defects() {
         .iter()
         .map(|w| w.kind)
         .collect();
-    assert!(kinds.contains(&CalWarningKind::NonMonotonicFreq), "{kinds:?}");
+    assert!(
+        kinds.contains(&CalWarningKind::NonMonotonicFreq),
+        "{kinds:?}"
+    );
 }

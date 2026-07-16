@@ -50,7 +50,9 @@ pub enum CalWarningKind {
         value_db: f64,
     },
     /// Exact 0.0000 between non-zero neighbours -- the vendor's known bug.
-    SuspectZero { neighbours_db: (f64, f64) },
+    SuspectZero {
+        neighbours_db: (f64, f64),
+    },
 }
 
 /// Split on whitespace OR commas: UMIK-1 rows are tab-separated and ParaEQ CSV
@@ -110,9 +112,10 @@ pub fn parse_cal(content: &str) -> Result<CalFile, DspError> {
             ignored_lines.push(line.to_string()); // header, comment, prose
             continue;
         };
-        let gain = cols.next().and_then(parse_number).ok_or_else(|| {
-            DspError::Parse(format!("malformed cal row: {}", line.trim()))
-        })?;
+        let gain = cols
+            .next()
+            .and_then(parse_number)
+            .ok_or_else(|| DspError::Parse(format!("malformed cal row: {}", line.trim())))?;
         freqs.push(freq);
         gains_db.push(gain);
     }

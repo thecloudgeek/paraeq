@@ -182,7 +182,10 @@ fn stereo_channels(dev: AudioObjectID) -> [u32; 2] {
 /// this way. The caller must refuse or fall back to the SPL solve; it must never
 /// assume a level (spec § Hard Caps, `VolumeUncontrollable`).
 pub fn output_volume(dev: AudioObjectID) -> Result<Option<OutputVolume>, CaError> {
-    let master = output_addr(kAudioDevicePropertyVolumeScalar, kAudioObjectPropertyElementMain);
+    let master = output_addr(
+        kAudioDevicePropertyVolumeScalar,
+        kAudioObjectPropertyElementMain,
+    );
     if has_property(dev, &master) {
         return Ok(Some(OutputVolume {
             elements: vec![VolumeElement {
@@ -200,7 +203,10 @@ pub fn output_volume(dev: AudioObjectID) -> Result<Option<OutputVolume>, CaError
     for channel in stereo_channels(dev) {
         // A mono device can report both halves of its "stereo" pair as the same
         // channel; deduplicate so it is neither read nor restored twice.
-        if elements.iter().any(|e: &VolumeElement| e.element == channel) {
+        if elements
+            .iter()
+            .any(|e: &VolumeElement| e.element == channel)
+        {
             continue;
         }
         let addr = output_addr(kAudioDevicePropertyVolumeScalar, channel);
