@@ -120,6 +120,40 @@ def gen_compensation():
                "mag_db": mag, "compensated": out})
 
 
+def gen_cal():
+    """Cal-file parse cases for REW's leading-numeric rule (Tier 2).
+
+    Constructive, and deliberately so: each file is RENDERED FROM the golden
+    curve, so no parser supplies its own expectation and neither half of the
+    rewrite grades its own homework. `single_header` and `tab_delimited` pin
+    the dropped-first-row bug the old quote-sniff + skiprows=2 parsers shared
+    -- under the old rule they load six rows, not seven. `two_header` and
+    `comma_delimited` are the invariance witnesses: the old rule got those
+    right, which is exactly why the bug survived.
+    """
+    freqs = np.array([20.0, 50.0, 100.0, 1000.0, 5000.0, 10000.0, 20000.0])
+    gains = np.array([0.5, 0.3, 0.0, -0.2, -0.5, -1.0, -2.0])
+    triples = "".join(f"{f:>10.4f} {g:>9.4f} {0.0:>9.4f}\n" for f, g in zip(freqs, gains))
+    cases = {
+        # ParaEQ CSV: # comment, comma-separated pairs.
+        "comma_delimited": "# ParaEQ compensation curve\n"
+                           + "".join(f"{f:.4f},{g:.4f}\n" for f, g in zip(freqs, gains)),
+        # UMIK-1 0-degree: ONE quoted header, 3-column whitespace rows.
+        "single_header": '"Sens Factor =-0.4210dB, SERNO: 7103798"\n' + triples,
+        # UMIK-1 as shipped: one header, tab-separated pairs.
+        "tab_delimited": '"Sens Factor =-0.4210dB, AGain =18dB, SERNO: 7103798"\n'
+                         + "".join(f"{f:.4f}\t{g:.4f}\n" for f, g in zip(freqs, gains)),
+        # miniDSP EARS: TWO quoted headers, * comments, 3-column rows.
+        "two_header": '"Sens Factor =-0.8dB, EARS Serial 999-9999, compensation RAW V1"\n'
+                      '"Use this file on the LEFT channel. Your sensitive side is RIGHT."\n'
+                      "*\n* Freq(Hz) SPL(dB) Phase(degrees)\n*\n" + triples,
+    }
+    for name, text in cases.items():
+        save_case("compensation", name, {"cal_file": f"{name}.cal.txt"},
+                  {"freqs": freqs, "gains": gains})
+        (OUT / "compensation" / f"{name}.cal.txt").write_text(text)
+
+
 def gen_targets():
     targets = list_builtin_targets()
     harman = next(t for t in targets if t.name == "Harman In-Ear 2019")
@@ -267,6 +301,7 @@ def main():
     gen_sweep()
     gen_deconvolution()
     gen_frequency_response()
+    gen_cal()
     gen_compensation()
     gen_targets()
     gen_fir()
