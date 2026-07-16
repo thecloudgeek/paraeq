@@ -17,6 +17,17 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # MS-1 (2026-07-15 measurement-safety-design.md): the level policy stays
+      # reachable from a future headless `paraeqd` and testable against mocks
+      # only while it depends on neither Tauri nor CoreAudio. The hardware side
+      # arrives through the `seam` traits, so this must stay empty.
+      - name: paraeq-measure depends on no Tauri and no CoreAudio
+        run: |
+          if cargo tree -p paraeq-measure -e normal | grep -Eiq 'tauri|core-?audio'; then
+            cargo tree -p paraeq-measure -e normal
+            echo "::error::paraeq-measure gained a forbidden dependency (MS-1)"
+            exit 1
+          fi
 
   frontend:
     runs-on: macos-15
