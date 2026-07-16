@@ -103,14 +103,30 @@ impl ParametricEQ {
     /// GraphicEQ/FIR outputs). No oracle counterpart: the prototype hardcodes
     /// "Preamp: 0.0 dB" (2026-07-15 engine-hardening spec, R1-1).
     ///
-    /// The peak is over the realized cascade (`frequency_response`), not the
-    /// per-band gain sum — overlapping boosts are superadditive, boosts
-    /// against cuts subadditive. Grid (decided in R1-1): sorted union of a
-    /// 1/48-octave log grid over [1.0, 0.499·sample_rate], every band's fc
-    /// clamped into that range (a peaking band's maximum sits at its fc, so
-    /// the union makes peaks exact regardless of grid density), and the two
-    /// endpoints (shelf maxima sit at DC/Nyquist).
+    /// The peak is over the realized cascade — what the engine's stability
+    /// funnel actually installs: rows failing [`biquad::is_stable`] are
+    /// evaluated as identity, mirroring `build_iir`'s R1-3 substitution.
+    /// (Without the mirror, one `q = 0`/NaN design turns the whole response
+    /// NaN, the max fold discards NaN, and the surviving boosts get zero
+    /// headroom — fail-unsafe in exactly the direction the preamp exists to
+    /// prevent.) Not the per-band gain sum — overlapping boosts are
+    /// superadditive, boosts against cuts subadditive. Grid (decided in
+    /// R1-1): sorted union of a 1/48-octave log grid over
+    /// [1.0, 0.499·sample_rate], every band's fc clamped into that range (a
+    /// peaking band's maximum sits at its fc, so the union makes peaks
+    /// exact regardless of grid density), and the two endpoints (shelf
+    /// maxima sit at DC/Nyquist).
     pub fn preamp_db(&self) -> f64 {
+        // sos_frequency_response_db's +1e-10 ADDITIVE magnitude floor lifts
+        // a near-unity response by up to ~8.7e-10 dB, which would turn a
+        // pure-cut cascade's preamp into a tiny negative number at the top
+        // grid endpoint (|H| within ~1e-12 of 1.0 there). Peaks at or below
+        // this ceiling are the bias, not a boost: exactly 0.0 by the
+        // DIVERGENCES.md #14 convention.
+        const BIAS_CEILING_DB: f64 = 1e-8;
+        if self.bands.is_empty() {
+            return 0.0;
+        }
         // .max(1.0) keeps the range non-empty (and fc's clamp valid) for
         // degenerate sample rates; unreachable for real audio rates.
         let f_max = (0.499 * self.sample_rate).max(1.0);
@@ -128,11 +144,21 @@ impl ParametricEQ {
         }
         grid.sort_by(f64::total_cmp);
         grid.dedup();
-        let peak = self
-            .frequency_response(&grid)
+        let sos: Vec<[f64; 6]> = self
+            .combined_sos()
+            .into_iter()
+            .map(|row| {
+                if biquad::is_stable(&row) {
+                    row
+                } else {
+                    biquad::IDENTITY
+                }
+            })
+            .collect();
+        let peak = biquad::sos_frequency_response_db(&sos, &grid, self.sample_rate)
             .into_iter()
             .fold(f64::NEG_INFINITY, f64::max);
-        if peak > 0.0 {
+        if peak > BIAS_CEILING_DB {
             -peak
         } else {
             0.0

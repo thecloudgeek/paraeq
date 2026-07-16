@@ -7,7 +7,7 @@
 //! control plane via [`build_fir`] / [`build_iir`] and moved in whole through
 //! [`RealtimeChain::set_correction`].
 
-use paraeq_dsp::biquad::is_stable;
+use paraeq_dsp::biquad::{is_stable, IDENTITY};
 
 use crate::convolver::OverlapAddConvolver;
 use crate::iir::IIRProcessor;
@@ -24,11 +24,17 @@ impl Correction {
     /// IIR delay lines are copied over ([`IIRProcessor::adopt_state_from`]);
     /// a no-op across kinds (a FIR overlap tail is `x_prev (*) h_old` and
     /// cannot be transplanted -- R1-7b's crossfade covers that arm) and
-    /// across a channel-count change. Realtime-safe: a bounded memcpy over
-    /// already-sized state, no allocation.
-    pub fn adopt_state_from(&mut self, old: &Correction) {
+    /// across a channel-count change. `channels` is the stream width the
+    /// chain processes: the processors' own slot counts are
+    /// broadcast-inflated when a config carries more SOS sets than the
+    /// stream has channels ([`build_iir`] sizes `channels.max(sets)`), so
+    /// comparing raw slot counts would misread a set-count artifact as a
+    /// channel-count change and reintroduce the click on that swap.
+    /// Realtime-safe: a bounded memcpy over already-sized state, no
+    /// allocation.
+    pub fn adopt_state_from(&mut self, old: &Correction, channels: usize) {
         if let (Correction::Iir(new), Correction::Iir(old)) = (self, old) {
-            if new.channels() == old.channels() {
+            if new.channels().min(channels) == old.channels().min(channels) {
                 new.adopt_state_from(old);
             }
         }
@@ -117,7 +123,7 @@ impl RealtimeChain {
     /// the only place the old processor still lives.
     pub fn set_correction(&mut self, mut c: Option<Correction>) -> Option<Correction> {
         if let (Some(new), Some(old)) = (c.as_mut(), self.correction.as_ref()) {
-            new.adopt_state_from(old);
+            new.adopt_state_from(old, self.channels);
         }
         std::mem::replace(&mut self.correction, c)
     }
@@ -218,13 +224,17 @@ impl RealtimeChain {
                 }
             }
             if nonfinite > 0 {
-                // Self-heal: a non-finite output means poisoned filter state
-                // (one NaN makes a DF2T section NaN for its lifetime), so
-                // clear it (reset is fill(0.0)-only -- rt-safe) instead of
-                // emitting noise forever. An audible discontinuity, but a
-                // click beats permanent noise. Input NaN never reaches here
-                // (zeroed at the capture boundary), so this only fires on
-                // filter-internal non-finites.
+                // Self-heal: a non-finite output usually means poisoned
+                // filter state (one NaN makes a DF2T section NaN for its
+                // lifetime), so clear it (reset is fill(0.0)-only --
+                // rt-safe) instead of emitting noise forever. An audible
+                // discontinuity, but a click beats permanent noise. Input
+                // NaN never reaches here (zeroed at the capture boundary);
+                // this fires on filter-internal non-finites OR on a finite
+                // f64 output overflowing the f32 downcast (|y| > f32::MAX
+                // casts to inf -- a Jury-stable cascade can still realize
+                // >770 dB of gain), so the reset is not proof of NaN state
+                // and must stay unconditional rather than keyed on it.
                 if let Some(c) = correction.as_mut() {
                     c.reset();
                 }
@@ -284,10 +294,6 @@ pub fn build_fir(firs: Vec<Vec<f64>>, channels: usize, block_size: usize) -> Cor
     c
 }
 
-/// The identity section installed in place of a rejected SOS row: passes
-/// samples through bit-exactly.
-const IDENTITY_SOS: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
-
 /// Build + warm up an IIR correction. Control plane only (allocates).
 /// Returns the correction and the count of substituted (dropped) sections.
 ///
@@ -324,7 +330,7 @@ pub fn build_iir(
                         sos
                     } else {
                         substituted += 1;
-                        IDENTITY_SOS
+                        IDENTITY
                     }
                 })
                 .collect()

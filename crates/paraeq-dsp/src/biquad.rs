@@ -65,6 +65,13 @@ pub fn notch(fc: f64, q: f64, sample_rate: f64) -> [f64; 6] {
     )
 }
 
+/// The identity second-order section: passes samples through bit-exactly.
+/// What the R1-3 stability funnel substitutes for a row failing
+/// [`is_stable`], in the engine's `build_iir` and in
+/// `ParametricEQ::preamp_db`'s realized-cascade peak — one constant so the
+/// two sanitizers cannot drift apart.
+pub const IDENTITY: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+
 /// Jury stability conditions for a real-coefficient second-order section:
 /// both poles strictly inside the unit circle.
 pub fn is_stable(sos: &[f64; 6]) -> bool {

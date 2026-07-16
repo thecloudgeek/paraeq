@@ -257,3 +257,55 @@ fn preamp_self_consistent_with_own_frequency_response() {
     let expected = -max_response_db(&peq, &grid).max(0.0);
     assert!((peq.preamp_db() - expected).abs() < 1e-12);
 }
+
+#[test]
+fn preamp_counts_surviving_boosts_when_a_band_designs_nan() {
+    // A q = 0 design yields NaN coefficients; the engine's build_iir funnel
+    // (R1-3) substitutes identity for that row alone and keeps the rest of
+    // the cascade running. preamp_db mirrors the substitution: the +12 dB
+    // survivor still needs its headroom. (Un-mirrored, the NaN response is
+    // discarded by the max fold and the preamp collapses to 0.0 —
+    // fail-unsafe.)
+    let peq = ParametricEQ {
+        bands: vec![
+            peaking_band(1000.0, 12.0, 1.0),
+            peaking_band(200.0, 3.0, 0.0),
+        ],
+        sample_rate: 48000.0,
+    };
+    assert!((peq.preamp_db() - (-12.0)).abs() < 0.02);
+
+    let nan_fc = ParametricEQ {
+        bands: vec![
+            peaking_band(1000.0, 12.0, 1.0),
+            peaking_band(f64::NAN, 3.0, 1.0),
+        ],
+        sample_rate: 48000.0,
+    };
+    assert!((nan_fc.preamp_db() - (-12.0)).abs() < 0.02);
+}
+
+#[test]
+fn preamp_lone_pure_cut_is_exactly_zero() {
+    // A single cut leaves |H| within ~1e-12 of unity at the top grid
+    // endpoint, where the response's +1e-10 additive magnitude floor pushes
+    // the dB value slightly positive (~8e-10). The bias ceiling must absorb
+    // it: exactly 0.0, with no wideband cut around to mask the edge (the
+    // multi-band pure-cut test's shelf pulls |H| below the bias there).
+    let cut = ParametricEQ {
+        bands: vec![peaking_band(100.0, -6.0, 2.0)],
+        sample_rate: 48000.0,
+    };
+    assert_eq!(cut.preamp_db(), 0.0);
+
+    let notch = ParametricEQ {
+        bands: vec![EQBand {
+            filter_type: FilterType::Notch,
+            fc: 60.0,
+            gain_db: 0.0,
+            q: 5.0,
+        }],
+        sample_rate: 48000.0,
+    };
+    assert_eq!(notch.preamp_db(), 0.0);
+}

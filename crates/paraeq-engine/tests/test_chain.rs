@@ -486,6 +486,45 @@ fn fir_to_iir_swap_starts_fresh() {
 }
 
 #[test]
+fn extra_sos_sets_do_not_defeat_the_transplant() {
+    // A config carrying MORE SOS sets than the stream has channels is
+    // accepted (build_iir sizes channels.max(sets), extra slots never
+    // process), so its slot count is broadcast-inflated: 3 sets on a
+    // stereo stream build a 3-slot processor. The transplant gate keys on
+    // the stream width, not slot counts — an identical-coefficient
+    // 3-set -> 2-set swap must stay a bit-exact no-op, not a zero-state
+    // click (regression: slot-count equality misread this as a
+    // channel-count change).
+    let sos = peaking(100.0, 12.0, 10.0, 48000.0);
+    let mut swapped = RealtimeChain::new(2, BLOCK);
+    swapped.set_correction(Some(
+        build_iir(vec![vec![sos], vec![sos], vec![sos]], 2, BLOCK).0,
+    ));
+    let mut unswapped = RealtimeChain::new(2, BLOCK);
+    unswapped.set_correction(Some(
+        build_iir(vec![vec![sos], vec![sos], vec![sos]], 2, BLOCK).0,
+    ));
+    for b in 0..64 {
+        if b == 32 {
+            swapped.set_correction(Some(build_iir(vec![vec![sos], vec![sos]], 2, BLOCK).0));
+        }
+        let input = sine100(b * BLOCK, BLOCK, 2);
+        let (out_s, outcome) = chain_process(&mut swapped, &input, false, 1.0);
+        assert!(outcome.corrected);
+        let (out_u, _) = chain_process(&mut unswapped, &input, false, 1.0);
+        for ch in 0..2 {
+            for i in 0..BLOCK {
+                assert_eq!(
+                    out_s[ch][i].to_bits(),
+                    out_u[ch][i].to_bits(),
+                    "block {b} ch {ch} sample {i}: set-count artifact defeated the transplant"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn channel_count_change_swap_starts_fresh() {
     // Stereo correction -> mono-built correction: the transplant is a
     // no-op across a channel-count change (spec R1-7a), so the incoming
