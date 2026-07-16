@@ -4,9 +4,16 @@ edition.workspace = true
 license.workspace = true
 version.workspace = true
 
+[features]
+# Wire derives for the types that cross into paraeq-decide's serializable
+# bundle (TargetCurve, TransducerClass) and its CorrectionPlan (EQBand,
+# FilterType). Off by default: the realtime crates never serialize these.
+serde = ["dep:serde"]
+
 [dependencies]
 realfft = { workspace = true }
 rustfft = { workspace = true }
+serde = { workspace = true, optional = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

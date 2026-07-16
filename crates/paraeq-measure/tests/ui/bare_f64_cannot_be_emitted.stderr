@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+  --> tests/ui/bare_f64_cannot_be_emitted.rs:30:34
+   |
+30 |     let _ = sink.emit(&[0.0; 4], -3.01);
+   |                  ----            ^^^^^ expected `SweepLevel`, found floating-point number
+   |                  |
+   |                  arguments to this method are incorrect
+   |
+note: method defined here
+  --> src/seam.rs
+   |
+   |     fn emit(&mut self, block: &[f64], level: SweepLevel) -> Result<(), MeasureError>;
+   |        ^^^^

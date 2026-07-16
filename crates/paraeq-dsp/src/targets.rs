@@ -10,7 +10,38 @@ pub const ANCHOR_FREQS: [f64; 16] = [
     8000.0, 12500.0, 20000.0,
 ];
 
+/// The four physical device kinds. Lives here because this is the only crate
+/// every consumer may depend on; its SEMANTICS are owned by `paraeq-decide`
+/// (it is `decide()`'s `bundle.class` input) and by the 2026-07-15
+/// decision-engine spec, which pins these four variants and no coarser
+/// `Room`: a room target is legal for BOTH room kinds.
+///
+/// Bookshelf and Floorstander are not an analysis branch — they differ in one
+/// capture-safety number (`sweep_f_start_hz`), and the low corner that
+/// actually distinguishes them is measured, never declared.
+///
+/// PROVISIONAL, pending the owner's call on the implementation plan's open
+/// question 3: this placement is the only one compatible with the crate DAG,
+/// but the variant naming is unsettled. The wizard spec labels these
+/// `Headphone`/`Iem`; those are DISPLAY names for `OverEar`/`InEar`, not
+/// distinct variants. Only the enum lives here — `match_closest_target`'s
+/// required-class rework and the `# classes:` header are Stage 3's, and the
+/// target fixtures are frozen until then.
+///
+/// `Ord` is declaration (alphabetical) order and carries no meaning — no class
+/// is "greater" than another. It exists so a class is usable as an ordered key
+/// and as a member of `paraeq-decide`'s `Domain::Choice` candidate set.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub enum TransducerClass {
+    Bookshelf,
+    Floorstander,
+    InEar,
+    OverEar,
+}
+
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct TargetCurve {
     pub name: String,
     pub frequencies: Vec<f64>,

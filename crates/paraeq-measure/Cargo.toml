@@ -1,0 +1,17 @@
+[package]
+name = "paraeq-measure"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+# Spec constraint (2026-07-15 measurement-safety-design.md, MS-1): paraeq-dsp
+# ONLY. No Tauri (the policy must stay reachable from a future `paraeqd`), no
+# paraeq-coreaudio (the hardware side arrives through the `seam` traits, so the
+# level policy stays testable against mocks), no unsafe. The `cargo tree`
+# assertion in CI is the enforcement; `#![forbid(unsafe_code)]` is the rest.
+[dependencies]
+paraeq-dsp = { path = "../paraeq-dsp" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+trybuild = { workspace = true }
