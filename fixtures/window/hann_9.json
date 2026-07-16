@@ -1,0 +1,18 @@
+{
+ "arrays": {
+  "window": {
+   "file": "hann_9.window.f64",
+   "len": 9,
+   "shape": [
+    9
+   ]
+  }
+ },
+ "params": {
+  "kind": "hann",
+  "n": 9,
+  "scipy_window": "hann",
+  "sym": true
+ },
+ "scalars": {}
+}
