@@ -78,3 +78,60 @@ fn fir_design_impulse_is_finite() {
     );
     assert!(taps.iter().all(|t| t.is_finite()));
 }
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// `is_stable` (strict Jury form) accepts every design inside the box
+    /// the four stability props above pin — designed filters sit strictly
+    /// inside the unit circle with margin, never on the slack boundary.
+    #[test]
+    fn is_stable_accepts_designed_box(fc in 20.0f64..20000.0, gain in -24.0f64..24.0, q in 0.1f64..20.0) {
+        prop_assert!(biquad::is_stable(&biquad::peaking(fc, gain, q, 48000.0)));
+        prop_assert!(biquad::is_stable(&biquad::low_shelf(fc, gain, q, 48000.0)));
+        prop_assert!(biquad::is_stable(&biquad::high_shelf(fc, gain, q, 48000.0)));
+        prop_assert!(biquad::is_stable(&biquad::notch(fc, q, 48000.0)));
+    }
+}
+
+/// Hand-constructed sections on the wrong side of each Jury condition,
+/// including the boundary itself (the strict form rejects |pole| == 1).
+#[test]
+fn is_stable_rejects_unstable_sections() {
+    // |a2| >= 1: pole radius at or outside the unit circle.
+    assert!(!biquad::is_stable(&[1.0, 0.0, 0.0, 1.0, 0.0, 1.01]));
+    assert!(!biquad::is_stable(&[1.0, 0.0, 0.0, 1.0, 0.0, 1.0]));
+    assert!(!biquad::is_stable(&[1.0, 0.0, 0.0, 1.0, 0.0, -1.0]));
+    // |a1| >= a2 + 1: a real pole at or outside the unit circle.
+    assert!(!biquad::is_stable(&[1.0, 0.0, 0.0, 1.0, 2.5, 0.9]));
+    assert!(!biquad::is_stable(&[1.0, 0.0, 0.0, 1.0, 1.9, 0.9]));
+    assert!(!biquad::is_stable(&[1.0, 0.0, 0.0, 1.0, -2.0, 1.0]));
+}
+
+/// Any non-finite coefficient fails — b-side too (a NaN numerator poisons
+/// the DF2T state even with stable poles).
+#[test]
+fn is_stable_rejects_non_finite_coefficients() {
+    let stable = [0.2, 0.3, 0.1, 1.0, -0.5, 0.25];
+    assert!(biquad::is_stable(&stable));
+    for i in 0..6 {
+        for bad in [f64::INFINITY, f64::NAN, f64::NEG_INFINITY] {
+            let mut sos = stable;
+            sos[i] = bad;
+            assert!(!biquad::is_stable(&sos), "sos[{i}] = {bad} must fail");
+        }
+    }
+}
+
+/// q = 0 makes `wa`'s alpha infinite and `row` divides inf/inf — the
+/// designers stay infallible by design (spec R1-3: they are oracle-pinned);
+/// `is_stable` is the wall that catches the NaN result.
+#[test]
+fn q_zero_designs_nan_coefficients_and_fails_is_stable() {
+    let sos = biquad::peaking(1000.0, 6.0, 0.0, 48000.0);
+    assert!(
+        sos.iter().any(|c| c.is_nan()),
+        "q = 0 must yield NaN coefficients, got {sos:?}"
+    );
+    assert!(!biquad::is_stable(&sos));
+}

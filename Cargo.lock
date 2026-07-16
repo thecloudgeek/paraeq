@@ -2362,6 +2362,7 @@ dependencies = [
  "arc-swap",
  "log",
  "paraeq-dsp",
+ "proptest",
  "realfft",
  "rtrb",
  "rustfft",

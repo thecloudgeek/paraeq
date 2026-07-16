@@ -3,14 +3,20 @@
 
 use std::f64::consts::PI;
 
+use paraeq_dsp::biquad;
 use paraeq_dsp::biquad::peaking;
-use paraeq_engine::chain::{build_fir, build_iir, ChainOutcome, RealtimeChain};
+use paraeq_engine::chain::{build_fir, build_iir, ChainOutcome, Correction, RealtimeChain};
 use paraeq_engine::convolver::OverlapAddConvolver;
 use paraeq_engine::iir::IIRProcessor;
+use proptest::prelude::*;
 
 const BLOCK: usize = 64;
+/// The identity section `build_iir` substitutes for an unstable row.
+const IDENTITY: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
 /// A stable, stateful biquad section (a1 = -0.5, a2 = 0.25).
 const SOS: [f64; 6] = [0.2, 0.3, 0.1, 1.0, -0.5, 0.25];
+/// A hand-unstable section: a2 > 1 puts a pole outside the unit circle.
+const UNSTABLE_SOS: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 1.01];
 
 /// Deterministic non-trivial test signal.
 fn sig(block: usize, ch: usize, i: usize) -> f32 {
@@ -79,7 +85,7 @@ fn no_correction_is_identity_with_gain_and_clamp() {
 #[test]
 fn iir_path_matches_direct_processor_across_blocks() {
     let mut chain = RealtimeChain::new(2, BLOCK);
-    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK)));
+    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK).0));
 
     let mut direct = IIRProcessor::new();
     direct.set_sos(0, vec![SOS]);
@@ -155,7 +161,7 @@ fn fir_path_matches_direct_convolver() {
 #[test]
 fn bypass_passes_through_and_edge_resets_state() {
     let mut chain = RealtimeChain::new(2, BLOCK);
-    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK)));
+    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK).0));
     let gain = 0.5f32;
 
     // Block 0: loud, correction active -- builds internal filter state.
@@ -209,7 +215,7 @@ fn mono_iir_config_broadcasts_to_both_channels() {
     // ONE SOS set on a 2-channel chain: the last (only) set is broadcast,
     // so both channels are corrected identically.
     let mut chain = RealtimeChain::new(2, BLOCK);
-    chain.set_correction(Some(build_iir(vec![vec![SOS]], 2, BLOCK)));
+    chain.set_correction(Some(build_iir(vec![vec![SOS]], 2, BLOCK).0));
 
     let mut direct = IIRProcessor::new();
     direct.set_sos(0, vec![SOS]);
@@ -666,7 +672,7 @@ fn nonfinite_correction_output_fires_backstop_and_resets() {
 #[test]
 fn oversized_frames_pass_through_for_any_correction() {
     let mut chain = RealtimeChain::new(2, BLOCK);
-    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK)));
+    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK).0));
 
     // 2x block_size exceeds the preallocated scratch; must NOT panic (the
     // HAL occasionally resizes) -- pass through with gain + clamp.
@@ -678,6 +684,151 @@ fn oversized_frames_pass_through_for_any_correction() {
         assert_eq!(ch.len(), 2 * BLOCK);
         for &s in ch {
             assert_eq!(s, 1.0, "0.9 * 2.0 clamps to 1.0");
+        }
+    }
+}
+
+#[test]
+fn stable_sections_install_without_substitution() {
+    let (_, substituted) = build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK);
+    assert_eq!(substituted, 0);
+}
+
+/// An injected unstable section is installed as identity: audio passes
+/// through that section unchanged (bit-exact through the f64 round trip)
+/// instead of exploding.
+#[test]
+fn unstable_section_is_substituted_and_passes_audio_unchanged() {
+    let (correction, substituted) = build_iir(vec![vec![UNSTABLE_SOS]], 2, BLOCK);
+    assert_eq!(substituted, 1);
+    let mut chain = RealtimeChain::new(2, BLOCK);
+    chain.set_correction(Some(correction));
+
+    for b in 0..3 {
+        let input = make_block(b, 2, BLOCK);
+        let (out, outcome) = chain_process(&mut chain, &input, false, 1.0);
+        assert!(outcome.corrected);
+        for ch in 0..2 {
+            for i in 0..BLOCK {
+                assert_eq!(
+                    out[ch][i].to_bits(),
+                    input[ch][i].to_bits(),
+                    "block {b} ch {ch} sample {i}: identity must pass through"
+                );
+            }
+        }
+    }
+}
+
+/// A mixed cascade keeps its stable rows: only the unstable row becomes
+/// identity, so the output equals a direct processor running the stable
+/// row alone.
+#[test]
+fn mixed_cascade_substitutes_only_the_unstable_row() {
+    let (correction, substituted) = build_iir(vec![vec![SOS, UNSTABLE_SOS]], 2, BLOCK);
+    assert_eq!(substituted, 1);
+    let mut chain = RealtimeChain::new(2, BLOCK);
+    chain.set_correction(Some(correction));
+
+    let mut direct = IIRProcessor::new();
+    direct.set_sos(0, vec![SOS]);
+    direct.set_sos(1, vec![SOS]);
+
+    let gain = 0.8f32;
+    for b in 0..3 {
+        let input = make_block(b, 2, BLOCK);
+        let (out, outcome) = chain_process(&mut chain, &input, false, gain);
+        assert!(outcome.corrected);
+
+        let in64: Vec<Vec<f64>> = input
+            .iter()
+            .map(|v| v.iter().map(|&s| s as f64).collect())
+            .collect();
+        let views: Vec<&[f64]> = in64.iter().map(|v| v.as_slice()).collect();
+        let mut out64 = vec![vec![0.0f64; BLOCK]; 2];
+        direct.process(&views, &mut out64);
+
+        for ch in 0..2 {
+            for i in 0..BLOCK {
+                let expected = downcast_gain_clamp(out64[ch][i], gain);
+                assert_eq!(
+                    out[ch][i].to_bits(),
+                    expected.to_bits(),
+                    "block {b} ch {ch} sample {i}: unstable row must act as identity"
+                );
+            }
+        }
+    }
+}
+
+/// q = 0 designs NaN coefficients (dsp-level test: test_props.rs); the
+/// build_iir funnel must catch them: identity installed, count == 1 (the
+/// bad INPUT row counts once, not once per broadcast channel).
+#[test]
+fn q_zero_design_is_substituted_and_counted_once() {
+    let sos = biquad::peaking(1000.0, 6.0, 0.0, 48000.0);
+    let (correction, substituted) = build_iir(vec![vec![sos]], 2, BLOCK);
+    assert_eq!(substituted, 1);
+    match &correction {
+        Correction::Iir(p) => {
+            for ch in 0..2 {
+                assert_eq!(p.sos(ch), Some(&[IDENTITY][..]), "channel {ch}");
+            }
+        }
+        Correction::Fir(_) => panic!("expected an Iir correction"),
+    }
+}
+
+/// fc at and above Nyquist: substituted and counted.
+#[test]
+fn nyquist_and_supra_nyquist_designs_are_substituted() {
+    // fc == sr/2 exactly: w0 = pi, alpha ~ 0 -- the poles land ON the unit
+    // circle in f64 and the strict Jury form rejects them.
+    let at_nyquist = biquad::peaking(24000.0, 6.0, 1.0, 48000.0);
+    let (_, substituted) = build_iir(vec![vec![at_nyquist]], 1, BLOCK);
+    assert_eq!(substituted, 1, "fc == sr/2 must be substituted");
+
+    // fc > sr/2: finite but aliased math; this design has a pole outside
+    // the unit circle.
+    let above_nyquist = biquad::peaking(30000.0, 6.0, 1.0, 48000.0);
+    let (_, substituted) = build_iir(vec![vec![above_nyquist]], 1, BLOCK);
+    assert_eq!(substituted, 1, "fc > sr/2 must be substituted");
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Hostile box (spec R1-3): far outside the parameter range the dsp
+    /// stability props pin, `build_iir` never panics and never installs a
+    /// section failing the STRICT Jury form -- bad rows surface only as
+    /// the substitution count.
+    #[test]
+    fn hostile_box_never_installs_unstable_sections(
+        fc in 0.0f64..1e6,
+        gain in -60.0f64..60.0,
+        q in 1e-6f64..1e6,
+        sr in prop_oneof![Just(44100.0f64), Just(48000.0f64), Just(96000.0f64)],
+    ) {
+        let designed = vec![
+            biquad::peaking(fc, gain, q, sr),
+            biquad::low_shelf(fc, gain, q, sr),
+            biquad::high_shelf(fc, gain, q, sr),
+            biquad::notch(fc, q, sr),
+        ];
+        let unstable = designed.iter().filter(|sos| !biquad::is_stable(sos)).count();
+        let (correction, substituted) = build_iir(vec![designed], 2, 32);
+        prop_assert_eq!(substituted, unstable);
+        match &correction {
+            Correction::Iir(p) => {
+                for ch in 0..2 {
+                    let sos = p.sos(ch).expect("broadcast installs every channel");
+                    prop_assert_eq!(sos.len(), 4);
+                    for row in sos {
+                        prop_assert!(biquad::is_stable(row), "installed unstable row {:?}", row);
+                    }
+                }
+            }
+            Correction::Fir(_) => prop_assert!(false, "expected an Iir correction"),
         }
     }
 }

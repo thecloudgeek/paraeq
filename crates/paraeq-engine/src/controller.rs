@@ -110,7 +110,18 @@ pub fn build_correction(
     match config {
         CorrectionConfig::Fir { firs } => build_fir(firs.clone(), channels, block_size),
         CorrectionConfig::Iir { sos_per_channel } => {
-            build_iir(sos_per_channel.clone(), channels, block_size)
+            let (correction, substituted) =
+                build_iir(sos_per_channel.clone(), channels, block_size);
+            if substituted > 0 {
+                // Stability backstop (spec R1-3): the dropped bands do
+                // nothing rather than destabilize the chain; surface the
+                // count. Control plane only -- never the realtime path.
+                log::warn!(
+                    "correction contained {substituted} unstable SOS section(s); \
+                     each was replaced with the identity section (band dropped)"
+                );
+            }
+            correction
         }
     }
 }

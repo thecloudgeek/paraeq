@@ -7,6 +7,8 @@
 //! control plane via [`build_fir`] / [`build_iir`] and moved in whole through
 //! [`RealtimeChain::set_correction`].
 
+use paraeq_dsp::biquad::is_stable;
+
 use crate::convolver::OverlapAddConvolver;
 use crate::iir::IIRProcessor;
 
@@ -282,7 +284,21 @@ pub fn build_fir(firs: Vec<Vec<f64>>, channels: usize, block_size: usize) -> Cor
     c
 }
 
+/// The identity section installed in place of a rejected SOS row: passes
+/// samples through bit-exactly.
+const IDENTITY_SOS: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+
 /// Build + warm up an IIR correction. Control plane only (allocates).
+/// Returns the correction and the count of substituted (dropped) sections.
+///
+/// Stability backstop (spec R1-3): this is the single funnel every SOS row
+/// passes through on its way to the realtime thread. Rows failing the
+/// strict Jury check ([`is_stable`] -- non-finite coefficients, `q = 0`
+/// NaN designs, at/above-Nyquist poles) are replaced with the identity
+/// section BEFORE broadcast, so one bad band degrades to "that band did
+/// nothing" instead of a runaway filter or no correction at all. Each bad
+/// input row counts once toward the returned count regardless of how many
+/// channels it broadcasts to.
 ///
 /// When fewer SOS sets are supplied than `channels`, the LAST provided set
 /// is broadcast to the remaining channels (mirroring
@@ -293,11 +309,27 @@ pub fn build_iir(
     sos_per_channel: Vec<Vec<[f64; 6]>>,
     channels: usize,
     block_size: usize,
-) -> Correction {
+) -> (Correction, usize) {
     assert!(
         !sos_per_channel.is_empty(),
         "at least one SOS set is required"
     );
+    let mut substituted = 0;
+    let sos_per_channel: Vec<Vec<[f64; 6]>> = sos_per_channel
+        .into_iter()
+        .map(|set| {
+            set.into_iter()
+                .map(|sos| {
+                    if is_stable(&sos) {
+                        sos
+                    } else {
+                        substituted += 1;
+                        IDENTITY_SOS
+                    }
+                })
+                .collect()
+        })
+        .collect();
     let mut p = IIRProcessor::new();
     for ch in 0..channels.max(sos_per_channel.len()) {
         let sos = sos_per_channel[ch.min(sos_per_channel.len() - 1)].clone();
@@ -305,5 +337,5 @@ pub fn build_iir(
     }
     let mut c = Correction::Iir(p);
     warm_up(&mut c, channels, block_size);
-    c
+    (c, substituted)
 }

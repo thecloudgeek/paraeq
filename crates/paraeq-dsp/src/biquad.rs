@@ -65,6 +65,13 @@ pub fn notch(fc: f64, q: f64, sample_rate: f64) -> [f64; 6] {
     )
 }
 
+/// Jury stability conditions for a real-coefficient second-order section:
+/// both poles strictly inside the unit circle.
+pub fn is_stable(sos: &[f64; 6]) -> bool {
+    let (a1, a2) = (sos[4], sos[5]);
+    sos.iter().all(|c| c.is_finite()) && a2.abs() < 1.0 && a1.abs() < a2 + 1.0
+}
+
 /// scipy.signal.sosfreqz equivalent at worN = freqs·2π/sr, returned as
 /// 20·log10(|H| + 1e-10)  — NOTE the +1e-10 is ADDED (biquad.py convention),
 /// not a max() floor (frequency_response.py uses max(); do not mix them up).

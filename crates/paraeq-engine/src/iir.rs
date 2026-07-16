@@ -50,6 +50,15 @@ impl IIRProcessor {
         }
     }
 
+    /// The SOS rows installed for `channel`, if any. Control-plane
+    /// introspection (tests, telemetry); never called on the realtime path.
+    pub fn sos(&self, channel: usize) -> Option<&[[f64; 6]]> {
+        self.channels
+            .get(channel)
+            .and_then(Option::as_ref)
+            .map(|state| state.sos.as_slice())
+    }
+
     /// Filter one block per channel in place, with persistent per-channel state.
     ///
     /// Each `input[ch]` is filtered by the cascaded-biquad state for that
