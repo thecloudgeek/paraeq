@@ -4,7 +4,10 @@
 **Specs covered:** the six `docs/specs/2026-07-15-*.md` rescope specs
 (decision-engine, engine-hardening, measurement-safety, measurement-suite,
 room-dsp, wizard).
-**Status:** Stage 1 in progress (this branch).
+**Status:** Stages 1 and 2 implemented (`feature/rescope-stage1` →
+`feature/rescope-stage2`, stacked, unmerged). Stage 2's merge-gated items
+(engine-hardening R1-1 engine half, R1-8, R1-6) and the Tier-4 REW corpus
+remain open — see the gates below.
 
 This plan sequences the six specs into seven stages. It exists because the
 specs cross-reference each other heavily (shared deliverables, ordering
@@ -175,3 +178,63 @@ R7 ship (signed DMG, notarization, PLD 2024/2853 posture decision).
 
 Also record before R7: the PLD 2024/2853 commercial-posture decision
 (appears in three specs).
+
+## Open questions raised by implementing Stages 1–2
+
+These were found while building, not while planning. Each is recorded at the
+type or in a test on the branch; none is invented policy.
+
+6. **The MS-3 DC gate is infeasible for the sweep (spec defect).** The
+   measurement-safety spec's post-fade assertion `|mean(x)| < 1e-4` cannot be
+   met by a sweep at the policy fade (10 ms in / 50 ms out). Measured
+   independently twice (two numpy ports agreeing to every digit): 1.59e-3
+   un-faded → 1.24e-3 faded on a 5 s / 20 Hz–20 kHz / 48 kHz sweep. Post-scale
+   it improves but still misses — 1.76e-4 at −20 dBFS (1.8×) and 4.42e-4 at
+   −12 dBFS (4.4×). The sweep's DC is the LF stationary-phase residue, not an
+   edge artefact, so no fade-out can touch it; only a ~100 ms fade-in gets
+   under the gate (−7.6e-5) and the same spec section rejects a long fade-in
+   for costing real LF energy. The pilot tone meets the gate easily
+   (−1.5e-5), so this is sweep-specific. **Decision needed:** restate the
+   threshold for sweeps, or DC-block in MS-4's stimulus assembly — but do not
+   inflate the fade-in. `apply_fade` implements the spec's envelope exactly;
+   `test_sweep.rs::fade_is_not_a_dc_blocker` documents the gap.
+7. **MS-2's per-class dBFS column: cap, or starting point?** The spec calls
+   the −20 dBFS coupler / −12 dBFS room "sweep level" column "a starting
+   point for the solve, not the emitted level — the solve overrides it", yet
+   MS-2 requires `SweepLevel::new` to refuse "above the class cap" and that
+   column is the only per-class dBFS number in the table. Implemented as the
+   cap (reading "the solve overrides it" as downward-only), so a chain too
+   insensitive to reach the SPL target at ≤ −20 dBFS is refused. If a
+   separate, higher ceiling is intended, only the table constant changes.
+8. **The cal-parser spec is silent on encodings and line endings.** The
+   spec's algorithm step 1 ("attempt to parse column 1 as a float; on
+   failure, push the line to `ignored_lines`") literally licenses a UTF-8 BOM
+   silently eating a headerless file's first data row — the exact bug class
+   the rewrite exists to eliminate. Fixed in lockstep on the branch (BOM
+   stripped, `\r`/`\r\n`/`\n` all end a line, number grammar pinned to the
+   C-locale float), but the spec needs a sentence saying so.
+9. **`q_cap`'s domain is a range over a scalar, not over the enum.** The spec
+   gives `q_cap`'s domain as "Range 1.0..=20.0 on the ceiling" while typing
+   the decision over `QCapPolicy`, so the room's own `LogLinear` value has no
+   representable membership answer and the "every value is inside its domain"
+   invariant is not mechanically checkable for it. Either the domain becomes
+   a `Choice` over the two path policies, or `QCapPolicy` splits into a
+   decided ceiling scalar plus a profile-owned shape.
+10. **`authority`'s domain is unexpressible as typed.** Spec: "Choice:
+    Standard, Conservative(×0.5), Custom(curve)" but `Decision<AuthorityCurve>`
+    — so `Domain::Choice` can hold only concrete curves and the preset NAMES
+    (what the drawer labels its control with, and what an override would
+    round-trip) have nowhere to live.
+11. **Type reconciliations due when Stage 3 lands** (all flagged in-source):
+    `SmoothingMode` {Fixed, None, Variable} in paraeq-decide vs room-dsp's
+    `Smoothing` incl. `Gaussian { fraction }`; `CorrectionKind`
+    {MinPhaseFir, Peq} sharing a name with the engine's {Fir, Iir};
+    `CorrectionPlan.bands: Vec<Vec<EQBand>>` becoming `PerChannel`;
+    `AuthorityCurve` becoming a re-export of `authority.rs`'s; and the
+    coupler `f_start` modelled `None` (per-DUT, safety spec) vs `20.0`
+    (PathProfile).
+12. **trybuild snapshots vs a floating toolchain.** MS-2's compile-fail proof
+    pins rustc's E0308/E0423 wording while CI and `rust-toolchain.toml` track
+    `stable`, so a compiler release can turn it red on an unrelated PR.
+    Regenerate with `TRYBUILD=overwrite`; pinning the toolchain is a
+    repo-wide call left to the owner.
