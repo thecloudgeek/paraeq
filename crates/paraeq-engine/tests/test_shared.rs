@@ -197,7 +197,7 @@ fn output_guard_feeds_invalid_samples_and_output_stays_finite() {
     let shared = Arc::new(RtShared::default());
     let chain = RealtimeChain::new(1, 8);
     let mut proc_ = RtProcessor::new(shared.clone(), rt, chain);
-    ctl.send(RtMsg::Correction(Some(build_iir(scale_sos(0.5), 1, 8))))
+    ctl.send(RtMsg::Correction(Some(build_iir(scale_sos(0.5), 1, 8).0)))
         .expect("send fits an empty ring");
 
     // Clean block: the output guard counts nothing (zero-cost happy path).

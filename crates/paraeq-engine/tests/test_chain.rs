@@ -337,12 +337,12 @@ fn identical_coefficient_swap_is_bit_exact_noop() {
     // block boundary must be sample-for-sample identical to never swapping.
     let sos = peaking(100.0, 12.0, 10.0, 48000.0);
     let mut swapped = RealtimeChain::new(2, BLOCK);
-    swapped.set_correction(Some(build_iir(vec![vec![sos]], 2, BLOCK)));
+    swapped.set_correction(Some(build_iir(vec![vec![sos]], 2, BLOCK).0));
     let mut unswapped = RealtimeChain::new(2, BLOCK);
-    unswapped.set_correction(Some(build_iir(vec![vec![sos]], 2, BLOCK)));
+    unswapped.set_correction(Some(build_iir(vec![vec![sos]], 2, BLOCK).0));
     for b in 0..64 {
         if b == 32 {
-            swapped.set_correction(Some(build_iir(vec![vec![sos]], 2, BLOCK)));
+            swapped.set_correction(Some(build_iir(vec![vec![sos]], 2, BLOCK).0));
         }
         let input = sine100(b * BLOCK, BLOCK, 2);
         let (out_s, outcome) = chain_process(&mut swapped, &input, false, 1.0);
@@ -373,19 +373,19 @@ fn gain_only_swap_with_transplant_has_no_step() {
     let sos_b = peaking(100.0, 11.0, 10.0, 48000.0);
 
     let mut chain = RealtimeChain::new(2, BLOCK);
-    chain.set_correction(Some(build_iir(vec![vec![sos_a]], 2, BLOCK)));
+    chain.set_correction(Some(build_iir(vec![vec![sos_a]], 2, BLOCK).0));
     let mut y = Vec::new();
     for b in 0..WARM {
         let input = sine100(b * BLOCK, BLOCK, 2);
         let (out, _) = chain_process(&mut chain, &input, false, 1.0);
         y.extend_from_slice(&out[0]);
     }
-    chain.set_correction(Some(build_iir(vec![vec![sos_b]], 2, BLOCK)));
+    chain.set_correction(Some(build_iir(vec![vec![sos_b]], 2, BLOCK).0));
 
     // Zero-state control: the same continuation through a fresh chain --
     // exactly what every swap sounded like before the transplant existed.
     let mut fresh = RealtimeChain::new(2, BLOCK);
-    fresh.set_correction(Some(build_iir(vec![vec![sos_b]], 2, BLOCK)));
+    fresh.set_correction(Some(build_iir(vec![vec![sos_b]], 2, BLOCK).0));
     let mut y_zero_state = y.clone();
     for b in WARM..WARM + TAIL {
         let input = sine100(b * BLOCK, BLOCK, 2);
@@ -414,7 +414,7 @@ fn iir_to_fir_swap_is_safe_noop() {
     // Cross-kind swap: no state can carry over (a FIR overlap tail cannot
     // be transplanted). Must not panic; the FIR behaves exactly as fresh.
     let mut chain = RealtimeChain::new(2, BLOCK);
-    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK)));
+    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK).0));
     for b in 0..2 {
         chain_process(&mut chain, &make_block(b, 2, BLOCK), false, 1.0);
     }
@@ -456,7 +456,7 @@ fn fir_to_iir_swap_starts_fresh() {
     for b in 0..2 {
         chain_process(&mut chain, &make_block(b, 2, BLOCK), false, 1.0);
     }
-    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK)));
+    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK).0));
 
     let mut fresh = IIRProcessor::new();
     fresh.set_sos(0, vec![SOS]);
@@ -491,11 +491,11 @@ fn channel_count_change_swap_starts_fresh() {
     // no-op across a channel-count change (spec R1-7a), so the incoming
     // processor behaves exactly as fresh and nothing panics.
     let mut chain = RealtimeChain::new(2, BLOCK);
-    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK)));
+    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK).0));
     for b in 0..2 {
         chain_process(&mut chain, &make_block(b, 2, BLOCK), false, 1.0);
     }
-    chain.set_correction(Some(build_iir(vec![vec![SOS]], 1, BLOCK)));
+    chain.set_correction(Some(build_iir(vec![vec![SOS]], 1, BLOCK).0));
 
     let mut fresh = IIRProcessor::new();
     fresh.set_sos(0, vec![SOS]);
@@ -527,7 +527,7 @@ fn channel_count_change_swap_starts_fresh() {
 #[test]
 fn nan_input_zeroes_poisoned_output_and_self_heals() {
     let mut chain = RealtimeChain::new(2, BLOCK);
-    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK)));
+    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK).0));
 
     let mut direct = IIRProcessor::new();
     direct.set_sos(0, vec![SOS]);
@@ -645,9 +645,13 @@ fn nonfinite_correction_output_fires_backstop_and_resets() {
     // guard in-test): the output overflows f32 range within one block.
     // The backstop must keep the block finite and reset the filter so an
     // identical next block repeats identically instead of compounding.
+    // Constructed directly rather than via build_iir, whose stability
+    // funnel (R1-3) would substitute identity and defeat the test.
     const UNSTABLE: [f64; 6] = [1.0, 0.0, 0.0, 1.0, -10.0, 0.0];
     let mut chain = RealtimeChain::new(1, BLOCK);
-    chain.set_correction(Some(build_iir(vec![vec![UNSTABLE]], 1, BLOCK)));
+    let mut unstable = IIRProcessor::new();
+    unstable.set_sos(0, vec![UNSTABLE]);
+    chain.set_correction(Some(Correction::Iir(unstable)));
 
     let input = vec![vec![0.9f32; BLOCK]];
     let (out0, outcome0) = chain_process(&mut chain, &input, false, 1.0);
