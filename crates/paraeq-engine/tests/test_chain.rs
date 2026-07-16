@@ -97,7 +97,10 @@ fn iir_path_matches_direct_processor_across_blocks() {
         let (out, outcome) = chain_process(&mut chain, &input, false, gain);
         assert!(outcome.corrected);
         assert!(!outcome.frame_mismatch);
-        assert_eq!(outcome.nonfinite_outputs, 0, "clean audio must not trip the output guard");
+        assert_eq!(
+            outcome.nonfinite_outputs, 0,
+            "clean audio must not trip the output guard"
+        );
 
         // Hand-driven reference with the chain's exact casts.
         let in64: Vec<Vec<f64>> = input
@@ -135,7 +138,10 @@ fn fir_path_matches_direct_convolver() {
         let (out, outcome) = chain_process(&mut chain, &input, false, gain);
         assert!(outcome.corrected);
         assert!(!outcome.frame_mismatch);
-        assert_eq!(outcome.nonfinite_outputs, 0, "clean audio must not trip the output guard");
+        assert_eq!(
+            outcome.nonfinite_outputs, 0,
+            "clean audio must not trip the output guard"
+        );
 
         let in64: Vec<Vec<f64>> = input
             .iter()
@@ -328,7 +334,9 @@ fn sine100(start_sample: usize, frames: usize, channels: usize) -> Vec<Vec<f32>>
 }
 
 fn max_first_diff(y: &[f32]) -> f32 {
-    y.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f32::max)
+    y.windows(2)
+        .map(|w| (w[1] - w[0]).abs())
+        .fold(0.0, f32::max)
 }
 
 #[test]

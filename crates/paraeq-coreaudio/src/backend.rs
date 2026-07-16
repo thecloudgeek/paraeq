@@ -196,8 +196,7 @@ impl TapBackend {
                     if ch >= channels {
                         break;
                     }
-                    invalid +=
-                        deinterleave_sanitize_channel(data, bc, c, &mut in_scratch[ch][..f]);
+                    invalid += deinterleave_sanitize_channel(data, bc, c, &mut in_scratch[ch][..f]);
                 }
                 filled += bc;
             }

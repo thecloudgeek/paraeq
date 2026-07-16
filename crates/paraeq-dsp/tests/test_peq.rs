@@ -113,10 +113,7 @@ fn preamp_overlapping_boosts_are_superadditive() {
     // than +6 dB, so the per-band max would under-reserve headroom. The
     // realized value must also agree with a dense 1/384-octave sweep.
     let peq = ParametricEQ {
-        bands: vec![
-            peaking_band(100.0, 6.0, 1.0),
-            peaking_band(120.0, 6.0, 1.0),
-        ],
+        bands: vec![peaking_band(100.0, 6.0, 1.0), peaking_band(120.0, 6.0, 1.0)],
         sample_rate: 48000.0,
     };
     let preamp = peq.preamp_db();
@@ -130,10 +127,7 @@ fn preamp_octave_apart_boosts_are_superadditive() {
     // Spec prose case: "two +6 dB bands an octave apart sum to more than
     // +6 dB where they overlap".
     let peq = ParametricEQ {
-        bands: vec![
-            peaking_band(100.0, 6.0, 1.0),
-            peaking_band(200.0, 6.0, 1.0),
-        ],
+        bands: vec![peaking_band(100.0, 6.0, 1.0), peaking_band(200.0, 6.0, 1.0)],
         sample_rate: 48000.0,
     };
     assert!(peq.preamp_db() < -6.0);
@@ -193,7 +187,10 @@ fn preamp_high_q_band_off_grid_needs_fc_union() {
     // ...but the bare 1/48-octave grid (no fc union) visibly misses the
     // peak — the union is load-bearing, not belt-and-braces.
     let bare_max = max_response_db(&peq, &log_grid(0.499 * 48000.0, 48.0));
-    assert!(bare_max < 5.95, "bare log grid resolved the peak: {bare_max}");
+    assert!(
+        bare_max < 5.95,
+        "bare log grid resolved the peak: {bare_max}"
+    );
 }
 
 #[test]
