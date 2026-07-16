@@ -2332,6 +2332,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "paraeq-decide"
+version = "0.1.0"
+dependencies = [
+ "paraeq-dsp",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "paraeq-desktop"
 version = "0.1.0"
 dependencies = [
@@ -2351,6 +2360,7 @@ dependencies = [
  "proptest",
  "realfft",
  "rustfft",
+ "serde",
  "serde_json",
  "thiserror 2.0.18",
 ]

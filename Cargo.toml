@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/paraeq-coreaudio",
+    "crates/paraeq-decide",
     "crates/paraeq-dsp",
     "crates/paraeq-engine",
     "desktop/src-tauri",

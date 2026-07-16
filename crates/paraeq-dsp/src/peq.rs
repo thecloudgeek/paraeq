@@ -5,6 +5,7 @@ use crate::biquad;
 use crate::DspError;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub enum FilterType {
     HighShelf,
     LowShelf,
@@ -44,7 +45,11 @@ impl FilterType {
     }
 }
 
-#[derive(Clone, Debug)]
+// PartialEq: paraeq-decide's DecisionSet compares whole plans (the spec's
+// idempotence property — overriding a decision to the value auto already chose
+// must change nothing but its `source`).
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct EQBand {
     pub filter_type: FilterType,
     pub fc: f64,
