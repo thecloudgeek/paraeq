@@ -95,6 +95,50 @@ impl ParametricEQ {
         biquad::sos_frequency_response_db(&self.combined_sos(), freqs, self.sample_rate)
     }
 
+    /// Preamp for this band set, in dB: `-max(0, peak of the realized
+    /// cascade)`. Never positive — a pure-cut EQ gets exactly 0.0, not a
+    /// boost (DIVERGENCES.md #14: AutoEQ's `−max_gain` is signed; ours is
+    /// clamped). No headroom constant — AutoEQ's ParametricEQ.txt convention
+    /// is exactly `−max_gain` (its PREAMP_HEADROOM applies only to the
+    /// GraphicEQ/FIR outputs). No oracle counterpart: the prototype hardcodes
+    /// "Preamp: 0.0 dB" (2026-07-15 engine-hardening spec, R1-1).
+    ///
+    /// The peak is over the realized cascade (`frequency_response`), not the
+    /// per-band gain sum — overlapping boosts are superadditive, boosts
+    /// against cuts subadditive. Grid (decided in R1-1): sorted union of a
+    /// 1/48-octave log grid over [1.0, 0.499·sample_rate], every band's fc
+    /// clamped into that range (a peaking band's maximum sits at its fc, so
+    /// the union makes peaks exact regardless of grid density), and the two
+    /// endpoints (shelf maxima sit at DC/Nyquist).
+    pub fn preamp_db(&self) -> f64 {
+        // .max(1.0) keeps the range non-empty (and fc's clamp valid) for
+        // degenerate sample rates; unreachable for real audio rates.
+        let f_max = (0.499 * self.sample_rate).max(1.0);
+        let mut grid: Vec<f64> = Vec::new();
+        for k in 0.. {
+            let f = 2f64.powf(f64::from(k) / 48.0);
+            if f >= f_max {
+                break;
+            }
+            grid.push(f);
+        }
+        grid.push(f_max);
+        for band in &self.bands {
+            grid.push(band.fc.clamp(1.0, f_max));
+        }
+        grid.sort_by(f64::total_cmp);
+        grid.dedup();
+        let peak = self
+            .frequency_response(&grid)
+            .into_iter()
+            .fold(f64::NEG_INFINITY, f64::max);
+        if peak > 0.0 {
+            -peak
+        } else {
+            0.0
+        }
+    }
+
     /// parametric_eq.py:92-106 — ParametricEQ.export_autoeq_format:
     ///   lines = ["Preamp: 0.0 dB"]
     ///   for i, band in enumerate(self.bands, 1):

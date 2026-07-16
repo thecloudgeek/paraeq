@@ -82,5 +82,18 @@ differs from `prototype/paraeq/`, so a red parity test is always actionable.
     RuntimeWarning) — whereas Rust returns `DspError::InvalidInput` instead
     of yielding NaN. Ragged measurement lists raise in numpy (shape error)
     and error in Rust.
+14. **`ParametricEQ::preamp_db` is clamped at ≤ 0; AutoEQ's is signed.**
+    New in Rust (2026-07-15 engine-hardening spec, R1-1) — the prototype
+    computes no preamp at all (`export_autoeq_format` hardcodes
+    `"Preamp: 0.0 dB"`). The convention it implements is AutoEQ's
+    `ParametricEQ.txt` preamp, exactly `−compound.max_gain`
+    (frequency_response.py:211, no headroom constant — `PREAMP_HEADROOM`
+    applies only to the GraphicEQ string and the FIR impulse responses),
+    with one deliberate divergence: AutoEQ's `−max_gain` is signed, so a
+    pure-cut EQ gets a *positive* preamp boosting the signal back to
+    unity; ParaEQ returns `−max(0, peak)`, so a pure-cut EQ gets exactly
+    `0.0`. Auto-boosting a source that may already sit at 0 dBFS to
+    recover headroom we did not spend is a clipping risk taken for
+    nothing. Pinned by `test_peq.rs::preamp_pure_cut_is_exactly_zero`.
 
 (add entries here as they are discovered during implementation)
