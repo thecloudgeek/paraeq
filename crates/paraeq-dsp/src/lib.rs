@@ -8,12 +8,22 @@ pub mod autofit;
 pub mod biquad;
 pub mod compensation;
 pub mod deconvolution;
+pub mod fdw;
 pub mod fir;
 pub mod fr;
+pub mod gating;
+pub mod logf;
 pub mod peq;
+pub mod splice;
 pub mod spline;
 pub mod sweep;
 pub mod targets;
+pub mod window;
+
+/// Re-exported so consumers (and this crate's integration tests) can name the
+/// complex type on `logf`/`fdw`/`fr` signatures without depending on rustfft.
+/// Already in the tree via realfft; `fir.rs` uses the same path.
+pub use rustfft::num_complex::Complex;
 
 /// Error type shared by parsing/validation entry points across modules.
 #[derive(Debug, thiserror::Error)]
