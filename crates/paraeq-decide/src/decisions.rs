@@ -139,6 +139,18 @@ pub struct Overrides {
 /// produce it. This definition is the contract's placeholder until Stage 3
 /// lands that module, at which point it becomes a re-export and `decide()`
 /// must not re-specify different numbers.
+///
+/// OPEN for the owner — `authority`'s domain is not expressible as written.
+/// The spec's decision table gives it as `Choice: Standard, Conservative
+/// (x0.5), Custom(curve)` while typing the decision `Decision<AuthorityCurve>`,
+/// so `Domain<AuthorityCurve>::Choice` can only hold concrete curves: the
+/// drawer can offer the two precomputed ones and a custom curve arrives via
+/// [`Overrides`], but the NAMES ("Standard", "Conservative") — the thing the
+/// drawer would actually label its control with, and the thing an override
+/// would round-trip — have nowhere to live. Either the domain becomes a
+/// `Choice` over a named `AuthorityPreset` that resolves to a curve, or the
+/// decision splits into a preset plus a derived curve. Left as the spec types
+/// it rather than invented here.
 #[derive(Clone, Debug, Deserialize, PartialEq, PartialOrd, Serialize)]
 pub struct AuthorityCurve {
     pub freqs: Vec<f64>,

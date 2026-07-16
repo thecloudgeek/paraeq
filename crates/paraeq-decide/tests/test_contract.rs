@@ -132,3 +132,33 @@ fn a_refusal_is_still_a_full_decision_set() {
     assert_eq!(set.decisions.iter().count(), 21);
     assert_eq!(round_trip(&set), serde_json::to_string(&set).unwrap());
 }
+
+/// A band-valued decision bounds BOTH its endpoints. Rust's tuple ordering is
+/// lexicographic, so a naive `min <= value && value <= max` reads only the
+/// lower edge whenever it settles the comparison — `align_spl_band`'s
+/// documented `Range` within 100..=8000 would then admit a band running to
+/// 99 kHz. The two band decisions (align_spl_band, correction_range) are the
+/// spec's only tuple-valued ones, and the drawer and the override path both
+/// rest on "every value is inside its domain".
+#[test]
+fn a_band_domain_bounds_both_endpoints() {
+    // align_spl_band's spec row: value (500.0, 2000.0), Range within 100..=8000.
+    let domain = Domain::Range {
+        max: (8000.0, 8000.0),
+        min: (100.0, 100.0),
+        step: None,
+    };
+    assert!(domain.contains(&(500.0, 2000.0)), "the spec's own value");
+    assert!(domain.contains(&(100.0, 8000.0)), "endpoints are inclusive");
+
+    // The lexicographic bug: a low edge inside the range decides the whole
+    // comparison and the upper edge rides free.
+    assert!(
+        !domain.contains(&(500.0, 99_999.0)),
+        "an out-of-range upper edge must not be admitted by an in-range lower edge"
+    );
+    // ...and the mirror, which lexicographic ordering happens to catch.
+    assert!(!domain.contains(&(99.0, 2000.0)));
+    // Both edges out, on the same side.
+    assert!(!domain.contains(&(9000.0, 9000.0)));
+}

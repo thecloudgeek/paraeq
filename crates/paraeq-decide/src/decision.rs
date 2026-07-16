@@ -3,6 +3,7 @@
 //! invalidation tier an override triggers. Every parameter a competitor asks
 //! or hardcodes is one of these.
 
+use paraeq_dsp::targets::TransducerClass;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -42,7 +43,48 @@ impl<T> Domain<T> {
     }
 }
 
-impl<T: PartialOrd> Domain<T> {
+/// Whether a value lies inside a [`Domain::Range`]'s bounds.
+///
+/// Deliberately NOT `PartialOrd`. The two band-valued decisions
+/// (`align_spl_band`, `correction_range`) are `(f64, f64)`, and Rust's tuple
+/// ordering is LEXICOGRAPHIC — it looks at the second element only when the
+/// first is equal — so `min <= value && value <= max` bounds a band's lower
+/// edge and leaves its upper edge free: `(500.0, 99_999.0)` would satisfy
+/// `align_spl_band`'s documented `Range` within 100..=8000, because
+/// `500 < 8000` settles the comparison before the upper edge is ever read.
+/// A band is bounded when BOTH endpoints are, so tuples compare element-wise.
+pub trait InRange {
+    /// `false` by default: a `Range` over a type with no ordering is
+    /// meaningless, and reporting "not contained" surfaces that as the
+    /// invariant violation it is instead of silently passing. Choice-only
+    /// types take this default.
+    fn in_range(&self, _min: &Self, _max: &Self) -> bool {
+        false
+    }
+}
+
+macro_rules! in_range_scalar {
+    ($($t:ty),*) => {$(
+        impl InRange for $t {
+            fn in_range(&self, min: &Self, max: &Self) -> bool {
+                min <= self && self <= max
+            }
+        }
+    )*};
+}
+in_range_scalar!(f64, u32, usize);
+
+/// A band: both endpoints bounded, element-wise.
+impl InRange for (f64, f64) {
+    fn in_range(&self, min: &Self, max: &Self) -> bool {
+        self.0.in_range(&min.0, &max.0) && self.1.in_range(&min.1, &max.1)
+    }
+}
+
+/// `class` is a `Choice` — the four transducer types are unordered.
+impl InRange for TransducerClass {}
+
+impl<T: InRange + PartialEq> Domain<T> {
     /// The spec's standing invariant: every `Decision::value` is inside its
     /// `Domain`. `Derived` constrains nothing — the rule that produced the
     /// value is the constraint, and there is no control to bound.
@@ -50,7 +92,7 @@ impl<T: PartialOrd> Domain<T> {
         match self {
             Domain::Choice(alternatives) => alternatives.iter().any(|a| a == value),
             Domain::Derived => true,
-            Domain::Range { max, min, .. } => min <= value && value <= max,
+            Domain::Range { max, min, .. } => value.in_range(min, max),
         }
     }
 }

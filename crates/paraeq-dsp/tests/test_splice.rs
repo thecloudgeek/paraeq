@@ -24,14 +24,17 @@ const OVERLAP: SpliceSpec = SpliceSpec {
 /// discontinuity beyond the underlying curve's own slope" is a real constraint
 /// rather than a tautology about a constant.
 fn low_curve(grid: &LogGrid) -> Vec<f64> {
-    grid.freqs()
-        .iter()
-        .map(|&f| {
-            let tilt = -0.9 * (f / 1000.0).log2();
-            let bump = 3.0 * (-(f.log10() - 2.5).powi(2) / 0.02).exp();
-            tilt + bump
-        })
-        .collect()
+    grid.freqs().iter().map(|&f| tilt(f) + bump(f)).collect()
+}
+
+fn tilt(f: f64) -> f64 {
+    -0.9 * (f / 1000.0).log2()
+}
+
+/// Centred at ~316 Hz — inside the 200–400 Hz overlap on purpose, so a curve
+/// carrying it and one that does not actually disagree where the blend runs.
+fn bump(f: f64) -> f64 {
+    3.0 * (-(f.log10() - 2.5).powi(2) / 0.02).exp()
 }
 
 #[test]
@@ -109,4 +112,79 @@ fn splice_is_continuous_after_level_matching() {
             "weights sum to 1 at u={u}"
         );
     }
+}
+
+/// The continuity test above deliberately makes `high` differ from `low` by a
+/// pure constant, so after level matching the two agree everywhere and the
+/// blend output is `low` for ANY weights. That is what makes its one assertion
+/// so sharp about level matching — and it is exactly why it can say nothing
+/// about the blend: a `splice` ignoring `overlap_lo_hz`/`overlap_hi_hz`
+/// entirely still passes it.
+///
+/// So here the two curves genuinely disagree, by a bump centred inside the
+/// overlap. The assertions are structural rather than a pinned expected curve,
+/// because the level match's exact value depends on how `splice` averages over
+/// the overlap, and this test must not over-constrain a module the FDW
+/// asymmetry result may yet delete.
+///
+/// Verified against modelled implementations: a raised-cosine blend passes
+/// (89 of the overlap's bins land strictly between the sources); one ignoring
+/// the overlap bounds fails on the first bin below 200 Hz; a hard switchover
+/// fails on `blended_bins == 0`. A LINEAR blend also passes — deliberately:
+/// the weight function's raised-cosine shape is pinned by
+/// `splice_is_continuous_after_level_matching`'s `blend_weight` assertions,
+/// and this test's job is that `splice` applies those weights over the right
+/// frequencies.
+#[test]
+#[ignore = "splice.rs lands in Stage 4 (room-dsp/6), only if FDW misses"]
+fn the_blend_runs_over_the_overlap_and_nowhere_else() {
+    let grid = LogGrid::new(20.0, 20_000.0, PPO).unwrap();
+    let low = low_curve(&grid);
+    // `high` is the same tilt WITHOUT the bump, offset down: the two sources
+    // disagree by `bump(f)`, which peaks inside the overlap.
+    let high: Vec<f64> = grid.freqs().iter().map(|&f| tilt(f) - OFFSET_DB).collect();
+
+    let (out, report) = splice::splice(&low, &high, &grid, &OVERLAP).unwrap();
+    assert_eq!(out.len(), grid.len());
+    let matched: Vec<f64> = high.iter().map(|v| v + report.level_offset_db).collect();
+
+    let mut blended_bins = 0;
+    for (i, &f) in grid.freqs().iter().enumerate() {
+        if f < OVERLAP.overlap_lo_hz {
+            assert!(
+                (out[i] - low[i]).abs() < 1e-12,
+                "{f:.1} Hz is below the overlap: the output must be `low` \
+                 untouched, not a blend"
+            );
+        } else if f > OVERLAP.overlap_hi_hz {
+            assert!(
+                (out[i] - matched[i]).abs() < 1e-12,
+                "{f:.1} Hz is above the overlap: the output must be the \
+                 level-matched `high`"
+            );
+        } else {
+            // Inside: a convex combination of the two sources, so it lies
+            // between them and never outside.
+            let (lo_v, hi_v) = (low[i].min(matched[i]), low[i].max(matched[i]));
+            assert!(
+                out[i] >= lo_v - 1e-12 && out[i] <= hi_v + 1e-12,
+                "{f:.1} Hz: {} is outside [{lo_v}, {hi_v}] — not a convex blend",
+                out[i]
+            );
+            // Count the bins where the sources actually disagree AND the
+            // output sits strictly between them: that is the blend being
+            // observed. A hard switchover would produce none.
+            if (low[i] - matched[i]).abs() > 0.1
+                && (out[i] - low[i]).abs() > 1e-9
+                && (out[i] - matched[i]).abs() > 1e-9
+            {
+                blended_bins += 1;
+            }
+        }
+    }
+    assert!(
+        blended_bins > 0,
+        "no bin in the overlap sits strictly between the two sources: this is \
+         a hard switchover, not a blend"
+    );
 }
