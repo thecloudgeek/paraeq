@@ -8,6 +8,7 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 
 use objc2_core_audio_types::{AudioBuffer, AudioBufferList};
+use paraeq_coreaudio::backend::deinterleave_sanitize_channel;
 use paraeq_coreaudio::ioproc::{BufferList, BufferListMut};
 
 /// Two-buffer `AudioBufferList` exactly as the HAL lays it out: the second
@@ -118,6 +119,55 @@ fn byte_sizes_not_divisible_by_four_truncate() {
     let (data, _channels) = view.buffers().next().expect("one buffer");
     assert_eq!(data.len(), 3);
     assert_eq!(data, &[7.0, 7.0, 7.0]);
+}
+
+#[test]
+fn deinterleave_sanitize_zeroes_non_finite_and_counts() {
+    // 4 frames x 2 channels interleaved (L0 R0 L1 R1 ...): a NaN in L, a
+    // -inf in R, plus a negative zero and a subnormal to pin bit-exact
+    // copying of finite samples (the capture-boundary guard, spec R1-2).
+    let mut storage: [f32; 8] = [
+        0.5,
+        -0.25, // frame 0
+        f32::NAN,
+        0.125, // frame 1
+        1.5,
+        f32::NEG_INFINITY, // frame 2
+        -0.0,
+        2.0e-40, // frame 3 (negative zero, subnormal)
+    ];
+    let byte_size = storage.len() * 4;
+    let mut list = AudioBufferList {
+        mNumberBuffers: 1,
+        mBuffers: [buffer_over(&mut storage, 2, byte_size)],
+    };
+    // SAFETY: `list` describes live, aligned, exclusively-owned f32 storage
+    // that outlives `view`; the single buffer is in bounds of the list.
+    let view = unsafe { BufferList::new(NonNull::from(&mut list)) };
+    let (data, channels) = view.buffers().next().expect("one buffer");
+    assert_eq!(channels, 2);
+
+    let mut dst = [7.7f32; 4]; // sentinel: every slot must be overwritten
+    let invalid = deinterleave_sanitize_channel(data, 2, 0, &mut dst);
+    assert_eq!(invalid, 1, "one NaN in the left channel");
+    for (i, (d, e)) in dst.iter().zip([0.5f32, 0.0, 1.5, -0.0]).enumerate() {
+        assert_eq!(
+            d.to_bits(),
+            e.to_bits(),
+            "L frame {i}: finite samples bit-exact, NaN zeroed"
+        );
+    }
+
+    let mut dst = [7.7f32; 4];
+    let invalid = deinterleave_sanitize_channel(data, 2, 1, &mut dst);
+    assert_eq!(invalid, 1, "one -inf in the right channel");
+    for (i, (d, e)) in dst.iter().zip([-0.25f32, 0.125, 0.0, 2.0e-40]).enumerate() {
+        assert_eq!(
+            d.to_bits(),
+            e.to_bits(),
+            "R frame {i}: finite samples bit-exact, -inf zeroed"
+        );
+    }
 }
 
 #[test]

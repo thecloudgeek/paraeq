@@ -38,6 +38,12 @@ pub struct RtShared {
     pub frame_mismatch_blocks: AtomicU64,
     /// Linear trim gain as f32 bits (control writes, rt reads).
     pub gain_bits: AtomicU32,
+    /// Non-finite (NaN/inf) samples sanitized to 0.0 (rt writes): input
+    /// samples zeroed at the backend's capture boundary
+    /// ([`RtProcessor::note_invalid_samples`]) plus correction outputs
+    /// zeroed by the chain's output backstop. Logging happens on the
+    /// controller tick, never the realtime thread.
+    pub invalid_samples: AtomicU64,
     /// Blocks with at least one nonzero input sample (rt writes) -- the
     /// watchdog's raw "audio is flowing" signal.
     pub nonzero_blocks: AtomicU64,
@@ -59,6 +65,7 @@ impl Default for RtShared {
             callbacks: AtomicU64::new(0),
             frame_mismatch_blocks: AtomicU64::new(0),
             gain_bits: AtomicU32::new(1.0f32.to_bits()),
+            invalid_samples: AtomicU64::new(0),
             nonzero_blocks: AtomicU64::new(0),
             peak_in_bits: AtomicU32::new(0),
             sample_time_delta_bits: AtomicU64::new(0),
@@ -195,6 +202,18 @@ impl RtProcessor {
         Arc::clone(&self.shared)
     }
 
+    /// Record `n` non-finite input samples the backend zeroed at the
+    /// capture boundary (the deinterleave copy -- where samples first
+    /// become ours). NOT a callback count: the same invocation still runs
+    /// [`process_block`](Self::process_block) on the sanitized block.
+    /// Realtime-safe: one relaxed atomic add, skipped when `n == 0` so the
+    /// happy path pays nothing.
+    pub fn note_invalid_samples(&mut self, n: u64) {
+        if n > 0 {
+            self.shared.invalid_samples.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
     /// Record an IOProc invocation whose block the backend skipped before
     /// reaching [`process_block`](Self::process_block) (mismatched or
     /// oversize HAL buffers). Increments BOTH `callbacks` (which counts
@@ -209,7 +228,7 @@ impl RtProcessor {
     /// allocation, no logging; never panics on HAL-supplied frame counts.
     ///
     /// Order: counters -> input scan -> swap poll -> read params ->
-    /// chain process -> mismatch telemetry.
+    /// chain process -> mismatch + non-finite telemetry.
     pub fn process_block(
         &mut self,
         input: &[&[f32]],
@@ -247,6 +266,13 @@ impl RtProcessor {
         let outcome = self.chain.process(input, output, bypass, gain);
         if outcome.frame_mismatch {
             shared.frame_mismatch_blocks.fetch_add(1, Ordering::Relaxed);
+        }
+        // Output-backstop sanitizations share the capture-boundary counter:
+        // one published number for "non-finite samples were zeroed".
+        if outcome.nonfinite_outputs > 0 {
+            shared
+                .invalid_samples
+                .fetch_add(u64::from(outcome.nonfinite_outputs), Ordering::Relaxed);
         }
     }
 }

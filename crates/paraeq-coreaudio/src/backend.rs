@@ -5,11 +5,12 @@
 //!
 //! Realtime discipline: everything the IOProc closure needs (de/interleave
 //! scratch, the [`RtProcessor`]) is preallocated/moved in at `start`; the
-//! per-callback work is layout resolve + deinterleave + `process_block` +
-//! interleave — no allocation, no locks, no logging. HAL-supplied values
-//! are never trusted: mismatched or oversized frame counts zero the output
-//! (silence) and record the skip via `RtProcessor::note_skipped_block`
-//! (which keeps the callback counter honest) instead of panicking.
+//! per-callback work is layout resolve + deinterleave (with the non-finite
+//! capture guard fused in) + `process_block` + interleave — no allocation,
+//! no locks, no logging. HAL-supplied values are never trusted: mismatched
+//! or oversized frame counts zero the output (silence) and record the skip
+//! via `RtProcessor::note_skipped_block` (which keeps the callback counter
+//! honest) instead of panicking.
 //!
 //! Teardown: [`TapBackend::stop`] encodes the FULL invariant order in one
 //! place — `AudioDeviceStop` → `AudioDeviceDestroyIOProcID` (both inside
@@ -48,6 +49,35 @@ impl From<CaError> for EngineError {
 /// delivering more frames than scratch capacity is skipped (silence +
 /// `skipped_blocks`), never allocated for.
 const MIN_SCRATCH_FRAMES: usize = 4096;
+
+/// One channel of the deinterleave copy with the capture-boundary guard
+/// fused in: finite samples copy bit-exact; non-finite samples (NaN/+-inf)
+/// are written as 0.0 and counted. `f32::clamp` propagates NaN, so the
+/// chain's downstream clamps are not sanitizers, and ONE NaN reaching a
+/// DF2T biquad poisons its state for the processor's lifetime -- taps
+/// deliver f32, the format class that can encode it. Extracts `dst.len()`
+/// frames of lane `channel` from the interleaved `data` (`stride` = the
+/// buffer's channel count). Returns the sanitized count; the caller reports
+/// it through an atomic ([`RtProcessor::note_invalid_samples`]) -- never a
+/// log. Realtime-safe: no allocation, no locks, no logging.
+pub fn deinterleave_sanitize_channel(
+    data: &[f32],
+    stride: usize,
+    channel: usize,
+    dst: &mut [f32],
+) -> u64 {
+    let mut invalid = 0;
+    for (i, d) in dst.iter_mut().enumerate() {
+        let v = data[i * stride + channel];
+        if v.is_finite() {
+            *d = v;
+        } else {
+            invalid += 1;
+            *d = 0.0;
+        }
+    }
+    invalid
+}
 
 /// Production tap backend. One instance drives at most one live
 /// tap/aggregate/IOProc set at a time; the engine controller starts/stops
@@ -142,6 +172,7 @@ impl TapBackend {
             let mut frames: usize = 0;
             let mut first = true;
             let mut filled = 0usize; // input channels deinterleaved so far
+            let mut invalid = 0u64; // non-finite input samples zeroed
             for (data, buf_channels) in block.input.buffers() {
                 let bc = buf_channels.max(1);
                 let f = data.len() / bc;
@@ -170,10 +201,8 @@ impl TapBackend {
                     if ch >= channels {
                         break;
                     }
-                    let dst = &mut in_scratch[ch][..f];
-                    for (i, d) in dst.iter_mut().enumerate() {
-                        *d = data[i * bc + c];
-                    }
+                    invalid +=
+                        deinterleave_sanitize_channel(data, bc, c, &mut in_scratch[ch][..f]);
                 }
                 filled += bc;
             }
@@ -182,6 +211,10 @@ impl TapBackend {
             for ch_scratch in in_scratch.iter_mut().skip(filled) {
                 ch_scratch[..frames].fill(0.0);
             }
+            // Report zeroed non-finite input samples (relaxed atomic add,
+            // no-op at 0). The warn! stays OFF the realtime thread: the
+            // controller tick reads the counter and logs the delta.
+            processor.note_invalid_samples(invalid);
 
             // Input views from StreamInfo.channels (matching the chain's
             // build parameter after renegotiation): a stack array sliced to

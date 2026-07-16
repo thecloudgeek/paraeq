@@ -307,6 +307,10 @@ struct Session {
     block_size: usize,
     channels: usize,
     control: ControlLink,
+    /// `invalid_samples` value already reported via log: the tick warns on
+    /// the delta only (the rt side never logs; the tick period is the rate
+    /// limit).
+    invalid_seen: u64,
     shared: Arc<RtShared>,
     stream: StreamInfo,
 }
@@ -454,6 +458,17 @@ impl<B: AudioBackend> Controller<B> {
             // is normal idling -- rebuilding on it would loop forever while
             // the system is idle. Device death arrives as backend events.
             self.watchdog.observe(now, callbacks, nonzero);
+            // Non-finite sanitization report, moved OFF the realtime thread
+            // (the rt side only bumps the atomic): warn on the delta, at
+            // most once per tick.
+            let invalid = s.shared.invalid_samples.load(Ordering::Relaxed);
+            if invalid > s.invalid_seen {
+                log::warn!(
+                    "ignored {} non-finite samples (zeroed at the capture/output guards)",
+                    invalid - s.invalid_seen
+                );
+                s.invalid_seen = invalid;
+            }
             // Free retired corrections on the control thread.
             s.control.drain_retired();
         }
@@ -591,6 +606,7 @@ impl<B: AudioBackend> Controller<B> {
             block_size,
             channels,
             control,
+            invalid_seen: 0,
             shared,
             stream: stream.clone(),
         });

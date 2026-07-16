@@ -50,6 +50,12 @@ pub struct ChainOutcome {
     /// A correction was active but the HAL-supplied frame count did not fit
     /// its contract; the block was passed through (gain + clamp only).
     pub frame_mismatch: bool,
+    /// Non-finite correction outputs zeroed by the output backstop; any
+    /// nonzero count also reset the correction state (a poisoned DF2T
+    /// section emits NaN forever otherwise). Always 0 on the pass-through
+    /// path (its clamp handles +-inf; input NaN is zeroed upstream at the
+    /// capture boundary).
+    pub nonfinite_outputs: u32,
 }
 
 /// Per-stream realtime chain state. Owned by the realtime side; the control
@@ -126,7 +132,9 @@ impl RealtimeChain {
     /// and trigger a chain rebuild on the control plane.
     ///
     /// Sample path when correcting: f32 up-cast to f64, correction in f64,
-    /// down-cast to f32, then gain, then clamp.
+    /// down-cast to f32, then gain, then clamp -- with non-finite outputs
+    /// zeroed + counted and the correction state reset (the output
+    /// backstop; see [`ChainOutcome::nonfinite_outputs`]).
     pub fn process(
         &mut self,
         input: &[&[f32]],
@@ -191,14 +199,38 @@ impl RealtimeChain {
                 Correction::Iir(p) => p.process(&views[..channels], &mut out_f64[..channels]),
             }
 
+            // Output backstop: the gain+clamp loop also zeroes non-finite
+            // correction outputs and counts them (f32::clamp propagates NaN,
+            // so the clamp alone is not a sanitizer). Finite samples take
+            // the identical downcast -> gain -> clamp path bit-for-bit.
+            let mut nonfinite = 0u32;
             for (out_ch, y_ch) in output.iter_mut().zip(out_f64.iter()) {
                 for (o, y) in out_ch.iter_mut().zip(y_ch.iter()) {
-                    *o = ((*y as f32) * gain).clamp(-1.0, 1.0);
+                    let v = (*y as f32) * gain;
+                    if v.is_finite() {
+                        *o = v.clamp(-1.0, 1.0);
+                    } else {
+                        nonfinite += 1;
+                        *o = 0.0;
+                    }
+                }
+            }
+            if nonfinite > 0 {
+                // Self-heal: a non-finite output means poisoned filter state
+                // (one NaN makes a DF2T section NaN for its lifetime), so
+                // clear it (reset is fill(0.0)-only -- rt-safe) instead of
+                // emitting noise forever. An audible discontinuity, but a
+                // click beats permanent noise. Input NaN never reaches here
+                // (zeroed at the capture boundary), so this only fires on
+                // filter-internal non-finites.
+                if let Some(c) = correction.as_mut() {
+                    c.reset();
                 }
             }
             ChainOutcome {
                 corrected: true,
                 frame_mismatch: false,
+                nonfinite_outputs: nonfinite,
             }
         } else {
             // Pass-through: gain + clamp, pure f32 path, no scratch needed.
@@ -222,6 +254,7 @@ impl RealtimeChain {
             ChainOutcome {
                 corrected: false,
                 frame_mismatch,
+                nonfinite_outputs: 0,
             }
         }
     }

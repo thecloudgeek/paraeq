@@ -91,6 +91,7 @@ fn iir_path_matches_direct_processor_across_blocks() {
         let (out, outcome) = chain_process(&mut chain, &input, false, gain);
         assert!(outcome.corrected);
         assert!(!outcome.frame_mismatch);
+        assert_eq!(outcome.nonfinite_outputs, 0, "clean audio must not trip the output guard");
 
         // Hand-driven reference with the chain's exact casts.
         let in64: Vec<Vec<f64>> = input
@@ -128,6 +129,7 @@ fn fir_path_matches_direct_convolver() {
         let (out, outcome) = chain_process(&mut chain, &input, false, gain);
         assert!(outcome.corrected);
         assert!(!outcome.frame_mismatch);
+        assert_eq!(outcome.nonfinite_outputs, 0, "clean audio must not trip the output guard");
 
         let in64: Vec<Vec<f64>> = input
             .iter()
@@ -513,6 +515,151 @@ fn channel_count_change_swap_starts_fresh() {
                 "block {b} ch 1 sample {i}: expected pass-through"
             );
         }
+    }
+}
+
+#[test]
+fn nan_input_zeroes_poisoned_output_and_self_heals() {
+    let mut chain = RealtimeChain::new(2, BLOCK);
+    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK)));
+
+    let mut direct = IIRProcessor::new();
+    direct.set_sos(0, vec![SOS]);
+    direct.set_sos(1, vec![SOS]);
+    let gain = 1.0f32;
+
+    // Block 0: clean -- builds real filter state.
+    let input = make_block(0, 2, BLOCK);
+    let (_, outcome) = chain_process(&mut chain, &input, false, gain);
+    assert!(outcome.corrected);
+    assert_eq!(outcome.nonfinite_outputs, 0);
+    let in64: Vec<Vec<f64>> = input
+        .iter()
+        .map(|v| v.iter().map(|&s| s as f64).collect())
+        .collect();
+    let views: Vec<&[f64]> = in64.iter().map(|v| v.as_slice()).collect();
+    let mut out64 = vec![vec![0.0f64; BLOCK]; 2];
+    direct.process(&views, &mut out64);
+
+    // Block 1: one NaN mid-block on ch 0. The DF2T section is poisoned
+    // from that sample on; the output backstop must zero exactly the
+    // poisoned tail, leave every finite sample bit-identical, and reset
+    // the correction state.
+    const NAN_AT: usize = 10;
+    let mut input = make_block(1, 2, BLOCK);
+    input[0][NAN_AT] = f32::NAN;
+    let (out, outcome) = chain_process(&mut chain, &input, false, gain);
+    assert!(outcome.corrected);
+    assert_eq!(
+        outcome.nonfinite_outputs as usize,
+        BLOCK - NAN_AT,
+        "exactly the poisoned tail is sanitized"
+    );
+    for ch in &out {
+        for &s in ch {
+            assert!(s.is_finite(), "output must never carry non-finite samples");
+        }
+    }
+    let in64: Vec<Vec<f64>> = input
+        .iter()
+        .map(|v| v.iter().map(|&s| s as f64).collect())
+        .collect();
+    let views: Vec<&[f64]> = in64.iter().map(|v| v.as_slice()).collect();
+    let mut out64 = vec![vec![0.0f64; BLOCK]; 2];
+    direct.process(&views, &mut out64);
+    for i in 0..BLOCK {
+        if i < NAN_AT {
+            let expected = downcast_gain_clamp(out64[0][i], gain);
+            assert_eq!(
+                out[0][i].to_bits(),
+                expected.to_bits(),
+                "ch 0 sample {i}: pre-NaN samples must be bit-identical"
+            );
+        } else {
+            assert_eq!(out[0][i].to_bits(), 0.0f32.to_bits(), "ch 0 sample {i}");
+        }
+        // The clean channel is untouched bit-for-bit.
+        let expected = downcast_gain_clamp(out64[1][i], gain);
+        assert_eq!(out[1][i].to_bits(), expected.to_bits(), "ch 1 sample {i}");
+    }
+
+    // Block 2: clean again -- the backstop's reset self-heals within one
+    // block, so output equals a FRESH processor fed only this block
+    // (without the reset, the DF2T state would stay NaN forever).
+    let input = make_block(2, 2, BLOCK);
+    let (out, outcome) = chain_process(&mut chain, &input, false, gain);
+    assert!(outcome.corrected);
+    assert_eq!(outcome.nonfinite_outputs, 0);
+    let mut fresh = IIRProcessor::new();
+    fresh.set_sos(0, vec![SOS]);
+    fresh.set_sos(1, vec![SOS]);
+    let in64: Vec<Vec<f64>> = input
+        .iter()
+        .map(|v| v.iter().map(|&s| s as f64).collect())
+        .collect();
+    let views: Vec<&[f64]> = in64.iter().map(|v| v.as_slice()).collect();
+    let mut out64 = vec![vec![0.0f64; BLOCK]; 2];
+    fresh.process(&views, &mut out64);
+    for ch in 0..2 {
+        for i in 0..BLOCK {
+            let expected = downcast_gain_clamp(out64[ch][i], gain);
+            assert_eq!(
+                out[ch][i].to_bits(),
+                expected.to_bits(),
+                "ch {ch} sample {i}: state not healed after NaN block"
+            );
+        }
+    }
+}
+
+#[test]
+fn inf_input_on_pass_through_clamps_to_unity() {
+    // No correction installed: the pass-through path's clamp already
+    // handles +-inf correctly (f32::clamp only fails to sanitize NaN) --
+    // pinned so it cannot regress.
+    let mut chain = RealtimeChain::new(2, BLOCK);
+    let mut input = vec![vec![0.25f32; BLOCK]; 2];
+    input[0][3] = f32::INFINITY;
+    input[1][7] = f32::NEG_INFINITY;
+    let (out, outcome) = chain_process(&mut chain, &input, false, 1.0);
+    assert!(!outcome.corrected);
+    assert_eq!(
+        outcome.nonfinite_outputs, 0,
+        "the output guard lives on the corrected path only"
+    );
+    assert_eq!(out[0][3], 1.0, "+inf clamps to exactly +1.0");
+    assert_eq!(out[1][7], -1.0, "-inf clamps to exactly -1.0");
+    assert_eq!(out[0][0], 0.25);
+    assert_eq!(out[1][0], 0.25);
+}
+
+#[test]
+fn nonfinite_correction_output_fires_backstop_and_resets() {
+    // Fabricated unstable SOS (pole at 10 -- bypasses the design-side
+    // guard in-test): the output overflows f32 range within one block.
+    // The backstop must keep the block finite and reset the filter so an
+    // identical next block repeats identically instead of compounding.
+    const UNSTABLE: [f64; 6] = [1.0, 0.0, 0.0, 1.0, -10.0, 0.0];
+    let mut chain = RealtimeChain::new(1, BLOCK);
+    chain.set_correction(Some(build_iir(vec![vec![UNSTABLE]], 1, BLOCK)));
+
+    let input = vec![vec![0.9f32; BLOCK]];
+    let (out0, outcome0) = chain_process(&mut chain, &input, false, 1.0);
+    assert!(outcome0.corrected);
+    assert!(
+        outcome0.nonfinite_outputs > 0,
+        "a divergent filter must trip the backstop"
+    );
+    for &s in &out0[0] {
+        assert!(s.is_finite(), "output must never carry non-finite samples");
+    }
+
+    // Same block again, post-reset: bit-identical output (state healed,
+    // not left saturated at inf).
+    let (out1, outcome1) = chain_process(&mut chain, &input, false, 1.0);
+    assert_eq!(outcome1.nonfinite_outputs, outcome0.nonfinite_outputs);
+    for (i, (a, b)) in out0[0].iter().zip(out1[0].iter()).enumerate() {
+        assert_eq!(a.to_bits(), b.to_bits(), "sample {i}: reset did not heal");
     }
 }
 
