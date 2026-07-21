@@ -151,10 +151,10 @@ R7 ship (signed DMG, notarization, PLD 2024/2853 posture decision).
    R1-6 says `build_correction` *refuses* on `design_rate != stream_rate`
    (fail open to flat pass-through); decision-engine Open Q1's recommended
    fix says `CorrectionConfig::Peq { bands, design_rate }` with SOS
-   *re-derived* at the live rate on every rebuild. Materially different
-   behavior on an AirPods 44.1↔48 handoff (correction drops vs. survives).
-   Plausible reconciliation: land R1-6's refusal as the engine invariant,
-   then layer band-carrying re-derivation on top — but no spec says that.
+   *re-derived* at the live rate on every rebuild. **Resolved** — adopt fix
+   (1) (re-derive), with R1-6's refuse-and-fail-open as the last-resort guard
+   for configs that cannot be re-derived; see
+   `docs/decisions/2026-07-21-decision-engine-open-questions.md` §Q1.
 2. **Authority-limited autofit shape (blocks Stage 5):** three different
    shapes across specs (mutate `auto_fit_parametric_eq` / add
    `auto_fit_parametric_eq_with_authority` / per-channel `auto_fit_room`).
