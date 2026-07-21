@@ -341,3 +341,75 @@ shown (Q5), clock-adjust toggle + ppm readout (Q6), position count up to the
 ceiling (Q7). Every one of these is REW's actual control; together they make
 the Advanced drawer a superset of REW rather than a walled garden — which is
 the point of automating the judgment without taking the wheel away.
+
+## Moving Microphone Method (MMM) — a second room capture modality
+
+**Decision (owner-directed, 2026-07-21):** offer MMM alongside discrete-position
+sweep capture for the room path. REW has it and it is popular for exactly the
+reasons below.
+
+**What it is.** Continuous pink noise plays while the user slowly moves the mic
+through the listening volume, and a real-time analyzer power-averages over the
+whole traversal (REW: RTA + "Forever" averaging). The output is **one
+spatially-averaged magnitude curve** — no impulse response, no phase, no
+per-position data. The moving mic + noise averages the position-dependent phase
+away, so the power average falls out directly. It is fast, forgiving, samples
+the whole area rather than a few points, and is **inherently immune to the
+two-clock problem (Q6)** — with no gating and no t=0 to recover, clock drift is
+irrelevant (this is the case "Farina tolerates skew" actually covered).
+
+**Why it is not just another averaging mode.** MMM produces a *different kind of
+bundle*. Because there is no impulse response it cannot feed most of the
+sweep-path machinery:
+
+- no time gating / FDW (Q3) — nothing to window;
+- no per-position σ(f) (Q5) — the spatial average is baked in at capture;
+- no excess-group-delay authority (Q4) — needs phase;
+- no Schroeder decay / T60.
+
+So an MMM correction falls back to the safe universal rule — **cut peaks, do not
+fill dips, fixed conservative boost ceiling, heavy smoothing** (variable /
+psychoacoustic) — which is exactly what a REW MMM user does by hand. A good,
+robust, but deliberately *less sophisticated* correction than the full sweep
+path. The cal file still applies (it is per-frequency magnitude compensation).
+
+**Architectural implications (all new work, sequenced no earlier than Stage 4's
+room path):**
+
+1. **Capture method on the bundle.** `MeasurementBundle` assumes per-position
+   `ImpulseResponse`s; MMM has none. Add `CaptureMethod { DiscreteSweep,
+   MovingMic }` and branch `decide()`'s authority model on it — full σ(f) +
+   group-delay for sweeps, conservative magnitude-only for MMM. The IR-derived
+   bundle fields become absent/optional under `MovingMic`.
+2. **New stimulus + capture runtime.** Pink-noise stimulus and continuous RTA
+   power-averaging, distinct from sweep-and-deconvolve. A new `StimulusSink`
+   stimulus kind and a capture loop in `paraeq-measure` / the wizard.
+3. **New level-safety policy (OPEN).** The measurement-safety level ladder is
+   entirely sweep-specific; pink noise is continuous energy with a different
+   crest factor, so hearing-exposure (a longer continuous capture) and driver
+   heating need their own MMM numbers. This wants its own row in the safety
+   spec — do not reuse the sweep caps unexamined.
+4. **Thinner persistence.** The decision-engine spec mandates raw per-position
+   IR storage so Reanalyze is ~200 ms; MMM has no IRs, so it stores the averaged
+   magnitude curve and Reanalyze can only re-smooth / re-target, not re-gate.
+
+**Open questions MMM raises:**
+
+- **Room easy-mode default: MMM or discrete sweep?** MMM is faster, more
+  forgiving, and two-clock-immune, which argues for it as the "just fix my
+  sound" room default — but it asks the user to physically move the mic
+  continuously while noise plays, a different kind of effort than
+  place-measure-move-repeat, and it yields the weaker (magnitude-only)
+  correction. Owner call; it interacts with the two-front-ends seam.
+- **MMM authority model.** Confirm the conservative magnitude-only policy
+  (cut-focused, fixed boost ceiling, heavy smoothing) and how a bundle with no
+  IRs is represented so the σ(f)/EGD fields are cleanly absent rather than
+  faked.
+- **A middle-ground modality?** Some tools do "moving mic with periodic
+  sweeps," which recovers some IR/gating while still sampling the area. Noted;
+  likely out of scope for the first release, but record the choice rather than
+  omit it silently.
+
+Consistent with the power-user principle: offer both modalities, expose the
+choice in the mode chooser, and keep MMM's simpler authority overridable within
+safe bounds in the drawer.
