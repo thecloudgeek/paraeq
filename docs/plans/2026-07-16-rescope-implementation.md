@@ -169,7 +169,11 @@ R7 ship (signed DMG, notarization, PLD 2024/2853 posture decision).
 4. **Two-clock capture problem (gates the room path):** "Farina tolerates
    skew" covers only ungated coupler magnitude; gating needs a trustworthy
    t=0. Run the experiment (measurement-suite/9) the moment the Stage-4
-   aggregate exists; day-one mitigation is `Warn(TwoClock)` on gated paths.
+   aggregate exists. **Likely resolution (see the REW comparison below):**
+   adopt REW's bracketed-timing-marker skew estimate + resample, default on,
+   with `Warn(TwoClock)` as the fallback when no estimate can be formed — REW
+   already ships this and reports the drift is only ~12 ppm, so this is a
+   port, not open research.
 5. **Verification gate definition (blocks Stage 6):** residual RMS >
    2×flatness_target over the authority band (decision-engine,
    measurement-safety) vs. residual_vs_prediction with threshold unstated
@@ -238,3 +242,102 @@ type or in a test on the branch; none is invented policy.
     `stable`, so a compiler release can turn it red on an unrelated PR.
     Regenerate with `TRYBUILD=overwrite`; pinning the toolchain is a
     repo-wide call left to the owner.
+
+## REW comparison and the automate-with-an-override principle
+
+How REW (Room EQ Wizard, the field-standard measurement tool) handles the
+five room-specific decision-engine open questions (Q3–Q7), researched against
+its official help and John Mulcahy's forum posts. The organizing finding:
+**REW gives the expert user the data and the controls and leaves the judgment
+to them; ParaEQ automates the judgment as a safe default.** That is the
+"just fix my sound" premise — but it is only safe if the automation is never
+a cage.
+
+**The principle (owner-directed, 2026-07-19).** Every automated decision must
+also be a *manual control for power users*. This is already the decision-engine
+spec's architecture, not new work: each `Decision<T>` carries a legal `Domain`,
+a `Source` that flips `Auto → UserOverride`, and the Advanced drawer renders
+each as a control (see "The One-Engine-Two-Front-Ends Seam" and "Override
+Semantics"). So there is a third disclosure level above auto and guided: the
+drawer, where a power user has REW-equivalent reach. The REW comparison's job
+here is to pin **which specific levers must be exposed** so the drawer is a
+genuine superset of REW, not a subset — an auto user never touches them, a REW
+refugee finds all of them.
+
+Per question (REW behavior → ParaEQ default + the power-user override the
+drawer must expose):
+
+- **Q3 — windowing (FDW).** REW uses a *single symmetric* window ("cycles" or
+  octave-fraction; 15 cycles = 150 ms @ 100 Hz, 15 ms @ 1 kHz, 1.5 ms @ 10 kHz)
+  with no pre/post-peak asymmetry — only Acourate exposes that, and REW users
+  have asked Mulcahy for it. REW's "variable smoothing" (1/48 oct <100 Hz →
+  1/3 oct >10 kHz) is what it "recommends for responses to be equalised", which
+  matches ParaEQ's room smoothing curve. **Default:** auto variable window; the
+  pre/post asymmetry (`n_c_pre`/`n_c_post`) stays an optional refinement, decided
+  from real rooms — shipping it puts ParaEQ ahead of REW, in Acourate territory.
+  **Drawer override:** window cycles / octave-fraction and smoothing mode, at
+  minimum matching REW's single-value control.
+  ([impulseresponse.html](https://www.roomeqwizard.com/help/help_en-GB/html/impulseresponse.html),
+  [analysis.html](https://www.roomeqwizard.com/help/help_en-GB/html/analysis.html))
+- **Q4 — where to boost (peaks vs dips).** REW's auto-EQ leaves the
+  boost-vs-fill-a-null judgment to the user via a **global max-boost limit**
+  plus standing advice to cut not boost; its minimum-phase / excess-group-delay
+  displays are diagnostics the user reads, they do **not** feed the auto-EQ.
+  ParaEQ's Q4 (per-region boost authority derived automatically from group
+  delay + σ(f)) is doing by machine what REW expects expertise to do — the
+  biggest philosophical gap, and the reason to err conservative on the auto
+  path. **Drawer override:** the `authority` Decision (Standard / Conservative /
+  Custom) plus a max-boost ceiling, i.e. REW's actual knob, on top of a safe
+  default. (Resolving open question 10 above — the preset *names* need a home —
+  is what makes this override presentable.)
+  ([Match Response to Target / Filter Tasks, eq.html])
+- **Q5 — seat disagreement.** REW gives the spatial average (RMS/power average
+  for different positions; vector/phase average only for the same position or
+  after alignment) but computes **no** per-frequency variance and does **not**
+  throttle EQ by it — "correct less where the seats disagree" is entirely the
+  user's call. ParaEQ's σ(f) authority throttle is a genuine value-add over
+  REW. **Default:** auto-throttle by σ(f); **surface** the σ(f) band on the
+  results screen (the confidence information REW never shows). **Drawer
+  override:** the authority scaling and smoothing, so a power user can push
+  correction further up-band against ParaEQ's advice — with the σ curve visible
+  so they see the risk.
+  ([graph_allspl.html](https://www.roomeqwizard.com/help/help_en-GB/html/graph_allspl.html))
+- **Q6 — two clocks. REW already solved this; adopt its method.** REW handles
+  the UMIK-1-vs-separate-output case with an **acoustic timing reference**, and
+  its opt-in "Adjust clock with acoustic ref" plays a timing marker at the
+  **start and end** of the sweep, counts elapsed samples vs expected, computes
+  the clock-rate difference, and **resamples** the capture — exactly the
+  "estimate-skew + resample" option. Mulcahy, verbatim: *"REW knows how many
+  samples there should be between the timing signals and if there are more or
+  fewer it knows the clocks were different and can resample the data
+  accordingly"*; typical magnitude *"Only 12 ppm… when output and input are on
+  different devices."* This **de-risks the spec's "largest unpriced item"**:
+  it is a known technique with a known ~12 ppm magnitude, not open research.
+  **Recommendation:** replace the plan's cross-spec open question 4 mitigation
+  ("`Warn(TwoClock)`, resolution unscheduled") with **adopt REW's
+  bracketed-timing-marker skew estimate + resample, default on**, keep
+  `Warn(TwoClock)` only as the fallback when the estimate cannot be formed, and
+  still run measurement-suite/9 to confirm the magnitude on our own rig before
+  hardening. **Drawer override:** a clock-adjust on/off toggle with the
+  estimated ppm shown — REW exposes it as an opt-in preference; ParaEQ should
+  default it on and let a power user see and disable it.
+  ([analysis.html](https://www.roomeqwizard.com/help/help_en-GB/html/analysis.html),
+  [Mulcahy, AVNirvana](https://www.avnirvana.com/threads/propper-use-of-clock-adjustment.7839/))
+- **Q7 — number of positions.** REW prescribes no count and effectively no cap
+  (a configurable "Maximum measurements" pool defaults to 30, up to 250, but
+  never binds spatial averaging), and offers the Moving Microphone Method as a
+  continuous alternative to discrete points. Dirac prescribes fixed 9/13/17.
+  ParaEQ's ceiling of 15 is a sensible middle — far below REW's pool limit, so
+  it never constrains a REW-style workflow. **Default:** ~9 (where the known
+  benefit plateaus). **Drawer override:** raise to the 15 ceiling or lower;
+  consider offering MMM as a scope item, since REW has it and ParaEQ (discrete
+  only) would not.
+  ([graph_allspl.html](https://www.roomeqwizard.com/help/help_en-GB/html/graph_allspl.html),
+  [spectrum.html](https://www.roomeqwizard.com/help/help_en-GB/html/spectrum.html))
+
+**Net for the drawer's must-expose list:** window cycles + smoothing mode (Q3),
+authority preset + max-boost ceiling (Q4), authority scaling with the σ(f) band
+shown (Q5), clock-adjust toggle + ppm readout (Q6), position count up to the
+ceiling (Q7). Every one of these is REW's actual control; together they make
+the Advanced drawer a superset of REW rather than a walled garden — which is
+the point of automating the judgment without taking the wheel away.
