@@ -39,6 +39,8 @@ R1 sits between the stage-4 merge and stage 5. Three hard ordering constraints:
 
 Everything else is independent and parallelizable.
 
+**Status (2026-07-21):** R1-1's DSP half (`ParametricEQ::preamp_db`), R1-2, R1-3, R1-5, and R1-7a landed in Stage 1 on `feature/rescope-stage1`; R1-1's engine half, R1-6, and R1-8 are the post-merge Stage-2 remainder (per `docs/plans/2026-07-16-rescope-implementation.md`).
+
 ---
 
 ## R1-1 — Auto-preamp
@@ -215,7 +217,7 @@ pub fn is_stable(sos: &[f64; 6]) -> bool {
 
 *Why not `Result` on the designers:* they are golden-fixture-pinned against the Python oracle (`tests/test_biquad.rs`), the oracle itself is infallible, and a signature change churns every call site to buy a guarantee we can enforce more cheaply at the one boundary that matters.
 
-**OPEN:** `validate_bands`'s range check should move out of `desktop/src-tauri/src/eq.rs` so the daemon seam inherits it. `paraeq-dsp` (next to the designers, pure math) or `paraeq-engine` (next to `validate_correction`, `controller.rs:80`)? `paraeq-engine` keeps `paraeq-dsp` free of policy; `paraeq-dsp` puts the guard next to the thing being guarded. Owner's call.
+**OPEN [OWNER]:** validate_bands guard location — `validate_bands`'s range check should move out of `desktop/src-tauri/src/eq.rs` so the daemon seam inherits it. `paraeq-dsp` (next to the designers, pure math) or `paraeq-engine` (next to `validate_correction`, `controller.rs:80`)? `paraeq-engine` keeps `paraeq-dsp` free of policy; `paraeq-dsp` puts the guard next to the thing being guarded. Owner's call. This is **distinct from** decision-engine Q2 (whether the four designers themselves become fallible — decided **No**: the guard stays at the install boundary, see `docs/decisions/2026-07-21-decision-engine-open-questions.md` §Q2); that question is settled, and this one is only about *where the range check physically lives*.
 
 **Tests.**
 
@@ -256,11 +258,13 @@ The distinction that survives adversarial review and that this fix encodes: **mo
 let score = if residual[i] < 0.0 { -residual[i] } else { residual[i] * BOOST_WEIGHT };
 ```
 
-`BOOST_WEIGHT ≈ 0.5` — **OPEN**, needs the owner's ears. Plus a hard rule: **reject any positive-gain candidate whose estimated Q exceeds a narrow-dip threshold** (skip it and zero that residual bin so the greedy loop moves on). Narrow dips are interference; wide dips may be real response. Proposed threshold `Q > 3.0` — **OPEN**.
+`BOOST_WEIGHT ≈ 0.5` — **OPEN [OWNER]:** needs the owner's ears; the interim safe default (symmetric Trinnov curve, reject boosts above Q=3) stands. Plus a hard rule: **reject any positive-gain candidate whose estimated Q exceeds a narrow-dip threshold** (skip it and zero that residual bin so the greedy loop moves on). Narrow dips are interference; wide dips may be real response. Proposed threshold `Q > 3.0` — **OPEN [OWNER]:** needs the owner's ears; the interim safe default (symmetric Trinnov curve, reject boosts above Q=3) stands.
 
 *2. Frequency-indexed excursion curve* — Trinnov's shipped values: **±10 dB at or below 150 Hz, tapering to ±2 dB by 500 Hz, ±2 dB above.** Implemented as `authority::excursion_db(f) -> f64`, linear-in-dB over log-f between 150 and 500 Hz. Applied as `gain_db = peak_gain.clamp(-cut_limit, excursion_db(fc))`.
 
-*Cut limit:* cuts cannot clip and cannot over-excurse a driver — they only remove energy — so a symmetric application of Trinnov's curve is stricter than necessary. Proposed: `cut_limit = 2 × excursion_db(fc)` (so −20 dB below 150 Hz, −4 dB above 500 Hz). **OPEN** — the honest, defensible default until the owner has listened is to apply Trinnov's curve **symmetrically** exactly as shipped and relax only on evidence.
+*Cut limit:* cuts cannot clip and cannot over-excurse a driver — they only remove energy — so a symmetric application of Trinnov's curve is stricter than necessary. Proposed: `cut_limit = 2 × excursion_db(fc)` (so −20 dB below 150 Hz, −4 dB above 500 Hz). **OPEN [OWNER]:** the honest, defensible default until the owner has listened is to apply Trinnov's curve **symmetrically** exactly as shipped and relax only on evidence.
+
+**Note — the autofit *shape* these three constants live in is itself an open cross-spec reconciliation, not settled here.** Which function signature owns them (`auto_fit_parametric_eq` mutated in place / `auto_fit_parametric_eq_with_authority` added / a per-channel `auto_fit_room`) is tracked in `docs/plans/2026-07-16-rescope-implementation.md` (cross-spec question 2, blocks Stage 5). And room-dsp's Open Q4 (`boost_ratio = 0.5`, `min_dip_width_oct = 1/6`) is **the same decision** as this section's `BOOST_WEIGHT` and narrow-dip Q threshold — the two specs must reconcile to one definition together, not be tuned independently.
 
 *3. REW boost-Q cap* — `Q_max = 0.227 · f₀ / A`, `A = 10^(G/40)`, boosts only, replacing the blanket `0.5..=20.0` for positive-gain bands. Worked values:
 
@@ -378,6 +382,8 @@ The realized filter lands at `fc' = fc · (new_rate / design_rate)`:
 **Status: PARTIALLY CLOSED on `feature/rust-port-tauri-shell` — verified.** `desktop/src-tauri/src/eq.rs:120–134` `resend_decision(last_rate, snapshot, have_bands)` returns `Some(new_rate)` when the snapshot's stream rate differs from the last seen (or on the first-ever stream); `engine_bridge.rs:143–159` re-validates the bands at the new rate and re-sends `SetCorrection(design_correction(&bands, rate))`, or `ClearCorrection` on validation failure. It is unit-tested at `eq.rs:452–482` (first stream, unchanged, changed, no-bands, no-stream). **Verify this before merge and keep those tests** — they are the regression guard the task asks for.
 
 **What remains open after the merge — the engine is still structurally rate-blind:**
+
+**DECIDED (2026-07-21):** the rate-independence *shape* is settled — adopt decision-engine fix (1): `CorrectionConfig` carries the design *inputs* (`bands` + `design_rate`) and `build_correction` re-derives coefficients at the live rate on every rebuild, so a correction normally *survives* a rate switch rather than being refused (a 47 Hz mode filter stays at 47 Hz across an AirPods 44.1↔48 kHz handoff). R1-6's refuse-on-mismatch + fail-open-to-flat is retained as the last-resort net for configs that genuinely cannot be re-derived (a legacy baked-SOS `Iir { sos_per_channel }`). See `docs/decisions/2026-07-21-decision-engine-open-questions.md` §Q1. The three structural gaps this fix must close remain:
 
 1. **The fix lives in the Tauri crate.** `paraeq-engine` is the daemon-ready crate (2026-07-02 spec, line 75). Any other consumer — a future `paraeqd`, the auto front-end calling the engine directly — gets no protection. The forwarder is a *policy*; the engine needs an *invariant*.
 2. **It only covers the band path.** `eq.rs:97` `design_correction` only ever emits `CorrectionConfig::Iir`; stage 4 has no FIR path. The FIR room correction (stage 6) designs taps against a frequency grid, and a rate change makes those taps wrong the same way — but `resend_decision` would have nothing to redesign *from*, because the Tauri layer would be holding **taps**, not intent.
@@ -612,7 +618,7 @@ Order-of-magnitude arithmetic: single-partition ≈ 32768·log₂(32768) = 491k 
 | Risk | Mitigation |
 |---|---|
 | R1-4 lands before `authority.rs` is designed, and the excursion/Q constants get invented locally | R1-4 is explicitly *gated* on the room-DSP spec's `authority.rs`. If it slips, ship the wrapper + the existing fixture and hold the new fn — do **not** hardcode Trinnov's numbers in `autofit.rs`. |
-| `BOOST_WEIGHT`, the narrow-dip Q threshold, and the cut limit are guesses that ship untuned | All three are marked OPEN. The safe default is Trinnov's curve applied **symmetrically** and boosts rejected above Q=3; relax only after the owner has listened. Every one of them is a named constant in one module, changeable without touching the algorithm. |
+| `BOOST_WEIGHT`, the narrow-dip Q threshold, and the cut limit are guesses that ship untuned | All three are marked **OPEN [OWNER]**. The safe default is Trinnov's curve applied **symmetrically** and boosts rejected above Q=3; relax only after the owner has listened. Every one of them is a named constant in one module, changeable without touching the algorithm. |
 | R1-6's `CorrectionConfig` change conflicts with the unmerged stage-4 branch | Sequenced explicitly: R1-6 lands **after** the merge. The branch's `resend_decision` tests (`eq.rs:452–482`) are retained and re-pointed, not deleted. |
 | `kAudioSubDeviceInputChannelsKey` is not exported by `objc2-core-audio` 0.3.x | Fall back to a locally defined CFString literal citing `AudioHardware.h`. The key's *value* is a CFNumber, not a CFBoolean — a 2-minute check at implementation time, called out at the point of use. |
 | The R1-7b FIR crossfade is ParaEQ's own invention with no reference implementation to check against | The no-op-swap test (swap to identical coefficients → bit-identical output) is a total-correctness oracle for the state machine that needs no external reference. Ship the IIR arm (R1-7a) first; the FIR arm only gates on the FIR path existing. |

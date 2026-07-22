@@ -567,13 +567,13 @@ order are replaced by R0–R7.
 
 | Risk | Severity | Mitigation |
 |---|---|---|
-| **Two-clock topology + gating.** The mic runs at its own fixed rate against the output device. "Farina tolerates their small clock skew (prototype proved it)" was proven for an **ungated coupler magnitude** measurement; gating needs a trustworthy *t = 0* and an undistorted IR shape, and that claim does not transfer. **Biggest unscheduled cost in the rescope.** | High | Schedule it explicitly in R5, not as a footnote. Measure the actual drift before designing around it: capture a known stimulus on both clocks and quantify the *t = 0* jitter across a 5 s sweep. Escalation path, cheapest first: (1) accept it if measured jitter is small against the FDW's LF window; (2) resample the capture to the playback clock via a measured drift estimate; (3) drift-compensate in the aggregate as the tap path already does (`kAudioSubTapDriftCompensationKey`); (4) require the mic and output on one aggregate. Cross-cutting constraint: the Farina harmonic bound `dt₂ = T·ln2/ln(f₂/f₁)` puts H2 only **502 ms** before the peak for a 5 s 20 Hz–20 kHz sweep, so a long left window folds distortion into the "linear" response — and `deconvolve()` puts the IR peak at only **~46–64 ms** (tap latency + propagation), so REW's 125 ms left window is **physically impossible**: clamp left to `min(requested, peak_index)`. |
-| **Scope doubling.** R2–R6 replace two stages with five. Four to six months at current cadence. | High | Cut **room ambition, not room presence**: if the date is at risk, correct below the transition only. Dirac sells exactly that as a $499 Limited-Bandwidth tier, so the precedent is commercial, not apologetic. The transducer count is **not** the risk — four types is one spine parameterized by a `PathProfile`, and bookshelf vs. floorstanding is one data-derived low-corner rule, not a branch. |
+| **Two-clock topology + gating.** The mic runs at its own fixed rate against the output device. "Farina tolerates their small clock skew (prototype proved it)" was proven for an **ungated coupler magnitude** measurement; gating needs a trustworthy *t = 0* and an undistorted IR shape, and that claim does not transfer. **Biggest unscheduled cost in the rescope — now de-risked to a known-magnitude port (see Mitigation).** | High | **DECIDED (method) [NEEDS DATA]:** adopt REW's bracketed-timing-marker skew estimate + resample (default on; ~12 ppm typical), and confirm the magnitude on the owner's rig via measurement-suite/9 before hardening — see docs/decisions/2026-07-21-decision-engine-open-questions.md §Q6 and the plan doc's REW-comparison section; option (2) below is now the chosen path, not one of four coequals. Schedule it explicitly in R5, not as a footnote. Measure the actual drift before designing around it: capture a known stimulus on both clocks and quantify the *t = 0* jitter across a 5 s sweep. Escalation path, cheapest first: (1) accept it if measured jitter is small against the FDW's LF window; **(2) resample the capture to the playback clock via a measured drift estimate — the adopted method**; (3) drift-compensate in the aggregate as the tap path already does (`kAudioSubTapDriftCompensationKey`); (4) require the mic and output on one aggregate. Cross-cutting constraint: the Farina harmonic bound `dt₂ = T·ln2/ln(f₂/f₁)` puts H2 only **502 ms** before the peak for a 5 s 20 Hz–20 kHz sweep, so a long left window folds distortion into the "linear" response — and `deconvolve()` puts the IR peak at only **~46–64 ms** (tap latency + propagation), so REW's 125 ms left window is **physically impossible**: clamp left to `min(requested, peak_index)`. |
+| **Scope doubling.** R2–R6 replace two stages with five. Four to six months at current cadence. | High | **OPEN [OWNER]:** schedule contingency — correct below the transition only if the date slips (owner's ship-scope call). Cut **room ambition, not room presence**: if the date is at risk, correct below the transition only. Dirac sells exactly that as a $499 Limited-Bandwidth tier, so the precedent is commercial, not apologetic. The transducer count is **not** the risk — four types is one spine parameterized by a `PathProfile`, and bookshelf vs. floorstanding is one data-derived low-corner rule, not a branch. |
 | **The competitive window.** ~12–18 months before an OSS tap EQ bolts on a sweep. Dirac shipped Mac ART 2026-06-30. | High | Do not ship coupler-only as an interim — it re-anchors ParaEQ as "the EARS app" and burns the window on the weakest claim it owns. Ship the two differentiators nobody has and that are nearly free once R3 lands: **σ(f) as measured confidence** gating EQ authority (REW's author describes it in prose; no product automates it) and **closed-loop verification** (neither Dirac nor Sonarworks re-measures). |
 | **Oracle-less room DSP.** ~two-thirds of the room core has no oracle of any kind. | High | The four tiers, decided in R0 before code. Tier 3 is the honest answer and is a **strict upgrade** over parity for this code: an analytic-physics test cannot inherit an oracle's bugs. Be candid that Tier 3 covers fewer behaviours than a fixture would — pair each Tier-3 module with Tier-4 REW characterization at 0.1–0.5 dB so a regression is caught even where an invariant does not pin the value. |
 | **Smoothing is O(N²) and room IRs are 10–100× longer than headphone IRs.** `fractional_octave_smooth` (`fr.rs:34-59`) is a rectangular boxcar whose inner loop scans **every** bin for **every** bin — measured **2586 ms for 65536 bins**. It never bit because headphone IRs are short. It will visibly hang the wizard. | Medium | Alvarez–Mazorra recursive Gaussian (λ = q²/(2K), ν = (1+2λ−√(1+4λ))/(2λ), K ≈ 4, with Getreuer's q-correction) gives O(N·K) with published boundary handling. **The kernel changes from boxcar to Gaussian, so exact fixture parity is impossible** — keep `Fixed(n)` bit-exact on the old code path (Tier 1 is frozen) and make the new modes **additive**. Likewise implement FDW as an O(N log N) convolution on a log-f axis, never the O(F·N) per-frequency loop — and note the FDW **must** operate on the *complex* spectrum; magnitude smoothing is a different, wrong operation. |
 | **Target category error.** `match_closest_target` has no category filter. Adding a room target to `targets/` without fixing this lets a speaker measurement match `harman_oe_2018` and double-apply ~11 dB of ear gain at 3 kHz. | Medium | `TransducerClass` as a **required argument**, landed in the same commit as the first room target. Compiler-enforced, not a UI default. This is the one defect whose exploit is *created by* the rescope: it is inert today only because all six bundled curves are coupler targets. |
-| **The FDW at low frequency needs data we do not have.** A symmetric 15-cycle FDW at 50 Hz wants **300 ms** of pre-peak data; ParaEQ has ~46–64 ms. | Medium | Asymmetric pre/post cycle counts, with the left side clamped to `min(requested, peak_index)`. Publish `min_valid_freq = 1/T_right` and render it — grey out what the measurement cannot resolve rather than plotting noise. The resolution limit is not folklore: a window of length T resolves nothing below ~1/T, with the stricter criterion `f = (1/T)/(2^(1/2N) − 2^(−1/2N))`. |
+| **The FDW at low frequency needs data we do not have.** A symmetric 15-cycle FDW at 50 Hz wants **300 ms** of pre-peak data; ParaEQ has ~46–64 ms. | Medium | **OPEN [NEEDS DATA]:** the pre-peak data gap cannot close until real EARS/UMIK captures exist. Asymmetric pre/post cycle counts, with the left side clamped to `min(requested, peak_index)`. Publish `min_valid_freq = 1/T_right` and render it — grey out what the measurement cannot resolve rather than plotting noise. The resolution limit is not folklore: a window of length T resolves nothing below ~1/T, with the stricter criterion `f = (1/T)/(2^(1/2N) − 2^(−1/2N))`. |
 | **σ(f)-derived transition frequency has no shipping precedent.** It is the one genuinely novel piece with no competitor to check against. | Medium | It is also the best differentiator in the set: σ separates correctable-everywhere features (σ ≈ 0.6–0.8 dB) from position-dependent junk (σ ≈ 10 dB), and rises toward the diffuse-field asymptote of **5.57 dB** above Schroeder — so confidence-derived authority **reproduces the ~200 Hz rule without hardcoding it** and adapts to a treated room. Fallback if it proves unstable on real rooms: the 200 Hz constant, with the variance curve retained as **evidence only**. Cross-check against `f_s = 2000·√(T60/V)` where volume is given, and return a **range** (0.5·f_s … 2·f_s) rather than a point. |
 | **Align SPL is mandatory and easy to forget.** REW: "it is usually best to first use Align SPL to remove overall level differences due to different source distances." | Low | Make it structural: `average_measurements_rms` takes already-aligned curves and the room pipeline calls `normalize_to_reference_band` (the existing primitive) first. Without it, near positions dominate the power average **and** inflate σ(f), corrupting the confidence metric that everything downstream depends on. |
 | **Tap goes all-zero in steady state.** Apple forum reports describe taps going silent after minutes of correct operation, not just at engage. | Low | The watchdog must cover steady-state, not just the ~5 s engage window. The engine's fail-open-on-undetected-input behaviour (commit `179cd34`) is the right shape; extend its coverage and test it. |
@@ -619,9 +619,16 @@ Explicitly, in writing, so a future session does not relitigate:
 
 ## Open Questions
 
-Marked OPEN because they are not settled and must not be papered over.
+Retagged by kind on 2026-07-21 as the settled decisions were folded in.
+**DECIDED** items carry a pointer to where they were resolved; **OPEN [OWNER]**
+items are value / business / ears calls that block ship, not the next code;
+**OPEN [NEEDS DATA]** items cannot close until real EARS/UMIK measurements exist;
+**RESOLVED** items were settled in a companion spec. Nothing here is papered over.
 
-1. **Commercial posture.** EU PLD 2024/2853 (transposition due 9 Dec 2026 — inside
+1. **Commercial posture. OPEN [OWNER]:** owner's business call; the recommendation
+   is to stay FOSS / non-commercial to retain the PLD Art. 2(2) exemption — see
+   docs/decisions/2026-07-21-decision-engine-open-questions.md §Q8. EU PLD 2024/2853
+   (transposition due 9 Dec 2026 — inside
    this release's life) makes software a product; Art. 6(1)(a) covers personal
    injury; **Art. 14 voids any contractual exclusion**, so the MIT "AS IS"
    disclaimer is inert against a personal-injury claim. The real protection is
@@ -631,16 +638,25 @@ Marked OPEN because they are not settled and must not be papered over.
    explicitly and it must be recorded in a spec.** Any paid tier forfeits the
    exemption and attaches strict liability that cannot be disclaimed.
 2. **Is the two-clock skew tolerable for gating, or does the mic have to join the
-   aggregate?** Not answerable from the corpus. R5 must measure it before
-   designing around it. The answer changes the shape of the measurement runtime.
-3. **Does the σ(f)-derived transition frequency hold up on real rooms?** No
-   shipping precedent exists. Fallback is specified (200 Hz constant, variance as
-   evidence only) but the decision needs the owner's hardware in the loop.
+   aggregate? DECIDED (method) [NEEDS DATA]:** adopt REW's bracketed-timing-marker
+   skew estimate + resample (REW reports ~12 ppm typical); confirm the magnitude on
+   the owner's rig via measurement-suite/9 before hardening. See
+   docs/decisions/2026-07-21-decision-engine-open-questions.md §Q6 and the plan
+   doc's REW-comparison section. The technique is a port, not open research; what is
+   left is R5 measuring the drift on ParaEQ's own EARS/UMIK rig before the runtime
+   hardens around it. The answer still shapes the measurement runtime.
+3. **Does the σ(f)-derived transition frequency hold up on real rooms? OPEN [NEEDS
+   DATA]:** this novel confidence-derived transition metric needs owner-hardware
+   validation and has no shipping precedent. Note that the σ_full/σ_none authority
+   endpoints themselves are decided — σ_full = 1.0 dB, σ_none = 6.0 dB, see
+   docs/decisions/2026-07-21-decision-engine-open-questions.md §Q5 — with the 200 Hz
+   constant + variance-as-evidence fallback if the derived transition proves
+   unstable.
 4. **Where does `decide()` live? — RESOLVED.** The decision-engine spec settled
    this: a new crate **`paraeq-decide`** depending on `paraeq-dsp` only, keeping
    `paraeq-dsp` pure math rather than widening its charter to "pure math and pure
    policy." This spec's Decisions Log and Architecture reflect that. (Left in the
-   list as a resolved pointer, not an open item.)
+   list as a resolved pointer, not a live question.)
 5. **Companion spec filenames — RESOLVED.** The sibling sessions landed as
    `room-dsp-design.md`, `decision-engine-design.md`, `wizard-design.md`,
    `measurement-safety-design.md` and `engine-hardening-design.md`; there is no

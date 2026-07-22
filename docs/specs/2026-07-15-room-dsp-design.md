@@ -417,7 +417,7 @@ Magnitude smoothing is a **different, wrong operation**. It discards the phase-d
 
 **Derotate first.** Phase-rotate the spectrum by `e^{+j2πf·t_peak}` (remove the bulk delay) **before** the log-f resample. Without it, the complex spectrum at 20 kHz with a 50 ms delay winds ~1000 full turns and **no log grid could sample it** — the Gaussian would smooth a rapidly rotating phasor to zero. Derotation is what makes 96 ppo sufficient. Re-apply the rotation afterwards only if a caller needs absolute phase (correction design does not).
 
-### Asymmetry — and an honest open question
+### Asymmetry — an honest question, now decided
 
 A symmetric FDW at low frequency needs pre-peak data ParaEQ does not have: 15 cycles at 50 Hz is a 300 ms window, 150 ms of it *before* the peak, against the ~46–64 ms available. So `FdwSpec` carries independent pre/post cycle counts (Acourate's convention):
 
@@ -463,7 +463,7 @@ pub fn apply_fdw_bruteforce(
 
 The justification for applying it anyway with `n_c = post_cycles`: **a deconvolved IR is causal.** `h(t) ≈ 0` before the peak — the only things living there are tap-latency noise, deconvolution pre-ringing, and Farina harmonic products. The pre-side of the window therefore multiplies near-zero data and contributes negligibly to the effective kernel. This reframes `pre_cycles` correctly: it is a **noise gate on pre-peak artifacts, not a resolution parameter**, and it is applied in the **time domain** by `gating.rs` as a fixed left gate at `min(pre_cycles/f_min, peak_time, farina_h2_bound)` — frequency-independent, which is exactly what a fixed time gate can express.
 
-**OPEN:** the magnitude of the residual error from treating the asymmetric window as symmetric is not established analytically. It is bounded empirically by the test below. If that test shows > 0.1 dB, revisit before release.
+**DECIDED (default) [NEEDS DATA]:** retain the asymmetry, default `n_c_pre = 3.0` (see docs/decisions/2026-07-21-decision-engine-open-questions.md §Q3 — the lowest-confidence knob, first to collapse to symmetric if real rooms show no effect). The magnitude of the residual error from treating the asymmetric window as symmetric is not established analytically; it is bounded empirically by the test below, and if that test shows > 0.1 dB, revisit before release.
 
 **Tests (Tier 3 — the brute force *is* the oracle).**
 - **`apply_fdw` matches `apply_fdw_bruteforce` to < 2e-15 dB** across `n_c ∈ {3, 5, 15, 30, 61}` at `ppo = 192`, on a synthetic multi-reflection IR. Write the brute force first; ship the fast path against it.
@@ -896,6 +896,8 @@ pub fn auto_fit_room(
 
 ## `compensation.rs` — rewrite
 
+**Status (2026-07-21):** landed in Stage 2 — the REW leading-numeric rewrite shipped in `compensation.rs` in lockstep with the Python oracle (`compensation.py`) in one commit, with a new single-header Tier-2 fixture pinning the fix (see docs/plans/2026-07-16-rescope-implementation.md, Stage 2 and fixture-plan item 7). The design below is retained as the rationale of record.
+
 ### The rule
 
 **REW's own documented rule replaces all format sniffing:** *"Only lines which begin with a number are loaded, others are ignored."* That single rule handles EARS (2 quoted headers), UMIK-1 0-degree (1 header), UMIK-1 90-degree (2 headers), unquoted legacy files, and `*`-comments — uniformly, with **no dispatch at all**.
@@ -1024,7 +1026,7 @@ These are **not** `paraeq-dsp`, but the room path depends on them and a DSP spec
 | Risk | Mitigation |
 |---|---|
 | **Two-clock topology (biggest unscheduled cost in the rescope).** A UMIK-1 runs at its own fixed rate vs. the output device. The existing spec's *"the Farina method tolerates their small clock skew (prototype proved it)"* was proven for an **ungated coupler magnitude** measurement. **Gating needs a trustworthy `t = 0` and an undistorted IR shape — that claim does not transfer.** | Schedule it explicitly as a prerequisite, not an assumption. Measure skew directly: repeat the same sweep N times and track `detect_peak` drift across repeats. If drift exceeds ~1 sample over a sweep, resample the capture to the playback clock before deconvolution. Gate the room path on this experiment, not on hope. |
-| **FDW asymmetry approximation.** The exact identity is proven for a symmetric window; ParaEQ applies it with `n_c = post_cycles` and justifies it by IR causality (`h(t) ≈ 0` before the peak). The residual error is not established analytically. | Bounded empirically by the Tier-3 asymmetry test (< 0.1 dB vs. full brute-force asymmetric windowing on an IR with realistic pre-peak H2 energy). Revisit before release if it fails. Marked OPEN. |
+| **FDW asymmetry approximation.** The exact identity is proven for a symmetric window; ParaEQ applies it with `n_c = post_cycles` and justifies it by IR causality (`h(t) ≈ 0` before the peak). The residual error is not established analytically. | Bounded empirically by the Tier-3 asymmetry test (< 0.1 dB vs. full brute-force asymmetric windowing on an IR with realistic pre-peak H2 energy). **DECIDED (default) [NEEDS DATA]:** retain the asymmetry, default `n_c_pre = 3.0` (see docs/decisions/2026-07-21-decision-engine-open-questions.md §Q3); revisit before release only if that test exceeds 0.1 dB. |
 | **σ(f)-derived authority is novel; no competitor ships it.** If σ(f) proves noisy or unstable across realistic 5–9 position sets, authority becomes erratic. | σ(f) has a known expected shape (0.6–0.8 dB for coherent features; rising to the 5.57 dB diffuse-field asymptote above Schroeder). Validate against `room.rs`'s independently-computed `TransitionRange` as a **sanity check** — if σ(f) crosses its midpoint far from `0.5·f_s…2·f_s`, log `authority.sigma_implausible`. `align_spl` being type-enforced removes the dominant σ-inflation failure mode. |
 | **Kernel change breaks the smoothing contract.** Boxcar → Gaussian means exact fixture parity is impossible. | `Fixed(n)` routes to the existing boxcar path bit-exact; new modes are additive and tested against scipy at the method's published accuracy (1e-3 dB), not at parity. Tier-1 fixtures never regenerate. |
 | **`compensation.rs` oracle divergence.** Fixing `skip(2)` in Rust alone manufactures a red fixture. | Both sides change in **one commit**. The existing EARS fixture is invariant under the fix (verified by inspection); a new single-header fixture pins the actual change. |
@@ -1035,13 +1037,13 @@ These are **not** `paraeq-dsp`, but the room path depends on them and a DSP spec
 
 ## Open Questions
 
-1. **FDW asymmetry (highest priority).** The symmetric-Gaussian identity applied with `n_c = post_cycles` is justified by IR causality, but the residual error is bounded only empirically. If the Tier-3 asymmetry test exceeds 0.1 dB, either raise `ppo` and model the complex asymmetric kernel properly, or restrict `pre_cycles` further. **Resolve before release.**
-2. **Two-clock skew under gating.** Does UMIK-1-vs-output-device skew perturb `detect_peak` or IR shape enough to matter at a 3–6 ms effective HF window? Unmeasured. **Blocks the room path; schedule the experiment first.**
-3. **σ_full / σ_none defaults (1.0 dB / 6.0 dB).** Chosen to bracket the known 0.6–0.8 dB coherent and ~10 dB position-dependent regimes, and to sit below the 5.57 dB diffuse-field asymptote. Not validated against real multi-position sets. Expose in the Advanced drawer; revisit after the owner's ears-on run.
-4. **`boost_ratio = 0.5` and `min_dip_width_oct = 1/6`.** Principled (cut freely, fill grudgingly) but not tuned. The Trinnov excursion curve is *shipped* and therefore trustworthy; these two numbers are ParaEQ's own.
-5. **Room target defaults.** Tilt −0.9 dB/oct is the domestic consensus midpoint; shelf +4.0 dB at 105 Hz / Q 0.71 is a starting point, not a measured preference. Needs the owner's ears.
-6. **Number of measurement positions.** The averaging math is specified for arbitrary N, but the wizard must pick a default. The `10·log10((N−k)/N)` floor argues for N ≥ 5 (a single null costs ≤ 0.97 dB); ergonomics argue for fewer. Unresolved.
-7. **`splice.rs` at all.** If FDW lands clean, splice is dead code. Decide after the FDW brute-force test passes; do not build both speculatively.
+1. **FDW asymmetry (highest priority). DECIDED (default) [NEEDS DATA]:** retain the asymmetry, default `n_c_pre = 3.0` (see docs/decisions/2026-07-21-decision-engine-open-questions.md §Q3 — the lowest-confidence knob, first to collapse to symmetric if real rooms show no effect); the residual-error bound stays gated on the Tier-3 fast-vs-brute-force asymmetry test. The symmetric-Gaussian identity applied with `n_c = post_cycles` is justified by IR causality, but the residual error is bounded only empirically. If that test exceeds 0.1 dB, either raise `ppo` and model the complex asymmetric kernel properly, or restrict `pre_cycles` further — resolve before release.
+2. **Two-clock skew under gating. DECIDED (method) [NEEDS DATA]:** adopt REW's bracketed-timing-marker skew estimate + resample, default on (see docs/decisions/2026-07-21-decision-engine-open-questions.md §Q6 — a known ~12 ppm port, not open research), with `Warn(TwoClock)` as the fallback when no estimate can be formed; confirm the magnitude on the owner's own rig via measurement-suite/9 before hardening. Does UMIK-1-vs-output-device skew perturb `detect_peak` or IR shape enough to matter at a 3–6 ms effective HF window? Still to be measured, but no longer open research. **Schedule the experiment the moment the Stage-4 aggregate exists.**
+3. **σ_full / σ_none defaults (1.0 dB / 6.0 dB). DECIDED (starting value) [NEEDS DATA]:** ship as-is (see docs/decisions/2026-07-21-decision-engine-open-questions.md §Q5 — 6.0 sits just above the 5.571 dB diffuse-field asymptote, keep the wide gap), validate on real multi-position sets. Chosen to bracket the known 0.6–0.8 dB coherent and ~10 dB position-dependent regimes. Expose in the Advanced drawer; revisit after the owner's ears-on run.
+4. **`boost_ratio = 0.5` and `min_dip_width_oct = 1/6`. OPEN [OWNER]:** owner tuning; reconcile with engine-hardening R1-4 (BOOST_WEIGHT / narrow-dip Q / cut_limit) as ONE autofit-shape decision (see docs/plans/2026-07-16-rescope-implementation.md cross-spec question 2). Principled (cut freely, fill grudgingly) but not tuned. The Trinnov excursion curve is *shipped* and therefore trustworthy; these two numbers are ParaEQ's own.
+5. **Room target defaults. OPEN [OWNER]:** owner's ears. Tilt −0.9 dB/oct is the domestic consensus midpoint; shelf +4.0 dB at 105 Hz / Q 0.71 is a starting point, not a measured preference.
+6. **Number of measurement positions. DECIDED (2026-07-21):** 9 room / 5 coupler, ceiling 15, floor 5, hard-min 3 (see docs/decisions/2026-07-21-decision-engine-open-questions.md §Q7; the wizard owns the per-class defaults). The averaging math is specified for arbitrary N; the `10·log10((N−k)/N)` floor argues for N ≥ 5 (a single null costs ≤ 0.97 dB), and 9 lands on the knee of the mean-convergence curve while 15 sits near the half-wavelength decorrelation limit.
+7. **`splice.rs` at all. OPEN [DESIGN — decided by the Stage-4 FDW test]:** build splice only if the FDW brute-force asymmetry test misses; do not build speculatively. If FDW lands clean, splice is dead code.
 
 ## Out of Scope (this release)
 
