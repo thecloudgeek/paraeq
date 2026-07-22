@@ -625,8 +625,9 @@ items are value / business / ears calls that block ship, not the next code;
 **OPEN [NEEDS DATA]** items cannot close until real EARS/UMIK measurements exist;
 **RESOLVED** items were settled in a companion spec. Nothing here is papered over.
 
-1. **Commercial posture. OPEN [OWNER]:** owner's business call; the recommendation
-   is to stay FOSS / non-commercial to retain the PLD Art. 2(2) exemption — see
+1. **Commercial posture. DECIDED (owner, 2026-07-22):** stay FOSS /
+   non-commercial to retain the PLD Art. 2(2) exemption; no paid tier. See
+   docs/decisions/2026-07-22-owner-value-calls.md and
    docs/decisions/2026-07-21-decision-engine-open-questions.md §Q8. EU PLD 2024/2853
    (transposition due 9 Dec 2026 — inside
    this release's life) makes software a product; Art. 6(1)(a) covers personal

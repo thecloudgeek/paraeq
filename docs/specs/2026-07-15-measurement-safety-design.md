@@ -137,7 +137,7 @@ The measurement capture path needs its own metering. It cannot reuse the engine'
 Notes on the table:
 
 - **Sweep level is a starting point for the solve, not the emitted level.** The solve overrides it. It is the value used when no cal file is present — which is itself a refusal condition, so in practice the column documents intent and bounds the ladder's first rung.
-- **OPEN [OWNER]:** the per-class dBFS "sweep level" column is implemented as a **hard cap** — `SweepLevel::new` refuses above it, so a chain too insensitive to hit the SPL target at ≤ that level is refused rather than driven louder (reading "the solve overrides it" as downward-only). If a separate, higher ceiling than the solve's starting point is intended, only the table constant changes. See `docs/plans/2026-07-16-rescope-implementation.md` §"Open questions raised by implementing Stages 1–2" item 7.
+- **DECIDED (owner, 2026-07-22):** the per-class dBFS "sweep level" column is a **hard cap** — `SweepLevel::new` refuses a chain too insensitive to hit the SPL target at ≤ that level rather than driving it louder. Quiet is the safe direction on every axis, and MS-17's envelope check refuses such a chain anyway. No separate higher ceiling. See `docs/decisions/2026-07-22-owner-value-calls.md`.
 - The coupler paths run **8 dB below REW's −12 dBFS default**.
 - The 84 dB coupler target sits deliberately just under the 85 dB warn line: at target the warning never fires, and any solve that lands hot is immediately visible.
 - Room paths refuse 10 dB lower than coupler paths because a room measurement necessarily happens in a space a person may be standing in, whereas a coupler measurement is nominally on a jig.
@@ -362,7 +362,7 @@ Cross-referenced to the DSP/correction spec but load-bearing for driver safety, 
 
 **Action required from the owner, recorded in this spec because it is a design input and not only a business one:** decide the commercial posture explicitly. **Any paid tier plausibly forfeits the FOSS exemption and attaches strict liability that cannot be disclaimed.** If ParaEQ stays free and non-commercial, the exemption is the real protection and the MIT disclaimer is decoration. If a paid tier is ever contemplated, the safety case stops being an engineering preference and becomes a compliance artifact — which changes what this spec has to be, not merely how carefully it is implemented.
 
-**OPEN [OWNER]:** commercial posture undecided — this is decision-engine §Q8. The recommendation on record is to stay FOSS / non-commercial to retain the PLD Art. 2(2) exemption; see `docs/decisions/2026-07-21-decision-engine-open-questions.md` §Q8. Blocking for a published release, not for implementation.
+**DECIDED (owner, 2026-07-22):** stay FOSS / non-commercial, retaining the PLD Art. 2(2) exemption — no paid tier, no pay-with-data. This is what keeps the "AS IS" disclaimer effective and is why the level-safety conservatism below is load-bearing. See `docs/decisions/2026-07-22-owner-value-calls.md` and decision-engine §Q8. (The clause-number verification in S-1 and S-3 above still needs counsel before a published release.)
 
 ## Risks and Mitigations
 

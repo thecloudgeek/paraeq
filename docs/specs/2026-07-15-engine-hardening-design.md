@@ -217,7 +217,7 @@ pub fn is_stable(sos: &[f64; 6]) -> bool {
 
 *Why not `Result` on the designers:* they are golden-fixture-pinned against the Python oracle (`tests/test_biquad.rs`), the oracle itself is infallible, and a signature change churns every call site to buy a guarantee we can enforce more cheaply at the one boundary that matters.
 
-**OPEN [OWNER]:** validate_bands guard location — `validate_bands`'s range check should move out of `desktop/src-tauri/src/eq.rs` so the daemon seam inherits it. `paraeq-dsp` (next to the designers, pure math) or `paraeq-engine` (next to `validate_correction`, `controller.rs:80`)? `paraeq-engine` keeps `paraeq-dsp` free of policy; `paraeq-dsp` puts the guard next to the thing being guarded. Owner's call. This is **distinct from** decision-engine Q2 (whether the four designers themselves become fallible — decided **No**: the guard stays at the install boundary, see `docs/decisions/2026-07-21-decision-engine-open-questions.md` §Q2); that question is settled, and this one is only about *where the range check physically lives*.
+**DECIDED (owner, 2026-07-22):** `validate_bands`'s range check moves out of `desktop/src-tauri/src/eq.rs` into `paraeq-engine`, next to `validate_correction` (`controller.rs:80`), so the daemon seam inherits it and `paraeq-dsp` stays free of policy. See docs/decisions/2026-07-22-owner-value-calls.md. This is **distinct from** decision-engine Q2 (whether the four designers themselves become fallible — decided **No**: the guard stays at the install boundary, see `docs/decisions/2026-07-21-decision-engine-open-questions.md` §Q2); that question is settled, and this one is only about *where the range check physically lives*.
 
 **Tests.**
 

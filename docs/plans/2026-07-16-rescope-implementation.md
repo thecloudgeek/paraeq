@@ -163,9 +163,10 @@ R7 ship (signed DMG, notarization, PLD 2024/2853 posture decision).
    (BOOST_WEIGHT, narrow-dip Q threshold, cut_limit) need one reconciled
    definition.
 3. **`TransducerClass` ownership + naming (blocks Stage 3 targets rework):**
-   the enum must physically live in `paraeq-dsp` (the only crate all
-   consumers may depend on) with decision-engine owning its semantics;
-   variant naming (Headphone/Iem vs OverEar/InEar) must be settled.
+   **Resolved** — enum in `paraeq-dsp` with variants `{Bookshelf,
+   Floorstander, InEar, OverEar}`; `Headphone`/`Iem` become `display_name()`
+   strings, not variants; decision-engine `PathProfile` is canonical. See
+   docs/decisions/2026-07-22-owner-value-calls.md.
 4. **Two-clock capture problem (gates the room path):** "Farina tolerates
    skew" covers only ungated coupler magnitude; gating needs a trustworthy
    t=0. Run the experiment (measurement-suite/9) the moment the Stage-4
@@ -240,8 +241,9 @@ type or in a test on the branch; none is invented policy.
 12. **trybuild snapshots vs a floating toolchain.** MS-2's compile-fail proof
     pins rustc's E0308/E0423 wording while CI and `rust-toolchain.toml` track
     `stable`, so a compiler release can turn it red on an unrelated PR.
-    Regenerate with `TRYBUILD=overwrite`; pinning the toolchain is a
-    repo-wide call left to the owner.
+    **Decided (owner, 2026-07-22): do not pin** `rust-toolchain.toml`;
+    regenerate with `TRYBUILD=overwrite` on drift. See
+    docs/decisions/2026-07-22-owner-value-calls.md.
 
 ## REW comparison and the automate-with-an-override principle
 
@@ -395,12 +397,12 @@ room path):**
 
 **Open questions MMM raises:**
 
-- **Room easy-mode default: MMM or discrete sweep?** MMM is faster, more
-  forgiving, and two-clock-immune, which argues for it as the "just fix my
-  sound" room default — but it asks the user to physically move the mic
-  continuously while noise plays, a different kind of effort than
-  place-measure-move-repeat, and it yields the weaker (magnitude-only)
-  correction. Owner call; it interacts with the two-front-ends seam.
+- **Room easy-mode default: MMM or discrete sweep? DECIDED (owner,
+  2026-07-22): MMM** is the "just fix my sound" room default (faster, more
+  forgiving, two-clock-immune), with discrete sweeps as the precision option —
+  accepting the weaker magnitude-only correction on the easy path in exchange
+  for robustness. See docs/decisions/2026-07-22-owner-value-calls.md. (The MMM
+  authority model and its level-safety row, below, remain open.)
 - **MMM authority model.** Confirm the conservative magnitude-only policy
   (cut-focused, fixed boost ceiling, heavy smoothing) and how a bundle with no
   IRs is represented so the σ(f)/EGD fields are cleanly absent rather than
