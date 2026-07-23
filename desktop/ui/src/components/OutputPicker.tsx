@@ -47,9 +47,14 @@ export function OutputPicker({
   const current = devices.find((d) => d.uid === currentUid);
   const placeholder = current ? current.name : (currentUid ?? "Select an output device…");
 
+  // Always a defined string so the Select stays CONTROLLED for its whole life:
+  // `currentUid ?? undefined` flipped it uncontrolled↔controlled as the uid went
+  // null↔string, which React warns about. Radix Select ≥ 2.0 treats the empty
+  // string as "no selection" (resets to the placeholder), and no SelectItem uses
+  // an empty uid, so "" maps cleanly to the unselected state.
   return (
     <>
-      <Select value={currentUid ?? undefined} onValueChange={onSelect}>
+      <Select value={currentUid ?? ""} onValueChange={onSelect}>
         <SelectTrigger id={id} size={size} className={triggerClassName}>
           <SelectValue placeholder={placeholder} />
         </SelectTrigger>
