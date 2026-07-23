@@ -14,6 +14,7 @@ pub mod fr;
 pub mod gating;
 pub mod logf;
 pub mod peq;
+pub mod room;
 pub mod splice;
 pub mod spline;
 pub mod sweep;
