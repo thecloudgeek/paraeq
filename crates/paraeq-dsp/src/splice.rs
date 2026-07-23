@@ -2,16 +2,22 @@
 //! Test tier: 3 — analytic physics.
 //! Spec: docs/specs/2026-07-15-room-dsp-design.md, "`splice.rs` — new".
 //!
-//! STUB — room-dsp/6, lands in Stage 4 *if it lands at all*: `fdw.rs` subsumes
-//! this and tracks perception better (Toole's three-zone model has the ear
-//! integrating the first ~50 ms into timbre between 200 Hz and 1 kHz, which a
-//! cycles-based window follows naturally — 75 ms at 200 Hz, 15 ms at 1 kHz — and
-//! a two-window splice cannot). Build `fdw.rs` first: the room-dsp spec's
-//! asymmetry error bound (full brute-force asymmetric-window FDW vs fixed
-//! pre-gate + symmetric fast FDW, agreeing within 0.1 dB) is what decides
-//! whether this module is ever built. That test is NOT yet written — it needs an
-//! asymmetric brute-force entry point the spec's API does not define — and it is
-//! Stage 4's first FDW task, ahead of any work here.
+//! STUB — room-dsp/6, and staying one: `fdw.rs` subsumes this and tracks
+//! perception better (Toole's three-zone model has the ear integrating the
+//! first ~50 ms into timbre between 200 Hz and 1 kHz, which a cycles-based
+//! window follows naturally — 75 ms at 200 Hz, 15 ms at 1 kHz — and a
+//! two-window splice cannot).
+//!
+//! **DECIDED 2026-07-22 — FDW holds, splice stays unbuilt.** The room-dsp
+//! spec's asymmetry error bound is met:
+//! `tests/test_fdw.rs::asymmetric_truth_vs_fixed_pre_gate_plus_symmetric_fast_fdw`
+//! measures the full brute-force asymmetric-window FDW against (fixed pre-gate
+//! via `gating.rs` + symmetric fast FDW) at a worst case of **0.077 dB** over
+//! 20 Hz–20 kHz (bound: 0.1 dB), on an IR carrying −44 dB deconvolution
+//! pre-ringing and a −40 dB H2 cluster 40 ms before the peak. The residual is
+//! near-peak pre-ringing the fixed gate keeps but the narrow asymmetric
+//! pre-window would attenuate — bounded and inaudible. This module ships only
+//! if that test ever regresses past 0.1 dB.
 
 use crate::{logf::LogGrid, DspError};
 
