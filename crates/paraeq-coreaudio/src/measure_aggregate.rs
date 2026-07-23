@@ -102,10 +102,18 @@ impl Default for MeasureAggregateConfig {
 /// says exactly why not — it never proceeds degraded.
 #[derive(Debug, thiserror::Error)]
 pub enum MeasureAggregateError {
+    #[error(
+        "default output device changed between aggregate build and listener arming — rebuild required"
+    )]
+    DefaultOutputChangedDuringBuild,
     #[error("mic device UID must not be empty")]
     EmptyMicUid,
     #[error(transparent)]
     Hal(#[from] CaError),
+    #[error(
+        "measurement mic '{uid}' changed or died between aggregate build and listener arming — rebuild required"
+    )]
+    MicChangedDuringBuild { uid: String },
     #[error("device '{uid}' has no input channels — not usable as a measurement mic")]
     MicHasNoInput { uid: String },
     #[error("mic '{uid}' is the default output device — the measurement aggregate needs a separate microphone")]
@@ -264,6 +272,33 @@ impl MicCapture {
             )?,
             PropertyListener::watch(mic_dev, kAudioDevicePropertyDeviceIsAlive, tx)?,
         ];
+
+        // 7. Close the rebuild-window race (the backend.rs step-7 precedent):
+        // the default output — or the mic — may have changed between resolving
+        // the devices (step 2) / building the aggregate against them (step 3)
+        // and arming the listeners (step 6). A change in that window fired no
+        // listener and would leave this capture bound to the WRONG output route
+        // (or a dead mic) with no event ever arriving. Re-query now that the
+        // listeners are armed; on any mismatch REFUSE (the MS-22 posture) so the
+        // caller rebuilds — mirroring backend.rs, which queues a synthetic
+        // rebuild event, except that `create` returns a Result so the rebuild
+        // signal is a structured error. The still-live locals drop in the
+        // invariant teardown order on the early return — `listeners` first, then
+        // `io` (AudioDeviceStop → destroy IOProc), then `aggregate` (destroy
+        // aggregate device) — the same teardown every other create error path
+        // runs, so nothing (aggregate / IOProc / listeners) leaks.
+        let current_out = properties::default_output_device()?;
+        if current_out != out_dev {
+            return Err(MeasureAggregateError::DefaultOutputChangedDuringBuild);
+        }
+        // The mic's UID must still resolve to the SAME device: a mic that died
+        // or was unplugged in the window fails to resolve (0) or maps elsewhere
+        // — the same condition the mic-is-alive listener armed above watches.
+        if properties::translate_uid_to_device(&mic_uid)? != mic_dev {
+            return Err(MeasureAggregateError::MicChangedDuringBuild {
+                uid: mic_uid.clone(),
+            });
+        }
 
         log::debug!(
             "measure aggregate up: id={} mic='{mic_uid}' ({mic_nominal_rate_hz} Hz) \
@@ -623,7 +658,42 @@ pub fn drain_ring(consumer: &mut Consumer<f32>, block: &mut [f64]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::c_void;
+    use std::ptr::NonNull;
+
+    use objc2_core_audio_types::{AudioBuffer, AudioBufferList};
+
     use super::*;
+    use crate::ioproc::{BufferList, BufferListMut};
+
+    /// One `AudioBuffer` over live f32 storage (the tests/test_buffers.rs
+    /// helper): exposes `storage.len()` samples across `channels` channels.
+    fn buffer_over(storage: &mut [f32], channels: u32) -> AudioBuffer {
+        AudioBuffer {
+            mNumberChannels: channels,
+            mDataByteSize: (storage.len() * 4) as u32,
+            mData: storage.as_mut_ptr().cast::<c_void>(),
+        }
+    }
+
+    /// Invoke the realtime capture closure over a hand-built input/output
+    /// buffer-list pair — no HAL involved (the tests/test_buffers.rs
+    /// technique). `input` and `output` must each describe live, aligned f32
+    /// storage that outlives this call, and their storages must not overlap.
+    fn run_block(cb: &mut IoCallback, input: &mut AudioBufferList, output: &mut AudioBufferList) {
+        // SAFETY: both lists point at live, aligned, exclusively-owned f32
+        // storage that outlives `block`; each holds one in-bounds buffer and
+        // the input/output storages are distinct allocations (non-overlapping).
+        let block = unsafe {
+            IoBlock {
+                input: BufferList::new(NonNull::from(&mut *input)),
+                output: BufferListMut::new(NonNull::from(&mut *output)),
+                in_sample_time: 0.0,
+                out_sample_time: 0.0,
+            }
+        };
+        cb(block);
+    }
 
     #[test]
     fn default_config_is_drift_compensated_default_input() {
@@ -713,5 +783,147 @@ mod tests {
     fn unrelated_selectors_are_not_fatal() {
         // An arbitrary non-watched selector must not kill a capture.
         assert_eq!(map_capture_event(0x1234_5678, "mic"), None);
+    }
+
+    #[test]
+    fn capture_callback_zeroes_a_dirty_output_buffer() {
+        // The aggregate contributes silence to the output mix: a non-zeroed
+        // output plays GARBAGE at measurement volume — a real safety hole.
+        // Every output sample must be zeroed regardless of the dirty state the
+        // HAL buffer arrives in.
+        let (producer, _consumer) = RingBuffer::<f32>::new(64);
+        let counters = Arc::new(InnerCounters::default());
+        let mut cb = capture_callback(producer, Arc::clone(&counters), 64);
+
+        // Input: one interleaved stereo buffer, 2 frames (L0 R0 L1 R1).
+        let mut in_storage = vec![0.5f32, -0.5, 0.25, -0.25];
+        let mut in_list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [buffer_over(&mut in_storage, 2)],
+        };
+        // Output: one stereo buffer pre-dirtied with a 7.0 sentinel.
+        let mut out_storage = vec![7.0f32; 6];
+        let mut out_list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [buffer_over(&mut out_storage, 2)],
+        };
+
+        run_block(&mut cb, &mut in_list, &mut out_list);
+
+        assert!(
+            out_storage.iter().all(|&s| s == 0.0),
+            "every output sample must be zeroed, got {out_storage:?}"
+        );
+    }
+
+    #[test]
+    fn capture_callback_extracts_interleaved_channel_zero_into_the_ring() {
+        // Mono capture is channel 0 of the first populated interleaved buffer.
+        let (producer, mut consumer) = RingBuffer::<f32>::new(64);
+        let counters = Arc::new(InnerCounters::default());
+        let mut cb = capture_callback(producer, Arc::clone(&counters), 64);
+
+        // 4 frames x 2 channels interleaved: channel 0 = [1, 2, 3, 4].
+        let mut in_storage = vec![1.0f32, -1.0, 2.0, -2.0, 3.0, -3.0, 4.0, -4.0];
+        let mut in_list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [buffer_over(&mut in_storage, 2)],
+        };
+        let mut out_storage = vec![0.0f32; 8];
+        let mut out_list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [buffer_over(&mut out_storage, 2)],
+        };
+
+        run_block(&mut cb, &mut in_list, &mut out_list);
+
+        let mut drained = [0.0f64; 8];
+        let n = drain_ring(&mut consumer, &mut drained);
+        assert_eq!(n, 4, "four frames of channel 0 landed in the ring");
+        assert_eq!(&drained[..4], &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(counters.callbacks.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            counters.dropped.load(Ordering::Relaxed),
+            0,
+            "nothing dropped"
+        );
+        assert_eq!(
+            counters.invalid.load(Ordering::Relaxed),
+            0,
+            "no non-finite input"
+        );
+    }
+
+    #[test]
+    fn capture_callback_counts_the_dropped_tail_of_an_oversized_block() {
+        // A block delivering MORE frames than the scratch capacity keeps what
+        // fits and counts the tail as dropped — never allocating. The ring is
+        // roomy so the ONLY drops come from the oversized tail, letting this
+        // assert the tail count EXACTLY. (This is the assertion that kills the
+        // surviving mutant `dropped += (frames - n)` -> `dropped += 0`.)
+        const SCRATCH: usize = 4; // tiny scratch to force the oversize path
+        let (producer, mut consumer) = RingBuffer::<f32>::new(64);
+        let counters = Arc::new(InnerCounters::default());
+        let mut cb = capture_callback(producer, Arc::clone(&counters), SCRATCH);
+
+        // Mono, 10 frames: n = min(10, 4) = 4 fit, 6 dropped as the tail.
+        let mut in_storage: Vec<f32> = (0..10).map(|i| i as f32).collect();
+        let mut in_list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [buffer_over(&mut in_storage, 1)],
+        };
+        let mut out_storage = vec![0.0f32; 4];
+        let mut out_list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [buffer_over(&mut out_storage, 1)],
+        };
+
+        run_block(&mut cb, &mut in_list, &mut out_list);
+
+        assert_eq!(
+            counters.dropped.load(Ordering::Relaxed),
+            6,
+            "exactly the 6-frame tail beyond the 4-frame scratch is dropped"
+        );
+        // The 4 that fit still land, in order.
+        let mut drained = [0.0f64; 8];
+        let n = drain_ring(&mut consumer, &mut drained);
+        assert_eq!(n, 4);
+        assert_eq!(&drained[..4], &[0.0, 1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn capture_callback_counts_ring_overflow() {
+        // A ring too small to hold the block: the overflow samples are dropped
+        // and counted; the realtime side never blocks. Scratch is roomy so the
+        // ONLY drops come from the ring, and every input frame is accounted for
+        // (captured or counted-dropped).
+        let (producer, mut consumer) = RingBuffer::<f32>::new(4); // tiny ring
+        let counters = Arc::new(InnerCounters::default());
+        let mut cb = capture_callback(producer, Arc::clone(&counters), 64); // roomy scratch
+
+        let mut in_storage: Vec<f32> = (0..10).map(|i| i as f32).collect();
+        let mut in_list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [buffer_over(&mut in_storage, 1)],
+        };
+        let mut out_storage = vec![0.0f32; 4];
+        let mut out_list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [buffer_over(&mut out_storage, 1)],
+        };
+
+        run_block(&mut cb, &mut in_list, &mut out_list);
+
+        let mut drained = [0.0f64; 16];
+        let received = drain_ring(&mut consumer, &mut drained);
+        let dropped = counters.dropped.load(Ordering::Relaxed) as usize;
+        assert!(dropped > 0, "an overflowing ring must count drops");
+        assert_eq!(
+            received + dropped,
+            10,
+            "every input frame is captured or counted dropped \
+             (received {received}, dropped {dropped})"
+        );
     }
 }
