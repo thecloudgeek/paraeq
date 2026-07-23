@@ -95,8 +95,9 @@ pub fn marker_chirp(
 /// ±`min_separation` samples around each pick, then a threshold: every picked
 /// peak must clear 6× the off-peak correlation RMS (≈15.6 dB), else the train
 /// is not credibly present and the answer is `None` — the caller's
-/// `Warn(TwoClock)` path, never a fabricated estimate. Hits are returned
-/// sorted by position.
+/// `Warn(TwoClock)` path, never a fabricated estimate. `None` also when the
+/// exclusion zones cover the whole correlation (no off-peak samples ⇒ no floor
+/// ⇒ no credibility judgment). Hits are returned sorted by position.
 pub fn find_marker_train(
     capture: &[f64],
     marker: &[f64],
@@ -138,11 +139,21 @@ pub fn find_marker_train(
             noise_count += 1;
         }
     }
-    let floor = if noise_count > 0 {
-        (noise_energy / noise_count as f64).sqrt()
-    } else {
-        0.0
-    };
+    // No off-peak samples at all (the exclusion zones cover the ENTIRE
+    // correlation — a capture short enough that one pick's ±separation zone
+    // blankets it): no floor can be estimated, so no credibility judgment can
+    // be made. Refuse rather than fabricate. A `floor = 0.0` here would
+    // silently disable BOTH the 6x gate below (`floor > 0.0` is false) and
+    // make every `snr_db` INFINITY, passing any pick as a credible marker.
+    // This is the `Warn(TwoClock)`/no-estimate path. NOTE the deliberate
+    // asymmetry with `noise_energy == 0`: real silence outside the exclusion
+    // zones still has `noise_count > 0` and legitimately yields `floor = 0.0`
+    // with an INFINITY SNR (the "embed into silence" case) — only the
+    // all-excluded (`noise_count == 0`) case is refused here.
+    if noise_count == 0 {
+        return None;
+    }
+    let floor = (noise_energy / noise_count as f64).sqrt();
 
     picks.sort_unstable();
     let mut hits = Vec::with_capacity(expected);
@@ -374,6 +385,56 @@ mod tests {
     }
 
     #[test]
+    fn find_marker_train_refuses_when_every_sample_is_excluded() {
+        // A capture so short that the single pick's exclusion zone
+        // (±min_separation) blankets the ENTIRE correlation, leaving zero
+        // off-peak samples. With no off-peak samples no floor can be
+        // estimated, so no 6x credibility judgment can be made — the train
+        // must be refused (the Warn(TwoClock)/no-estimate path), never blessed
+        // with an INFINITY SNR by a silently-zero floor.
+        let marker = [1.0, 0.5, 0.25];
+        let capture = [1.0, 1.0, 1.0, 1.0, 1.0]; // corr has 3 taps, all == 1.75
+        assert!(
+            find_marker_train(&capture, &marker, 1, 10).is_none(),
+            "an all-excluded correlation has no floor and must be refused"
+        );
+    }
+
+    #[test]
+    fn find_marker_train_with_real_noise_reports_finite_snr_and_gates() {
+        // Real off-peak noise (not exact silence) gives a POSITIVE floor, so
+        // the SNR is finite and the 6x gate is live. This is the legitimate
+        // `floor > 0` path the all-excluded refusal must not disturb.
+        let marker = marker_chirp(RATE, 0.03, 1_000.0, 4_000.0);
+        let mut signal = lcg_noise(16_000, 0.03, 99);
+        let starts = [3_000usize, 9_000];
+        for &s in &starts {
+            embed(&mut signal, &marker, s, 0.9);
+        }
+        let hits =
+            find_marker_train(&signal, &marker, 2, 2_000).expect("two strong markers present");
+        for hit in &hits {
+            assert!(
+                hit.snr_db.is_finite(),
+                "a real noise floor yields a finite SNR, got {}",
+                hit.snr_db
+            );
+            assert!(
+                hit.snr_db > 15.6,
+                "strong markers clear the 6x (~15.6 dB) gate, got {}",
+                hit.snr_db
+            );
+        }
+        // The gate still refuses a pick that does NOT clear 6x the floor:
+        // asking for a third marker that is not there finds only sub-threshold
+        // noise, so the whole train is refused rather than fabricated.
+        assert!(
+            find_marker_train(&signal, &marker, 3, 2_000).is_none(),
+            "a below-6x-floor pick fails the credibility gate"
+        );
+    }
+
+    #[test]
     fn estimate_skew_recovers_a_known_slope_and_offset() {
         // 200 ppm fast capture clock, 1234-sample transport offset.
         let expected = [8_000.0, 16_000.0, 24_000.0, 32_000.0, 40_000.0];
@@ -437,7 +498,13 @@ mod tests {
 
         for inserted_ppm in [0.0, 200.0, -150.0] {
             let capture = resample_by_ppm(&signal, inserted_ppm);
-            let hits = find_marker_train(&capture, &marker, starts.len(), interval / 2)
+            // Separation is interval/4, not interval/2: the chirp's matched
+            // filter main lobe is a few samples, so interval/4 amply separates
+            // markers 0.4 s apart while leaving off-peak samples between the
+            // exclusion zones — the correlation must NOT be fully tiled, or
+            // there is no floor and find_marker_train refuses (no off-peak
+            // samples ⇒ no credibility judgment).
+            let hits = find_marker_train(&capture, &marker, starts.len(), interval / 4)
                 .unwrap_or_else(|| panic!("markers findable at {inserted_ppm} ppm"));
             let expected: Vec<f64> = starts.iter().map(|&s| s as f64).collect();
             let measured: Vec<f64> = hits.iter().map(|h| h.position).collect();
