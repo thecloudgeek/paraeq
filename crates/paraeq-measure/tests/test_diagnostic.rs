@@ -37,6 +37,10 @@ fn all_variants() -> Vec<D> {
         D::StimulusDcOffset { mean: 1.24e-3 },
         D::StimulusOverFullScale { peak: 1.2 },
         D::StimulusNonFinite { count: 3 },
+        D::UserAborted,
+        D::MicDisconnected,
+        D::OutputDeviceChanged,
+        D::EngineFailed,
         D::LowSnr,
         D::FixedMaxVolume,
         D::TwoClock,
@@ -70,6 +74,10 @@ fn expected(d: &D) -> (u16, Severity) {
         D::StimulusDcOffset { .. } => (16, Error),
         D::StimulusOverFullScale { .. } => (17, Error),
         D::StimulusNonFinite { .. } => (18, Error),
+        D::UserAborted => (19, Error),
+        D::MicDisconnected => (20, Error),
+        D::OutputDeviceChanged => (21, Error),
+        D::EngineFailed => (22, Error),
         D::LowSnr => (100, Warning),
         D::FixedMaxVolume => (101, Warning),
         D::TwoClock => (102, Warning),
@@ -83,7 +91,7 @@ fn expected(d: &D) -> (u16, Severity) {
 #[test]
 fn every_wire_code_of_the_initial_set_is_pinned() {
     let variants = all_variants();
-    assert_eq!(variants.len(), 23, "all_variants() lags the enum");
+    assert_eq!(variants.len(), 27, "all_variants() lags the enum");
     for d in &variants {
         let (code, _) = expected(d);
         assert_eq!(d.code(), code, "{d:?} renumbered — wire contract broken");
@@ -179,6 +187,22 @@ fn every_spec_refusal_row_is_blocking_and_forms_a_refusal() {
 fn escalation_aborts_are_blocking() {
     for d in [D::RungOverCap, D::SplProjectionMismatch] {
         assert!(d.is_blocking(), "{d:?} must abort the escalation");
+    }
+}
+
+/// The § Abort Guards trigger rows appended for the session runtime
+/// (codes 19–22): each terminates the run, so each is blocking and can travel
+/// as the terminating diagnostic of an aborted session.
+#[test]
+fn abort_triggers_are_blocking() {
+    for d in [
+        D::UserAborted,
+        D::MicDisconnected,
+        D::OutputDeviceChanged,
+        D::EngineFailed,
+    ] {
+        assert!(d.is_blocking(), "{d:?} must terminate the run");
+        assert_eq!(Refusal::new(d).diagnostic(), d);
     }
 }
 
