@@ -66,6 +66,12 @@ pub enum GatingMode {
     None,
 }
 
+/// PROVISIONAL TYPE: room-dsp's `fr::Smoothing` landed in Stage 4 and is the
+/// canonical smoothing type — it additionally offers `Gaussian { fraction }`,
+/// which this contract-side enum does not. The two merge when Stage 6 wires
+/// `decide()` to the analysis pipeline; until then this stays the wire/domain
+/// shape the spec's decision table names, and must not grow variants
+/// `decide()` cannot yet honour.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum SmoothingMode {
     /// Fractional-octave, e.g. `Fixed(6)` = 1/6 octave.
