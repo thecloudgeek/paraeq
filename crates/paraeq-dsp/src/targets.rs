@@ -77,6 +77,7 @@ const ALL_CLASSES: [TransducerClass; 4] = [
 
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(try_from = "RawTargetCurve"))]
 pub struct TargetCurve {
     pub name: String,
     pub frequencies: Vec<f64>,
@@ -92,12 +93,52 @@ pub struct TargetCurve {
     /// class. Always sorted and deduplicated. EMPTY means legal for NO
     /// class — [`match_closest_target`] will never return such a curve.
     ///
-    /// `serde(default)`: a serialized curve predating this field
-    /// deserializes as legal-nowhere, never as legal-everywhere.
-    #[cfg_attr(feature = "serde", serde(default))]
+    /// On deserialize the field defaults to empty: a serialized curve
+    /// predating it deserializes as legal-nowhere, never legal-everywhere
+    /// (see [`RawTargetCurve`]).
     pub classes: Vec<TransducerClass>,
     pub description: Option<String>,
     pub source: Option<String>,
+}
+
+/// Wire shape [`TargetCurve`] deserializes through (`serde(try_from)`): the
+/// raw fields land here, then [`validate_curve_data`]'s invariants run before
+/// a `TargetCurve` exists. Deserialization is otherwise a third construction
+/// path — after [`parse_target_csv`] and struct literals — and the only one
+/// fed by untrusted wire data (`MeasurementBundle` is "the bug-report
+/// attachment"), so it must not bypass the no-panic guarantee
+/// [`TargetCurve::interpolate`] documents.
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+struct RawTargetCurve {
+    name: String,
+    frequencies: Vec<f64>,
+    gains_db: Vec<f64>,
+    category: Option<String>,
+    /// Missing -> empty -> legal for NO class, never legal-everywhere.
+    #[serde(default)]
+    classes: Vec<TransducerClass>,
+    description: Option<String>,
+    source: Option<String>,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<RawTargetCurve> for TargetCurve {
+    type Error = String;
+
+    fn try_from(raw: RawTargetCurve) -> Result<Self, Self::Error> {
+        let curve = TargetCurve {
+            category: raw.category,
+            classes: raw.classes,
+            description: raw.description,
+            frequencies: raw.frequencies,
+            gains_db: raw.gains_db,
+            name: raw.name,
+            source: raw.source,
+        };
+        validate_curve_data(&curve).map_err(|e| e.to_string())?;
+        Ok(curve)
+    }
 }
 
 fn log10_floored(freqs: &[f64]) -> Vec<f64> {
@@ -164,6 +205,44 @@ fn parse_classes_header(raw: &str) -> Result<Vec<TransducerClass>, DspError> {
     }
     classes.sort();
     Ok(classes)
+}
+
+/// The data invariants [`TargetCurve::interpolate`] relies on (>= 2 knots,
+/// strictly increasing, finite, lengths in lockstep), enforced on every
+/// construction path that crosses a trust boundary: the CSV parser and — via
+/// `serde(try_from)` — deserialization, which is otherwise a third
+/// constructor that would bypass parse-time validation (a curve arriving in
+/// a serialized `MeasurementBundle` must not be able to panic `interpolate`).
+fn validate_curve_data(curve: &TargetCurve) -> Result<(), DspError> {
+    if curve.frequencies.len() < 2 {
+        return Err(DspError::Parse(format!(
+            "target curve needs at least 2 data points, got {}",
+            curve.frequencies.len()
+        )));
+    }
+    if curve.frequencies.len() != curve.gains_db.len() {
+        return Err(DspError::Parse(format!(
+            "target curve has {} frequencies but {} gains",
+            curve.frequencies.len(),
+            curve.gains_db.len()
+        )));
+    }
+    if curve
+        .frequencies
+        .iter()
+        .chain(curve.gains_db.iter())
+        .any(|v| !v.is_finite())
+    {
+        return Err(DspError::Parse(
+            "target curve contains non-finite values".into(),
+        ));
+    }
+    if curve.frequencies.windows(2).any(|w| w[1] <= w[0]) {
+        return Err(DspError::Parse(
+            "target curve frequencies must be strictly increasing".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Back-compat class legality for a curve WITHOUT a `# classes:` header
@@ -237,17 +316,7 @@ pub fn parse_target_csv(content: &str, fallback_name: &str) -> Result<TargetCurv
     }
     // Validate at parse time so a parsed curve can never panic later inside
     // `interpolate` (the spline requires >= 2 strictly increasing knots).
-    if curve.frequencies.len() < 2 {
-        return Err(DspError::Parse(format!(
-            "target CSV needs at least 2 data rows, got {}",
-            curve.frequencies.len()
-        )));
-    }
-    if curve.frequencies.windows(2).any(|w| w[1] <= w[0]) {
-        return Err(DspError::Parse(
-            "target CSV frequencies must be strictly increasing".into(),
-        ));
-    }
+    validate_curve_data(&curve)?;
     // Class legality (decision-engine spec, "Target selection"):
     //  - `# classes:` supersedes `# category:` when present; unknown tokens
     //    are parse errors (see `parse_classes_header`).
@@ -349,6 +418,21 @@ pub fn match_closest_target<'a>(
     measured_db: &[f64],
     targets: &'a [TargetCurve],
 ) -> Result<&'a TargetCurve, DspError> {
+    // Without these, the residual zip would silently truncate to the shorter
+    // slice, and an empty measurement would score every candidate NaN (0/0)
+    // yet still return the first class-legal curve as Ok.
+    if measured_freqs.is_empty() {
+        return Err(DspError::InvalidInput(
+            "match_closest_target: empty measurement".into(),
+        ));
+    }
+    if measured_freqs.len() != measured_db.len() {
+        return Err(DspError::InvalidInput(format!(
+            "match_closest_target: {} freqs vs {} dB values",
+            measured_freqs.len(),
+            measured_db.len()
+        )));
+    }
     let mut best: Option<(&TargetCurve, f64)> = None;
     for t in targets.iter().filter(|t| t.classes.contains(&class)) {
         let interp = t.interpolate(measured_freqs);

@@ -244,6 +244,16 @@ type or in a test on the branch; none is invented policy.
     **Decided (owner, 2026-07-22): do not pin** `rust-toolchain.toml`;
     regenerate with `TRYBUILD=overwrite` on drift. See
     docs/decisions/2026-07-22-owner-value-calls.md.
+13. **Room-target shelf default: two specs, two numbers.** **OPEN [OWNER]** —
+    surfaced by the Stage-3 review. room-dsp's Room target generator says
+    `shelf_gain_db` default **+4.0** (implemented as
+    `RoomTargetSpec::default()`); the decision-engine spec's decision table
+    says `shelf_db ∈ 0.0..=6.0 (default +3.0)`. One number must win before
+    Stage 6 wires `decide()`'s room-target default to `RoomTargetSpec` — an
+    ears call, same bucket as the other room-target defaults (room-dsp Open
+    Q5). When ruled, update the losing spec and add a cross-crate test
+    asserting the `decide()` default equals `RoomTargetSpec::default()`
+    field-for-field.
 
 ## REW comparison and the automate-with-an-override principle
 

@@ -477,3 +477,74 @@ fn display_names_match_owner_decision() {
         "Over-ear headphones"
     );
 }
+
+// ---- review-added hardening (Stage-3 review) --------------------------------
+
+/// An empty or ragged measurement must refuse: the residual zip would
+/// silently truncate to the shorter slice, and an empty measurement scores
+/// every candidate NaN (0/0) yet would still return the first class-legal
+/// curve as Ok.
+#[test]
+fn match_closest_target_rejects_empty_and_ragged_measurements() {
+    let all = targets::list_targets(&targets_dir()).unwrap();
+    assert!(targets::match_closest_target(TransducerClass::InEar, &[], &[], &all).is_err());
+    assert!(targets::match_closest_target(
+        TransducerClass::InEar,
+        &[100.0, 1000.0, 10000.0],
+        &[0.0, 1.0],
+        &all
+    )
+    .is_err());
+}
+
+/// Deserialization is the third `TargetCurve` construction path and the only
+/// one fed by wire data (a serialized `MeasurementBundle`); it must re-run the
+/// parse-time invariants so `interpolate`'s no-panic guarantee holds for it
+/// too, and a pre-`classes` serialization must come back legal-NOWHERE.
+#[cfg(feature = "serde")]
+mod serde_boundary {
+    use super::*;
+
+    #[test]
+    fn deserialize_validates_curve_invariants() {
+        // Valid round-trip survives.
+        let good =
+            targets::parse_target_csv("# name: t\n# classes: any\n20.0,1.0\n20000.0,-1.0\n", "t")
+                .unwrap();
+        let json = serde_json::to_string(&good).unwrap();
+        let back: TargetCurve = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.frequencies, good.frequencies);
+        assert_eq!(back.classes, good.classes);
+
+        // One point: would panic inside interpolate if admitted.
+        let one_point = r#"{"name":"bad","frequencies":[100.0],"gains_db":[0.0],
+            "category":null,"classes":[],"description":null,"source":null}"#;
+        assert!(serde_json::from_str::<TargetCurve>(one_point).is_err());
+
+        // Non-increasing frequencies: same panic path.
+        let unsorted = r#"{"name":"bad","frequencies":[100.0,50.0],"gains_db":[0.0,0.0],
+            "category":null,"classes":[],"description":null,"source":null}"#;
+        assert!(serde_json::from_str::<TargetCurve>(unsorted).is_err());
+
+        // Ragged lengths: the CSV parser can never produce this, the wire can.
+        let ragged = r#"{"name":"bad","frequencies":[100.0,200.0,300.0],"gains_db":[0.0,0.0],
+            "category":null,"classes":[],"description":null,"source":null}"#;
+        assert!(serde_json::from_str::<TargetCurve>(ragged).is_err());
+    }
+
+    #[test]
+    fn missing_classes_field_deserializes_legal_nowhere() {
+        let pre_classes = r#"{"name":"old","frequencies":[100.0,200.0],"gains_db":[0.0,0.0],
+            "category":null,"description":null,"source":null}"#;
+        let curve: TargetCurve = serde_json::from_str(pre_classes).unwrap();
+        assert!(
+            curve.classes.is_empty(),
+            "a pre-`classes` serialization must be legal for NO class, never all"
+        );
+        let all = [curve];
+        assert!(
+            targets::match_closest_target(TransducerClass::InEar, &[150.0], &[0.0], &all).is_err(),
+            "legal-nowhere means match_closest_target never returns it"
+        );
+    }
+}

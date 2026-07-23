@@ -303,3 +303,125 @@ fn resamplers_reject_bad_inputs() {
             .unwrap_err()
     ));
 }
+
+// ---------------------------------------------------------------- Tier 3: boundary behavior
+// Review-added (Stage-3 review): these three pin behavior that the fixture
+// deliberately does not exercise — the mutants "extrapolate past the edges",
+// "mag/phase-interpolate the complex path", and "exclusive anti-comb bounds"
+// all survived the original suite.
+
+/// np.interp semantics clamp to the edge values outside the input range. A
+/// 32 kHz capture tops out at a 16 kHz axis while the standard grid runs to
+/// ~19.9 kHz — ~300 bins land above the axis and MUST hold data[last], not a
+/// linear extrapolation (and symmetric below). A single-point axis holds its
+/// one value everywhere.
+#[test]
+fn out_of_range_queries_clamp_to_edge_values() {
+    let grid = LogGrid::standard();
+    // Truncated axis: 100 Hz .. 16 kHz, with an interior slope so a linear
+    // extrapolation would visibly diverge from the edge value.
+    let freqs = [100.0, 1000.0, 16000.0];
+    let data = [3.0, 7.0, -5.0];
+    for prefilter in [Prefilter::None, Prefilter::AntiComb { fraction: 48 }] {
+        let out = resample_db_to_log_grid(&freqs, &data, &grid, prefilter).unwrap();
+        for (f, v) in grid.freqs().iter().zip(&out) {
+            if *f < 100.0 {
+                assert_eq!(
+                    *v, 3.0,
+                    "below-range bin {f} must hold data[0] ({prefilter:?})"
+                );
+            }
+            if *f > 16000.0 {
+                assert_eq!(
+                    *v, -5.0,
+                    "above-range bin {f} must hold data[last] ({prefilter:?})"
+                );
+            }
+        }
+        // log2(19897/16000)·96 ≈ 30 bins above the axis top, ~220 below 100 Hz.
+        assert!(
+            grid.freqs().iter().filter(|f| **f > 16000.0).count() > 20,
+            "the upper clamp region must actually be exercised"
+        );
+        assert!(
+            grid.freqs().iter().filter(|f| **f < 100.0).count() > 100,
+            "the lower clamp region must actually be exercised"
+        );
+
+        // Single-point axis: every query is out-of-range on at least one side.
+        let out = resample_db_to_log_grid(&[1000.0], &[4.25], &grid, prefilter).unwrap();
+        assert!(
+            out.iter().all(|v| *v == 4.25),
+            "single-point axis must hold its value everywhere ({prefilter:?})"
+        );
+    }
+}
+
+/// The complex resampler is component-wise linear — NOT magnitude/phase
+/// interpolation, the canonical mistake it exists to avoid. Adjacent bins
+/// holding 1+0j and −1+0j must lerp through ~0 at the midpoint; mag/phase
+/// interpolation would put a unit-magnitude value there. Asserted two ways:
+/// bit-equality with the scalar resampler run on re/im independently, and the
+/// midpoint magnitude itself.
+#[test]
+fn complex_resample_is_component_wise_not_mag_phase() {
+    let grid = LogGrid::standard();
+    // Coarse axis whose values alternate ±1 (a phase wrap at every step).
+    let freqs: Vec<f64> = (0..24).map(|i| 20.0 * 1.4f64.powi(i)).collect();
+    let spectrum: Vec<Complex<f64>> = (0..24)
+        .map(|i| Complex::new(if i % 2 == 0 { 1.0 } else { -1.0 }, 0.3 * i as f64))
+        .collect();
+    let re: Vec<f64> = spectrum.iter().map(|c| c.re).collect();
+    let im: Vec<f64> = spectrum.iter().map(|c| c.im).collect();
+    for prefilter in [Prefilter::None, Prefilter::AntiComb { fraction: 48 }] {
+        let out = resample_complex_to_log_grid(&freqs, &spectrum, &grid, prefilter).unwrap();
+        let re_out = resample_db_to_log_grid(&freqs, &re, &grid, prefilter).unwrap();
+        let im_out = resample_db_to_log_grid(&freqs, &im, &grid, prefilter).unwrap();
+        for ((c, r), i) in out.iter().zip(&re_out).zip(&im_out) {
+            assert_eq!(c.re, *r, "re must be the scalar resample ({prefilter:?})");
+            assert_eq!(c.im, *i, "im must be the scalar resample ({prefilter:?})");
+        }
+    }
+    // The wrap midpoint: a grid bin at the geometric center between two axis
+    // points carrying +1 and −1 must have |re| well below 1. Mag/phase
+    // interpolation cannot produce this (|H| would stay 1 everywhere).
+    let out = resample_complex_to_log_grid(&freqs, &spectrum, &grid, Prefilter::None).unwrap();
+    let (lo, hi) = (freqs[10], freqs[11]);
+    let mid = (lo * hi).sqrt();
+    let bin = grid
+        .freqs()
+        .iter()
+        .position(|f| (*f - mid).abs() / mid < 0.01)
+        .expect("the standard grid has a bin within 1% of the wrap midpoint");
+    assert!(
+        out[bin].re.abs() < 0.2,
+        "component-wise lerp passes near zero at the wrap; got {}",
+        out[bin].re
+    );
+}
+
+/// The anti-comb neighbourhood is INCLUSIVE: [f·2^(−1/2k), f·2^(+1/2k)]. Input
+/// points sitting exactly on both boundaries are part of the average. The
+/// boundary frequencies are constructed with the same expressions the
+/// implementation uses, so equality is bit-exact.
+#[test]
+fn anti_comb_neighbourhood_bounds_are_inclusive() {
+    let grid = LogGrid::standard();
+    let f = grid.freqs()[900];
+    let half_oct = 1.0 / (2.0 * 48.0);
+    let lo = f * 2f64.powf(-half_oct);
+    let hi = f * 2f64.powf(half_oct);
+    // Values chosen so the inclusive mean (10+99+30)/3 differs from every
+    // exclusive-bounds fallback (interpolation at f returns ~99).
+    let freqs = [lo * 0.9, lo, f, hi, hi * 1.1];
+    let data = [1000.0, 10.0, 99.0, 30.0, 1000.0];
+    let out = resample_db_to_log_grid(&freqs, &data, &grid, Prefilter::AntiComb { fraction: 48 })
+        .unwrap();
+    let expected = (10.0 + 99.0 + 30.0) / 3.0;
+    let got = out[900];
+    assert!(
+        (got - expected).abs() < 1e-12,
+        "bin 900 must average all three in-window points incl. both boundaries: \
+         expected {expected}, got {got}"
+    );
+}

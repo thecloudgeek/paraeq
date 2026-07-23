@@ -43,7 +43,23 @@ impl LogGrid {
         let ppo = f64::from(points_per_octave);
         // N = floor(ppo·log2(f_max/f_min)) + 1; per-index pow, matching the
         // oracle's `f_min * 2.0 ** (np.arange(n) / ppo)` term for term.
-        let n = (ppo * (f_max / f_min).log2()).floor() as usize + 1;
+        //
+        // The magnitude guard keeps the constructor total: parameters that
+        // individually pass validation can still make `f_max / f_min`
+        // overflow to infinity (f_min = 1e-300, f_max = 1e300) — floor(inf)
+        // as usize would return Ok with an EMPTY grid in release and panic in
+        // debug — or demand a multi-terabyte allocation (ppo = u32::MAX).
+        // 1e6 points is ~10x the densest sane grid (20 Hz–20 kHz @ 96 ppo is
+        // 957).
+        const MAX_GRID_POINTS: f64 = 1_000_000.0;
+        let scaled_octaves = ppo * (f_max / f_min).log2();
+        if !scaled_octaves.is_finite() || scaled_octaves + 1.0 > MAX_GRID_POINTS {
+            return Err(DspError::InvalidInput(format!(
+                "log grid would need more than {MAX_GRID_POINTS} points \
+                 (f_min {f_min}, f_max {f_max}, ppo {points_per_octave})"
+            )));
+        }
+        let n = scaled_octaves.floor() as usize + 1;
         let freqs = (0..n).map(|i| f_min * 2f64.powf(i as f64 / ppo)).collect();
         Ok(LogGrid {
             freqs,

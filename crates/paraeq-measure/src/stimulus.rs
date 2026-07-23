@@ -167,9 +167,8 @@ impl AssembledStimulus {
     /// **already at `level`** — verification's `max|x| ≤ 1.0` runs
     /// post-scale, and the emit guard clamps final samples. The `level`
     /// argument of [`StimulusSink::emit`] is provenance to log and verify
-    /// against, not a second gain stage; `seam.rs`'s scaffold-era comment
-    /// ("implementations scale by `level`") predates assembly and is
-    /// reconciled at integration.
+    /// against, not a second gain stage; the [`StimulusSink`] contract in
+    /// `seam.rs` states the same from the sink's side.
     pub fn emit_to(
         &self,
         sink: &mut dyn StimulusSink,
@@ -462,5 +461,77 @@ fn scale_to(x: &mut [f64], level: SweepLevel) {
     let gain = 10f64.powf(level.dbfs_rms() / 20.0) / rms;
     for v in x.iter_mut() {
         *v *= gain;
+    }
+}
+
+// ---------------------------------------------------------------- MS-4 placement
+#[cfg(test)]
+mod tests {
+    //! MS-4's PLACEMENT proof (review-added): the guard must run inside
+    //! [`AssembledStimulus::emit_to`] — the last stage before the seam — not
+    //! merely exist as a callable. Integration tests cannot pin this:
+    //! `AssembledStimulus` is deliberately unforgeable there, and a verified
+    //! stimulus is already clean, so deleting the `emit_guard` call from
+    //! `emit_to` would leave every `tests/` test green. Only here, where the
+    //! private fields are reachable, can a doctored instance exist.
+
+    use super::*;
+    use crate::seam::StreamFormat;
+
+    struct RecordingSink {
+        level: Option<SweepLevel>,
+        received: Vec<f64>,
+    }
+
+    impl StimulusSink for RecordingSink {
+        fn format(&self) -> StreamFormat {
+            StreamFormat {
+                channels: 1,
+                frames_per_block: 512,
+                sample_rate_hz: 48_000.0,
+            }
+        }
+
+        fn emit(&mut self, block: &[f64], level: SweepLevel) -> Result<(), MeasureError> {
+            self.level = Some(level);
+            self.received.extend_from_slice(block);
+            Ok(())
+        }
+
+        fn stop(&mut self) -> Result<(), MeasureError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn emit_to_runs_the_guard_immediately_before_the_sink() {
+        let doctored = AssembledStimulus {
+            kind: StimulusKind::Pilot,
+            level: SweepLevel::new(-40.0, TransducerClass::OverEar).expect("legal level"),
+            sample_rate_hz: 48_000,
+            samples: vec![0.0, f64::NAN, 2.0, -0.5, f64::INFINITY, 0.25],
+        };
+        let mut sink = RecordingSink {
+            level: None,
+            received: Vec::new(),
+        };
+        let warnings = doctored.emit_to(&mut sink).expect("emit succeeds");
+
+        assert_eq!(
+            sink.received,
+            vec![0.0, 0.0, 1.0, -0.5, 0.0, 0.25],
+            "the sink must receive the GUARDED buffer: NaN/∞ zeroed, 2.0 clamped"
+        );
+        assert!(sink.level.is_some(), "level provenance rides along");
+        assert!(
+            warnings.contains(&MeasurementDiagnostic::EmitNonFiniteSanitized { count: 2 }),
+            "got {warnings:?}"
+        );
+        assert!(
+            warnings.contains(&MeasurementDiagnostic::EmitClamped { count: 1 }),
+            "got {warnings:?}"
+        );
+        // The doctored instance itself is untouched — the guard runs on a copy.
+        assert!(doctored.samples[1].is_nan());
     }
 }

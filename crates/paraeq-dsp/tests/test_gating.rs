@@ -450,3 +450,119 @@ fn scalar_formulas_match_spec() {
     assert!((dt2 - 5.0 * 2f64.ln() / 1000f64.ln()).abs() < 1e-12);
     assert!((dt2 - 0.5017).abs() < 1e-4);
 }
+
+// ---- review-added hardening (Stage-3 review) --------------------------------
+
+/// Non-finite gate parameters are refused, not propagated: +inf right_ms would
+/// otherwise allocate `inf as usize` samples, NaN Tukey alpha would gate the
+/// IR with NaN taper weights and return Ok(NaN samples).
+#[test]
+fn non_finite_gate_params_are_rejected() {
+    let ir = ImpulseResponse {
+        samples: vec![0.0, 1.0, 0.0, 0.0],
+        peak: 1.0,
+        sample_rate: SR,
+    };
+    let ok_spec = GateSpec {
+        left_ms: 0.0,
+        right_ms: 0.02,
+        sweep: None,
+        window: WindowSpec::default(),
+    };
+
+    let mut spec = ok_spec;
+    spec.right_ms = f64::INFINITY;
+    assert!(gating::apply_gate(&ir, &spec).is_err(), "infinite right_ms");
+    let mut spec = ok_spec;
+    spec.right_ms = f64::NAN;
+    assert!(gating::apply_gate(&ir, &spec).is_err(), "NaN right_ms");
+    let mut spec = ok_spec;
+    spec.left_ms = f64::INFINITY;
+    assert!(gating::apply_gate(&ir, &spec).is_err(), "infinite left_ms");
+    let mut spec = ok_spec;
+    spec.sweep = Some(SweepParams {
+        duration_s: f64::INFINITY,
+        f1: 20.0,
+        f2: 20000.0,
+    });
+    assert!(gating::apply_gate(&ir, &spec).is_err(), "infinite duration");
+    let mut spec = ok_spec;
+    spec.window = WindowSpec {
+        left: WindowKind::Tukey { alpha: f64::NAN },
+        right: WindowKind::Rect,
+    };
+    assert!(gating::apply_gate(&ir, &spec).is_err(), "NaN Tukey alpha");
+}
+
+/// A right gate longer than the ENTIRE recording is a programmer error and,
+/// unchecked, an unbounded allocation — refused fast, no allocation.
+#[test]
+fn oversized_right_gate_is_rejected_not_allocated() {
+    let ir = ImpulseResponse {
+        samples: vec![0.0; 1000],
+        peak: 10.0,
+        sample_rate: SR,
+    };
+    let spec = GateSpec {
+        left_ms: 0.0,
+        right_ms: 1.0e12,
+        sweep: None,
+        window: WindowSpec::default(),
+    };
+    let mut ir = ir;
+    ir.samples[10] = 1.0;
+    assert!(
+        gating::apply_gate(&ir, &spec).is_err(),
+        "a right gate of ~2e13 samples must refuse, not allocate"
+    );
+}
+
+/// When the recording ends before the right gate does, the zero-filled tail
+/// adds no resolution: the report's figures must come from the data that
+/// exists, not the requested window — otherwise `authority.rs` (which must
+/// respect `min_valid_freq_hz`) would fit bands the gate never resolved.
+#[test]
+fn truncated_recording_reports_effective_resolution() {
+    // Peak at 10 ms; the recording ends 5 ms (240 samples) after the peak;
+    // 12 ms right gate requested (576 samples, legal: < the 721-sample IR).
+    let mut samples = vec![0.0; 721];
+    samples[480] = 1.0;
+    let ir = ImpulseResponse {
+        samples,
+        peak: 480.0,
+        sample_rate: SR,
+    };
+    let spec = GateSpec {
+        left_ms: 2.0,
+        right_ms: 12.0,
+        sweep: None,
+        window: WindowSpec::default(),
+    };
+    let (gated, report) = gating::apply_gate(&ir, &spec).unwrap();
+    // The gate itself keeps its length contract (zero-filled)...
+    assert_eq!(gated.len(), 96 + 576 + 1);
+    assert_eq!(report.applied_right_ms, 12.0);
+    // ...but the resolution figures reflect the 5 ms of real data.
+    assert!(
+        (report.min_valid_freq_hz - 200.0).abs() < 1e-9,
+        "1000/5 ms = 200 Hz, got {}",
+        report.min_valid_freq_hz
+    );
+    let expected = gating::resolution_limit_hz(0.005, gating::RESOLUTION_FRACTION);
+    assert!(
+        (report.resolution_limit_hz - expected).abs() < 1e-9,
+        "resolution limit must use the effective 5 ms window"
+    );
+
+    // Control: the same gate on a long-enough recording reports the requested
+    // window's figures.
+    let mut samples = vec![0.0; 4800];
+    samples[480] = 1.0;
+    let ir = ImpulseResponse {
+        samples,
+        peak: 480.0,
+        sample_rate: SR,
+    };
+    let (_, report) = gating::apply_gate(&ir, &spec).unwrap();
+    assert!((report.min_valid_freq_hz - 1000.0 / 12.0).abs() < 1e-9);
+}

@@ -34,10 +34,14 @@ pub struct StreamFormat {
 ///   interlock: an implementation may not be handed a bare `f64`, so a level
 ///   that skipped the caps table cannot be emitted. The `.stderr` files under
 ///   `tests/ui/` are the proof.
-/// - Implementations scale by `level` and by nothing else. The stimulus path
-///   does not traverse `RealtimeChain`, so it inherits neither the trim gain
-///   nor either ±1.0 clamp; the emitter carries its own clamp and non-finite
-///   guard (MS-4) and cannot borrow the engine's.
+/// - The block arrives ALREADY scaled to `level` by the assembly pipeline
+///   (`AssembledStimulus::emit_to` in `stimulus.rs`); implementations apply
+///   NO gain of their own — scaling here would double-apply the level. The
+///   `level` parameter is provenance: log it and verify against it, never
+///   multiply by it. The stimulus path does not traverse `RealtimeChain`, so
+///   it inherits neither the trim gain nor either ±1.0 clamp; the emitter
+///   carries its own clamp and non-finite guard (MS-4) and cannot borrow the
+///   engine's.
 /// - `stop` runs the sink's full teardown and MUST be idempotent — every exit
 ///   path, including panic unwinding, runs it, and it precedes the volume
 ///   restore in the abort sequence. The system must never be left at

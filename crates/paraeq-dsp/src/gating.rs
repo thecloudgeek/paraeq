@@ -5,7 +5,10 @@
 //! shorter than τ must return it exactly flat. No oracle can be wrong here.
 //! Spec: docs/specs/2026-07-15-room-dsp-design.md, "`gating.rs` — new".
 
-use crate::{window::WindowSpec, DspError};
+use crate::{
+    window::{WindowKind, WindowSpec},
+    DspError,
+};
 
 /// The 1/N-octave fraction `apply_gate` reports `resolution_limit_hz` at:
 /// 1/6 octave, the spec's running example and the standard room-correction
@@ -78,9 +81,11 @@ pub enum LeftClamp {
 ///
 /// This signature (spec-fixed) carries no sample rate, so the 1 ms threshold
 /// is expressed as [`PEAK_FALLBACK_LEAD_SAMPLES`] — 1 ms at the pipeline's
-/// 48 kHz. Callers at other rates use [`detect_peak_with_lead`] with
-/// `sample_rate / 1000`, which also returns the structured
-/// `gate.peak_fallback` warning.
+/// 48 kHz. **Pipeline code MUST use [`detect_peak_with_lead`]** with
+/// `sample_rate / 1000`: this wrapper assumes 48 kHz and DISCARDS the
+/// structured `gate.peak_fallback` warning, which the measurement session is
+/// required to surface. It exists to satisfy the spec's signature and for
+/// rate-agnostic tests, not for the capture path.
 pub fn detect_peak(samples: &[f64]) -> Result<f64, DspError> {
     Ok(detect_peak_with_lead(samples, PEAK_FALLBACK_LEAD_SAMPLES)?.peak)
 }
@@ -190,8 +195,10 @@ fn parabolic_delta(y: &[f64], i: usize) -> f64 {
 /// - The half-tapers are applied with their inner edge (exactly 1.0) at the
 ///   peak — `window.left` pre-peak, `window.right` post-peak — so the peak
 ///   sample carries weight 1.0.
-/// - `resolution_limit_hz` is reported at [`RESOLUTION_FRACTION`] (1/6 octave)
-///   for the applied right gate.
+/// - `resolution_limit_hz` is reported at [`RESOLUTION_FRACTION`] (1/6 octave).
+///   Both report figures use the EFFECTIVE right duration — the shorter of the
+///   applied right gate and the post-peak data the recording actually holds —
+///   because a zero-filled tail adds no resolution.
 pub fn apply_gate(
     ir: &ImpulseResponse,
     spec: &GateSpec,
@@ -220,27 +227,40 @@ pub fn apply_gate(
         )));
     }
     // Comparisons are written so a NaN fails them: NaN compares false.
-    let right_ok = spec.right_ms > 0.0;
+    let right_ok = spec.right_ms.is_finite() && spec.right_ms > 0.0;
     if !right_ok {
         return Err(DspError::InvalidInput(format!(
-            "apply_gate: right_ms must be positive, got {}",
+            "apply_gate: right_ms must be finite and positive, got {}",
             spec.right_ms
         )));
     }
-    let left_ok = spec.left_ms >= 0.0;
+    let left_ok = spec.left_ms.is_finite() && spec.left_ms >= 0.0;
     if !left_ok {
         return Err(DspError::InvalidInput(format!(
-            "apply_gate: left_ms must be non-negative, got {}",
+            "apply_gate: left_ms must be finite and non-negative, got {}",
             spec.left_ms
         )));
     }
     if let Some(s) = &spec.sweep {
-        let sweep_ok = s.duration_s > 0.0 && s.f1 > 0.0 && s.f2 > s.f1;
+        let sweep_ok = s.duration_s.is_finite()
+            && s.duration_s > 0.0
+            && s.f1 > 0.0
+            && s.f2.is_finite()
+            && s.f2 > s.f1;
         if !sweep_ok {
             return Err(DspError::InvalidInput(format!(
                 "apply_gate: invalid sweep params (duration {} s, {} → {} Hz)",
                 s.duration_s, s.f1, s.f2
             )));
+        }
+    }
+    for kind in [spec.window.left, spec.window.right] {
+        if let WindowKind::Tukey { alpha } = kind {
+            if !alpha.is_finite() {
+                return Err(DspError::InvalidInput(format!(
+                    "apply_gate: Tukey alpha must be finite, got {alpha}"
+                )));
+            }
         }
     }
 
@@ -273,6 +293,17 @@ pub fn apply_gate(
     // `left_samples <= peak_index` up to float dust; the min() guards the dust.
     let left_samples = ((applied_left_ms * sr / 1000.0).round() as usize).min(peak_index);
     let right_samples = (applied_right_ms * sr / 1000.0).round() as usize;
+    // A right gate somewhat past the recording's end is legal (zero-fill,
+    // below); one longer than the ENTIRE recording is a programmer error and,
+    // unchecked, an unbounded allocation.
+    if right_samples > ir.samples.len() {
+        return Err(DspError::InvalidInput(format!(
+            "apply_gate: right_ms {} ({} samples) exceeds the whole recording ({} samples)",
+            applied_right_ms,
+            right_samples,
+            ir.samples.len()
+        )));
+    }
     let start = peak_index - left_samples;
     let len = left_samples + right_samples + 1;
 
@@ -296,12 +327,19 @@ pub fn apply_gate(
         *g *= w;
     }
 
+    // The report's resolution figures come from the data that EXISTS: when the
+    // recording ends before the right gate does, the zero-filled tail adds no
+    // information, and reporting 1/T of the requested window would overstate
+    // low-frequency validity to exactly the consumers (`authority.rs`) that
+    // must respect it.
+    let available_right_ms = (ir.samples.len() - 1 - peak_index) as f64 * 1000.0 / sr;
+    let effective_right_ms = applied_right_ms.min(available_right_ms).max(1000.0 / sr);
     let report = GateReport {
         applied_left_ms,
         applied_right_ms,
         clamped_left,
-        min_valid_freq_hz: min_valid_freq(applied_right_ms),
-        resolution_limit_hz: resolution_limit_hz(applied_right_ms / 1000.0, RESOLUTION_FRACTION),
+        min_valid_freq_hz: min_valid_freq(effective_right_ms),
+        resolution_limit_hz: resolution_limit_hz(effective_right_ms / 1000.0, RESOLUTION_FRACTION),
         harmonic_bound_ms,
     };
     Ok((gated, report))
