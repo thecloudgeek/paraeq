@@ -27,17 +27,22 @@
 //! [`SweepLevel::new`], and a `trybuild` compile-fail proof that no other type
 //! reaches a [`StimulusSink`].
 //!
-//! Scaffold scope (MS-1/MS-2). The level ladder itself (floor → pilot → solve →
-//! envelope → ≤6 dB rungs), stimulus assembly, the session state machine with
+//! Scope so far: MS-1/MS-2 (the seam and the level interlock), MS-3/MS-4
+//! (stimulus assembly, the post-fade assertion set, and the emit guard —
+//! [`stimulus`]), MS-9/MS-20 (the refusal framework and the numbered
+//! diagnostic contract — [`diagnostic`]). The level ladder itself (floor →
+//! pilot → solve → envelope → ≤6 dB rungs), the session state machine with
 //! its RAII volume restore, and the `paraeq-coreaudio` impls of the seam are
-//! later stages; they are the callers this crate's types were written to
-//! constrain.
+//! later stages; they are the callers these types were written to constrain.
 
 #![forbid(unsafe_code)]
 
+pub mod diagnostic;
 pub mod level;
 pub mod seam;
+pub mod stimulus;
 
+pub use diagnostic::{CalSensitivity, MeasurementDiagnostic, MicSensitivity, Refusal, Severity};
 pub use level::{caps_for, LevelError, SweepLevel, TransducerCaps, ABSOLUTE_MAX_DBFS_RMS};
 /// Re-exported: the enum lives in `paraeq-dsp` because that is the only crate
 /// every consumer may depend on. Its semantics are `paraeq-decide`'s; this
@@ -45,6 +50,10 @@ pub use level::{caps_for, LevelError, SweepLevel, TransducerCaps, ABSOLUTE_MAX_D
 /// second argument.
 pub use paraeq_dsp::targets::TransducerClass;
 pub use seam::{CaptureSource, StimulusSink, StreamFormat};
+pub use stimulus::{
+    assemble_pilot, assemble_sweep, emit_guard, verify_stimulus, AssembledStimulus, GuardCounts,
+    StimulusError, StimulusKind,
+};
 
 /// Error type shared by this crate's entry points.
 ///
