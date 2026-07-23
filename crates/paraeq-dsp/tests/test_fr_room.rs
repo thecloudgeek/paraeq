@@ -132,7 +132,7 @@ fn rms_average_and_sigma_match_numpy_fixture() {
     // (offsets at float-noise level) and the expected outputs are numpy's
     // alone — which is what keeps the tier honest.
     let set = fr::align_spl(&rows, &freqs, (200.0, 2000.0)).unwrap();
-    for (j, o) in set.offsets_db.iter().enumerate() {
+    for (j, o) in set.offsets_db().iter().enumerate() {
         assert!(o.abs() < 1e-12, "offset[{j}] = {o}, expected float noise");
     }
     assert_allclose(
@@ -290,7 +290,7 @@ fn power_mean_inequality_holds_with_zero_violations() {
     let set = fr::align_spl(&curves, &freqs, BAND).unwrap();
     // Both estimators on the SAME (aligned) data.
     let rms = fr::average_measurements_rms(&set);
-    let db_avg = fr::average_measurements(&set.measurements_db).unwrap();
+    let db_avg = fr::average_measurements(set.measurements_db()).unwrap();
     let violations = rms.iter().zip(&db_avg).filter(|(r, a)| r < a).count();
     assert_eq!(violations, 0, "power-mean inequality violated");
     // The gap is genuinely large for spatially-scattered data — this is not a
@@ -319,7 +319,7 @@ fn gap_formula_holds_to_one_percent() {
             .collect();
         let set = fr::align_spl(&curves, &FREQS, BAND).unwrap();
         let gap = fr::average_measurements_rms(&set)[NULL_BIN]
-            - fr::average_measurements(&set.measurements_db).unwrap()[NULL_BIN];
+            - fr::average_measurements(set.measurements_db()).unwrap()[NULL_BIN];
         let sigma_hat = fr::sigma_db(&set)[NULL_BIN];
         assert!(
             (sigma_hat - sigma).abs() < 0.01 * sigma,
@@ -401,6 +401,26 @@ fn flat_spectrum_is_preserved_in_every_mode() {
     }
 }
 
+/// Tier 2: the whole Variable profile pinned bin-for-bin against an independent
+/// numpy re-implementation of the exact per-bin truncated-Gaussian convolution
+/// (`fixtures/fr/variable_smooth`). This is the spec-mandated Tier-2 for the
+/// Variable mode — a scipy single-σ primitive can't express a per-bin σ, so the
+/// reference is a hand-rolled loop; the tolerance is parity, not method
+/// accuracy, because both sides implement the same closed form.
+#[test]
+fn variable_smoothing_matches_numpy_reference() {
+    let c = Case::load("fr", "variable_smooth");
+    let grid = LogGrid::standard();
+    let mag_db = c.array("mag_db");
+    assert_eq!(
+        mag_db.len(),
+        grid.len(),
+        "fixture built on the standard grid"
+    );
+    let out = fr::smooth(&mag_db, &grid, Smoothing::Variable).unwrap();
+    assert_allclose(&out, &c.array("smoothed"), 0.0, 1e-9, "variable_smooth");
+}
+
 #[test]
 fn variable_smoothing_is_fine_in_bass_coarse_in_treble() {
     // The Variable profile is 1/48 oct below 100 Hz and 1/3 oct above 10 kHz —
@@ -431,6 +451,59 @@ fn variable_smoothing_is_fine_in_bass_coarse_in_treble() {
 }
 
 #[test]
+fn variable_smoothing_width_matches_the_profile_in_the_mid_band() {
+    // The endpoint test above only probes the clamped bass floor (100 Hz) and
+    // clamped treble (10 kHz), where FRAC_MID and the log-f interpolation law
+    // barely move the result. This pins the σ(f) the Variable profile actually
+    // applies at 300 Hz / 1 kHz / 3 kHz — the region a FRAC_MID change or a
+    // linear-in-f interpolation would silently corrupt. Method: a unit spike's
+    // Variable-smoothed response is the (edge-effect-free) normalized Gaussian
+    // kernel, so its second moment recovers σ_bins directly.
+    let grid = LogGrid::standard();
+    // fraction/σ conversion, replicated from fr.rs's public contract so a
+    // change to the private curve must move the measured width to disagree.
+    let expected_sigma_bins = |f: f64| -> f64 {
+        const FRAC_BASS: f64 = 1.0 / 48.0;
+        const FRAC_MID: f64 = 1.0 / 6.0;
+        const FRAC_TREBLE: f64 = 1.0 / 3.0;
+        let fraction = if f <= 100.0 {
+            FRAC_BASS
+        } else if f <= 1000.0 {
+            FRAC_BASS + (FRAC_MID - FRAC_BASS) * (f / 100.0).log10()
+        } else if f <= 10_000.0 {
+            FRAC_MID + (FRAC_TREBLE - FRAC_MID) * (f / 1000.0).log10()
+        } else {
+            FRAC_TREBLE
+        };
+        fraction / fr::GAUSSIAN_FWHM_PER_SIGMA * f64::from(grid.points_per_octave())
+    };
+    // bin 375 ≈ 300 Hz, 542 ≈ 1 kHz, 694 ≈ 3 kHz (f = 20·2^(i/96)).
+    for &bin in &[375usize, 542, 694] {
+        let f = grid.freqs()[bin];
+        let mut spike = vec![0.0; grid.len()];
+        spike[bin] = 6.0;
+        let out = fr::smooth(&spike, &grid, Smoothing::Variable).unwrap();
+        // Second moment of the (positive) response about the spike bin.
+        let (mut m0, mut m2) = (0.0f64, 0.0f64);
+        for (j, &v) in out.iter().enumerate() {
+            let d = j as f64 - bin as f64;
+            m0 += v;
+            m2 += d * d * v;
+        }
+        let measured = (m2 / m0).sqrt();
+        let expected = expected_sigma_bins(f);
+        assert!(
+            (measured / expected - 1.0).abs() < 0.03,
+            "σ at {f:.0} Hz (bin {bin}): measured {measured:.3} bins vs profile {expected:.3}"
+        );
+    }
+    // And the profile is strictly monotone increasing across these three — the
+    // "fine in bass, coarse in treble" shape, not just three matching numbers.
+    assert!(expected_sigma_bins(300.0) < expected_sigma_bins(1000.0));
+    assert!(expected_sigma_bins(1000.0) < expected_sigma_bins(3000.0));
+}
+
+#[test]
 fn align_spl_removes_constant_offsets() {
     // Curves differing by constants must align to IDENTICAL curves, with
     // offsets summing to zero (the ensemble's absolute level is preserved,
@@ -445,17 +518,17 @@ fn align_spl_removes_constant_offsets() {
         .map(|k| base.iter().map(|v| v + k).collect())
         .collect();
     let set = fr::align_spl(&curves, grid.freqs(), BAND).unwrap();
-    assert_eq!(set.reference_band, BAND);
+    assert_eq!(set.reference_band(), BAND);
 
-    let offset_sum: f64 = set.offsets_db.iter().sum();
+    let offset_sum: f64 = set.offsets_db().iter().sum();
     assert!(offset_sum.abs() < 1e-9, "offsets sum to {offset_sum}");
     // offset_j = k_j − mean(k): 3.5 − 1.0, −1.25 − 1.0, 0.75 − 1.0.
     let mean_shift = shifts.iter().sum::<f64>() / shifts.len() as f64;
-    for (o, k) in set.offsets_db.iter().zip(&shifts) {
+    for (o, k) in set.offsets_db().iter().zip(&shifts) {
         assert!((o - (k - mean_shift)).abs() < 1e-12, "offset {o} for {k}");
     }
     // All aligned curves identical: base + mean(k).
-    for m in &set.measurements_db {
+    for m in set.measurements_db() {
         for (i, v) in m.iter().enumerate() {
             assert!(
                 (v - (base[i] + mean_shift)).abs() < 1e-12,

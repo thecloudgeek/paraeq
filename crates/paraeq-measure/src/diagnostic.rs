@@ -132,6 +132,13 @@ pub enum MeasurementDiagnostic {
     /// `EngineStatus::Failed`): the audio topology is no longer known-good,
     /// so the run aborts.
     EngineFailed = 22,
+    /// The solved level is a legal projected SPL but not a legal output level:
+    /// after the MS-11 margin it lands above the class's dBFS cap or above the
+    /// −3 dBFS RMS ceiling, so `SweepLevel::new` refuses it. Distinct from
+    /// [`Self::ProjectedSplOverCap`] (which is the SPL projection, not the
+    /// dBFS level) — a very insensitive chain can project an in-cap SPL yet
+    /// demand a level ParaEQ will not emit.
+    SolvedLevelIllegal = 23,
 
     // ── Non-blocking warnings: 100… ─────────────────────────────────────────
     /// SNR accepted on the degraded row (median ≥ 30 dB but below the
@@ -183,6 +190,7 @@ impl MeasurementDiagnostic {
             Self::MicDisconnected => 20,
             Self::OutputDeviceChanged => 21,
             Self::EngineFailed => 22,
+            Self::SolvedLevelIllegal => 23,
             Self::LowSnr => 100,
             Self::FixedMaxVolume => 101,
             Self::TwoClock => 102,
@@ -208,6 +216,7 @@ impl MeasurementDiagnostic {
             | Self::SensitivityOutOfEnvelope
             | Self::SensitivityUnparseable
             | Self::SnrUnachievable
+            | Self::SolvedLevelIllegal
             | Self::SplOverCap
             | Self::SplProjectionMismatch
             | Self::StimulusDcOffset { .. }
@@ -313,6 +322,11 @@ impl MeasurementDiagnostic {
             Self::EngineFailed => {
                 "ParaEQ's audio engine hit a problem, so the measurement was \
                  stopped. Restart ParaEQ and try again."
+            }
+            Self::SolvedLevelIllegal => {
+                "This device needs an unsafe output level to reach a usable \
+                 measurement volume. Turn up the device's own volume (or use a \
+                 more sensitive one) and try again."
             }
             Self::LowSnr => {
                 "The measurement is usable, but a quieter room would make it \
@@ -487,6 +501,13 @@ impl MeasurementDiagnostic {
                  the audio topology the measurement depends on is no longer \
                  known-good. The stimulus was ramped to zero and the session \
                  aborted, then the pre-measurement state was restored."
+                .to_owned(),
+            Self::SolvedLevelIllegal => "The level ladder solved a projected SPL within the class \
+                 cap, but the output level it requires — after the calibration \
+                 safety margin — lands above the class's dBFS ceiling or above \
+                 −3 dBFS RMS, which the sole level constructor refuses. The chain \
+                 is too insensitive to measure safely at this device volume; no \
+                 sample was emitted and the pre-measurement state was restored."
                 .to_owned(),
             Self::LowSnr => "The measurement cleared the reduced signal-to-noise bar \
                  (median ≥ 30 dB) but not the preferred one (median ≥ 40 dB \

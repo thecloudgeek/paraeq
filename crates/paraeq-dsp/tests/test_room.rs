@@ -95,6 +95,91 @@ fn fixture_ir_t60_is_recovered() {
     );
 }
 
+/// A two-slope decay — a fast early portion (direct + early reflections) then a
+/// slower reverberant tail — is exactly why ISO 3382 fits over [−5, −25] dB
+/// rather than from 0: the fit must recover the REVERBERANT slope, skipping the
+/// steep top. A naive [0, −20] window would drag the steep early portion into
+/// the fit and report a too-short T60. A clean single-exponential can't tell the
+/// two windows apart; this can.
+#[test]
+fn two_slope_decay_recovers_the_reverberant_tail() {
+    const T60_FAST: f64 = 0.10;
+    const T60_SLOW: f64 = 0.45;
+    let k_fast = 1000f64.ln() / T60_FAST;
+    let k_slow = 1000f64.ln() / T60_SLOW;
+    // Knee ~10 dB down (amplitude): t where 20·log10(exp(−k_fast·t)) = −10.
+    let t_knee = 0.5 * 10f64.ln() / k_fast;
+    let n = (0.6 * SR as f64) as usize;
+    let w = noise(n, 0x2545_F491_4F6C_DD1D);
+    let samples: Vec<f64> = w
+        .iter()
+        .enumerate()
+        .map(|(i, wi)| {
+            let t = i as f64 / SR as f64;
+            let env = if t < t_knee {
+                (-k_fast * t).exp()
+            } else {
+                (-k_fast * t_knee).exp() * (-k_slow * (t - t_knee)).exp()
+            };
+            wi * env
+        })
+        .collect();
+    let ir = ImpulseResponse {
+        samples,
+        peak: 0.0,
+        sample_rate: SR,
+    };
+    let est = estimate_t60(&ir, None).unwrap();
+    // The [−5, −25] fit sits in the slow tail and recovers ~T60_SLOW; a [0, −20]
+    // fit contaminated by the fast top would report markedly less.
+    assert!(
+        (est.t60_s - T60_SLOW).abs() / T60_SLOW < 0.15,
+        "two-slope T60 {} vs reverberant {T60_SLOW} — the fit window let the fast top in?",
+        est.t60_s
+    );
+}
+
+/// A decay with a deterministic ripple on top of the exponential bends the
+/// Schroeder curve enough to drop `fit_r2` into (0.5, 0.95): the estimator must
+/// call it unusable at the 0.95 gate. Pure noise is rejected over-determinedly
+/// (its r² is already ~0 AND the floor probe fails), so it can't pin the
+/// threshold; this marginal case can.
+#[test]
+fn marginal_fit_quality_is_unusable() {
+    const T60: f64 = 0.35;
+    let k = 1000f64.ln() / T60;
+    let n = (0.45 * SR as f64) as usize;
+    let w = noise(n, 0x1234_5678_9ABC_DEF1);
+    let samples: Vec<f64> = w
+        .iter()
+        .enumerate()
+        .map(|(i, wi)| {
+            let t = i as f64 / SR as f64;
+            // Exponential with a slow, deep amplitude ripple (deterministic, so
+            // fit_r2 is reproducible): bends the decay off the fit line.
+            let ripple = 1.0 + 0.85 * (2.0 * std::f64::consts::PI * 18.0 * t).sin();
+            wi * (-k * t).exp() * ripple.abs()
+        })
+        .collect();
+    let ir = ImpulseResponse {
+        samples,
+        peak: 0.0,
+        sample_rate: SR,
+    };
+    let est = estimate_t60(&ir, None).unwrap();
+    // The test only bites if the fit really landed in the marginal band — assert
+    // that first, so a future change that moves r² can't make this vacuous.
+    assert!(
+        est.fit_r2 > 0.5 && est.fit_r2 < 0.95,
+        "fit_r2 {} not in the marginal (0.5, 0.95) band this test needs",
+        est.fit_r2
+    );
+    assert!(
+        !est.usable,
+        "a marginal-r² fit must be unusable at the 0.95 gate: {est:?}"
+    );
+}
+
 /// Pure stationary noise has no decay; its Schroeder curve only reaches
 /// −25 dB in the end-of-integration plunge. The estimate must disqualify
 /// itself — Ok, but `usable: false`.

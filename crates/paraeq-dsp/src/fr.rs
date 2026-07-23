@@ -150,19 +150,42 @@ pub const GAUSSIAN_FWHM_PER_SIGMA: f64 = 2.354_820_045_030_949_3;
 /// Spatially-aligned measurement set. Constructible ONLY via `align_spl`, so a
 /// caller cannot power-average unaligned data.
 ///
-/// `#[non_exhaustive]` is what enforces that: it blocks struct-literal
-/// construction outside this crate while leaving the fields readable. Skipping
-/// alignment does not merely tilt the mean — near positions dominate the power
-/// average AND inflate σ(f), corrupting the confidence metric `authority.rs`
-/// depends on, which would silently make ParaEQ back off from features that are
-/// genuinely correctable. That failure is invisible on a plot, so the compiler
-/// prevents it instead.
+/// The fields are PRIVATE, not `pub` — that is what enforces the invariant. The
+/// spec's API sketch shows `pub` fields, but `#[non_exhaustive]` alone would
+/// only block struct-literal construction: it leaves existing `pub` fields
+/// writable, so `set.measurements_db = unaligned` (or a post-alignment
+/// `set.measurements_db.remove(i)`) would compile and re-introduce unaligned
+/// data. Skipping alignment does not merely tilt the mean — near positions
+/// dominate the power average AND inflate σ(f), corrupting the confidence
+/// metric `authority.rs` depends on, which would silently make ParaEQ back off
+/// from features that are genuinely correctable. That failure is invisible on a
+/// plot, so read-only accessors + the single `align_spl` constructor prevent it
+/// at the type level; the spec's own `pub`-field sketch is honoured in intent,
+/// not letter.
 #[derive(Clone, Debug)]
-#[non_exhaustive]
 pub struct AlignedSet {
-    pub measurements_db: Vec<Vec<f64>>,
-    pub offsets_db: Vec<f64>,
-    pub reference_band: (f64, f64),
+    measurements_db: Vec<Vec<f64>>,
+    offsets_db: Vec<f64>,
+    reference_band: (f64, f64),
+}
+
+impl AlignedSet {
+    /// The aligned per-position curves — read-only; mutating them would defeat
+    /// the alignment the type exists to guarantee.
+    pub fn measurements_db(&self) -> &[Vec<f64>] {
+        &self.measurements_db
+    }
+
+    /// The per-position level offsets `align_spl` removed. Sum to zero (the
+    /// ensemble's absolute level is preserved).
+    pub fn offsets_db(&self) -> &[f64] {
+        &self.offsets_db
+    }
+
+    /// The band the alignment was computed over.
+    pub fn reference_band(&self) -> (f64, f64) {
+        self.reference_band
+    }
 }
 
 /// Remove overall level differences due to different source distances.

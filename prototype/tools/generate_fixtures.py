@@ -24,6 +24,7 @@ The manifest is a provenance record of what ran, never the pin.
 """
 import argparse
 import json
+import math
 import platform
 import shutil
 import sys
@@ -221,6 +222,63 @@ def gen_gaussian_smoothing():
                    "sigma_bins": sigma, "truncate": 4.0},
                   {"freqs": freqs, "mag_db": mag_db,
                    "smoothed": gaussian_filter1d(mag_db, sigma, mode="reflect", truncate=4.0)})
+
+
+def gen_variable_smooth():
+    """fr.rs Variable smoothing: per-bin truncated sampled Gaussian (Tier 2).
+
+    The Variable profile cannot be a scipy.ndimage.gaussian_filter1d call -- its
+    sigma is per-bin (1/48 oct <100 Hz, 1/6 at 1 kHz, 1/3 >10 kHz, log-f
+    interpolated), which no single-sigma primitive expresses. So this is an
+    INDEPENDENT numpy re-implementation of the exact operation
+    `variable_gaussian_smooth` performs (truncate=4.0, normalized weights,
+    clamp-to-edge extension); a transcription bug in the Rust convolution -- wrong
+    fraction anchors, linear-vs-log interpolation, wrong normalization -- diverges
+    from this reference. The inner accumulation is a scalar loop mirroring the
+    Rust summation ORDER so parity holds to 1e-12, not just method accuracy.
+
+    GAUSSIAN_FWHM_PER_SIGMA and the fraction anchors are fr.rs's contract,
+    replicated here; the fixture freezes their product, so a change to either on
+    the Rust side must move the output to disagree.
+    """
+    ppo = 96
+    freqs = log_grid(ppo=ppo)
+    n = freqs.shape[0]
+    fwhm_per_sigma = 2.3548200450309493  # 2*sqrt(2 ln 2)
+
+    def variable_fraction(f):
+        frac_bass, frac_mid, frac_treble = 1.0 / 48.0, 1.0 / 6.0, 1.0 / 3.0
+        if f <= 100.0:
+            return frac_bass
+        if f <= 1000.0:
+            return frac_bass + (frac_mid - frac_bass) * math.log10(f / 100.0)
+        if f <= 10000.0:
+            return frac_mid + (frac_treble - frac_mid) * math.log10(f / 1000.0)
+        return frac_treble
+
+    # A structured input so mid-band bins carry gradient the smoothing acts on
+    # (a flat input would pass through every profile identically and pin nothing).
+    rng = np.random.default_rng(50)
+    mag_db = np.cumsum(rng.standard_normal(n)) * 0.25
+    mag_db = np.clip(mag_db - mag_db.mean(), -15.0, 15.0)
+
+    out = np.empty(n, dtype=np.float64)
+    for i, f in enumerate(freqs):
+        sigma = variable_fraction(f) / fwhm_per_sigma * ppo
+        radius = math.ceil(4.0 * sigma)
+        inv_two_sigma_sq = 1.0 / (2.0 * sigma * sigma)
+        num = 0.0
+        den = 0.0
+        for m in range(-radius, radius + 1):  # same order as the Rust loop
+            w = math.exp(-(m * m) * inv_two_sigma_sq)
+            j = min(max(i + m, 0), n - 1)
+            num += w * float(mag_db[j])
+            den += w
+        out[i] = num / den
+
+    save_case("fr", "variable_smooth",
+              {"fwhm_per_sigma": fwhm_per_sigma, "ppo": ppo, "truncate": 4.0},
+              {"freqs": freqs, "mag_db": mag_db, "smoothed": out})
 
 
 def gen_logf():
@@ -494,6 +552,7 @@ def main():
     gen_logf()
     gen_rms_average()
     gen_schroeder()
+    gen_variable_smooth()
     gen_windows()
     manifest = {
         "dtype": "<f8",

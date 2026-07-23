@@ -91,6 +91,65 @@ fn time_axis_recovers_known_delay() {
     );
 }
 
+/// The sub-sample refinement must SURVIVE into `ir.peak` — a `peak.round()`
+/// anywhere in the chain would silently discard it, and every other test here
+/// uses an integer delay where rounding is a no-op. A half-sample fractional
+/// delay (equal energy at t₀ and t₀+1) deconvolves to a kernel symmetric about
+/// t₀+0.5, so the refined peak must carry a ~0.5 fractional part.
+#[test]
+fn time_axis_preserves_sub_sample_refinement() {
+    const SR: u32 = 48_000;
+    const T0: usize = 333;
+    let sweep = generate_sweep(0.5, SR, 20.0, 20_000.0);
+    // recorded = ½·δ(T0) ⊛ sweep + ½·δ(T0+1) ⊛ sweep: a half-sample delay.
+    let mut recorded = vec![0.0; sweep.len() + T0 + 1];
+    for (i, &s) in sweep.iter().enumerate() {
+        recorded[T0 + i] += 0.5 * s;
+        recorded[T0 + 1 + i] += 0.5 * s;
+    }
+    let ir = deconvolve_ir(&recorded, &sweep, SR).unwrap();
+    assert!(
+        (ir.peak - (T0 as f64 + 0.5)).abs() < 0.05,
+        "peak {} should refine to ~{}.5",
+        ir.peak,
+        T0
+    );
+    assert!(
+        (ir.peak - ir.peak.round()).abs() > 0.3,
+        "peak {} lost its fractional part — refinement was rounded away",
+        ir.peak
+    );
+}
+
+/// The 1 ms fallback-lead threshold must scale with the sample rate: at 96 kHz
+/// a 70-sample (0.73 ms) pre-peak arrival is INSIDE 1 ms and must NOT trip the
+/// fallback, but a rate-blind 48-sample lead (1 ms at 48 kHz only) would fire
+/// spuriously and shift t₀ onto the earlier arrival. Every other test runs at
+/// 48 kHz where 48 == sample_rate/1000, so the constant hides.
+#[test]
+fn fallback_lead_scales_with_sample_rate() {
+    const SR: u32 = 96_000;
+    const LEAD: usize = 70; // 0.73 ms at 96 kHz — inside 1 ms (96 samples).
+    let sweep = generate_sweep(0.25, SR, 20.0, 20_000.0);
+    // A 0.7 early arrival (crosses 0.5·max) then a 1.0 later arrival (argmax).
+    let mut recorded = vec![0.0; sweep.len() + 200 + LEAD];
+    for (i, &s) in sweep.iter().enumerate() {
+        recorded[200 + i] += 0.7 * s;
+        recorded[200 + LEAD + i] += 1.0 * s;
+    }
+    let (ir, fallback) = deconvolve_ir_with_fallback(&recorded, &sweep, SR).unwrap();
+    assert!(
+        fallback.is_none(),
+        "0.73 ms lead is inside 1 ms at 96 kHz; fallback must not fire: {fallback:?}"
+    );
+    assert!(
+        (ir.peak - (200.0 + LEAD as f64)).abs() < 1.0,
+        "peak {} should stay on the argmax arrival at ~{}",
+        ir.peak,
+        200 + LEAD
+    );
+}
+
 /// The structured `gate.peak_fallback` warning is surfaced (gating.rs requires
 /// the measurement session to show it); a clean single-delta recording must
 /// not raise it.

@@ -42,10 +42,19 @@ pub struct StreamFormat {
 ///   it inherits neither the trim gain nor either ±1.0 clamp; the emitter
 ///   carries its own clamp and non-finite guard (MS-4) and cannot borrow the
 ///   engine's.
+/// - `emit` is PACED by the hardware: it must not return until the device has
+///   consumed the block (or is within ~one block of consuming it), so the sink
+///   buffers at most about one block ahead. The session's MS-14 abort model
+///   depends on this — it polls the abort handle once per block and expects the
+///   ramp to reach the device within roughly one block of the trigger; a sink
+///   that accepted the whole sweep into a deep queue and returned immediately
+///   would make the poll-per-block cadence fictional and the ramp arrive after
+///   seconds of already-queued full-level audio.
 /// - `stop` runs the sink's full teardown and MUST be idempotent — every exit
 ///   path, including panic unwinding, runs it, and it precedes the volume
-///   restore in the abort sequence. The system must never be left at
-///   measurement volume.
+///   restore in the abort sequence. `stop` must not click: it drops any
+///   still-queued audio rather than flushing it at level. The system must never
+///   be left at measurement volume.
 pub trait StimulusSink: Send {
     fn format(&self) -> StreamFormat;
 

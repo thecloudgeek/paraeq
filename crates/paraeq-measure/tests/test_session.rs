@@ -77,6 +77,7 @@ impl TapStatus for MockTap {
 #[derive(Clone, Default)]
 struct MockSink {
     blocks: Arc<Mutex<Vec<Vec<f64>>>>,
+    fail_stop: Arc<AtomicBool>,
     journal: Journal,
     trip: Arc<Mutex<Option<(usize, AbortHandle, AbortReason)>>>,
 }
@@ -91,6 +92,12 @@ impl MockSink {
 
     fn trip_on_call(&self, nth: usize, handle: AbortHandle, reason: AbortReason) {
         *lock(&self.trip) = Some((nth, handle, reason));
+    }
+
+    /// Make `stop` return `Err` — the teardown must collect the fault and still
+    /// run the volume restore behind it (the `TapSystem` never-mask posture).
+    fn fail_stop(&self) {
+        self.fail_stop.store(true, Ordering::SeqCst);
     }
 
     fn blocks(&self) -> Vec<Vec<f64>> {
@@ -131,6 +138,9 @@ impl StimulusSink for MockSink {
 
     fn stop(&mut self) -> Result<(), MeasureError> {
         self.journal.record("stop");
+        if self.fail_stop.load(Ordering::SeqCst) {
+            return Err(MeasureError::Sink("injected stop failure".to_owned()));
+        }
         Ok(())
     }
 }
@@ -168,6 +178,7 @@ impl StimulusSink for PanickingSink {
 
 #[derive(Clone)]
 struct MockVolume {
+    fail_set: Arc<AtomicBool>,
     journal: Journal,
     scalar: f64,
     sets: Arc<Mutex<Vec<f64>>>,
@@ -176,6 +187,7 @@ struct MockVolume {
 impl MockVolume {
     fn new(scalar: f64, journal: Journal) -> Self {
         Self {
+            fail_set: Arc::default(),
             journal,
             scalar,
             sets: Arc::default(),
@@ -184,6 +196,12 @@ impl MockVolume {
 
     fn sets(&self) -> Vec<f64> {
         lock(&self.sets).clone()
+    }
+
+    /// Make `set_volume` return `Err` — the restore failure must be logged
+    /// (`VolumeRestoreFailed`), never swallowed and never masking teardown.
+    fn fail_set(&self) {
+        self.fail_set.store(true, Ordering::SeqCst);
     }
 }
 
@@ -195,6 +213,9 @@ impl VolumeControl for MockVolume {
     fn set_volume(&mut self, scalar: f64) -> Result<(), MeasureError> {
         self.journal.record("set_volume");
         lock(&self.sets).push(scalar);
+        if self.fail_set.load(Ordering::SeqCst) {
+            return Err(MeasureError::Sink("injected volume failure".to_owned()));
+        }
         Ok(())
     }
 }
@@ -413,6 +434,46 @@ fn a_stale_acknowledgement_is_rejected() {
         SessionError::AckSplStale { .. }
     ));
     assert_eq!(session.phase(), SessionPhase::Solved, "no transition");
+}
+
+/// The ACK_SPL_TOLERANCE_DB boundary, pinned so a widened (or NaN-permissive)
+/// tolerance can't slip through: the projection is 84.0, so 84.0 + tolerance is
+/// still fresh, 84.0 + 2·tolerance is stale, and a NaN acknowledged SPL — which
+/// passes no comparison — is stale, not accepted.
+#[test]
+fn acknowledgement_freshness_is_pinned_at_the_tolerance_boundary() {
+    use paraeq_measure::ACK_SPL_TOLERANCE_DB as TOL;
+    let fresh_session = || {
+        let mut s = MeasurementSession::begin(
+            healthy_cal(TransducerClass::OverEar),
+            1.0,
+            seam(
+                MockSink::default(),
+                MockTap::new(true),
+                MockVolume::new(PRE_VOLUME, Journal::default()),
+            ),
+        )
+        .expect("begin succeeds");
+        s.install_solve(solve()).expect("solve installs");
+        s
+    };
+
+    // At the tolerance: still this run's projection.
+    fresh_session()
+        .acknowledge("Amp", 84.0 + TOL)
+        .expect("within tolerance is fresh");
+    // Past twice the tolerance: stale.
+    assert!(matches!(
+        fresh_session()
+            .acknowledge("Amp", 84.0 + 2.0 * TOL)
+            .unwrap_err(),
+        SessionError::AckSplStale { .. }
+    ));
+    // NaN acknowledges nothing.
+    assert!(matches!(
+        fresh_session().acknowledge("Amp", f64::NAN).unwrap_err(),
+        SessionError::AckSplStale { .. }
+    ));
 }
 
 // ── Refusals at the solve boundary ────────────────────────────────────────
@@ -833,4 +894,204 @@ fn a_rung_cannot_be_recorded_outside_the_level_check() {
         session.record_rung(74.2).unwrap_err(),
         SessionError::WrongPhase { .. }
     ));
+}
+
+// ── Review-added hardening (Stage-4 review) ───────────────────────────────
+
+/// The sweep gate must reject a non-Sweep stimulus even when its level matches
+/// the session's decided level — the vulnerable case, since the pilot's fixed
+/// −40 dBFS can coincide with a margined level. Here the solve is arranged so
+/// the session's level is exactly −40 dBFS, matching the pilot, so only the
+/// kind check (which runs before the level check) can catch it.
+#[test]
+fn sweep_rejects_a_pilot_even_at_a_matching_level() {
+    // solved −40 dBFS with a matching gain pin ⇒ emitted level −40 dBFS, the
+    // pilot's fixed level; projected 64 dB is well under the OverEar cap.
+    let matching_solve = SolveOutcome {
+        chain_sensitivity_spl_per_dbfs: 104.0,
+        projected_spl_db: 64.0,
+        solved_dbfs_rms: -40.0,
+    };
+    let sink = MockSink::default();
+    let mut session = MeasurementSession::begin(
+        healthy_cal(TransducerClass::OverEar),
+        1.0,
+        seam(
+            sink.clone(),
+            MockTap::new(true),
+            MockVolume::new(PRE_VOLUME, Journal::default()),
+        ),
+    )
+    .expect("begin succeeds");
+    let level = session
+        .install_solve(matching_solve)
+        .expect("solve installs");
+    session.acknowledge("Amp", 64.0).expect("ack records");
+
+    let pilot = paraeq_measure::assemble_pilot(0.25, 48_000, TransducerClass::OverEar)
+        .expect("pilot assembles");
+    assert_eq!(
+        pilot.level().dbfs_rms(),
+        level.dbfs_rms(),
+        "the test only bites if the levels genuinely match"
+    );
+    assert!(matches!(
+        session.sweep(&pilot).unwrap_err(),
+        SessionError::StimulusNotSweep { .. }
+    ));
+    assert_eq!(
+        sink.emit_calls(),
+        0,
+        "no pilot sample plays under the sweep gate"
+    );
+}
+
+/// An abort armed during the FINAL block must not be lost: the run must end
+/// `Aborted` with the terminating diagnostic in the log, not a clean
+/// `Completed`. The trigger fires during the last emit, after which the loop
+/// exits — the post-loop re-check is the only thing that can catch it.
+#[test]
+fn abort_on_the_final_block_is_not_lost() {
+    let journal = Journal::default();
+    let sink = MockSink::with_journal(journal.clone());
+    let volume = MockVolume::new(PRE_VOLUME, journal.clone());
+    let mut session = acknowledged_session(sink.clone(), MockTap::new(true), volume.clone());
+
+    let level = session.emit_level().expect("level installed");
+    let stim = assemble_sweep(0.25, 48_000, 20.0, 20_000.0, level).expect("stimulus assembles");
+    let total_blocks = stim.samples().len().div_ceil(BLOCK);
+    sink.trip_on_call(
+        total_blocks,
+        session.abort_handle(),
+        AbortReason::UserRequest,
+    );
+
+    match session.sweep(&stim).expect("an abort is an outcome") {
+        SweepOutcome::Aborted { diagnostic, .. } => assert_eq!(diagnostic, D::UserAborted),
+        completed => panic!("a final-block abort was lost as {completed:?}"),
+    }
+    // Every block emitted (the trigger was on the last), no extra ramp block —
+    // the stimulus was exhausted, so there is nothing to fade.
+    assert_eq!(
+        sink.emit_calls(),
+        total_blocks,
+        "no ramp block: stimulus exhausted"
+    );
+    let log = session.finish();
+    assert_eq!(
+        log.events().last(),
+        Some(&SessionEvent::Terminated {
+            diagnostic: Some(D::UserAborted),
+        }),
+        "the log must end aborted, not SweepCompleted"
+    );
+    assert!(
+        !log.events().contains(&SessionEvent::SweepCompleted),
+        "a lost abort would have logged SweepCompleted"
+    );
+    assert_eq!(volume.sets(), vec![PRE_VOLUME], "restore still runs");
+}
+
+/// A solve that clears the SPL projection cap but whose margined output level
+/// is illegal (over the class dBFS cap / −3 dBFS) must terminate through a
+/// refusal with a diagnostic — never `?`-propagate a bare Level error leaving
+/// the log without a terminating event (MS-23).
+#[test]
+fn an_illegal_solved_level_refuses_with_a_diagnostic() {
+    let journal = Journal::default();
+    let sink = MockSink::with_journal(journal.clone());
+    let volume = MockVolume::new(PRE_VOLUME, journal.clone());
+    let mut session = MeasurementSession::begin(
+        healthy_cal(TransducerClass::OverEar),
+        1.0,
+        seam(sink.clone(), MockTap::new(true), volume.clone()),
+    )
+    .expect("begin succeeds");
+    // In-cap SPL projection (64 dB ≪ OverEar cap) but a solved level of 0 dBFS
+    // — above the unconditional −3 dBFS RMS ceiling SweepLevel::new refuses.
+    let illegal = SolveOutcome {
+        chain_sensitivity_spl_per_dbfs: 64.0,
+        projected_spl_db: 64.0,
+        solved_dbfs_rms: 0.0,
+    };
+    match session.install_solve(illegal).unwrap_err() {
+        SessionError::Refused(refusal) => assert_eq!(refusal.diagnostic(), D::SolvedLevelIllegal),
+        other => panic!("expected a SolvedLevelIllegal refusal, got {other:?}"),
+    }
+    assert_eq!(
+        sink.emit_calls(),
+        0,
+        "no sample emitted at an illegal level"
+    );
+    assert_eq!(session.phase(), SessionPhase::Terminated);
+    // MS-23: the log carries the terminating diagnostic, not a silent finish.
+    let log = session.finish();
+    assert_eq!(
+        log.events().last(),
+        Some(&SessionEvent::Terminated {
+            diagnostic: Some(D::SolvedLevelIllegal),
+        }),
+    );
+    assert_eq!(
+        volume.sets(),
+        vec![PRE_VOLUME],
+        "restore runs on the refusal"
+    );
+}
+
+/// The teardown never-mask posture: a failing sink `stop()` is collected as a
+/// `SinkFault` but must NOT block the volume restore behind it.
+#[test]
+fn a_failing_stop_still_restores_the_volume() {
+    let journal = Journal::default();
+    let sink = MockSink::with_journal(journal.clone());
+    sink.fail_stop();
+    let volume = MockVolume::new(PRE_VOLUME, journal.clone());
+    let mut session = acknowledged_session(sink.clone(), MockTap::new(true), volume.clone());
+    // Abort at the sweep gate to force a teardown through the failing stop.
+    session.abort_handle().trigger(AbortReason::UserRequest);
+    let level = session.emit_level().expect("level installed");
+    let stim = assemble_sweep(0.25, 48_000, 20.0, 20_000.0, level).expect("stimulus assembles");
+    let _ = session.sweep(&stim).expect("abort is an outcome");
+
+    // stop failed, yet the volume was still restored after it.
+    assert_eq!(
+        volume.sets(),
+        vec![PRE_VOLUME],
+        "volume restored despite a failing stop"
+    );
+    let log = session.finish();
+    assert!(
+        log.events()
+            .iter()
+            .any(|e| matches!(e, SessionEvent::SinkFault { .. })),
+        "the stop fault must be collected, not swallowed"
+    );
+    // The restore ran in its normal slot in the order (stop attempted first).
+    assert_eq!(journal.calls().last(), Some(&"set_volume".to_owned()));
+}
+
+/// A failing volume restore is logged (`VolumeRestoreFailed`) and surfaced,
+/// never swallowed — the other half of the never-mask posture.
+#[test]
+fn a_failing_volume_restore_is_logged() {
+    let journal = Journal::default();
+    let sink = MockSink::with_journal(journal.clone());
+    let volume = MockVolume::new(PRE_VOLUME, journal.clone());
+    volume.fail_set();
+    let mut session = acknowledged_session(sink.clone(), MockTap::new(true), volume.clone());
+    session.abort_handle().trigger(AbortReason::UserRequest);
+    let level = session.emit_level().expect("level installed");
+    let stim = assemble_sweep(0.25, 48_000, 20.0, 20_000.0, level).expect("stimulus assembles");
+    let _ = session.sweep(&stim).expect("abort is an outcome");
+
+    // The restore was attempted (recorded) and its failure logged.
+    assert_eq!(volume.sets(), vec![PRE_VOLUME], "restore attempted");
+    let log = session.finish();
+    assert!(
+        log.events()
+            .iter()
+            .any(|e| matches!(e, SessionEvent::VolumeRestoreFailed { .. })),
+        "the restore failure must be logged"
+    );
 }

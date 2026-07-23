@@ -254,6 +254,16 @@ type or in a test on the branch; none is invented policy.
     Q5). When ruled, update the losing spec and add a cross-crate test
     asserting the `decide()` default equals `RoomTargetSpec::default()`
     field-for-field.
+14. **`align_spl` default band: two specs, two numbers.** **OPEN [OWNER]** —
+    surfaced by the Stage-4 review. `fr.rs`'s `DEFAULT_SPL_ALIGN_BAND` is
+    **(200, 2000) Hz** per room-dsp; the decision-engine spec's `align_spl_band`
+    decision default is **(500, 2000) Hz**. The constant has zero consumers
+    today (`align_spl` takes the band as an argument), so nothing is wrong at
+    runtime — but the two published defaults must be reconciled before Stage 6
+    wires the `align_spl_band` decision. Same shape as item 13: pick one, fix
+    the losing spec, and let the `decide()` default be the single source. Lower
+    stakes than the shelf (both bands sit above the modal region and below
+    directivity); a desk call, not an ears call.
 
 ## REW comparison and the automate-with-an-override principle
 

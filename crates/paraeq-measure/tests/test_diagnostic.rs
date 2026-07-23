@@ -41,6 +41,7 @@ fn all_variants() -> Vec<D> {
         D::MicDisconnected,
         D::OutputDeviceChanged,
         D::EngineFailed,
+        D::SolvedLevelIllegal,
         D::LowSnr,
         D::FixedMaxVolume,
         D::TwoClock,
@@ -78,6 +79,7 @@ fn expected(d: &D) -> (u16, Severity) {
         D::MicDisconnected => (20, Error),
         D::OutputDeviceChanged => (21, Error),
         D::EngineFailed => (22, Error),
+        D::SolvedLevelIllegal => (23, Error),
         D::LowSnr => (100, Warning),
         D::FixedMaxVolume => (101, Warning),
         D::TwoClock => (102, Warning),
@@ -91,7 +93,7 @@ fn expected(d: &D) -> (u16, Severity) {
 #[test]
 fn every_wire_code_of_the_initial_set_is_pinned() {
     let variants = all_variants();
-    assert_eq!(variants.len(), 27, "all_variants() lags the enum");
+    assert_eq!(variants.len(), 28, "all_variants() lags the enum");
     for d in &variants {
         let (code, _) = expected(d);
         assert_eq!(d.code(), code, "{d:?} renumbered — wire contract broken");

@@ -45,7 +45,7 @@ use crate::cal::{margined_emit_dbfs, CalSummary, PinnedGain};
 use crate::diagnostic::{MeasurementDiagnostic, Refusal};
 use crate::level::{caps_for, LevelError, SweepLevel};
 use crate::seam::{StimulusSink, TapStatus, VolumeControl};
-use crate::stimulus::{emit_guard, AssembledStimulus, GuardCounts};
+use crate::stimulus::{emit_guard, AssembledStimulus, GuardCounts, StimulusKind};
 use crate::MeasureError;
 use paraeq_dsp::targets::TransducerClass;
 
@@ -285,6 +285,8 @@ pub enum SessionError {
         emit_dbfs_rms: f64,
         stimulus_dbfs_rms: f64,
     },
+    #[error("sweep() was handed a {kind:?} stimulus, not a Sweep")]
+    StimulusNotSweep { kind: StimulusKind },
     #[error("{method}() requires phase {required}; session is {actual:?}")]
     WrongPhase {
         actual: SessionPhase,
@@ -401,9 +403,16 @@ impl MeasurementSession {
             return Err(self.refuse(MeasurementDiagnostic::ProjectedSplOverCap));
         }
         // MS-11: the margin decides the number; the sole constructor decides
-        // whether it is a level at all.
+        // whether it is a level at all. A projection can clear the SPL cap yet
+        // still demand an illegal *level* (over the class dBFS cap or −3 dBFS
+        // after the margin) — that must terminate through a refusal, not
+        // `?`-propagate a bare `Level` error and leave the log without a
+        // terminating diagnostic (MS-23).
         let emitted_dbfs_rms = margined_emit_dbfs(solve.solved_dbfs_rms, self.pin);
-        let level = SweepLevel::new(emitted_dbfs_rms, self.cal.class())?;
+        let level = match SweepLevel::new(emitted_dbfs_rms, self.cal.class()) {
+            Ok(level) => level,
+            Err(_) => return Err(self.refuse(MeasurementDiagnostic::SolvedLevelIllegal)),
+        };
         self.log.push(SessionEvent::SolveInstalled {
             chain_sensitivity_spl_per_dbfs: solve.chain_sensitivity_spl_per_dbfs,
             emitted_dbfs_rms,
@@ -490,10 +499,19 @@ impl MeasurementSession {
         if !self.tap.self_excluded() {
             return Err(self.refuse(MeasurementDiagnostic::SelfExclusionUnavailable));
         }
+        // Provenance, part 1 — kind: the pilot's fixed −40 dBFS could coincide
+        // with a session's margined level, so a level match alone would let a
+        // pilot play under a `SweepStarted`/`SweepCompleted` log. The sweep gate
+        // takes a Sweep.
+        if stimulus.kind() != StimulusKind::Sweep {
+            return Err(SessionError::StimulusNotSweep {
+                kind: stimulus.kind(),
+            });
+        }
         let level = self.emit_level.expect("Acknowledged phase implies a level");
-        // Provenance: the buffer must be scaled to the very level this
-        // session decided — a stimulus assembled at any other level is not
-        // this run's stimulus.
+        // Provenance, part 2 — level: the buffer must be scaled to the very
+        // level this session decided — a stimulus assembled at any other level
+        // is not this run's stimulus.
         if stimulus.level() != level {
             return Err(SessionError::StimulusLevelMismatch {
                 emit_dbfs_rms: level.dbfs_rms(),
@@ -551,6 +569,18 @@ impl MeasurementSession {
         for warning in &warnings {
             self.log.push(SessionEvent::Warning {
                 diagnostic: *warning,
+            });
+        }
+        // An abort that arms during the final block (or between the last emit
+        // and the loop exit) is polled here too — otherwise the run would be
+        // logged as a clean `Completed` with no diagnostic. No ramp: the
+        // stimulus is already exhausted, so there is nothing left to fade.
+        if let Some(reason) = self.abort.triggered() {
+            let diagnostic = reason.diagnostic();
+            self.teardown(Some(diagnostic));
+            return Ok(SweepOutcome::Aborted {
+                diagnostic,
+                warnings,
             });
         }
         self.log.push(SessionEvent::SweepCompleted);

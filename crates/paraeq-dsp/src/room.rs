@@ -166,6 +166,18 @@ pub fn estimate_t60(
             fit.len()
         )));
     }
+    // A digital-silence tail makes the Schroeder curve jump to −∞ (log of zero
+    // energy); if the first ≤ −25 dB crossing lands ON that −∞ sample, the fit
+    // window carries it, `mean_y`/`slope` go non-finite, and the `slope < 0`
+    // guard below (NaN fails every comparison) would let a NaN `DecayEstimate`
+    // reach the display. Refuse here, matching the degenerate-input guards
+    // above — the record decays into silence before −25 dB, so it cannot be fit.
+    if fit.iter().any(|d| !d.is_finite()) {
+        return Err(DspError::InvalidInput(
+            "estimate_t60: decay reaches −∞ (digital-silence tail) before −25 dB; cannot fit"
+                .into(),
+        ));
+    }
 
     // Least squares of decay_db against time. x is relative to `top` (a shift
     // does not move the slope) in seconds, so the slope is in dB/s.
@@ -186,7 +198,10 @@ pub fn estimate_t60(
     // values: sxx > 0 and syy > 0. Monotone decrease also forces slope < 0;
     // guard anyway rather than divide a display value by a surprise.
     let slope = sxy / sxx;
-    if slope >= 0.0 {
+    // Explicit non-finite check so a NaN/∞ slope takes the error path rather
+    // than dividing a display value by a surprise (the fit-window guard above
+    // already rejects the −∞ source, but sxx == 0 could still produce one).
+    if !slope.is_finite() || slope >= 0.0 {
         return Err(DspError::InvalidInput(format!(
             "estimate_t60: non-decaying fit (slope {slope} dB/s)"
         )));
