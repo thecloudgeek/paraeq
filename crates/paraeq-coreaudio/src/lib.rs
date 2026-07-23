@@ -7,8 +7,10 @@ pub mod backend;
 pub mod error;
 pub mod ioproc;
 pub mod listeners;
+pub mod measure_aggregate;
 pub mod properties;
 pub mod tap;
+pub mod two_clock;
 pub mod volume;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
