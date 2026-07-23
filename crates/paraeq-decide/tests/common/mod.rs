@@ -283,6 +283,7 @@ pub fn bundle() -> MeasurementBundle {
             frequencies: vec![20.0, 20000.0],
             gains_db: vec![6.0, -6.0],
             category: None,
+            classes: vec![TransducerClass::Bookshelf, TransducerClass::Floorstander],
             description: None,
             source: None,
         }],
