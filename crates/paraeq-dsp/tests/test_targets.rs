@@ -62,7 +62,7 @@ fn anchor_deviation_matches_oracle() {
 fn match_closest_matches_oracle() {
     let c = Case::load("targets", "match_closest");
     let all = targets::list_targets(&targets_dir()).unwrap();
-    assert_eq!(all.len(), 6, "builtin count");
+    assert_eq!(all.len(), 7, "builtin count");
     let best =
         targets::match_closest_target(&c.array("measured_freqs"), &c.array("measured_db"), &all);
     assert_eq!(best.name, c.scalar("expected_name").as_str().unwrap());

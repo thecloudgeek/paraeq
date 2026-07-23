@@ -1,5 +1,6 @@
 # name: Flat
 # category: reference
+# classes: any
 # description: Reference 0 dB target. Applies no correction beyond what the user explicitly draws. Useful baseline for manual EQ work.
 # source: hand-authored (two-point flat reference)
 # frequency_hz,gain_db

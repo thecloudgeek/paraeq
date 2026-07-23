@@ -1,5 +1,6 @@
 # name: Harman Over-Ear 2018 (No Bass Shelf)
 # category: over-ear
+# classes: OverEar
 # description: Harman 2018 over-ear with the bass shelf removed. Preferred for over-ear listening at lower volumes or by treble-sensitive ears.
 # source: AutoEq @ commit 7ae0f56 / Harman over-ear 2018 without bass.csv
 # frequency_hz,gain_db

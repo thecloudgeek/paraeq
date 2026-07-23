@@ -106,11 +106,12 @@ def test_load_target_csv_no_metadata_falls_back_to_stem():
     assert curve.gains_db[2] == -6.0
 
 
-def test_list_builtin_targets_returns_six():
+def test_list_builtin_targets_returns_seven():
     targets = list_builtin_targets()
-    assert len(targets) == 6
+    assert len(targets) == 7
     names = {t.name for t in targets}
     assert names == {
+        "B&K Room 1974",
         "Diffuse Field",
         "Flat",
         "Harman In-Ear 2019",
@@ -124,7 +125,7 @@ def test_builtin_curves_have_descriptions_and_categories():
     targets = list_builtin_targets()
     for t in targets:
         assert t.description, f"{t.name!r} missing description"
-        assert t.category in ("in-ear", "over-ear", "reference"), (
+        assert t.category in ("in-ear", "over-ear", "reference", "room"), (
             f"{t.name!r} has unexpected category {t.category!r}"
         )
         assert t.source, f"{t.name!r} missing source"

@@ -1,5 +1,6 @@
 # name: Harman Over-Ear 2018
 # category: over-ear
+# classes: OverEar
 # description: Sean Olive's 2018 over-ear preference target. Mild bass shelf, pronounced 3 kHz ear-gain peak, gentle treble roll-off. Best fit for closed-back and open-back over-ear headphones.
 # source: AutoEq @ commit 7ae0f56 / Harman over-ear 2018.csv
 # frequency_hz,gain_db
