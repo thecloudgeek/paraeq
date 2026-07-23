@@ -95,31 +95,30 @@ fn fixture_ir_t60_is_recovered() {
     );
 }
 
-/// A two-slope decay — a fast early portion (direct + early reflections) then a
-/// slower reverberant tail — is exactly why ISO 3382 fits over [−5, −25] dB
-/// rather than from 0: the fit must recover the REVERBERANT slope, skipping the
-/// steep top. A naive [0, −20] window would drag the steep early portion into
-/// the fit and report a too-short T60. A clean single-exponential can't tell the
-/// two windows apart; this can.
+/// An IR with a flat early-reflection plateau (dense early energy, ~60 ms) then
+/// a reverberant decay is exactly why ISO 3382 fits over [−5, −25] dB rather
+/// than from 0: the plateau keeps the Schroeder curve high through the first
+/// few dB, so a [0, −20] fit spans the plateau's curved integration and reports
+/// a badly inflated T60, while the −5 dB skip lands the fit in the clean
+/// reverberant slope. A single-exponential can't tell the two windows apart
+/// (it's linear from the top); this can — measured, the wrong window nearly
+/// doubles the reported T60.
 #[test]
-fn two_slope_decay_recovers_the_reverberant_tail() {
-    const T60_FAST: f64 = 0.10;
-    const T60_SLOW: f64 = 0.45;
-    let k_fast = 1000f64.ln() / T60_FAST;
-    let k_slow = 1000f64.ln() / T60_SLOW;
-    // Knee ~10 dB down (amplitude): t where 20·log10(exp(−k_fast·t)) = −10.
-    let t_knee = 0.5 * 10f64.ln() / k_fast;
-    let n = (0.6 * SR as f64) as usize;
+fn early_reflection_plateau_recovers_the_reverberant_tail() {
+    const T60_REVERB: f64 = 0.15;
+    const FLAT_MS: f64 = 60.0;
+    let i_flat = (FLAT_MS / 1000.0 * SR as f64) as usize;
+    let k = 1000f64.ln() / T60_REVERB;
+    let n = (0.5 * SR as f64) as usize;
     let w = noise(n, 0x2545_F491_4F6C_DD1D);
     let samples: Vec<f64> = w
         .iter()
         .enumerate()
         .map(|(i, wi)| {
-            let t = i as f64 / SR as f64;
-            let env = if t < t_knee {
-                (-k_fast * t).exp()
+            let env = if i < i_flat {
+                1.0
             } else {
-                (-k_fast * t_knee).exp() * (-k_slow * (t - t_knee)).exp()
+                (-k * (i - i_flat) as f64 / SR as f64).exp()
             };
             wi * env
         })
@@ -130,11 +129,11 @@ fn two_slope_decay_recovers_the_reverberant_tail() {
         sample_rate: SR,
     };
     let est = estimate_t60(&ir, None).unwrap();
-    // The [−5, −25] fit sits in the slow tail and recovers ~T60_SLOW; a [0, −20]
-    // fit contaminated by the fast top would report markedly less.
+    // The [−5, −25] fit recovers ~T60_REVERB; a [0, −20] fit dragged through the
+    // plateau reports ~0.28 s (measured), well outside this bound.
     assert!(
-        (est.t60_s - T60_SLOW).abs() / T60_SLOW < 0.15,
-        "two-slope T60 {} vs reverberant {T60_SLOW} — the fit window let the fast top in?",
+        (est.t60_s - T60_REVERB).abs() / T60_REVERB < 0.15,
+        "plateau T60 {} vs reverberant {T60_REVERB} — the fit window spanned the plateau?",
         est.t60_s
     );
 }
