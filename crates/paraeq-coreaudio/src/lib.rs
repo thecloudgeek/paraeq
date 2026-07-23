@@ -7,6 +7,7 @@ pub mod backend;
 pub mod error;
 pub mod ioproc;
 pub mod listeners;
+pub mod measure_aggregate;
 pub mod properties;
 pub mod tap;
 pub mod volume;

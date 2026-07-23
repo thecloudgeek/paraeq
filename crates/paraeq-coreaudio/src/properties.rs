@@ -8,13 +8,15 @@ use std::ptr::NonNull;
 
 use objc2_core_audio::{
     kAudioDevicePropertyBufferFrameSize, kAudioDevicePropertyDeviceUID,
-    kAudioDevicePropertyNominalSampleRate, kAudioHardwarePropertyDefaultOutputDevice,
-    kAudioHardwarePropertyTranslatePIDToProcessObject, kAudioObjectPropertyElementMain,
-    kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, kAudioTapPropertyFormat,
-    AudioObjectGetPropertyData, AudioObjectID, AudioObjectPropertyAddress,
-    AudioObjectSetPropertyData,
+    kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertyStreamConfiguration,
+    kAudioHardwarePropertyDefaultInputDevice, kAudioHardwarePropertyDefaultOutputDevice,
+    kAudioHardwarePropertyTranslatePIDToProcessObject, kAudioHardwarePropertyTranslateUIDToDevice,
+    kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal,
+    kAudioObjectPropertyScopeInput, kAudioObjectSystemObject, kAudioTapPropertyFormat,
+    AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectID,
+    AudioObjectPropertyAddress, AudioObjectSetPropertyData,
 };
-use objc2_core_audio_types::AudioStreamBasicDescription;
+use objc2_core_audio_types::{AudioBuffer, AudioBufferList, AudioStreamBasicDescription};
 use objc2_core_foundation::{CFRetained, CFString};
 
 use crate::error::{check, CaError};
@@ -43,6 +45,25 @@ pub fn default_output_device() -> Result<AudioObjectID, CaError> {
         )
     };
     check(status, "get default output device")?;
+    Ok(dev)
+}
+
+pub fn default_input_device() -> Result<AudioObjectID, CaError> {
+    let mut dev: AudioObjectID = 0;
+    let mut size = size_of::<AudioObjectID>() as u32;
+    // SAFETY: address/size/out pointers reference live stack locals; the out
+    // buffer is exactly `size` bytes of plain-old-data (AudioObjectID = u32).
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            kAudioObjectSystemObject as u32,
+            (&addr(kAudioHardwarePropertyDefaultInputDevice)).into(),
+            0,
+            std::ptr::null(),
+            (&mut size).into(),
+            NonNull::from(&mut dev).cast::<c_void>(),
+        )
+    };
+    check(status, "get default input device")?;
     Ok(dev)
 }
 
@@ -113,6 +134,96 @@ pub fn translate_pid(pid: i32) -> Result<AudioObjectID, CaError> {
     };
     check(status, "translate PID to process object")?;
     Ok(obj)
+}
+
+/// Device UID -> AudioObjectID. Returns 0 (kAudioObjectUnknown) if no device
+/// has that UID — the `translate_pid` convention.
+pub fn translate_uid_to_device(uid: &str) -> Result<AudioObjectID, CaError> {
+    let mut dev: AudioObjectID = 0;
+    let mut size = size_of::<AudioObjectID>() as u32;
+    let cf = CFString::from_str(uid);
+    // The qualifier is the CFStringRef VALUE (one pointer slot), passed by
+    // address — the same shape translate_pid uses for its pid_t.
+    let cf_ref: *const CFString = &*cf;
+    // SAFETY: qualifier points at a live CFStringRef of the declared size
+    // (`cf` outlives the call); the out buffer is exactly `size` bytes of
+    // plain-old-data (AudioObjectID = u32).
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            kAudioObjectSystemObject as u32,
+            (&addr(kAudioHardwarePropertyTranslateUIDToDevice)).into(),
+            size_of::<*const CFString>() as u32,
+            (&raw const cf_ref).cast(),
+            (&mut size).into(),
+            NonNull::from(&mut dev).cast::<c_void>(),
+        )
+    };
+    check(status, "translate UID to device")?;
+    Ok(dev)
+}
+
+/// Total input channels across the device's input streams
+/// (kAudioDevicePropertyStreamConfiguration, input scope). 0 means the device
+/// captures nothing — it is not usable as a mic.
+pub fn input_stream_channel_count(dev: AudioObjectID) -> Result<u32, CaError> {
+    let address = AudioObjectPropertyAddress {
+        mSelector: kAudioDevicePropertyStreamConfiguration,
+        mScope: kAudioObjectPropertyScopeInput,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let mut size: u32 = 0;
+    // SAFETY: address/out pointers reference live stack locals.
+    let status = unsafe {
+        AudioObjectGetPropertyDataSize(
+            dev,
+            NonNull::from(&address),
+            0,
+            std::ptr::null(),
+            NonNull::from(&mut size),
+        )
+    };
+    check(status, "get input stream configuration size")?;
+    if (size as usize) < size_of::<AudioBufferList>() {
+        return Ok(0);
+    }
+    // 8-byte-aligned backing for the variable-length AudioBufferList (u32
+    // fields + a pointer per AudioBuffer).
+    let mut backing: Vec<u64> = vec![0; size as usize / 8 + 1];
+    let mut got = size;
+    // SAFETY: the out buffer is `backing`, which is at least `size` bytes,
+    // 8-byte aligned, and outlives the call.
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            dev,
+            (&address).into(),
+            0,
+            std::ptr::null(),
+            (&mut got).into(),
+            NonNull::new(backing.as_mut_ptr().cast::<c_void>()).expect("vec ptr"),
+        )
+    };
+    check(status, "get input stream configuration")?;
+    let list = backing.as_ptr().cast::<AudioBufferList>();
+    // SAFETY: the HAL wrote a valid AudioBufferList into `backing`.
+    let declared = unsafe { (*list).mNumberBuffers } as usize;
+    // Trust-but-bound: never read past what the HAL actually wrote (`got`
+    // bytes, of which the first AudioBuffer is inside AudioBufferList).
+    let fitting =
+        (got as usize).saturating_sub(size_of::<AudioBufferList>()) / size_of::<AudioBuffer>() + 1;
+    let mut channels: u32 = 0;
+    for i in 0..declared.min(fitting) {
+        // SAFETY: i is within both the declared entry count and the bytes
+        // the HAL wrote; `&raw const` keeps the base pointer's provenance
+        // over the trailing entries (the ioproc::raw_buffer idiom).
+        let buf = unsafe {
+            (&raw const (*list).mBuffers)
+                .cast::<AudioBuffer>()
+                .add(i)
+                .read()
+        };
+        channels += buf.mNumberChannels;
+    }
+    Ok(channels)
 }
 
 pub fn tap_format(tap: AudioObjectID) -> Result<AudioStreamBasicDescription, CaError> {

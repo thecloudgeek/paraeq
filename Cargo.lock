@@ -2328,6 +2328,8 @@ dependencies = [
  "objc2-foundation",
  "paraeq-dsp",
  "paraeq-engine",
+ "paraeq-measure",
+ "rtrb",
  "thiserror 2.0.18",
 ]
 

@@ -13,6 +13,11 @@ objc2-core-audio-types = { workspace = true }
 objc2-core-foundation = { workspace = true }
 objc2-foundation = { workspace = true }
 paraeq-engine = { path = "../paraeq-engine" }
+# The seam this crate implements (MS-22): paraeq-measure defines CaptureSource;
+# the dependency points INTO the measure crate (which depends only on
+# paraeq-dsp), so no cycle and the level policy stays free of CoreAudio.
+paraeq-measure = { path = "../paraeq-measure" }
+rtrb = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
