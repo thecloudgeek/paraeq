@@ -71,3 +71,44 @@ pub trait CaptureSource: Send {
 
     fn stop(&mut self) -> Result<(), MeasureError>;
 }
+
+/// Live read-back of the engine's tap self-exclusion — the MS-6 witness.
+///
+/// The engine side (Stage 4, over the live `TapSystem`) implements this; mocks
+/// implement it in tests. What it witnesses is the invariant the crate header
+/// states: the stimulus path is validated **only** when the tap excludes
+/// ParaEQ's own process. When `translate_pid` fell back to an empty exclusion
+/// list, a sweep would be muted at the device and routed through the
+/// correction chain — an unvalidated topology. The session refuses
+/// (`SelfExclusionUnavailable`) **before a single sample is emitted**, and
+/// re-checks at the sweep gate because exclusion can vanish mid-session (a
+/// device change forces a tap rebuild).
+///
+/// Contract:
+/// - `self_excluded` reports the tap's *current* state, not the state at
+///   construction; the session polls it at every gate that precedes emission.
+pub trait TapStatus: Send {
+    fn self_excluded(&self) -> bool;
+}
+
+/// Output-device volume — the software half of MS-5.
+///
+/// `paraeq-coreaudio` implements this on the default output device (a later
+/// stage; the spec records that no volume plumbing exists in the tree today);
+/// mocks implement it in tests. `scalar` follows the CoreAudio volume-scalar
+/// convention: 0.0 silent, 1.0 full scale.
+///
+/// Contract:
+/// - `volume` reads without side effects; the session pins the pre-measurement
+///   value from it exactly once, at `begin`.
+/// - `set_volume` is called on the RAII restore path on **every** exit —
+///   command, drop, panic — in the same teardown position tap destruction
+///   occupies in the engine. The system must never be left at measurement
+///   volume. Implementations must therefore be safe to call during unwinding:
+///   no panics of their own on the restore path, failures reported as `Err`
+///   (the session records them; it never masks the remaining teardown steps).
+pub trait VolumeControl: Send {
+    fn volume(&self) -> Result<f64, MeasureError>;
+
+    fn set_volume(&mut self, scalar: f64) -> Result<(), MeasureError>;
+}

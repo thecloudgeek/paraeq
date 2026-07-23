@@ -116,6 +116,22 @@ pub enum MeasurementDiagnostic {
     StimulusOverFullScale { peak: f64 } = 17,
     /// Stimulus defect (MS-3): non-finite samples in an assembled buffer.
     StimulusNonFinite { count: u64 } = 18,
+    /// The run was stopped by request — Esc, Space, or window close (§ Abort
+    /// Guards, first trigger row). The abort ramp and the full restore
+    /// sequence ran; nothing about the chain is suspect.
+    UserAborted = 19,
+    /// The measurement microphone disappeared mid-run (§ Abort Guards).
+    /// Without the mic there is no SPL witness, so the closed loop the caps
+    /// depend on is gone and the run aborts.
+    MicDisconnected = 20,
+    /// The output device changed or died mid-run (§ Abort Guards). A solved
+    /// level is valid only for the chain it was solved on; a new device is an
+    /// uncharacterized chain, so the run aborts rather than playing into it.
+    OutputDeviceChanged = 21,
+    /// The engine entered `Failed` mid-run (§ Abort Guards,
+    /// `EngineStatus::Failed`): the audio topology is no longer known-good,
+    /// so the run aborts.
+    EngineFailed = 22,
 
     // ── Non-blocking warnings: 100… ─────────────────────────────────────────
     /// SNR accepted on the degraded row (median ≥ 30 dB but below the
@@ -163,6 +179,10 @@ impl MeasurementDiagnostic {
             Self::StimulusDcOffset { .. } => 16,
             Self::StimulusOverFullScale { .. } => 17,
             Self::StimulusNonFinite { .. } => 18,
+            Self::UserAborted => 19,
+            Self::MicDisconnected => 20,
+            Self::OutputDeviceChanged => 21,
+            Self::EngineFailed => 22,
             Self::LowSnr => 100,
             Self::FixedMaxVolume => 101,
             Self::TwoClock => 102,
@@ -176,8 +196,11 @@ impl MeasurementDiagnostic {
     pub fn severity(&self) -> Severity {
         match self {
             Self::CapExceedsMicFullScale
+            | Self::EngineFailed
             | Self::InputClipping
+            | Self::MicDisconnected
             | Self::MicUnidentified
+            | Self::OutputDeviceChanged
             | Self::ProjectedSplOverCap
             | Self::RungOverCap
             | Self::SelfExclusionUnavailable
@@ -192,6 +215,7 @@ impl MeasurementDiagnostic {
             | Self::StimulusFadeNotMonotone
             | Self::StimulusNonFinite { .. }
             | Self::StimulusOverFullScale { .. }
+            | Self::UserAborted
             | Self::VolumeUncontrollable => Severity::Error,
             Self::EmitClamped { .. }
             | Self::EmitNonFiniteSanitized { .. }
@@ -273,6 +297,22 @@ impl MeasurementDiagnostic {
             Self::StimulusOverFullScale { .. } => {
                 "This is a defect in ParaEQ's level solve, not something you \
                  did. Nothing was played. Please report it."
+            }
+            Self::UserAborted => {
+                "The measurement was stopped. Nothing more was played, and \
+                 your volume was put back. Start again whenever you like."
+            }
+            Self::MicDisconnected => {
+                "The measurement microphone disconnected. Plug it back in and \
+                 start the measurement again."
+            }
+            Self::OutputDeviceChanged => {
+                "The output device changed during the measurement. Pick the \
+                 device you are measuring and start again."
+            }
+            Self::EngineFailed => {
+                "ParaEQ's audio engine hit a problem, so the measurement was \
+                 stopped. Restart ParaEQ and try again."
             }
             Self::LowSnr => {
                 "The measurement is usable, but a quieter room would make it \
@@ -425,6 +465,29 @@ impl MeasurementDiagnostic {
                      the output."
                 )
             }
+            Self::UserAborted => "The run was stopped by request — Esc, Space, or closing the \
+                 window. The stimulus was ramped to zero within a few \
+                 milliseconds (a hard stop would itself be a full-scale \
+                 click), the output stream stopped, and the pre-measurement \
+                 volume and engine state were restored."
+                .to_owned(),
+            Self::MicDisconnected => "The measurement microphone vanished mid-run. The mic is the \
+                 only witness the SPL caps have — without it the closed loop \
+                 that bounds the sweep's loudness is gone, so the stimulus \
+                 was ramped to zero and the session aborted."
+                .to_owned(),
+            Self::OutputDeviceChanged => {
+                "The output device changed or disappeared mid-run. The solved \
+                 sweep level is only valid for the exact chain it was solved \
+                 on; a different device is an uncharacterized chain, so the \
+                 stimulus was ramped to zero and the session aborted."
+                    .to_owned()
+            }
+            Self::EngineFailed => "ParaEQ's audio engine entered its failed state mid-run, so \
+                 the audio topology the measurement depends on is no longer \
+                 known-good. The stimulus was ramped to zero and the session \
+                 aborted, then the pre-measurement state was restored."
+                .to_owned(),
             Self::LowSnr => "The measurement cleared the reduced signal-to-noise bar \
                  (median ≥ 30 dB) but not the preferred one (median ≥ 40 dB \
                  with every band ≥ 20 dB). It is usable; the quiet parts of \
