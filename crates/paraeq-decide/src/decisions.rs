@@ -136,7 +136,7 @@ pub struct Overrides {
 ///
 /// PROVISIONAL LOCATION: room-dsp's `authority.rs` owns this type and the
 /// `AuthorityPolicy` endpoints (σ_full = 1.0 dB, σ_none = 6.0 dB) that
-/// produce it. This definition is the contract's placeholder until Stage 3
+/// produce it. This definition is the contract's placeholder until Stage 5
 /// lands that module, at which point it becomes a re-export and `decide()`
 /// must not re-specify different numbers.
 ///
