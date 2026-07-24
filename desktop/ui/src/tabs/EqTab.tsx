@@ -370,9 +370,13 @@ export function EqTab({ state }: EqTabProps): JSX.Element {
   };
 
   return (
-    <div className="flex h-full flex-col gap-3 p-2">
+    // The column is clipped to the tab height (overflow-hidden + min-h-0), so the
+    // WINDOW never grows a scrollbar. The band table and the plot share the
+    // leftover space as flex regions; only the band table scrolls internally when
+    // it has more bands than fit. Everything else is shrink-0 (fixed height).
+    <div className="flex h-full min-h-0 flex-col gap-3 overflow-hidden p-2">
       {/* Toolbar */}
-      <div className="flex flex-wrap items-center gap-2">
+      <div className="flex shrink-0 flex-wrap items-center gap-2">
         <Button size="sm" variant="secondary" onClick={addBand}>
           Add Band
         </Button>
@@ -398,7 +402,7 @@ export function EqTab({ state }: EqTabProps): JSX.Element {
       {error ? (
         <div
           role="alert"
-          className="flex items-start justify-between gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+          className="flex shrink-0 items-start justify-between gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive"
         >
           <span>{error}</span>
           <button className="shrink-0 opacity-70 hover:opacity-100" onClick={() => setError(null)}>
@@ -406,7 +410,7 @@ export function EqTab({ state }: EqTabProps): JSX.Element {
           </button>
         </div>
       ) : notice ? (
-        <div className="flex items-start justify-between gap-2 rounded-md border bg-muted px-3 py-2 text-sm text-muted-foreground">
+        <div className="flex shrink-0 items-start justify-between gap-2 rounded-md border bg-muted px-3 py-2 text-sm text-muted-foreground">
           <span>{notice}</span>
           <button className="shrink-0 opacity-70 hover:opacity-100" onClick={() => setNotice(null)}>
             ✕
@@ -414,7 +418,10 @@ export function EqTab({ state }: EqTabProps): JSX.Element {
         </div>
       ) : null}
 
-      {/* Band table */}
+      {/* Band table — the "freq adjustment" section. A flex region (min-h-24 so
+          it can be constrained) that scrolls INTERNALLY once its bands overflow,
+          rather than growing the whole window. */}
+      <div className="min-h-24 flex-[2] overflow-y-auto rounded-md border">
       <Table>
         <TableHeader>
           <TableRow>
@@ -545,9 +552,10 @@ export function EqTab({ state }: EqTabProps): JSX.Element {
           )}
         </TableBody>
       </Table>
+      </div>
 
       {/* Preamp row */}
-      <div className="flex items-center gap-2">
+      <div className="flex shrink-0 items-center gap-2">
         <label className="flex items-center text-sm font-medium" htmlFor="preamp">
           Preamp (dB)
           <InfoTip term="Preamp">
@@ -572,8 +580,10 @@ export function EqTab({ state }: EqTabProps): JSX.Element {
         />
       </div>
 
-      {/* Frequency plot: curve + one draggable handle per band */}
-      <div className="min-h-48 flex-1">
+      {/* Frequency plot: curve + one draggable handle per band. Takes the larger
+          share of the flexible space (min-h-40 keeps it readable on a short
+          window); FrequencyPlot fills it via its own ResizeObserver. */}
+      <div className="min-h-40 flex-[3]">
         <FrequencyPlot
           handles={handles}
           onHandleDrag={onHandleDrag}
@@ -585,7 +595,7 @@ export function EqTab({ state }: EqTabProps): JSX.Element {
       </div>
 
       {/* Plain-language legend: reads the plot AND teaches the two gestures. */}
-      <p className="text-xs text-muted-foreground">
+      <p className="shrink-0 text-xs text-muted-foreground">
         Left is bass, right is treble; where the line rises your audio gets louder,
         where it dips it gets quieter. Drag a dot to move that band; scroll on a dot
         to make it wider or narrower (its Q).
@@ -655,7 +665,7 @@ function StatusStrip({
     !engine.enabled || kind === "auto_disabled_no_input" || kind === "failed";
 
   return (
-    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t pt-2 text-sm">
+    <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-t pt-2 text-sm">
       <span className="font-medium">Engine: {parts.join(" · ")}</span>
       {hint ? <span className="text-muted-foreground">{hint}</span> : null}
       <div className="flex-1" />

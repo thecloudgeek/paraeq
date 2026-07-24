@@ -34,7 +34,7 @@ function App() {
   return (
     <div className="flex h-screen flex-col p-4">
       <OutputHeader state={state} />
-      <Tabs defaultValue="eq" className="flex h-full flex-col">
+      <Tabs defaultValue="eq" className="flex h-full min-h-0 flex-col">
         <TabsList>
           <TabsTrigger value="measure">Measure</TabsTrigger>
           <TabsTrigger value="target">Target</TabsTrigger>
