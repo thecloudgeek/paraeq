@@ -17,11 +17,17 @@
 // pointer-up, after which the AppState snapshot is the sole truth again.
 
 import { useEffect, useRef, useState } from "react";
-import type { JSX } from "react";
+import type { JSX, ReactNode } from "react";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { Info } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import {
   Dialog,
   DialogContent,
@@ -73,6 +79,25 @@ const FILTER_TYPES: { label: string; value: FilterType }[] = [
   { label: "High Shelf", value: "high_shelf" },
   { label: "Notch", value: "notch" },
 ];
+
+// Plain-language hints for the newcomer. Gentle-prescriptive: define the term,
+// then a light nudge on what to actually do. Explanation only — no state.
+function InfoTip({ term, children }: { term: string; children: ReactNode }): JSX.Element {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          aria-label={`What is ${term}?`}
+          className="ml-1 inline-flex align-middle text-muted-foreground/70 hover:text-foreground focus-visible:text-foreground focus-visible:outline-none"
+        >
+          <Info className="size-3.5" aria-hidden />
+        </button>
+      </TooltipTrigger>
+      <TooltipContent>{children}</TooltipContent>
+    </Tooltip>
+  );
+}
 
 type NumField = "fc" | "gain_db" | "q";
 
@@ -393,10 +418,40 @@ export function EqTab({ state }: EqTabProps): JSX.Element {
       <Table>
         <TableHeader>
           <TableRow>
-            <TableHead>Type</TableHead>
-            <TableHead>Freq (Hz)</TableHead>
-            <TableHead>Gain (dB)</TableHead>
-            <TableHead>Q</TableHead>
+            <TableHead>
+              Type
+              <InfoTip term="the filter Type">
+                The shape of the adjustment. <b>Peaking</b> nudges one region up or
+                down; <b>Low/High Shelf</b> lifts or drops everything below/above a
+                point; <b>Notch</b> cuts out a narrow spot. If you&rsquo;re unsure,
+                Peaking is the everyday choice.
+              </InfoTip>
+            </TableHead>
+            <TableHead>
+              Freq (Hz)
+              <InfoTip term="Frequency">
+                Which part of the sound you&rsquo;re adjusting. Low numbers are bass,
+                the middle is where voices and most instruments live, high numbers are
+                treble and &ldquo;air.&rdquo;
+              </InfoTip>
+            </TableHead>
+            <TableHead>
+              Gain (dB)
+              <InfoTip term="Gain">
+                How much to boost (+) or cut (&minus;) that region. A little goes a
+                long way &mdash; ±3 dB is already very audible. Prefer cutting over
+                boosting where you can.
+              </InfoTip>
+            </TableHead>
+            <TableHead>
+              Q
+              <InfoTip term="Q">
+                How wide or narrow the adjustment is. A <b>low</b> Q spreads it over a
+                broad range (gentle tone shaping); a <b>high</b> Q focuses it on a
+                narrow spot (surgical). Most tone tweaks want a low-to-medium Q
+                (around 0.7&ndash;2).
+              </InfoTip>
+            </TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -493,8 +548,13 @@ export function EqTab({ state }: EqTabProps): JSX.Element {
 
       {/* Preamp row */}
       <div className="flex items-center gap-2">
-        <label className="text-sm font-medium" htmlFor="preamp">
+        <label className="flex items-center text-sm font-medium" htmlFor="preamp">
           Preamp (dB)
+          <InfoTip term="Preamp">
+            Turns the whole output down to leave room for boosts without distortion.
+            If a boosted band sounds crackly or harsh, lower this a little; otherwise
+            you can leave it alone.
+          </InfoTip>
         </label>
         <Input
           id="preamp"
@@ -523,6 +583,13 @@ export function EqTab({ state }: EqTabProps): JSX.Element {
           title={`${(sampleRate / 1000).toFixed(1)} kHz`}
         />
       </div>
+
+      {/* Plain-language legend: reads the plot AND teaches the two gestures. */}
+      <p className="text-xs text-muted-foreground">
+        Left is bass, right is treble; where the line rises your audio gets louder,
+        where it dips it gets quieter. Drag a dot to move that band; scroll on a dot
+        to make it wider or narrower (its Q).
+      </p>
 
       {/* Status strip */}
       <StatusStrip engine={engine} onToggleEnabled={toggleEnabled} onToggleBypass={toggleBypass} />
@@ -592,13 +659,21 @@ function StatusStrip({
       <span className="font-medium">Engine: {parts.join(" · ")}</span>
       {hint ? <span className="text-muted-foreground">{hint}</span> : null}
       <div className="flex-1" />
-      <Button
-        size="xs"
-        variant={engine.bypass ? "default" : "outline"}
-        onClick={onToggleBypass}
-      >
-        {engine.bypass ? "Bypassed" : "Bypass"}
-      </Button>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            size="xs"
+            variant={engine.bypass ? "default" : "outline"}
+            onClick={onToggleBypass}
+          >
+            {engine.bypass ? "Bypassed" : "Bypass"}
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>
+          Temporarily plays your audio with the EQ switched off, so you can hear the
+          before-and-after. It doesn&rsquo;t change any of your settings.
+        </TooltipContent>
+      </Tooltip>
       {showEnable ? (
         <Button size="xs" onClick={() => onToggleEnabled(true)}>
           Enable
