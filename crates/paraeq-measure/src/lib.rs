@@ -33,25 +33,46 @@
 //! diagnostic contract — [`diagnostic`]), MS-10/MS-11 (the cal-load
 //! full-scale witness rule and the gain-referenced margin — [`cal`]), and
 //! MS-6/MS-14/MS-18/MS-23 plus the RAII half of MS-5 (the sequencing state
-//! machine — [`session`]). The level ladder *solve* (floor → pilot → solve →
-//! envelope → ≤6 dB rungs, MS-7/MS-8/MS-17) is Stage 5 and enters through
-//! [`session::SolveOutcome`]; the `paraeq-coreaudio` impls of the seam are
-//! likewise later stages — they are the callers these types were written to
-//! constrain.
+//! machine — [`session`]).
+//!
+//! Stage 5 added the rest of the runtime: the closed-loop level ladder
+//! (MS-7/MS-8/MS-13/MS-17 — [`ladder`]), which enters the session through
+//! [`session::SolveOutcome`] and computes without ever emitting; the capture
+//! runtime and its own metering (MS-21, MS-4's boundary 2 — [`capture`]),
+//! which the engine's monotonic `peak_in` cannot substitute for; and the
+//! per-position IR store ([`store`]), without which every row of the
+//! decision engine's `Reanalyze` tier collapses into `Recapture`.
+//!
+//! Still outstanding, and blocked rather than skipped: the
+//! [`seam::TapStatus`] implementation over the live `TapSystem`. MS-6 requires
+//! `TapSystem` to expose `self_excluded: bool`, which is an `EngineState`
+//! shape change, and the rescope plan freezes that shape until
+//! `feature/rust-port-tauri-shell` merges (the branch pins the snapshot wire
+//! format). Until then a real session can only run against a mock witness —
+//! which is why [`session::MeasurementSession::begin`] takes the trait and not
+//! a `TapSystem`.
 
 #![forbid(unsafe_code)]
 
 pub mod cal;
+pub mod capture;
 pub mod diagnostic;
+pub mod ladder;
 pub mod level;
 pub mod seam;
 pub mod session;
 pub mod stimulus;
+pub mod store;
 
 pub use cal::{
     margined_emit_dbfs, CalSummary, PinnedGain, CAL_ERROR_MARGIN_DB, GAIN_MATCH_TOLERANCE,
 };
+pub use capture::{record, CaptureEnd, CaptureMeter, CaptureRun, CLIP_BLOCK_FRACTION};
 pub use diagnostic::{CalSensitivity, MeasurementDiagnostic, MicSensitivity, Refusal, Severity};
+pub use ladder::{
+    snr_band_hz, LadderError, LevelLadder, NoiseFloor, Remedy, Rung, SnrOutcome, MAX_REMEDIES,
+    MAX_RUNG_STEP_DB, NOISE_FLOOR_MAX_DBFS,
+};
 pub use level::{caps_for, LevelError, SweepLevel, TransducerCaps, ABSOLUTE_MAX_DBFS_RMS};
 /// Re-exported: the enum lives in `paraeq-dsp` because that is the only crate
 /// every consumer may depend on. Its semantics are `paraeq-decide`'s; this
@@ -67,6 +88,7 @@ pub use stimulus::{
     assemble_pilot, assemble_sweep, emit_guard, verify_stimulus, AssembledStimulus, GuardCounts,
     StimulusError, StimulusKind,
 };
+pub use store::{IrStore, StoreError, StoredIr, StoredWindow};
 
 /// Error type shared by this crate's entry points.
 ///

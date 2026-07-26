@@ -194,6 +194,7 @@ fn run_two_clock(label: &str, drift_comp: bool, build: fn(f64) -> Stimulus) {
     let config = MeasureAggregateConfig {
         drift_compensation: drift_comp,
         mic: mic_selector_from_env(),
+        ..MeasureAggregateConfig::default()
     };
     let mut cap = MicCapture::create(config).expect("MicCapture::create");
     let rate = cap.sample_rate_hz();
@@ -307,8 +308,8 @@ fn run_two_clock(label: &str, drift_comp: bool, build: fn(f64) -> Stimulus) {
 #[ignore = "requires audio hardware + input device + mic TCC grant"]
 fn measure_aggregate_lifecycle_roundtrip() {
     let mut cap = MicCapture::create(MeasureAggregateConfig {
-        drift_compensation: true,
         mic: mic_selector_from_env(),
+        ..MeasureAggregateConfig::default()
     })
     .expect("MicCapture::create");
 
@@ -368,8 +369,8 @@ fn measure_aggregate_lifecycle_roundtrip() {
 #[ignore = "requires audio hardware"]
 fn measure_aggregate_refuses_unknown_mic_uid() {
     let config = MeasureAggregateConfig {
-        drift_compensation: true,
         mic: MicSelector::Uid("com.paraeq.no-such-device".into()),
+        ..MeasureAggregateConfig::default()
     };
     match MicCapture::create(config) {
         Err(MeasureAggregateError::MicNotFound { uid }) => {
@@ -406,4 +407,231 @@ fn two_clock_drift_compensated_residual() {
 #[ignore = "requires audio hardware + mic TCC grant; plays audio (5 s sweep); run with --release"]
 fn two_clock_bracketed_sweep_skew() {
     run_two_clock("bracketed-sweep", false, bracketed_sweep_stimulus);
+}
+
+// ───────────────────── Stage 5: the one-clock stimulus sink ──────────────────
+// The Stage-4 aggregate reserved its output route for this; these exercise it
+// on real hardware. Together they are the software side of the stage's end
+// state — "a complete coupler measurement is testable end-to-end, headless".
+//
+// NOT yet a full `MeasurementSession` run: MS-6 refuses to open a session
+// without a `TapStatus` witness, and `TapSystem` cannot expose `self_excluded`
+// until the `EngineState` shape unfreezes at the tauri-shell merge. What these
+// prove is everything below that gate — that the sink plays, that it paces,
+// and that play and record really do share one clock.
+
+/// **Owner: listen.** Plays the 300 Hz pilot at its fixed −40 dBFS RMS through
+/// the aggregate's own output route and captures it back on the mic, then
+/// reports the measured level and the realtime counters.
+///
+/// This is the first sound ParaEQ has ever emitted through the level
+/// interlock, so it emits the quietest thing the design has: the pilot's level
+/// is fixed policy, `assemble_pilot` takes no level parameter, and a hot pilot
+/// is unrepresentable.
+#[test]
+#[ignore = "requires audio hardware + input device + mic TCC grant"]
+fn pilot_plays_through_the_aggregate_and_comes_back_on_the_mic() {
+    use paraeq_measure::{assemble_pilot, TransducerClass};
+
+    let mut cap = MicCapture::create(MeasureAggregateConfig {
+        mic: mic_selector_from_env(),
+        ..MeasureAggregateConfig::default()
+    })
+    .expect("MicCapture::create");
+    let rate = cap.sample_rate_hz();
+    let mut sink = cap
+        .take_stimulus_sink()
+        .expect("the sink is available once");
+    assert!(
+        cap.take_stimulus_sink().is_none(),
+        "and only once — two producers on one SPSC ring is not a thing"
+    );
+
+    let pilot =
+        assemble_pilot(1.0, rate as u32, TransducerClass::OverEar).expect("pilot assembles");
+    eprintln!(
+        "pilot: {} samples at {} dBFS RMS, aggregate rate {rate} Hz",
+        pilot.len(),
+        pilot.level().dbfs_rms()
+    );
+
+    // Drain whatever the mic buffered before playback starts.
+    let mut scratch = vec![0.0f64; 4096];
+    while cap.capture(&mut scratch).expect("capture") > 0 {}
+
+    let started = Instant::now();
+    pilot.emit_to(&mut sink).expect("emit");
+    let elapsed = started.elapsed();
+
+    let mut captured = Vec::new();
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        let n = cap.capture(&mut scratch).expect("capture");
+        captured.extend_from_slice(&scratch[..n]);
+        if n == 0 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    let rms = (captured.iter().map(|v| v * v).sum::<f64>() / captured.len().max(1) as f64).sqrt();
+    let counters = sink.counters();
+    eprintln!(
+        "emit took {elapsed:?} for {:.3} s of audio (pacing: the sink must NOT return early)",
+        pilot.duration_s()
+    );
+    eprintln!(
+        "captured {} samples, RMS {:.6} ({:.1} dBFS)",
+        captured.len(),
+        rms,
+        20.0 * rms.max(1e-12).log10()
+    );
+    eprintln!("stimulus counters: {counters:?}");
+    eprintln!("capture counters:  {:?}", cap.counters());
+
+    assert!(
+        counters.underrun_frames == 0,
+        "the emitter fell behind the device — the stimulus had gaps"
+    );
+    assert!(
+        elapsed.as_secs_f64() >= 0.5 * pilot.duration_s(),
+        "emit returned in {elapsed:?} for {:.3} s of audio: the sink is not \
+         pacing, and MS-14's abort model depends on it",
+        pilot.duration_s()
+    );
+    assert!(
+        rms > 1e-5,
+        "nothing came back on the mic — check routing, mic placement, and \
+         that the output device is the one under test"
+    );
+}
+
+/// `stop()` drops queued audio rather than playing it out at level, and
+/// refuses further emission. The audible half is the point: nothing should be
+/// heard after the stop.
+#[test]
+#[ignore = "requires audio hardware + input device + mic TCC grant"]
+fn stopping_the_sink_drops_queued_audio_rather_than_flushing_it() {
+    use paraeq_measure::{assemble_pilot, StimulusSink, TransducerClass};
+
+    let mut cap = MicCapture::create(MeasureAggregateConfig {
+        mic: mic_selector_from_env(),
+        ..MeasureAggregateConfig::default()
+    })
+    .expect("MicCapture::create");
+    let rate = cap.sample_rate_hz();
+    let mut sink = cap.take_stimulus_sink().expect("sink");
+
+    let pilot = assemble_pilot(1.0, rate as u32, TransducerClass::OverEar).expect("pilot");
+    // Push without pacing so audio really is queued when stop lands.
+    let format = StimulusSink::format(&sink);
+    let block = format.frames_per_block.max(1);
+    sink.emit(&pilot.samples()[..block.min(pilot.len())], pilot.level())
+        .expect("first block");
+    StimulusSink::stop(&mut sink).expect("stop is infallible here");
+    StimulusSink::stop(&mut sink).expect("and idempotent");
+
+    assert!(
+        sink.emit(pilot.samples(), pilot.level()).is_err(),
+        "a stopped sink must refuse further emission"
+    );
+    eprintln!("stimulus counters after stop: {:?}", sink.counters());
+}
+
+/// The one-clock claim, measured: play the bracketed marker pair through the
+/// aggregate's OWN output route (rather than `afplay` on the raw device) and
+/// report the skew. If the aggregate really does put play and record in one
+/// clock domain, this should read far below the ~12 ppm REW attributes to
+/// separate devices.
+///
+/// Prints rather than asserts a threshold — the number is the experiment's
+/// output. Pair it with the `afplay`-driven two-clock runs above: same rig,
+/// same markers, different playback route, so the difference between them is
+/// exactly what the aggregate buys.
+#[test]
+#[ignore = "requires audio hardware + input device + mic TCC grant"]
+fn one_clock_skew_through_the_aggregates_own_output() {
+    use paraeq_measure::{assemble_sweep, StimulusSink, SweepLevel, TransducerClass};
+
+    let mut cap = MicCapture::create(MeasureAggregateConfig {
+        mic: mic_selector_from_env(),
+        ..MeasureAggregateConfig::default()
+    })
+    .expect("MicCapture::create");
+    let rate = cap.sample_rate_hz();
+    let mut sink = cap.take_stimulus_sink().expect("sink");
+
+    let marker = two_clock::default_marker(rate);
+    let gap = vec![0.0f64; (0.25 * rate) as usize];
+    let level = SweepLevel::new(-20.0, TransducerClass::OverEar).expect("legal level");
+    let sweep = assemble_sweep(5.0, rate as u32, 20.0, 20_000.0, level).expect("sweep assembles");
+
+    let mut stimulus = Vec::new();
+    stimulus.extend(std::iter::repeat_n(0.0, (0.5 * rate) as usize));
+    let first_marker_at = stimulus.len();
+    stimulus.extend_from_slice(&marker);
+    stimulus.extend_from_slice(&gap);
+    stimulus.extend_from_slice(sweep.samples());
+    stimulus.extend_from_slice(&gap);
+    let second_marker_at = stimulus.len();
+    stimulus.extend_from_slice(&marker);
+    stimulus.extend(std::iter::repeat_n(0.0, (0.5 * rate) as usize));
+
+    let mut scratch = vec![0.0f64; 8192];
+    while cap.capture(&mut scratch).expect("capture") > 0 {}
+
+    // Capture on a second thread so play and record overlap, which is the
+    // whole point of a shared aggregate.
+    let expected = stimulus.len();
+    let capture = std::thread::spawn(move || {
+        let mut got = Vec::with_capacity(expected + 8192);
+        let deadline = Instant::now() + Duration::from_secs_f64(expected as f64 / rate + 2.0);
+        let mut buf = vec![0.0f64; 8192];
+        while Instant::now() < deadline {
+            let n = cap.capture(&mut buf).expect("capture");
+            if n == 0 {
+                std::thread::sleep(Duration::from_millis(2));
+                continue;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        (got, cap)
+    });
+
+    let block = StimulusSink::format(&sink).frames_per_block.max(1);
+    for chunk in stimulus.chunks(block) {
+        sink.emit(chunk, level).expect("emit");
+    }
+    let (captured, cap) = capture.join().expect("capture thread");
+
+    eprintln!(
+        "one-clock run: emitted {} samples, captured {} at {rate} Hz",
+        stimulus.len(),
+        captured.len()
+    );
+    eprintln!("stimulus counters: {:?}", sink.counters());
+    eprintln!("capture counters:  {:?}", cap.counters());
+
+    // The two-point bracket: find both markers in the capture, fit the
+    // capture-clock positions against the known playback-clock ones.
+    let separation = ((second_marker_at - first_marker_at) / 2).max(1);
+    let hits = two_clock::find_marker_train(&captured, &marker, 2, separation);
+    match hits.and_then(|hits| {
+        let expected = [first_marker_at as f64, second_marker_at as f64];
+        let measured: Vec<f64> = hits.iter().map(|h| h.position).collect();
+        two_clock::estimate_skew(&expected, &measured)
+    }) {
+        Some(SkewEstimate {
+            skew_ppm,
+            residual_peak_samples,
+            ..
+        }) => eprintln!(
+            "ONE-CLOCK SKEW: {skew_ppm:+.2} ppm, residual peak \
+             {residual_peak_samples:.2} samples (REW reports ~12 ppm across \
+             SEPARATE devices; a shared aggregate should be far below that)"
+        ),
+        None => eprintln!(
+            "no skew estimate could be formed — this is the Warn(TwoClock) \
+             fallback path; check marker SNR and mic placement"
+        ),
+    }
 }

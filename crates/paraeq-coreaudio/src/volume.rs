@@ -25,6 +25,8 @@ use objc2_core_audio::{
     AudioObjectPropertyAddress, AudioObjectSetPropertyData,
 };
 
+use paraeq_measure::MeasureError;
+
 use crate::error::{check, CaError};
 
 /// Real devices quantize the volume scalar coarsely (1/16 steps are common), so
@@ -281,6 +283,72 @@ pub fn restore_output_volume(dev: AudioObjectID, volume: &OutputVolume) -> Vec<C
         }
     }
     errors
+}
+
+/// The software half of MS-5: `paraeq-measure`'s
+/// [`VolumeControl`](paraeq_measure::VolumeControl) over one output device.
+///
+/// A thin adapter, deliberately. The functions above already carry the policy
+/// (refuse a non-finite scalar, refuse a read-only control, collect rather than
+/// short-circuit on restore); this only maps them onto the trait the session
+/// drives, so the session can restore the pre-measurement volume on **every**
+/// exit path — command, drop, panic — without depending on CoreAudio.
+///
+/// The device is pinned at construction rather than re-resolved per call: a
+/// session that solved a level against one device and restored the volume of
+/// whatever became default in the meantime would leave the measured device hot.
+/// That is the same reason a mid-run default-output change is an abort
+/// (`OutputDeviceChanged`) rather than a follow.
+pub struct DeviceVolume {
+    device: AudioObjectID,
+}
+
+impl DeviceVolume {
+    /// Pin `device`'s volume control.
+    pub fn new(device: AudioObjectID) -> Self {
+        Self { device }
+    }
+
+    /// The default output device at call time, pinned from then on.
+    pub fn for_default_output() -> Result<Self, CaError> {
+        Ok(Self::new(crate::properties::default_output_device()?))
+    }
+
+    pub fn device(&self) -> AudioObjectID {
+        self.device
+    }
+}
+
+impl paraeq_measure::VolumeControl for DeviceVolume {
+    /// Read the pinned device's volume, as the seam's 0.0..=1.0 scalar.
+    ///
+    /// A device with per-channel controls and a user-set imbalance has no one
+    /// scalar, so this reports the **loudest** element: the seam's contract is
+    /// that the session pins a value and restores it, and reporting the quieter
+    /// channel would understate how loud the device actually is. Restoring is
+    /// not built on this number — [`Self::set_volume`] writes every element,
+    /// and a caller that must preserve an imbalance exactly uses
+    /// [`restore_output_volume`] with the full [`OutputVolume`] snapshot.
+    fn volume(&self) -> Result<f64, MeasureError> {
+        let volume = output_volume(self.device)
+            .map_err(|e| MeasureError::Sink(e.to_string()))?
+            .ok_or_else(|| MeasureError::Sink("device exposes no volume control".to_owned()))?;
+        let loudest = volume
+            .elements()
+            .iter()
+            .map(|e| e.scalar)
+            .fold(f32::NEG_INFINITY, f32::max);
+        Ok(f64::from(loudest))
+    }
+
+    /// Set every element of the pinned device's control.
+    ///
+    /// Never panics, because this runs on the RAII restore path during
+    /// unwinding: an out-of-range or non-finite scalar is refused as an `Err`
+    /// the session records, not an assertion.
+    fn set_volume(&mut self, scalar: f64) -> Result<(), MeasureError> {
+        set_output_volume(self.device, scalar as f32).map_err(|e| MeasureError::Sink(e.to_string()))
+    }
 }
 
 #[cfg(test)]

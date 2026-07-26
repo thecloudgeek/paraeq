@@ -7,6 +7,20 @@
 //! the unguarded hot path does not typecheck.
 
 use paraeq_dsp::targets::TransducerClass;
+use std::ops::RangeInclusive;
+use std::sync::LazyLock;
+
+/// MS-17 envelope for the two coupler paths, dB SPL per dBFS RMS. Contains the
+/// 104 dB/dBFS chain that just reaches the 84 dB target at the −20 dBFS cap,
+/// with wide margin either side. See
+/// [`TransducerCaps::sensitivity_envelope_spl_per_dbfs`] — OPEN \[NEEDS DATA\].
+const COUPLER_SENSITIVITY_ENVELOPE: RangeInclusive<f64> = 85.0..=130.0;
+
+/// MS-17 envelope for the two room paths, dB SPL per dBFS RMS. Contains the
+/// 87 dB/dBFS chain that just reaches the 75 dB target at the −12 dBFS cap.
+/// Wider at the bottom than the coupler's because listening distance varies by
+/// far more than coupler geometry does. OPEN \[NEEDS DATA\].
+const ROOM_SENSITIVITY_ENVELOPE: RangeInclusive<f64> = 65.0..=120.0;
 
 /// Unconditional ceiling, checked before the table and independent of it.
 ///
@@ -86,7 +100,12 @@ pub enum LevelError {
 /// and warn thresholds are overridable *within* caps — those overrides live in
 /// `paraeq-decide`'s `Overrides` and are bounded by these numbers, never
 /// replacements for them.
-#[derive(Clone, Copy, Debug, PartialEq)]
+///
+/// No longer `Copy`: `sensitivity_envelope_spl_per_dbfs` is a
+/// `RangeInclusive`, which is not `Copy` (it is an iterator). The rows are
+/// `LazyLock` statics and [`caps_for`] still hands out `&'static`, so nothing
+/// clones a table row on any path.
+#[derive(Clone, Debug, PartialEq)]
 pub struct TransducerCaps {
     /// `None` on the coupler paths: per-DUT, because a headphone's usable low
     /// corner is a property of the headphone. `Some` on the room paths, where
@@ -127,6 +146,32 @@ pub struct TransducerCaps {
     /// Deliberately just above the coupler target: at target the warning never
     /// fires, so any solve that lands hot is immediately visible.
     pub spl_warn_db: f64,
+    /// MS-17's chain-sensitivity envelope, in dB SPL per dBFS RMS — i.e. the
+    /// SPL the whole chain would produce at 0 dBFS RMS. Solved sensitivity
+    /// outside this **refuses** (`SensitivityOutOfEnvelope`) rather than
+    /// escalating, because escalating into an empty jig is precisely how the
+    /// 122 dB scenario happens: the user then puts the IEM in.
+    ///
+    /// This detects the **chain**, not the head. It is a gross-error
+    /// discriminator — empty jig, headphone off the coupler, sweep misrouted
+    /// to the laptop speakers, wrong class selected — and nothing finer. A
+    /// headphone on a head with in-envelope sensitivity is indistinguishable
+    /// from one on a jig; the acknowledgement gate and the quiet targets are
+    /// the mitigation, and there is no detector.
+    ///
+    /// **OPEN \[NEEDS DATA\]:** the spec requires the envelope (MS-17) but
+    /// states no numbers, so these are engineering estimates, deliberately
+    /// wide. One end is not free, though, and
+    /// `test_ladder.rs::the_envelope_admits_every_chain_that_can_reach_target`
+    /// pins it: the envelope must contain
+    /// `spl_target_db − sweep_level_dbfs_rms` (104 dB SPL/dBFS coupler, 87
+    /// room), the least sensitive chain that can still hit target at the class
+    /// cap — otherwise this table would refuse chains the caps table calls
+    /// legal. The upper bounds say "no real transducer is this loud at full
+    /// scale; suspect the cal or the input gain". Settle them by measuring S
+    /// on the EARS rig and on a real room system, which Stage 5's headless
+    /// end-to-end run makes possible for the first time.
+    pub sensitivity_envelope_spl_per_dbfs: std::ops::RangeInclusive<f64>,
     /// The ladder's first rung *and* the cap [`SweepLevel::new`] enforces.
     ///
     /// The spec calls this "a starting point for the solve, not the emitted
@@ -139,42 +184,46 @@ pub struct TransducerCaps {
     pub sweep_level_dbfs_rms: f64,
 }
 
-static BOOKSHELF: TransducerCaps = TransducerCaps {
+static BOOKSHELF: LazyLock<TransducerCaps> = LazyLock::new(|| TransducerCaps {
     f_start_hz: Some(30.0),
     max_sweep_len_s: 5.5,
+    sensitivity_envelope_spl_per_dbfs: ROOM_SENSITIVITY_ENVELOPE,
     spl_refuse_db: 90.0,
     spl_target_db: 75.0,
     spl_warn_db: 85.0,
     sweep_level_dbfs_rms: -12.0,
-};
+});
 
-static FLOORSTANDER: TransducerCaps = TransducerCaps {
+static FLOORSTANDER: LazyLock<TransducerCaps> = LazyLock::new(|| TransducerCaps {
     f_start_hz: Some(20.0),
     max_sweep_len_s: 5.5,
+    sensitivity_envelope_spl_per_dbfs: ROOM_SENSITIVITY_ENVELOPE,
     spl_refuse_db: 90.0,
     spl_target_db: 75.0,
     spl_warn_db: 85.0,
     sweep_level_dbfs_rms: -12.0,
-};
+});
 
-static IN_EAR: TransducerCaps = TransducerCaps {
+static IN_EAR: LazyLock<TransducerCaps> = LazyLock::new(|| TransducerCaps {
     f_start_hz: None,
     max_sweep_len_s: 5.5,
+    sensitivity_envelope_spl_per_dbfs: COUPLER_SENSITIVITY_ENVELOPE,
     spl_refuse_db: 100.0,
     spl_target_db: 84.0,
     spl_warn_db: 85.0,
     // 8 dB below REW's -12 dBFS default.
     sweep_level_dbfs_rms: -20.0,
-};
+});
 
-static OVER_EAR: TransducerCaps = TransducerCaps {
+static OVER_EAR: LazyLock<TransducerCaps> = LazyLock::new(|| TransducerCaps {
     f_start_hz: None,
     max_sweep_len_s: 5.5,
+    sensitivity_envelope_spl_per_dbfs: COUPLER_SENSITIVITY_ENVELOPE,
     spl_refuse_db: 100.0,
     spl_target_db: 84.0,
     spl_warn_db: 85.0,
     sweep_level_dbfs_rms: -20.0,
-};
+});
 
 /// The caps are derivable from the class alone, which is why
 /// [`SweepLevel::new`] takes one: a second argument would be a second place to

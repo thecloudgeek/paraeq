@@ -5,13 +5,26 @@ license.workspace = true
 version.workspace = true
 
 # Spec constraint (2026-07-15 measurement-safety-design.md, MS-1): paraeq-dsp
-# ONLY. No Tauri (the policy must stay reachable from a future `paraeqd`), no
-# paraeq-coreaudio (the hardware side arrives through the `seam` traits, so the
-# level policy stays testable against mocks), no unsafe. The `cargo tree`
-# assertion in CI is the enforcement; `#![forbid(unsafe_code)]` is the rest.
+# ONLY among the workspace crates. No Tauri (the policy must stay reachable
+# from a future `paraeqd`), no paraeq-coreaudio (the hardware side arrives
+# through the `seam` traits, so the level policy stays testable against mocks),
+# no unsafe. The `cargo tree` assertion in CI is the enforcement;
+# `#![forbid(unsafe_code)]` is the rest.
+#
+# `hound` arrives with Stage 5's per-position IR store (`store.rs`), which the
+# measurement-suite architecture diagram assigns to this crate ("level solve,
+# capture orchestration, per-pos IR store"). It is a leaf WAV codec — no
+# platform API, no Tauri, no CoreAudio — so MS-1's constraint is untouched;
+# `serde` is optional and off by default, for the `StoredWindow` a manifest
+# above this crate records.
 [dependencies]
+hound = { workspace = true }
 paraeq-dsp = { path = "../paraeq-dsp" }
+serde = { workspace = true, optional = true }
 thiserror = { workspace = true }
+
+[features]
+serde = ["dep:serde"]
 
 # paraeq-decide is a DEV-dependency only: `test_level.rs` cross-checks the one
 # number both crates tabulate (room `f_start_hz` / `PathProfile.sweep_f_start_hz`)

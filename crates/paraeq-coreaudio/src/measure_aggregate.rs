@@ -17,10 +17,23 @@
 //! into a bounded SPSC ring (`rtrb`). [`CaptureSource::capture`] drains the
 //! ring to `f64` off the realtime thread. On overflow the newest samples are
 //! dropped and counted ([`MicCapture::counters`]) — the realtime side never
-//! blocks, allocates, or logs. The output side of the aggregate is zero-filled
-//! every cycle: the aggregate contributes silence to the output device's mix
-//! today, and that same output route is where a future one-clock
-//! `StimulusSink` will write.
+//! blocks, allocates, or logs.
+//!
+//! Stimulus path (Stage 5): the output route this module reserved is now
+//! written. The same IOProc zero-fills the output buffers and then drains a
+//! second SPSC ring into them, one mono sample per frame, honouring
+//! [`StimulusRouting`]; an empty ring writes silence and counts the underrun
+//! rather than holding the last sample, which would be a DC step into the
+//! driver. [`StimulusOutput`] is the non-realtime half — `paraeq-measure`'s
+//! [`StimulusSink`](paraeq_measure::StimulusSink), handed out once by
+//! [`MicCapture::take_stimulus_sink`]. **It writes into this aggregate rather
+//! than opening its own output device, and that is the whole point:** the
+//! safety spec's preferred resolution to the two-clock problem is one
+//! aggregate holding both the output and the mic with drift compensation, and
+//! a sink on a separate stream would put play and record back on different
+//! crystals and hand the gating path an untrustworthy `t = 0`. A caller that
+//! never takes the sink gets the pre-Stage-5 behaviour exactly: silence into
+//! the output device's mix.
 //!
 //! Sub-device hardening mirrors tap.rs: the OUTPUT sub-device is composed
 //! with `kAudioSubDeviceInputChannelsKey: 0` so a mic-capable default output
@@ -87,6 +100,11 @@ pub struct MeasureAggregateConfig {
     /// `true`.
     pub drift_compensation: bool,
     pub mic: MicSelector,
+    /// Which output channel(s) a stimulus plays on. Only consulted when the
+    /// caller takes the sink ([`MicCapture::take_stimulus_sink`]); with no
+    /// sink taken the aggregate's output side stays silent, exactly as before
+    /// Stage 5.
+    pub routing: StimulusRouting,
 }
 
 impl Default for MeasureAggregateConfig {
@@ -94,6 +112,7 @@ impl Default for MeasureAggregateConfig {
         MeasureAggregateConfig {
             drift_compensation: true,
             mic: MicSelector::DefaultInput,
+            routing: StimulusRouting::Both,
         }
     }
 }
@@ -142,6 +161,41 @@ struct InnerCounters {
     invalid: AtomicU64,
 }
 
+/// Where a mono stimulus goes on the aggregate's output side.
+///
+/// The stimulus is always mono — the mic is mono, and one capture measures one
+/// acoustic path. What varies is which output channel carries it, and a stereo
+/// coupler measurement needs that: left and right are separate measurements,
+/// so playing to both at once measures their sum and nothing useful.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StimulusRouting {
+    /// Every output channel. Correct for a single-driver path, and for a room
+    /// measurement of a system being corrected as one.
+    Both,
+    /// One channel index only; every other channel stays silent.
+    Only(usize),
+}
+
+/// Snapshot of the stimulus side's realtime counters (monotonic since create).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StimulusCounters {
+    /// Output frames the IOProc had to fill with silence because the ring was
+    /// empty. Nonzero mid-sweep means the emitter fell behind the device and
+    /// the stimulus has gaps — the measurement is not trustworthy.
+    pub underrun_frames: u64,
+    /// Stimulus samples discarded by [`StimulusOutput::stop`]'s flush. These
+    /// are intentional: `stop` drops queued audio rather than flushing it at
+    /// level, which is what keeps it from clicking.
+    pub flushed_samples: u64,
+}
+
+#[derive(Debug, Default)]
+struct StimulusInner {
+    flush: std::sync::atomic::AtomicBool,
+    flushed: AtomicU64,
+    underrun: AtomicU64,
+}
+
 /// The measurement capture source: RAII owner of the private (output + mic)
 /// aggregate, its IOProc, and its listeners. Implements
 /// [`paraeq_measure::CaptureSource`].
@@ -164,6 +218,9 @@ pub struct MicCapture {
     mic_nominal_rate_hz: f64,
     mic_uid: String,
     sample_rate_hz: f64,
+    /// Handed out once by [`MicCapture::take_stimulus_sink`]. Held here until
+    /// taken so a caller that only captures never has to know it exists.
+    stimulus: Option<StimulusOutput>,
     torn_down: bool,
 }
 
@@ -249,10 +306,21 @@ impl MicCapture {
         let ring_capacity = (sample_rate_hz as usize).max(MIN_RING_RATE) * RING_SECONDS;
         let (producer, consumer) = RingBuffer::<f32>::new(ring_capacity);
         let counters = Arc::new(InnerCounters::default());
+        // The stimulus ring is built unconditionally so the IOProc's output
+        // half is fixed at registration time — the HAL callback cannot grow a
+        // new branch later, and a caller that never takes the sink simply
+        // never pushes, leaving the aggregate silent exactly as before.
+        let (stimulus_producer, stimulus_consumer) = RingBuffer::<f32>::new(ring_capacity);
+        let stimulus_inner = Arc::new(StimulusInner::default());
         let cb = capture_callback(
             producer,
             Arc::clone(&counters),
             frames_per_block.max(MIN_SCRATCH_FRAMES),
+            Some(StimulusPath {
+                consumer: stimulus_consumer,
+                inner: Arc::clone(&stimulus_inner),
+                routing: config.routing,
+            }),
         );
 
         // 5. Register + start the IOProc on the aggregate. From here on the
@@ -320,8 +388,30 @@ impl MicCapture {
             mic_nominal_rate_hz,
             mic_uid,
             sample_rate_hz,
+            stimulus: Some(StimulusOutput {
+                capacity: ring_capacity,
+                format: StreamFormat {
+                    channels: 1,
+                    frames_per_block,
+                    sample_rate_hz,
+                },
+                inner: stimulus_inner,
+                producer: stimulus_producer,
+                stopped: false,
+            }),
             torn_down: false,
         })
+    }
+
+    /// Take the one-clock [`StimulusSink`](paraeq_measure::StimulusSink) for
+    /// this aggregate. `None` on the second call.
+    ///
+    /// Once, by construction: two sinks on one SPSC ring would interleave two
+    /// stimuli into the same output stream at unknown relative timing, and the
+    /// ring is single-producer regardless. The session takes it at `begin` and
+    /// owns it for the run.
+    pub fn take_stimulus_sink(&mut self) -> Option<StimulusOutput> {
+        self.stimulus.take()
     }
 
     /// Snapshot the realtime-side counters.
@@ -496,14 +586,20 @@ fn capture_callback(
     mut producer: Producer<f32>,
     counters: Arc<InnerCounters>,
     max_frames: usize,
+    stimulus: Option<StimulusPath>,
 ) -> IoCallback {
     let mut scratch = vec![0.0f32; max_frames];
+    let mut stimulus = stimulus;
     Box::new(move |mut block: IoBlock<'_>| {
-        // Zero ALL output buffers first (the backend.rs order): the
-        // measurement aggregate contributes silence to the output device's
-        // mix, and unwritten HAL output space must never leak stale samples.
+        // Zero ALL output buffers first (the backend.rs order): unwritten HAL
+        // output space must never leak stale samples, and with no stimulus
+        // armed the measurement aggregate contributes silence to the output
+        // device's mix.
         for (buf, _) in block.output.buffers_mut() {
             buf.fill(0.0);
+        }
+        if let Some(path) = stimulus.as_mut() {
+            path.fill(&mut block.output);
         }
 
         counters.callbacks.fetch_add(1, Ordering::Relaxed);
@@ -537,6 +633,207 @@ fn capture_callback(
         counters.dropped.fetch_add(dropped, Ordering::Relaxed);
         counters.invalid.fetch_add(invalid, Ordering::Relaxed);
     })
+}
+
+/// The realtime half of the stimulus path: drains the mono stimulus ring into
+/// the aggregate's output buffers, one frame at a time, honouring the routing.
+///
+/// Lives on the realtime thread inside the IOProc closure. No locks, no
+/// allocation, no logging — the same contract `capture_callback`'s input half
+/// keeps.
+struct StimulusPath {
+    consumer: Consumer<f32>,
+    inner: Arc<StimulusInner>,
+    routing: StimulusRouting,
+}
+
+impl StimulusPath {
+    /// Write one IO cycle's worth of stimulus.
+    ///
+    /// The output list may arrive as one interleaved N-channel buffer or as N
+    /// mono buffers (the DGR Labs layout gotcha `ioproc.rs` documents), and
+    /// this handles both: one mono sample is pulled per **frame** and written
+    /// to that frame's routed channels. Pulling per sample instead would play
+    /// the stimulus at N× speed on an interleaved device.
+    ///
+    /// Only the FIRST populated output buffer is driven. A HAL output list can
+    /// carry more than one stream, and writing the same stimulus into all of
+    /// them would play it twice into the same acoustic path at unknown
+    /// relative gain.
+    fn fill(&mut self, output: &mut crate::ioproc::BufferListMut<'_>) {
+        // `stop` flushes rather than fading: the session ramps the stimulus to
+        // zero BEFORE tearing down (MS-14), so by the time this fires there is
+        // nothing left at level to click.
+        if self.inner.flush.swap(false, Ordering::Relaxed) {
+            let mut flushed = 0u64;
+            while self.consumer.pop().is_ok() {
+                flushed += 1;
+            }
+            self.inner.flushed.fetch_add(flushed, Ordering::Relaxed);
+            return;
+        }
+        let mut underrun = 0u64;
+        for (buf, channels) in output.buffers_mut() {
+            let channels = channels.max(1);
+            let frames = buf.len() / channels;
+            if frames == 0 {
+                continue;
+            }
+            for frame in 0..frames {
+                let Ok(sample) = self.consumer.pop() else {
+                    // Silence, not the previous sample: a held sample is a DC
+                    // step into the driver and a defect in the measurement.
+                    underrun += (frames - frame) as u64;
+                    break;
+                };
+                match self.routing {
+                    StimulusRouting::Both => {
+                        for ch in 0..channels {
+                            buf[frame * channels + ch] = sample;
+                        }
+                    }
+                    StimulusRouting::Only(ch) if ch < channels => {
+                        buf[frame * channels + ch] = sample;
+                    }
+                    // A routing the device cannot honour plays silence rather
+                    // than falling back to channel 0: silence is an obvious
+                    // failure, a wrong channel is a plausible wrong answer.
+                    StimulusRouting::Only(_) => {}
+                }
+            }
+            break;
+        }
+        if underrun > 0 {
+            self.inner.underrun.fetch_add(underrun, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The non-realtime half of the stimulus path: `paraeq-measure`'s
+/// [`StimulusSink`](paraeq_measure::StimulusSink), writing into the SAME
+/// aggregate the mic is captured from.
+///
+/// **One clock domain, which is the entire point.** The safety spec's
+/// preferred resolution to the two-clock problem is an aggregate containing
+/// both the output device and the mic with drift compensation enabled; a sink
+/// on a *separate* output stream would put play and record back on different
+/// crystals and hand the gating path an untrustworthy `t = 0`. So this writes
+/// into the aggregate's output side rather than opening its own device — the
+/// route `measure_aggregate`'s module header reserved for it.
+///
+/// Obtained from [`MicCapture::take_stimulus_sink`], once. Dropping it leaves
+/// the aggregate outputting silence.
+pub struct StimulusOutput {
+    capacity: usize,
+    format: StreamFormat,
+    inner: Arc<StimulusInner>,
+    producer: Producer<f32>,
+    stopped: bool,
+}
+
+impl StimulusOutput {
+    /// Snapshot the realtime-side counters.
+    pub fn counters(&self) -> StimulusCounters {
+        StimulusCounters {
+            flushed_samples: self.inner.flushed.load(Ordering::Relaxed),
+            underrun_frames: self.inner.underrun.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Frames currently queued ahead of the device.
+    pub fn queued_frames(&self) -> usize {
+        self.capacity - self.producer.slots()
+    }
+}
+
+impl paraeq_measure::StimulusSink for StimulusOutput {
+    fn format(&self) -> StreamFormat {
+        self.format.clone()
+    }
+
+    /// Push one block and **wait for the device to take it** — the seam's
+    /// pacing contract, and the thing MS-14's abort model depends on.
+    ///
+    /// `seam.rs` states it directly: a sink that accepted the whole sweep into
+    /// a deep queue and returned immediately would make the session's
+    /// poll-the-abort-handle-per-block cadence fictional, and the 5 ms ramp
+    /// would arrive after seconds of already-queued full-level audio. So this
+    /// returns only once the queue is back within about one block.
+    ///
+    /// The `level` argument is provenance, not a gain: the buffer arrives
+    /// already scaled by `AssembledStimulus::emit_to`, and multiplying by it
+    /// here would double-apply the solved level.
+    fn emit(
+        &mut self,
+        block: &[f64],
+        level: paraeq_measure::SweepLevel,
+    ) -> Result<(), MeasureError> {
+        let _ = level;
+        if self.stopped {
+            return Err(MeasureError::Sink("stimulus sink is stopped".to_owned()));
+        }
+        let block_frames = self.format.frames_per_block.max(1);
+        let mut written = 0usize;
+        while written < block.len() {
+            if self.producer.is_abandoned() {
+                return Err(MeasureError::Sink(
+                    "measurement aggregate went away mid-emit".to_owned(),
+                ));
+            }
+            let mut pushed_any = false;
+            while written < block.len() {
+                // The realtime side never blocks, so a full ring means the
+                // device has not consumed yet — wait rather than drop. Dropping
+                // would put a hole in the stimulus, which is a measurement
+                // defect, not a glitch.
+                if self.producer.push(block[written] as f32).is_err() {
+                    break;
+                }
+                written += 1;
+                pushed_any = true;
+            }
+            if written >= block.len() {
+                break;
+            }
+            if !pushed_any {
+                std::thread::sleep(block_sleep(&self.format));
+            }
+        }
+        // Pace: hold until the device is within about one block of caught up.
+        while self.queued_frames() > block_frames {
+            if self.producer.is_abandoned() {
+                return Err(MeasureError::Sink(
+                    "measurement aggregate went away mid-emit".to_owned(),
+                ));
+            }
+            std::thread::sleep(block_sleep(&self.format));
+        }
+        Ok(())
+    }
+
+    /// Idempotent teardown. Arms the realtime flush so queued audio is
+    /// **dropped, not played out at level**, and refuses further emission.
+    ///
+    /// The stimulus is already at zero when a session calls this — `sweep`
+    /// ramps before terminating (MS-14) and every other caller has nothing
+    /// playing — so dropping the queue cannot click.
+    fn stop(&mut self) -> Result<(), MeasureError> {
+        self.stopped = true;
+        self.inner.flush.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// How long to sleep while waiting on the device: a quarter of a block, so the
+/// wait costs at most ~25% of a block's latency and never busy-spins a core.
+fn block_sleep(format: &StreamFormat) -> std::time::Duration {
+    let rate = if format.sample_rate_hz > 0.0 {
+        format.sample_rate_hz
+    } else {
+        48_000.0
+    };
+    let seconds = format.frames_per_block.max(1) as f64 / rate / 4.0;
+    std::time::Duration::from_secs_f64(seconds.clamp(1e-4, 0.05))
 }
 
 /// Compose the private measurement aggregate: `{ output (inputs: 0), mic
@@ -710,8 +1007,8 @@ mod tests {
     #[test]
     fn empty_mic_uid_refused_before_touching_the_hal() {
         let config = MeasureAggregateConfig {
-            drift_compensation: true,
             mic: MicSelector::Uid(String::new()),
+            ..MeasureAggregateConfig::default()
         };
         match MicCapture::create(config) {
             Err(MeasureAggregateError::EmptyMicUid) => {}
@@ -793,7 +1090,7 @@ mod tests {
         // HAL buffer arrives in.
         let (producer, _consumer) = RingBuffer::<f32>::new(64);
         let counters = Arc::new(InnerCounters::default());
-        let mut cb = capture_callback(producer, Arc::clone(&counters), 64);
+        let mut cb = capture_callback(producer, Arc::clone(&counters), 64, None);
 
         // Input: one interleaved stereo buffer, 2 frames (L0 R0 L1 R1).
         let mut in_storage = vec![0.5f32, -0.5, 0.25, -0.25];
@@ -816,12 +1113,243 @@ mod tests {
         );
     }
 
+    // ─────────────────── the Stage-5 stimulus output path ───────────────────
+
+    /// A callback with a stimulus ring armed, plus the producer to feed it.
+    fn stimulus_cb(routing: StimulusRouting) -> (IoCallback, Producer<f32>, Arc<StimulusInner>) {
+        let (_cap_tx, _cap_rx) = RingBuffer::<f32>::new(1024);
+        let (stim_tx, stim_rx) = RingBuffer::<f32>::new(1024);
+        let inner = Arc::new(StimulusInner::default());
+        let cb = capture_callback(
+            _cap_tx,
+            Arc::new(InnerCounters::default()),
+            64,
+            Some(StimulusPath {
+                consumer: stim_rx,
+                inner: Arc::clone(&inner),
+                routing,
+            }),
+        );
+        (cb, stim_tx, inner)
+    }
+
+    /// An empty input list: these tests are about the output half only.
+    fn silent_input() -> Vec<f32> {
+        vec![0.0f32; 8]
+    }
+
+    #[test]
+    fn the_stimulus_is_pulled_once_per_frame_not_once_per_sample() {
+        // The DGR Labs layout gotcha, as a rate bug: a stereo stream can arrive
+        // as ONE interleaved 2-channel buffer, and pulling per sample there
+        // would play the stimulus at 2x speed.
+        let (mut cb, mut tx, _) = stimulus_cb(StimulusRouting::Both);
+        for v in [0.1f32, 0.2, 0.3, 0.4] {
+            tx.push(v).expect("room");
+        }
+        let mut in_storage = silent_input();
+        let mut in_list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [buffer_over(&mut in_storage, 1)],
+        };
+        // 4 frames x 2 channels interleaved.
+        let mut out_storage = vec![9.0f32; 8];
+        let mut out_list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [buffer_over(&mut out_storage, 2)],
+        };
+
+        run_block(&mut cb, &mut in_list, &mut out_list);
+
+        assert_eq!(
+            out_storage,
+            vec![0.1, 0.1, 0.2, 0.2, 0.3, 0.3, 0.4, 0.4],
+            "one mono sample per FRAME, replicated across the frame's channels"
+        );
+    }
+
+    #[test]
+    fn routing_to_one_channel_leaves_the_other_silent() {
+        let (mut cb, mut tx, _) = stimulus_cb(StimulusRouting::Only(1));
+        for v in [0.5f32, 0.6] {
+            tx.push(v).expect("room");
+        }
+        let mut in_storage = silent_input();
+        let mut in_list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [buffer_over(&mut in_storage, 1)],
+        };
+        let mut out_storage = vec![9.0f32; 4];
+        let mut out_list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [buffer_over(&mut out_storage, 2)],
+        };
+
+        run_block(&mut cb, &mut in_list, &mut out_list);
+
+        assert_eq!(
+            out_storage,
+            vec![0.0, 0.5, 0.0, 0.6],
+            "a stereo coupler measures one side at a time"
+        );
+    }
+
+    #[test]
+    fn a_routing_the_device_cannot_honour_plays_silence_not_channel_zero() {
+        // A wrong channel is a plausible wrong answer; silence is an obvious
+        // failure. Prefer the obvious one.
+        let (mut cb, mut tx, _) = stimulus_cb(StimulusRouting::Only(5));
+        for v in [0.5f32, 0.6] {
+            tx.push(v).expect("room");
+        }
+        let mut in_storage = silent_input();
+        let mut in_list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [buffer_over(&mut in_storage, 1)],
+        };
+        let mut out_storage = vec![9.0f32; 4];
+        let mut out_list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [buffer_over(&mut out_storage, 2)],
+        };
+
+        run_block(&mut cb, &mut in_list, &mut out_list);
+
+        assert!(out_storage.iter().all(|&s| s == 0.0), "got {out_storage:?}");
+    }
+
+    #[test]
+    fn an_empty_ring_writes_silence_and_counts_the_underrun() {
+        // Silence, not the last sample held: a held sample is a DC step into
+        // the driver and a defect in the measurement.
+        let (mut cb, mut tx, inner) = stimulus_cb(StimulusRouting::Both);
+        tx.push(0.5f32).expect("room");
+        let mut in_storage = silent_input();
+        let mut in_list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [buffer_over(&mut in_storage, 1)],
+        };
+        let mut out_storage = vec![9.0f32; 4];
+        let mut out_list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [buffer_over(&mut out_storage, 1)],
+        };
+
+        run_block(&mut cb, &mut in_list, &mut out_list);
+
+        assert_eq!(out_storage, vec![0.5, 0.0, 0.0, 0.0]);
+        assert_eq!(inner.underrun.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn an_unarmed_stimulus_leaves_the_output_silent_exactly_as_before() {
+        // A caller that never takes the sink gets the pre-Stage-5 behaviour.
+        let (producer, _consumer) = RingBuffer::<f32>::new(64);
+        let mut cb = capture_callback(producer, Arc::new(InnerCounters::default()), 64, None);
+        let mut in_storage = silent_input();
+        let mut in_list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [buffer_over(&mut in_storage, 1)],
+        };
+        let mut out_storage = vec![7.0f32; 6];
+        let mut out_list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [buffer_over(&mut out_storage, 2)],
+        };
+
+        run_block(&mut cb, &mut in_list, &mut out_list);
+
+        assert!(out_storage.iter().all(|&s| s == 0.0));
+    }
+
+    #[test]
+    fn a_flush_drops_queued_audio_and_outputs_silence() {
+        // `stop` must not flush the queue at level — that is the click the
+        // whole fade design exists to prevent.
+        let (mut cb, mut tx, inner) = stimulus_cb(StimulusRouting::Both);
+        for _ in 0..8 {
+            tx.push(0.9f32).expect("room");
+        }
+        inner.flush.store(true, Ordering::Relaxed);
+        let mut in_storage = silent_input();
+        let mut in_list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [buffer_over(&mut in_storage, 1)],
+        };
+        let mut out_storage = vec![9.0f32; 4];
+        let mut out_list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [buffer_over(&mut out_storage, 1)],
+        };
+
+        run_block(&mut cb, &mut in_list, &mut out_list);
+
+        assert!(out_storage.iter().all(|&s| s == 0.0), "got {out_storage:?}");
+        assert_eq!(inner.flushed.load(Ordering::Relaxed), 8);
+        assert!(
+            !inner.flush.load(Ordering::Relaxed),
+            "the flush is one-shot; a later block plays normally again"
+        );
+    }
+
+    #[test]
+    fn only_the_first_populated_output_buffer_is_driven() {
+        // A HAL output list can carry more than one stream; writing the same
+        // stimulus into all of them plays it twice into one acoustic path at
+        // unknown relative gain.
+        let (mut cb, mut tx, _) = stimulus_cb(StimulusRouting::Both);
+        for v in [0.3f32, 0.4] {
+            tx.push(v).expect("room");
+        }
+        let mut in_storage = silent_input();
+        let mut in_list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [buffer_over(&mut in_storage, 1)],
+        };
+        let mut first = vec![9.0f32; 2];
+        let mut second = vec![9.0f32; 2];
+        // A two-entry `AudioBufferList`. `AudioBufferList` declares
+        // `mBuffers: [AudioBuffer; 1]` and the HAL over-allocates the trailing
+        // array, so a two-buffer list needs one extra `AudioBuffer` directly
+        // after it. A `#[repr(C)]` pair reproduces that layout *and* its
+        // alignment — a `Vec<u8>` scratch buffer would only be byte-aligned,
+        // and casting it to `*mut AudioBufferList` would be UB.
+        #[repr(C)]
+        struct TwoBufferList {
+            list: AudioBufferList,
+            extra: AudioBuffer,
+        }
+        let mut two = TwoBufferList {
+            list: AudioBufferList {
+                mNumberBuffers: 2,
+                mBuffers: [buffer_over(&mut first, 1)],
+            },
+            extra: buffer_over(&mut second, 1),
+        };
+        // SAFETY: `two` is a live, correctly aligned `#[repr(C)]` value whose
+        // layout is exactly a 2-entry AudioBufferList; both of its buffers
+        // point at distinct live f32 storages that outlive the block, and
+        // `in_list` likewise.
+        let block = unsafe {
+            IoBlock {
+                input: BufferList::new(NonNull::from(&mut in_list)),
+                output: BufferListMut::new(NonNull::from(&mut two.list)),
+                in_sample_time: 0.0,
+                out_sample_time: 0.0,
+            }
+        };
+        cb(block);
+
+        assert_eq!(first, vec![0.3, 0.4], "the first stream carries it");
+        assert_eq!(second, vec![0.0, 0.0], "and nothing else does");
+    }
+
     #[test]
     fn capture_callback_extracts_interleaved_channel_zero_into_the_ring() {
         // Mono capture is channel 0 of the first populated interleaved buffer.
         let (producer, mut consumer) = RingBuffer::<f32>::new(64);
         let counters = Arc::new(InnerCounters::default());
-        let mut cb = capture_callback(producer, Arc::clone(&counters), 64);
+        let mut cb = capture_callback(producer, Arc::clone(&counters), 64, None);
 
         // 4 frames x 2 channels interleaved: channel 0 = [1, 2, 3, 4].
         let mut in_storage = vec![1.0f32, -1.0, 2.0, -2.0, 3.0, -3.0, 4.0, -4.0];
@@ -864,7 +1392,7 @@ mod tests {
         const SCRATCH: usize = 4; // tiny scratch to force the oversize path
         let (producer, mut consumer) = RingBuffer::<f32>::new(64);
         let counters = Arc::new(InnerCounters::default());
-        let mut cb = capture_callback(producer, Arc::clone(&counters), SCRATCH);
+        let mut cb = capture_callback(producer, Arc::clone(&counters), SCRATCH, None);
 
         // Mono, 10 frames: n = min(10, 4) = 4 fit, 6 dropped as the tail.
         let mut in_storage: Vec<f32> = (0..10).map(|i| i as f32).collect();
@@ -900,7 +1428,7 @@ mod tests {
         // (captured or counted-dropped).
         let (producer, mut consumer) = RingBuffer::<f32>::new(4); // tiny ring
         let counters = Arc::new(InnerCounters::default());
-        let mut cb = capture_callback(producer, Arc::clone(&counters), 64); // roomy scratch
+        let mut cb = capture_callback(producer, Arc::clone(&counters), 64, None); // roomy scratch
 
         let mut in_storage: Vec<f32> = (0..10).map(|i| i as f32).collect();
         let mut in_list = AudioBufferList {
