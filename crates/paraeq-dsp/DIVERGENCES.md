@@ -95,5 +95,18 @@ differs from `prototype/paraeq/`, so a red parity test is always actionable.
     `0.0`. Auto-boosting a source that may already sit at 0 dBFS to
     recover headroom we did not spend is a clipping risk taken for
     nothing. Pinned by `test_peq.rs::preamp_pure_cut_is_exactly_zero`.
+15. **`ParametricEQ::export_autoeq_format_with_preamp` has no oracle
+    counterpart.** New in Rust (Stage 5; 2026-07-15 decision-engine spec
+    § Preamp requires "(a) `export_autoeq_format` emits the computed
+    preamp"). Implemented *additively* rather than by changing
+    `export_autoeq_format`, because that function is pinned byte-for-byte
+    against `fixtures/peq/two_band`'s `autoeq_export` scalar — a Tier-1
+    frozen fixture the rescope plan forbids regenerating. So
+    `export_autoeq_format` keeps the oracle's `"Preamp: 0.0 dB"` literal
+    (parity, frozen) and the new function carries `preamp_db()`. One
+    display divergence from a bare `{:.1}` format: a preamp in
+    `(-0.05, 0]` prints as `0.0`, not `-0.0`. Pinned by
+    `test_peq.rs::the_two_exports_differ_only_in_the_preamp_line` and
+    `::a_pure_cut_export_never_prints_negative_zero`.
 
 (add entries here as they are discovered during implementation)

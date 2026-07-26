@@ -134,30 +134,27 @@ pub struct Overrides {
 
 /// The per-frequency boost/cut/Q ceiling `decide()` consumes.
 ///
-/// PROVISIONAL LOCATION: room-dsp's `authority.rs` owns this type and the
-/// `AuthorityPolicy` endpoints (σ_full = 1.0 dB, σ_none = 6.0 dB) that
-/// produce it. This definition is the contract's placeholder until Stage 5
-/// lands that module, at which point it becomes a re-export and `decide()`
-/// must not re-specify different numbers.
+/// **Now a re-export** (Stage 5): `paraeq_dsp::authority` owns the type and the
+/// `AuthorityPolicy` endpoints (σ_full = 1.0 dB, σ_none = 6.0 dB) that produce
+/// it, exactly as the decision-engine spec requires — "`decide()` consumes the
+/// `AuthorityCurve` that module produces and must not re-specify different
+/// numbers." The provisional definition that lived here is gone, so there is no
+/// longer a second shape to drift from. Note the type is now **sealed**: only
+/// `authority::build_authority` constructs one, and deserialization is guarded,
+/// so `decide()` cannot fabricate a ceiling.
 ///
-/// OPEN for the owner — `authority`'s domain is not expressible as written.
-/// The spec's decision table gives it as `Choice: Standard, Conservative
-/// (x0.5), Custom(curve)` while typing the decision `Decision<AuthorityCurve>`,
-/// so `Domain<AuthorityCurve>::Choice` can only hold concrete curves: the
-/// drawer can offer the two precomputed ones and a custom curve arrives via
-/// [`Overrides`], but the NAMES ("Standard", "Conservative") — the thing the
-/// drawer would actually label its control with, and the thing an override
-/// would round-trip — have nowhere to live. Either the domain becomes a
-/// `Choice` over a named `AuthorityPreset` that resolves to a curve, or the
-/// decision splits into a preset plus a derived curve. Left as the spec types
-/// it rather than invented here.
-#[derive(Clone, Debug, Deserialize, PartialEq, PartialOrd, Serialize)]
-pub struct AuthorityCurve {
-    pub freqs: Vec<f64>,
-    pub max_boost_db: Vec<f64>,
-    pub max_cut_db: Vec<f64>,
-    pub max_q: Vec<f64>,
-}
+/// OPEN for the owner — `authority`'s domain is still not expressible as
+/// written. The spec's decision table gives it as `Choice: Standard,
+/// Conservative (x0.5), Custom(curve)` while typing the decision
+/// `Decision<AuthorityCurve>`, so `Domain<AuthorityCurve>::Choice` can only
+/// hold concrete curves: the drawer can offer the two precomputed ones and a
+/// custom curve arrives via [`Overrides`], but the NAMES ("Standard",
+/// "Conservative") — the thing the drawer would actually label its control
+/// with, and the thing an override would round-trip — have nowhere to live.
+/// Either the domain becomes a `Choice` over a named `AuthorityPreset` that
+/// resolves to a curve, or the decision splits into a preset plus a derived
+/// curve. Left as the spec types it rather than invented here (plan item 10).
+pub use paraeq_dsp::authority::AuthorityCurve;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum CorrectionKind {

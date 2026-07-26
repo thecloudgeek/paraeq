@@ -306,3 +306,68 @@ fn preamp_lone_pure_cut_is_exactly_zero() {
     };
     assert_eq!(notch.preamp_db(), 0.0);
 }
+
+// --- the computed-preamp export (Stage 5) ---------------------------------
+// `export_autoeq_format` keeps the oracle's literal and stays fixture-pinned
+// above; these pin the additive export that carries the real number.
+
+#[test]
+fn the_computed_export_carries_the_realized_preamp() {
+    let peq = ParametricEQ {
+        bands: vec![peaking_band(1000.0, 6.0, 1.0)],
+        sample_rate: 48000.0,
+    };
+    let expected = peq.preamp_db();
+    assert!(expected < -5.0, "sanity: a +6 dB boost needs real headroom");
+    let text = peq.export_autoeq_format_with_preamp();
+    assert_eq!(
+        text.lines().next().unwrap(),
+        format!("Preamp: {expected:.1} dB")
+    );
+}
+
+#[test]
+fn the_two_exports_differ_only_in_the_preamp_line() {
+    let peq = ParametricEQ {
+        bands: vec![
+            peaking_band(1000.0, 6.0, 1.0),
+            peaking_band(3000.0, -3.0, 2.0),
+        ],
+        sample_rate: 48000.0,
+    };
+    let oracle_text = peq.export_autoeq_format();
+    let oracle: Vec<&str> = oracle_text.lines().collect();
+    let computed_text = peq.export_autoeq_format_with_preamp();
+    let computed: Vec<&str> = computed_text.lines().collect();
+    assert_eq!(oracle[0], "Preamp: 0.0 dB");
+    assert_ne!(computed[0], oracle[0]);
+    assert_eq!(oracle[1..], computed[1..], "filter lines must be identical");
+}
+
+#[test]
+fn a_pure_cut_export_never_prints_negative_zero() {
+    // preamp_db() clamps at 0 for a pure cut, and a preamp inside the display
+    // rounding step must print as "0.0", never "-0.0" — which reads as a bug.
+    let peq = ParametricEQ {
+        bands: vec![peaking_band(1000.0, -6.0, 1.0)],
+        sample_rate: 48000.0,
+    };
+    assert_eq!(peq.preamp_db(), 0.0);
+    assert_eq!(
+        peq.export_autoeq_format_with_preamp()
+            .lines()
+            .next()
+            .unwrap(),
+        "Preamp: 0.0 dB"
+    );
+}
+
+#[test]
+fn an_empty_band_set_exports_a_zero_preamp_either_way() {
+    let peq = ParametricEQ {
+        bands: Vec::new(),
+        sample_rate: 48000.0,
+    };
+    assert_eq!(peq.export_autoeq_format(), "Preamp: 0.0 dB");
+    assert_eq!(peq.export_autoeq_format_with_preamp(), "Preamp: 0.0 dB");
+}

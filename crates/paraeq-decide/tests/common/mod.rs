@@ -12,6 +12,8 @@ use paraeq_decide::{
     Position, QCapPolicy, Rationale, RationaleKey, Severity, SmoothingMode, Source, SweepPlan,
     TargetChoice, TransducerClass, Unit, Verdict, WindowType,
 };
+use paraeq_dsp::authority::{build_authority, AuthorityPolicy};
+use paraeq_dsp::logf::LogGrid;
 use paraeq_dsp::targets::TargetCurve;
 
 pub fn decision<T>(
@@ -33,13 +35,15 @@ pub fn decision<T>(
     }
 }
 
+/// Built through `authority::build_authority` rather than a struct literal,
+/// because as of Stage 5 that is the only way to build one: `AuthorityCurve`
+/// is a re-export of the sealed `paraeq_dsp::authority` type, so `decide()` and
+/// its tests cannot fabricate a ceiling that skipped validation. A small grid
+/// keeps the round-trip fixtures readable.
 pub fn authority_curve() -> AuthorityCurve {
-    AuthorityCurve {
-        freqs: vec![20.0, 200.0, 20000.0],
-        max_boost_db: vec![5.0, 5.0, 0.0],
-        max_cut_db: vec![10.0, 10.0, 2.0],
-        max_q: vec![4.0, 4.0, 3.0],
-    }
+    let grid = LogGrid::new(20.0, 20_000.0, 1).expect("valid grid");
+    let sigma = vec![1.5; grid.len()];
+    build_authority(&grid, &sigma, &AuthorityPolicy::default()).expect("valid authority inputs")
 }
 
 pub fn decisions() -> Decisions {

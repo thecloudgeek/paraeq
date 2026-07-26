@@ -184,7 +184,47 @@ impl ParametricEQ {
     /// index, AutoEQ tag, Fc rounded to 0 decimals, Gain to 1 decimal, Q to 3
     /// decimals. Lines are joined with "\n" and there is no trailing newline.
     pub fn export_autoeq_format(&self) -> String {
-        let mut lines = vec!["Preamp: 0.0 dB".to_string()];
+        self.export_autoeq_lines(0.0)
+    }
+
+    /// [`Self::export_autoeq_format`] with the **computed** preamp
+    /// ([`Self::preamp_db`]) in the header instead of the oracle's `0.0`
+    /// literal. This is the export a user should actually load into other EQ
+    /// software, and the one ParaEQ's own UI must offer.
+    ///
+    /// Additive rather than a change to `export_autoeq_format`, and the reason
+    /// is not timidity: `export_autoeq_format` is pinned byte-for-byte against
+    /// `fixtures/peq/two_band`'s `autoeq_export` scalar
+    /// (`test_peq.rs::autoeq_export_matches_oracle_exactly`), which is a Tier-1
+    /// frozen fixture. Emitting a real preamp from it would require
+    /// regenerating a fixture the rescope plan forbids regenerating, to encode
+    /// a value the oracle does not compute. So the oracle-parity function keeps
+    /// its literal and this one carries the correction.
+    ///
+    /// The number is `−max(0, peak of the realized cascade)` — see
+    /// [`Self::preamp_db`] for why "realized" is load-bearing (after the Q cap,
+    /// the excursion clamp and band-dropping, the filters that run are not the
+    /// filters autofit first proposed) and why there is no headroom constant.
+    /// Formatted to one decimal, matching AutoEQ's own `ParametricEQ.txt`.
+    ///
+    /// **A preamp that lives only in exported text protects other people's EQ
+    /// software and not ParaEQ.** The engine-side half of this — sending
+    /// `SetGainDb(preamp_db)` alongside `SetCorrection` so the gain stage at
+    /// `chain.rs` carries it — is the Tauri backend's, and is sequenced
+    /// post-merge with the rest of the desktop wiring.
+    pub fn export_autoeq_format_with_preamp(&self) -> String {
+        self.export_autoeq_lines(self.preamp_db())
+    }
+
+    /// The shared body of the two public exports; the preamp is the only thing
+    /// they differ in, so it is the only parameter. Line format is transcribed
+    /// on [`Self::export_autoeq_format`].
+    fn export_autoeq_lines(&self, preamp_db: f64) -> String {
+        // A preamp between -0.05 and 0 dB rounds to zero at one decimal and
+        // would print as "-0.0 dB", which reads as a defect. It is zero to the
+        // precision the format carries, so print it as zero.
+        let shown = if preamp_db > -0.05 { 0.0 } else { preamp_db };
+        let mut lines = vec![format!("Preamp: {shown:.1} dB")];
         for (i, band) in self.bands.iter().enumerate() {
             lines.push(format!(
                 "Filter {}: ON {} Fc {:.0} Hz Gain {:.1} dB Q {:.3}",
