@@ -446,7 +446,20 @@ pub struct Capture {
 
 **`deconvolve` must change shape.** It is `deconvolve(recorded, sweep, _sample_rate) -> Vec<f64>` today (`deconvolution.rs:6`) — it takes the sample rate and discards it, so there is no time axis at all. Every gating operation needs t = 0. It must return `ImpulseResponse { peak_index, sample_rate, samples }`.
 
-**Storage bound.** The full deconvolved IR is `next_power_of_two(recorded.len() + sweep.len())` — 524288 samples for a 5.5 s sweep at 48 kHz, i.e. ~2 MB/channel, ~37 MB for a 9-position stereo bundle. Store a bounded window around the peak instead: `[peak − min(64 ms, peak_index), peak + 1500 ms]` with a Tukey α = 0.25 taper on the stored edges, recorded in `stored_window`. That is ~200 KB/channel, ~3.6 MB per bundle. The post-window figure is *derived from the drawer's domain, not picked*: the largest post-peak extent any in-scope decision can request is `n_c / f_min`, so a 1.5 s store bounds the FDW cycles domain at `n_c ≤ 20 × 1.5 = 30` — which comfortably contains the 15-cycle default and REW's usable range. The pre-window is not a choice: `deconvolve` puts the IR peak at only ~46–64 ms (tap latency + propagation), so there is nothing else to keep, and REW's 125 ms left window is physically impossible here. **OPEN [NEEDS DATA]:** the 1500 ms figure should be re-derived against real room IR decay before implementation; if a bass-heavy untreated room needs more, the drawer's `n_c` ceiling moves with it.
+**Storage bound.** The full deconvolved IR is `next_power_of_two(recorded.len() + sweep.len())` — 524288 samples for a 5.5 s sweep at 48 kHz, i.e. ~2 MB/channel, ~37 MB for a 9-position stereo bundle. Store a bounded window around the peak instead: `[peak − min(64 ms, peak_index), peak + 1500 ms]` with a Tukey α = 0.25 taper on the stored edges, recorded in `stored_window`.
+
+> **AMENDED (2026-07-25, Stage 5), two ways — see `crates/paraeq-measure/src/store.rs`.**
+> (1) The pre-window shipped is **100 ms** (still clamped by `peak_index`), the
+> decision-engine spec's figure: it is the larger of the two, satisfies both
+> specs' stated reasons, and costs 7 KB per channel. (2) **The Tukey α = 0.25
+> is a defect, not a preference.** A Tukey α is a fraction of the *whole*
+> window, so α = 0.25 over a 1.6 s store is a **200 ms** ramp at each end —
+> which would consume the entire pre-peak region and another 100 ms past the
+> peak, destroying the direct arrival the window exists to centre on. Any α
+> large enough to matter is large enough to eat the peak. The taper is
+> therefore specified as a **duration** (`STORE_TAPER_MS = 10.0`), clamped to
+> half the realized pre-roll so it can never reach the peak. The `+1500 ms`
+> and its OPEN \[NEEDS DATA\] note below stand unchanged. Plan item 19. That is ~200 KB/channel, ~3.6 MB per bundle. The post-window figure is *derived from the drawer's domain, not picked*: the largest post-peak extent any in-scope decision can request is `n_c / f_min`, so a 1.5 s store bounds the FDW cycles domain at `n_c ≤ 20 × 1.5 = 30` — which comfortably contains the 15-cycle default and REW's usable range. The pre-window is not a choice: `deconvolve` puts the IR peak at only ~46–64 ms (tap latency + propagation), so there is nothing else to keep, and REW's 125 ms left window is physically impossible here. **OPEN [NEEDS DATA]:** the 1500 ms figure should be re-derived against real room IR decay before implementation; if a bass-heavy untreated room needs more, the drawer's `n_c` ceiling moves with it.
 
 **Invalidation tiers** — this is the contract the drawer's glyphs render:
 

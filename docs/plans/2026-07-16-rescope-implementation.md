@@ -4,10 +4,14 @@
 **Specs covered:** the six `docs/specs/2026-07-15-*.md` rescope specs
 (decision-engine, engine-hardening, measurement-safety, measurement-suite,
 room-dsp, wizard).
-**Status:** Stages 1 and 2 implemented (`feature/rescope-stage1` →
-`feature/rescope-stage2`, stacked, unmerged). Stage 2's merge-gated items
-(engine-hardening R1-1 engine half, R1-8, R1-6) and the Tier-4 REW corpus
-remain open — see the gates below.
+**Status:** Stages 1–5 implemented (`feature/rescope-stage1` → `-stage2` →
+`-stage3` → `-stage4` → `-stage5`, stacked, unmerged). Stage 2's merge-gated
+items (engine-hardening R1-1 engine half, R1-8, R1-6) and the Tier-4 REW
+corpus remain open — see the gates below. Stage 5 closed cross-spec question 2
+(the autofit shape) and is complete except for one blocked item: the
+`TapStatus` implementation over the live `TapSystem`, which needs
+`self_excluded` on `TapSystem` — an `EngineState` shape change frozen until
+the shell merge. Next: Stage 6.
 
 This plan sequences the six specs into seven stages. It exists because the
 specs cross-reference each other heavily (shared deliverables, ordering
@@ -117,7 +121,7 @@ drift-compensated); MS-14/18/23 `MeasurementSession` (abort ramp, RAII
 restore, ack gate); **the two-clock skew experiment the moment the aggregate
 exists** — every spec flags it as the biggest unpriced risk.
 
-### Stage 5 — Authority, room-safe autofit, level ladder, persistence
+### Stage 5 — Authority, room-safe autofit, level ladder, persistence *(done)*
 
 `authority.rs` (σ_full=1.0/σ_none=6.0 canonical; Trinnov excursion;
 Q_max=0.227·f0/A) + `auto_fit_room` (legacy `auto_fit_parametric_eq` stays
@@ -155,13 +159,24 @@ R7 ship (signed DMG, notarization, PLD 2024/2853 posture decision).
    (1) (re-derive), with R1-6's refuse-and-fail-open as the last-resort guard
    for configs that cannot be re-derived; see
    `docs/decisions/2026-07-21-decision-engine-open-questions.md` §Q1.
-2. **Authority-limited autofit shape (blocks Stage 5):** three different
-   shapes across specs (mutate `auto_fit_parametric_eq` / add
-   `auto_fit_parametric_eq_with_authority` / per-channel `auto_fit_room`).
-   Only the additive shape is compatible with frozen Tier-1 fixtures; names,
-   signatures, per-channel-ness, and which spec's constants win
-   (BOOST_WEIGHT, narrow-dip Q threshold, cut_limit) need one reconciled
-   definition.
+2. **Authority-limited autofit shape (blocked Stage 5): RESOLVED
+   (2026-07-25).** Three shapes were proposed — mutate `auto_fit_parametric_eq`
+   in place (decision-engine), add a mono
+   `auto_fit_parametric_eq_with_authority` (engine-hardening), add a
+   per-channel `auto_fit_room` (room-dsp). **room-dsp's `auto_fit_room` wins**,
+   on three non-preference grounds: in-place mutation breaks the frozen Tier-1
+   fixture, so it is out on this plan's own terms; of the two additive shapes
+   only the per-channel one matches the `PerChannel<T>` seam Stage 3 landed
+   *specifically* so the policy code would not be written mono and rewritten;
+   and a mono variant would need a per-channel wrapper anyway, i.e. two
+   signatures owning one policy. Reasoning is in `autofit.rs`'s module header.
+   Two documented deviations from room-dsp's literal signature: it takes
+   `min_valid_freq_hz` (the spec's own item 4 requires it and the signature
+   omits it) and returns `RoomFitReport` rather than a bare `Vec<EQBand>` (a
+   bare return makes `clamp_band`'s mandated clamp reporting unreachable from
+   its only caller). The **constants** are reconciled per-field in
+   `authority::AuthorityPolicy` and remain OPEN \[OWNER\] as values — see
+   items 15 and 16.
 3. **`TransducerClass` ownership + naming (blocks Stage 3 targets rework):**
    **Resolved** — enum in `paraeq-dsp` with variants `{Bookshelf,
    Floorstander, InEar, OverEar}`; `Headphone`/`Iem` become `display_name()`
@@ -264,6 +279,88 @@ type or in a test on the branch; none is invented policy.
     the losing spec, and let the `decide()` default be the single source. Lower
     stakes than the shelf (both bands sit above the modal region and below
     directivity); a desk call, not an ears call.
+
+## Open questions raised by implementing Stage 5
+
+15. **`boost_ratio` / `BOOST_WEIGHT`: resolved by LAYER, still open by VALUE.**
+    room-dsp defaults it to 0.5, engine-hardening calls it `BOOST_WEIGHT ≈ 0.5`
+    and marks it OPEN \[OWNER\], and decision-engine § Authority 5 says room
+    **auto mode** ships cut-only (`boost_ceiling` scaled to 0 "unless the user
+    raises it in the drawer"). Those stop conflicting once the layers separate:
+    `paraeq-dsp` owns the *mechanism* and ships 0.5
+    (`authority::DEFAULT_BOOST_RATIO`), and whether the room auto path passes
+    `boost_ratio = 0.0` is `decide()`'s Stage-6 policy call — expressible as a
+    value, not a second default. **Still OPEN \[OWNER\]:** the number itself
+    needs ears on real measurements. One named constant; a ruling costs one
+    line.
+16. **Narrow-dip veto: 1/6 octave wins, on a 2-of-3 majority.** room-dsp types
+    it as a width (`min_dip_width_oct`, default 1/6 oct) and decision-engine
+    § Authority 4 words it identically; engine-hardening words the same veto as
+    `Q > 3.0` and itself records that the two "must reconcile to one definition
+    together". The width form wins because two specs state it and the API is
+    typed that way. The difference is material, not rounding —
+    `authority::width_oct_for_q` makes the conversion exact: Q = 3 is 0.479
+    octave, 1/6 octave is Q = 8.65, so engine-hardening's is the **stricter**
+    threshold. Shipped at 1/6, **OPEN \[OWNER\]** (an ears call), and bounded
+    meanwhile: any dip surviving the veto is still gain-limited to
+    `boost_ratio·e(f)·w(f)` — at most 5 dB below 150 Hz, 1 dB above 500 Hz.
+    **Update the losing spec (engine-hardening) when this is ruled.**
+17. **The MS-17 chain-sensitivity envelope has no numbers in any spec.**
+    MS-17 requires a per-class envelope and refuses outside it, but states no
+    values, so `TransducerCaps::sensitivity_envelope_spl_per_dbfs` ships
+    engineering estimates (coupler 85–130, room 65–120 dB SPL per dBFS RMS).
+    **OPEN \[NEEDS DATA\]** — settle by measuring `S` on the EARS rig and on a
+    real room system, which Stage 5's headless run makes possible for the first
+    time. One end is *not* a guess and is pinned by
+    `test_ladder.rs::the_envelope_admits_every_chain_that_can_reach_target`:
+    the envelope must contain `spl_target_db − sweep_level_dbfs_rms` (104
+    coupler, 87 room), or this table would refuse chains the caps table calls
+    legal.
+18. **The input-gain SNR remedy cannot be expressed in dB.** MS-8's first
+    remedy is "raise the input gain", but a CoreAudio gain scalar is a
+    normalized 0..=1 register position, not dB, and the HAL exposes no way to
+    ask a device what one step of it is worth acoustically. Implemented as
+    `INPUT_GAIN_REMEDY_STEP = 0.1` of the register's travel followed by a
+    re-measure — what a human does — bounded by the 2-attempt budget.
+    **OPEN \[NEEDS DATA\].** Note also the MS-11 interaction the spec does not
+    call out: moving the gain off the cal's reference makes `PinnedGain::matches`
+    false and derates the emitted level by 6 dB, which helps only when the floor
+    is *electrical*. `Remedy::RaiseInputGain`'s docs state it; the caller must
+    either re-pin against a cal captured at the new gain or accept the derate.
+19. **IR storage window: reconciled to the superset; both specs need updating.**
+    decision-engine says `[peak−100 ms, peak+1100 ms]` with no taper; wizard
+    says `[peak−min(64 ms, peak_index), peak+1500 ms]` with a Tukey α = 0.25
+    taper. Shipped as **−100 / +1500 ms**: the larger pre-window satisfies both
+    stated reasons for free, and the wizard's post figure binds a domain
+    (`n_c ≤ 30`) the decision-engine's does not. **The taper is a spec defect,
+    not a preference:** a Tukey α is a fraction of the *whole* window, so
+    α = 0.25 over a 1.6 s store is a 200 ms ramp at each end — it would consume
+    the entire pre-peak region and another 100 ms past the peak, destroying the
+    direct arrival the window exists to centre on. Any α large enough to matter
+    is large enough to eat the peak, so the taper is specified as a **duration**
+    (`STORE_TAPER_MS = 10.0`), additionally clamped to half the realized
+    pre-roll. Wizard's `+1500 ms` stays **OPEN \[NEEDS DATA\]** as it already
+    was (re-derive against real room IR decay; if a bass-heavy untreated room
+    needs more, the drawer's `n_c` ceiling moves with it).
+20. **`serde_json` needed `float_roundtrip`, and this was a real defect.** The
+    default parser is speed-optimized and best-effort to ~15 significant
+    digits, so `f64 → JSON → f64` can land one ULP away — measured on this
+    workspace, a 957-point `AuthorityCurve` came back different in *every*
+    component vector. Two things in the design require exact reload: the
+    decision engine's idempotence property ("identical in every field except
+    that decision's `source`"), compared across the `fixtures/decide/` bundles,
+    and profile persistence, where a reloaded profile must re-`decide()` to the
+    same plan or Reanalyze is not deterministic. Enabled workspace-wide; costs
+    ~2× on float parsing, nowhere near a hot path. Nothing further needed —
+    recorded because it would have surfaced in Stage 6 as flaky fixtures.
+21. **`TapStatus` over the live `TapSystem` is BLOCKED, not skipped.** MS-6
+    requires `TapSystem` to expose `self_excluded: bool`, and
+    `MeasurementSession::begin` refuses without that witness — so no real
+    headless run is possible regardless of what else exists. It is an
+    `EngineState` shape change, which the branch strategy above freezes until
+    `feature/rust-port-tauri-shell` merges (it is the same deferral as
+    wizard/1). This is one more item riding on the owner's ears-on acceptance
+    run, which remains the single cheapest unblock in the program.
 
 ## REW comparison and the automate-with-an-override principle
 

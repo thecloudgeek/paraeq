@@ -543,11 +543,21 @@ The tier is a property of the `Decision`, not a lookup table in the caller, so t
 
 | Item | Format | Notes |
 |---|---|---|
-| Per-position IRs | f32 WAV via `hound`, one file per position per channel | Window: `[peak − 100 ms, peak + 1100 ms]` — see below |
+| Per-position IRs | f32 WAV via `hound`, one file per position per channel | Window: `[peak − 100 ms, peak + 1100 ms]` — see below; **shipped as `+1500 ms`**, see the amendment |
 | `CapturePlan` | serde JSON | Device UIDs, rates, sweep params, `self_excluded` |
 | Cal file | verbatim text + parsed metadata | Never normalized; re-parsed on load so a parser fix retro-fixes old profiles |
 | `Overrides` | serde JSON | The user's intent, replayable against a re-`decide()` |
 | Last `DecisionSet` | serde JSON | Cache + audit trail; recomputable from the above |
+
+> **AMENDED (2026-07-25, Stage 5) — the post-window is `+1500 ms`.** The
+> wizard spec derives its post figure from the drawer's FDW domain (the largest
+> post-peak extent any in-scope decision can request is `n_c / f_min`, so 1.5 s
+> bounds the cycles domain at `n_c ≤ 30`) — a constraint this section's
+> derivation does not bind. The larger number satisfies both, so it wins; the
+> `− 100 ms` pre-window below is unchanged and is the figure that won over the
+> wizard's 64 ms. Cost at the shipped window: ~307 KB per position per channel,
+> so a 9-position stereo room profile is ~5.5 MB rather than the ~4 MB below.
+> Plan item 19; implementation in `crates/paraeq-measure/src/store.rs`.
 
 **The storage window is derived, not guessed.** `[peak − 100 ms, peak + 1100 ms]` because: 100 ms of pre-peak comfortably covers the entire `left_window_ms` domain (the IR peak sits at only ~46–64 ms — tap latency plus propagation — so REW's 125 ms left window is *physically impossible* here and left windows clamp to `min(requested, peak_index)`); and +1100 ms covers the `right_window_ms` domain ceiling of 1000 ms with margin for the noise-floor tail. It also discards the Farina harmonic products, which for a 5 s 20 Hz–20 kHz sweep arrive at `dt₂ = T·ln2/ln(f₂/f₁) = 502 ms` **before** the peak — data we never want in a "linear" response. Size: ~1.2 s × 48 kHz × 4 bytes ≈ 230 KB per position per channel; a 9-position stereo room profile is ~4 MB.
 

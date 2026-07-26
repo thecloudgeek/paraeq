@@ -266,6 +266,23 @@ let score = if residual[i] < 0.0 { -residual[i] } else { residual[i] * BOOST_WEI
 
 **Note — the autofit *shape* these three constants live in is itself an open cross-spec reconciliation, not settled here.** Which function signature owns them (`auto_fit_parametric_eq` mutated in place / `auto_fit_parametric_eq_with_authority` added / a per-channel `auto_fit_room`) is tracked in `docs/plans/2026-07-16-rescope-implementation.md` (cross-spec question 2, blocks Stage 5). And room-dsp's Open Q4 (`boost_ratio = 0.5`, `min_dip_width_oct = 1/6`) is **the same decision** as this section's `BOOST_WEIGHT` and narrow-dip Q threshold — the two specs must reconcile to one definition together, not be tuned independently.
 
+> **RESOLVED (2026-07-25, Stage 5) — this section's API shape is superseded.**
+> Cross-spec question 2 settled on room-dsp's per-channel
+> `autofit::auto_fit_room`; `auto_fit_parametric_eq_with_authority` was **not**
+> built, and `auto_fit_parametric_eq` stays byte-identical exactly as this
+> section requires. The reasoning is in `crates/paraeq-dsp/src/autofit.rs`'s
+> module header and plan cross-spec question 2.
+>
+> The narrow-dip threshold above is also superseded **in form**: the shipped
+> veto is room-dsp's width (`min_dip_width_oct`, 1/6 octave), not this
+> section's `Q > 3.0`, because two of the three specs state the width and the
+> API is typed that way. The two are not equivalent —
+> `authority::width_oct_for_q` makes the conversion exact, and `Q > 3` is
+> **0.479 octave**, i.e. materially *stricter* than 1/6. The value stays
+> OPEN \[OWNER\]; if the owner's ears pick the stricter one, the change is
+> `DEFAULT_MIN_DIP_WIDTH_OCT = width_oct_for_q(3.0)` and this note comes out.
+> See plan items 15 and 16.
+
 *3. REW boost-Q cap* — `Q_max = 0.227 · f₀ / A`, `A = 10^(G/40)`, boosts only, replacing the blanket `0.5..=20.0` for positive-gain bands. Worked values:
 
 | f₀ | G | A | Q_max |
