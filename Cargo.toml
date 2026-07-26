@@ -31,6 +31,18 @@ realfft = "3.5"
 rtrb = "0.3"
 rustfft = "6.4"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `float_roundtrip` is not optional for this workspace. serde_json's default
+# float parser is speed-optimized and best-effort to ~15 significant digits, so
+# f64 -> JSON -> f64 can land one ULP away. Two things in the design depend on
+# that round-trip being exact: the decision engine's idempotence property
+# ("overriding a decision to the value auto already chose must produce a
+# DecisionSet identical in every field except that decision's source"), which
+# is compared across the `fixtures/decide/<case>/{bundle,expected}.json`
+# characterization bundles; and profile persistence, where a reloaded profile
+# must re-`decide()` to the same plan or `Reanalyze` is not deterministic.
+# Measured on this workspace: a 957-point AuthorityCurve round-trips with ULP
+# drift in every component vector without this feature, and exactly with it.
+# Costs ~2x on float parsing, which is nowhere near any hot path.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 thiserror = "2"
 trybuild = "1"
