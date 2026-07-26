@@ -269,9 +269,19 @@ fn fit_one_channel(
         .collect();
 
     let mut residual = correction_db.to_vec();
+    // The realized cascade so far, in dB, on the grid. THE authority ceiling is
+    // a property of the cascade, not of any one band: clamping each band
+    // individually lets a greedy loop place band after band at the same
+    // frequency, each inside the ceiling, summing to far outside it. Measured
+    // before this was added: a −24 dB modal peak at 60 Hz produced a realized
+    // −22.9 dB against a ±10 dB envelope, plus two spurious boosts on the
+    // shoulders it over-cut. The envelope is a driver-excursion limit, so
+    // exceeding it 2.3× is exactly the failure it exists to prevent.
+    let mut applied = vec![0.0f64; freqs.len()];
     for _ in 0..max_bands {
         let Some((idx, gain, q)) = pick_candidate(
             &residual,
+            &applied,
             freqs,
             authority,
             &mut admissible,
@@ -288,7 +298,7 @@ fn fit_one_channel(
         };
         let (clamped, clamps) = authority::clamp_band(&requested, authority);
         report.clamps.extend(clamps);
-        let Some((realized, _sos)) = authority::stabilize_band(&clamped, sample_rate) else {
+        let Some((stable, _sos)) = authority::stabilize_band(&clamped, sample_rate) else {
             // The Jury funnel gave up. Strike the bin so the loop advances,
             // count it, and keep fitting the rest of the curve — dropping one
             // band is a defect to report, not a reason to abandon the fit.
@@ -296,21 +306,143 @@ fn fit_one_channel(
             admissible[idx] = false;
             continue;
         };
+        // THE cascade gate. Everything above bounds one band; this bounds the
+        // sum, which is the only thing the driver and the headroom budget
+        // actually see.
+        let Some((realized, response)) = shrink_into_cascade(
+            &stable,
+            &applied,
+            authority,
+            freqs,
+            sample_rate,
+            min_gain_db,
+        ) else {
+            // No usable gain survives here — the ceiling is already spent at
+            // this feature. Strike the bin rather than emitting a filter that
+            // does nothing, and do not charge the band budget for it.
+            admissible[idx] = false;
+            continue;
+        };
+        if realized.gain_db != stable.gain_db {
+            report.clamps.push(
+                authority
+                    .at(freqs[idx])
+                    .gain_clamp(stable.gain_db, realized.gain_db),
+            );
+        }
         // Subtract what will actually run, not what was asked for: the greedy
         // loop's bookkeeping must track the realized cascade or every
         // subsequent pick is fitting a residual that does not exist.
-        let response = ParametricEQ {
-            bands: vec![realized.clone()],
-            sample_rate,
-        }
-        .frequency_response(freqs);
-        for (r, resp) in residual.iter_mut().zip(&response) {
-            let v = if resp.is_finite() { *resp } else { 0.0 };
-            *r -= v;
+        for ((r, a), resp) in residual.iter_mut().zip(applied.iter_mut()).zip(&response) {
+            *r -= resp;
+            *a += resp;
         }
         report.bands.push(realized);
     }
     Ok(report)
+}
+
+/// What is left of the ceiling at a bin, given `applied` dB of realized
+/// cascade already there.
+///
+/// `applied > 0` is boost already spent, so it eats boost headroom and *frees*
+/// cut headroom, and vice versa — which is why the cut term adds. Both are
+/// floored at zero.
+fn remaining_headroom(at: &authority::AuthorityAt, applied: f64) -> (f64, f64) {
+    (
+        (at.max_boost_db - applied).max(0.0),
+        (at.max_cut_db + applied).max(0.0),
+    )
+}
+
+/// Reduce `band`'s gain until adding it keeps the **whole cascade** inside the
+/// authority curve at every bin, and return it with its realized response.
+///
+/// This is the gate the per-band clamp cannot be. `clamp_band` bounds one
+/// filter at one frequency; the excursion envelope is a driver-excursion limit
+/// on what the *driver* sees, which is the sum. Two things defeat a per-band
+/// reading, and both were measured before this existed:
+///
+/// - **Restacking.** A residual deeper than the ceiling stays the top-scoring
+///   candidate after being partially corrected, so the greedy loop places band
+///   after band at the same frequency, each individually legal. A −24 dB modal
+///   peak at 60 Hz realized **−22.9 dB** against a ±10 dB envelope.
+/// - **Skirts.** Bounding only each band's own centre bin still lets
+///   neighbouring bands' skirts pile up in between; the same case then realized
+///   **−14.6 dB**. Only checking every bin catches this.
+///
+/// Bisection on a scale factor is valid because a peaking filter's dB response
+/// is monotone in its gain parameter at every frequency, so feasibility is
+/// monotone in the scale. `scale = 0` is feasible by construction (a 0 dB band
+/// contributes nothing and `applied` is inside the curve by induction), which
+/// is what makes the search total. Returns `None` when nothing at or above
+/// `min_gain_db` fits.
+fn shrink_into_cascade(
+    band: &EQBand,
+    applied: &[f64],
+    authority: &AuthorityCurve,
+    freqs: &[f64],
+    sample_rate: f64,
+    min_gain_db: f64,
+) -> Option<(EQBand, Vec<f64>)> {
+    /// Enough halvings to land within ~0.4% of the true limit on a 20 dB band.
+    const BISECTION_STEPS: usize = 12;
+    /// Bins are products of interpolations; a strict `<=` would reject a band
+    /// that lands exactly on the ceiling.
+    const CEILING_SLOP_DB: f64 = 1e-9;
+
+    let response_at = |gain_db: f64| -> Vec<f64> {
+        ParametricEQ {
+            bands: vec![EQBand {
+                gain_db,
+                ..band.clone()
+            }],
+            sample_rate,
+        }
+        .frequency_response(freqs)
+        .into_iter()
+        // A non-finite section response contributes nothing rather than
+        // poisoning the cascade — the same substitution `preamp_db` makes.
+        .map(|v| if v.is_finite() { v } else { 0.0 })
+        .collect()
+    };
+    let fits = |response: &[f64]| -> bool {
+        freqs.iter().zip(applied).zip(response).all(|((&f, a), r)| {
+            let at = authority.at(f);
+            let total = a + r;
+            total <= at.max_boost_db + CEILING_SLOP_DB && total >= -at.max_cut_db - CEILING_SLOP_DB
+        })
+    };
+
+    let full = response_at(band.gain_db);
+    if fits(&full) {
+        return Some((band.clone(), full));
+    }
+    // Largest feasible scale in (0, 1). `lo` is always feasible, `hi` never.
+    let (mut lo, mut hi) = (0.0f64, 1.0f64);
+    let mut best: Option<(f64, Vec<f64>)> = None;
+    for _ in 0..BISECTION_STEPS {
+        let mid = 0.5 * (lo + hi);
+        let gain = band.gain_db * mid;
+        let response = response_at(gain);
+        if fits(&response) {
+            lo = mid;
+            best = Some((gain, response));
+        } else {
+            hi = mid;
+        }
+    }
+    let (gain, response) = best?;
+    if gain.abs() < min_gain_db {
+        return None;
+    }
+    Some((
+        EQBand {
+            gain_db: gain,
+            ..band.clone()
+        },
+        response,
+    ))
 }
 
 /// Pick the next admissible candidate, applying the narrow-dip veto and
@@ -321,6 +453,7 @@ fn fit_one_channel(
 /// at least one bin, so the loop is bounded by the grid size.
 fn pick_candidate(
     residual: &[f64],
+    applied: &[f64],
     freqs: &[f64],
     authority: &AuthorityCurve,
     admissible: &mut [bool],
@@ -354,6 +487,22 @@ fn pick_candidate(
             return None;
         }
         let gain = residual[idx];
+        // Spent authority: this bin's ceiling has already been used up by the
+        // bands placed so far, so nothing useful can be added here. Strike it
+        // — without this the greedy loop re-picks the same bin every iteration
+        // (the residual barely moves once the clamp bites) and burns the whole
+        // band budget producing near-zero-gain filters.
+        let at = authority.at(freqs[idx]);
+        let (remaining_boost, remaining_cut) = remaining_headroom(&at, applied[idx]);
+        let remaining = if gain < 0.0 {
+            remaining_cut
+        } else {
+            remaining_boost
+        };
+        if remaining < min_gain_db {
+            admissible[idx] = false;
+            continue;
+        }
         if gain > 0.0 {
             // Narrow-dip veto (a pick-time refusal, not a gain clamp): measure
             // the dip's half-amplitude width and refuse anything narrower than

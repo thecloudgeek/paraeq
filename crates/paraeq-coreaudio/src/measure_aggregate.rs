@@ -774,13 +774,14 @@ impl paraeq_measure::StimulusSink for StimulusOutput {
         }
         let block_frames = self.format.frames_per_block.max(1);
         let mut written = 0usize;
+        let mut stall = StallGuard::new(&self.format);
         while written < block.len() {
             if self.producer.is_abandoned() {
                 return Err(MeasureError::Sink(
                     "measurement aggregate went away mid-emit".to_owned(),
                 ));
             }
-            let mut pushed_any = false;
+            let before = written;
             while written < block.len() {
                 // The realtime side never blocks, so a full ring means the
                 // device has not consumed yet — wait rather than drop. Dropping
@@ -790,23 +791,24 @@ impl paraeq_measure::StimulusSink for StimulusOutput {
                     break;
                 }
                 written += 1;
-                pushed_any = true;
             }
             if written >= block.len() {
                 break;
             }
-            if !pushed_any {
-                std::thread::sleep(block_sleep(&self.format));
-            }
+            stall.observe(written != before)?;
         }
         // Pace: hold until the device is within about one block of caught up.
+        let mut stall = StallGuard::new(&self.format);
+        let mut previous = self.queued_frames();
         while self.queued_frames() > block_frames {
             if self.producer.is_abandoned() {
                 return Err(MeasureError::Sink(
                     "measurement aggregate went away mid-emit".to_owned(),
                 ));
             }
-            std::thread::sleep(block_sleep(&self.format));
+            let now = self.queued_frames();
+            stall.observe(now < previous)?;
+            previous = now;
         }
         Ok(())
     }
@@ -820,6 +822,61 @@ impl paraeq_measure::StimulusSink for StimulusOutput {
     fn stop(&mut self) -> Result<(), MeasureError> {
         self.stopped = true;
         self.inner.flush.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// Bounds how long [`StimulusOutput::emit`] will wait on a device that has
+/// stopped consuming.
+///
+/// **Without a bound this is a hang, and the hang is the dangerous kind.**
+/// `emit` waits for the HAL to drain the ring; if the output device stalls
+/// without the IOProc being destroyed — so `is_abandoned` stays false —
+/// nothing ever changes and the wait never ends. The session polls its abort
+/// handle *between* `emit` calls, so a blocked `emit` means MS-14's "ramp to
+/// zero within one block of the trigger" never happens, `teardown` never runs,
+/// and the pre-measurement volume is never restored. "The system must never be
+/// left at measurement volume" is the invariant that would break.
+///
+/// Progress, not elapsed time, is the trigger: a slow device is fine, a
+/// *stopped* one is not. Any forward progress resets the count.
+struct StallGuard {
+    idle: usize,
+    limit: usize,
+    sleep: std::time::Duration,
+}
+
+impl StallGuard {
+    /// ~2 seconds of no progress at the device's own block cadence, floored so
+    /// a tiny block size cannot make the timeout trigger-happy.
+    const STALL_SECONDS: f64 = 2.0;
+
+    fn new(format: &StreamFormat) -> Self {
+        let sleep = block_sleep(format);
+        Self {
+            idle: 0,
+            limit: ((Self::STALL_SECONDS / sleep.as_secs_f64()).ceil() as usize).max(8),
+            sleep,
+        }
+    }
+
+    /// Record whether this iteration made progress, then wait. `Err` once the
+    /// device has been stationary for [`Self::STALL_SECONDS`].
+    fn observe(&mut self, progressed: bool) -> Result<(), MeasureError> {
+        if progressed {
+            self.idle = 0;
+        } else {
+            self.idle += 1;
+            if self.idle >= self.limit {
+                return Err(MeasureError::Sink(format!(
+                    "output device stopped consuming the stimulus for {:.1} s — \
+                     abandoning the emit so the session can tear down and restore \
+                     the pre-measurement volume",
+                    Self::STALL_SECONDS
+                )));
+            }
+        }
+        std::thread::sleep(self.sleep);
         Ok(())
     }
 }

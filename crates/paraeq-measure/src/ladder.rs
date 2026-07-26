@@ -39,8 +39,15 @@
 //! **Remedies are input gain and sweep length. Never output level.** REW is
 //! imperative and correct: *"If input levels are low DO NOT KEEP MAKING THE
 //! TEST SIGNAL LOUDER."* [`Remedy`] has no variant that could, and
-//! [`LevelLadder::solved_level_dbfs_rms`] is fixed at the solve and never
-//! moves — `test_ladder.rs` asserts it across a full remedy sequence.
+//! `test_ladder.rs` asserts across a full remedy sequence that the emitted
+//! level never rises.
+//!
+//! A remedy may, however, **invalidate** the solve, and one does:
+//! [`Remedy::RaiseInputGain`] leaves the acoustic output untouched but changes
+//! what the mic reads, so the measured sensitivity, the projected SPL, every
+//! rung's projection and the MS-11 pin all stop describing the live chain.
+//! The ladder drops the solve rather than letting a stale Sens Factor produce
+//! a plausible-looking SPL. See [`LevelLadder::confirm_input_gain`].
 
 use crate::cal::{margined_emit_dbfs, CalSummary, PinnedGain};
 use crate::diagnostic::{MeasurementDiagnostic, Refusal};
@@ -154,20 +161,11 @@ impl NoiseFloor {
         // The 1e-20 floor keeps digital silence finite: log10(0) is -inf, and
         // an infinite floor makes every later comparison lie.
         let broadband_dbfs = 10.0 * mean_square.max(1e-20).log10();
-        let (freqs_linear, mag_db) =
-            paraeq_dsp::fr::compute_frequency_response(samples, sample_rate, None)?;
-        let on_grid = resample_db_to_log_grid(
-            &freqs_linear,
-            &mag_db,
-            grid,
-            Prefilter::AntiComb { fraction: 48 },
-        )?;
-        let spectrum_db = smooth(&on_grid, grid, Smoothing::Fixed(SNR_SMOOTHING_FRACTION))?;
         Ok(Self {
             broadband_dbfs,
             duration_s: samples.len() as f64 / f64::from(sample_rate),
             freqs_hz: grid.freqs().to_vec(),
-            spectrum_db,
+            spectrum_db: analyze_magnitude_db(samples, sample_rate, grid)?,
         })
     }
 
@@ -256,6 +254,7 @@ pub struct Rung {
 /// reported as such rather than silently reordered.
 #[derive(Clone, Debug)]
 pub struct LevelLadder {
+    cal: CalSummary,
     class: TransducerClass,
     floor_accepted: bool,
     gain_remedy_used: bool,
@@ -310,6 +309,7 @@ impl LevelLadder {
         let class = cal.class();
         let max_len = caps_for(class).max_sweep_len_s;
         Self {
+            cal: cal.clone(),
             class,
             floor_accepted: false,
             gain_remedy_used: false,
@@ -331,13 +331,16 @@ impl LevelLadder {
 
     /// **Step 1.** Accept the silence capture, or refuse.
     ///
-    /// Two gates: at least [`NOISE_FLOOR_MIN_DURATION_S`] of silence, and a
-    /// broadband floor at or below [`NOISE_FLOOR_MAX_DBFS`]. Both are positive
-    /// requirements, so a NaN refuses.
+    /// Two gates, both positive requirements so a NaN refuses: at least
+    /// [`NOISE_FLOOR_MIN_DURATION_S`] of silence, and a broadband floor at or
+    /// below [`NOISE_FLOOR_MAX_DBFS`].
     ///
-    /// A too-short capture is an internal error rather than a room problem, so
-    /// it refuses as `SnrUnachievable` only after the level gate — the caller
-    /// sees the room's real problem first when there is one.
+    /// Both refuse with the same diagnostic, `SnrUnachievable`, and the two are
+    /// not distinguished. That is a wart worth naming: a too-short capture is
+    /// an internal sequencing error, not a noisy room, and the user is told to
+    /// close a window either way. It is left as-is because the caller controls
+    /// the capture length and a short one is its bug to fix, not the user's —
+    /// but a future `MeasurementDiagnostic` variant would be the honest fix.
     pub fn accept_noise_floor(&mut self, floor: &NoiseFloor) -> Result<(), Refusal> {
         let quiet =
             floor.broadband_dbfs.is_finite() && floor.broadband_dbfs <= NOISE_FLOOR_MAX_DBFS;
@@ -470,10 +473,16 @@ impl LevelLadder {
     /// **MS-8.** Evaluate the SNR gate over `band_hz`, and pick a remedy if it
     /// misses.
     ///
-    /// `sweep_magnitude_db` and the floor's spectrum must be on the same grid
-    /// (both come from [`NoiseFloor::measure`]'s grid). `SNR(f)` is their
-    /// difference; the median and minimum are taken over the in-band bins
-    /// only.
+    /// **`sweep_magnitude_db` must come from [`analyze_magnitude_db`]**, the
+    /// same function [`NoiseFloor::measure`] uses — not from a bare
+    /// `compute_frequency_response`. `SNR(f)` is a *difference* of two levels,
+    /// so it is meaningless unless both were measured on one scale, and a raw
+    /// FFT magnitude scales with capture length: a 1 s floor against a 5 s
+    /// sweep overstates SNR by ~6.6 dB, in the direction that promotes a
+    /// should-have-warned measurement to a clean accept. See
+    /// [`analyze_magnitude_db`] for the normalization and the measurement.
+    ///
+    /// The median and minimum are taken over the in-band bins only.
     ///
     /// Calling this **applies** the remedy it returns — the gain or the length
     /// is updated in place and the attempt is counted — so the caller re-runs
@@ -549,6 +558,21 @@ impl LevelLadder {
         self.input_gain
     }
 
+    /// Record the input gain the device actually settled on, re-pin against
+    /// the cal (MS-11), and invalidate any solve.
+    ///
+    /// [`Remedy::RaiseInputGain`] *requests* a gain; a real device quantizes
+    /// (1/16 steps are common), so the caller sets it, reads it back, and tells
+    /// the ladder what it got. Call this even when the read-back matches the
+    /// request — it is the acknowledgement that the change happened.
+    ///
+    /// Always invalidates the solve, for the reason the remedy does: a new
+    /// input gain is a new sensitivity, and re-using the old one would compute
+    /// SPL through a Sens Factor that no longer describes the chain.
+    pub fn confirm_input_gain(&mut self, read_back: f64) {
+        self.apply_input_gain(read_back);
+    }
+
     /// How many of the [`MAX_REMEDIES`] attempts have been spent.
     pub fn remedies_used(&self) -> usize {
         self.remedies_used
@@ -581,6 +605,14 @@ impl LevelLadder {
     /// Only an *applied* remedy consumes an attempt. A gain already at 1.0 is
     /// not a spent attempt, it is an unavailable option, and charging the
     /// budget for it would spend the length remedy without ever trying it.
+    /// Adopt a new input gain: re-pin against the cal so MS-11's derate is
+    /// judged against the gain now in force, and drop the solve.
+    fn apply_input_gain(&mut self, gain: f64) {
+        self.input_gain = gain;
+        self.pin = self.cal.pin_gain(gain);
+        self.solve = None;
+    }
+
     fn next_remedy(&mut self) -> Option<Remedy> {
         if self.remedies_used >= MAX_REMEDIES {
             return None;
@@ -588,9 +620,17 @@ impl LevelLadder {
         if !self.gain_remedy_used && self.input_gain.is_finite() && self.input_gain < 1.0 {
             let from = self.input_gain;
             let to = (from + INPUT_GAIN_REMEDY_STEP).min(1.0);
-            self.input_gain = to;
             self.gain_remedy_used = true;
             self.remedies_used += 1;
+            // Moving the input gain invalidates the solve, and quietly: the
+            // acoustic output does not change, but the MIC's reading of it
+            // does, so the measured sensitivity, the projected SPL, every
+            // rung's projection and the MS-11 pin are all now about a chain
+            // that no longer exists. Nothing downstream can notice on its own
+            // — an SPL computed through a stale Sens Factor is a plausible
+            // number, not an obviously broken one — so the ladder drops the
+            // solve and makes the caller redo it.
+            self.apply_input_gain(to);
             return Some(Remedy::RaiseInputGain { from, to });
         }
         let max_len = caps_for(self.class).max_sweep_len_s;
@@ -606,6 +646,97 @@ impl LevelLadder {
         }
         None
     }
+}
+
+/// The **one** magnitude analysis both sides of the SNR gate must go through:
+/// `20·log10(|X_k| / √N)`, resampled onto `grid` and 1/6-octave smoothed.
+///
+/// # Why the `√N`, and why this is a shared function rather than a comment
+///
+/// A raw rfft magnitude scales with the capture length, so two captures of the
+/// *same* acoustic scene analyzed over different durations land at different
+/// levels — and `SNR(f) = sweep(f) − floor(f)` is then wrong by that
+/// difference. Measured on this crate before the normalization existed: the
+/// same synthetic noise floor read **6.6 dB lower over 1 s than over 5 s**
+/// (tracking `10·log10(5) = 7.0`). A one-second floor against a five-second
+/// sweep therefore *overstated* SNR by ~6.6 dB — the unsafe direction, since it
+/// silently promotes a measurement that should have warned or triggered a
+/// remedy into a clean accept.
+///
+/// `√N` is the right divisor rather than `N`: broadband noise has
+/// `E|X_k| ∝ a·√N`, so dividing by `√N` makes the **noise floor**
+/// length-invariant. Coherent content still gains `√N` at the bin level —
+/// measured +3.4 dB per doubling on a raw tone, matching the 3 dB
+/// [`Remedy::ExtendSweep`] buys. Note the 1/6-octave smoothing below then
+/// averages that narrowband gain away by design, so **do not read this as a
+/// per-bin coherent-gain meter**; it is a smoothed level, which is what the
+/// spec defines the SNR criterion on.
+///
+/// # The neighbourhood average is in the POWER domain, deliberately
+///
+/// `logf::resample_db_to_log_grid`'s `AntiComb` prefilter averages the values
+/// it is handed, so handing it dB would take a *geometric* mean of amplitudes
+/// — which under-reports peaks badly (measured −8.3 dB on a tone). For a noise
+/// floor that is not a rounding error but a safety inversion: real room floors
+/// are dominated by **tonal** components (mains hum and its harmonics, fan
+/// whine), a dB-domain average would read those several dB low, and an
+/// understated floor **overstates** SNR — promoting a hum-swamped band past
+/// the `min ≥ 20 dB` criterion that exists to catch exactly it. So the
+/// resampler is fed linear power and the result converted back, which makes
+/// the neighbourhood average an energy average.
+///
+/// This is a function, not a documented convention, because a convention only
+/// one side follows is the bug it is meant to prevent.
+pub fn analyze_magnitude_db(
+    samples: &[f64],
+    sample_rate: u32,
+    grid: &LogGrid,
+) -> Result<Vec<f64>, DspError> {
+    if samples.is_empty() {
+        return Err(DspError::InvalidInput(
+            "analyze_magnitude_db: empty capture".to_owned(),
+        ));
+    }
+    if sample_rate == 0 {
+        return Err(DspError::InvalidInput(
+            "analyze_magnitude_db: sample rate is 0".to_owned(),
+        ));
+    }
+    if samples.iter().any(|v| !v.is_finite()) {
+        return Err(DspError::InvalidInput(
+            "analyze_magnitude_db: capture contains non-finite samples".to_owned(),
+        ));
+    }
+    let (freqs_linear, mag_db) =
+        paraeq_dsp::fr::compute_frequency_response(samples, sample_rate, None)?;
+    // |X_k| / sqrt(N), carried as POWER for the resample (see the header).
+    let norm_db = 10.0 * (samples.len() as f64).log10();
+    let power: Vec<f64> = mag_db
+        .iter()
+        .map(|v| 10f64.powf((v - norm_db) / 10.0))
+        .collect();
+    // Resample onto the log grid BEFORE smoothing: the boxcar is O(N²), and
+    // over the ~24 000 rfft bins of a one-second capture at 48 kHz that is
+    // 576 M iterations for a result that has to be resampled anyway.
+    //
+    // `resample_db_to_log_grid` is used here as the plain scalar resampler it
+    // is — its `AntiComb` arm averages whatever values it is handed, and what
+    // this needs averaged is power, not dB. The name says `db` because dB is
+    // its only other caller's domain; feeding it power is what makes the
+    // neighbourhood average an ENERGY average, which is the whole point.
+    let on_grid = resample_db_to_log_grid(
+        &freqs_linear,
+        &power,
+        grid,
+        Prefilter::AntiComb { fraction: 48 },
+    )?;
+    // Back to dB, with the same 1e-10 floor convention `fr` uses so a silent
+    // bin is a finite number rather than -inf.
+    let on_grid_db: Vec<f64> = on_grid
+        .iter()
+        .map(|p| 10.0 * p.max(1e-20).log10())
+        .collect();
+    smooth(&on_grid_db, grid, Smoothing::Fixed(SNR_SMOOTHING_FRACTION))
 }
 
 /// The band the SNR gate is evaluated over, per class.

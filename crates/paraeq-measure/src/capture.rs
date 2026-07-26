@@ -61,6 +61,7 @@ pub struct CaptureMeter {
     clipped_blocks: u64,
     clipped_samples: u64,
     decay: f64,
+    non_finite_samples: u64,
     peak: f64,
 }
 
@@ -77,6 +78,7 @@ impl CaptureMeter {
             clipped_blocks: 0,
             clipped_samples: 0,
             decay: 10f64.powf(-PEAK_DECAY_DB_PER_BLOCK / 20.0),
+            non_finite_samples: 0,
             peak: 0.0,
         }
     }
@@ -85,10 +87,16 @@ impl CaptureMeter {
     /// this block trips REW's 30% rule — a **blocking** diagnostic, so the
     /// caller aborts rather than warns.
     ///
-    /// Non-finite samples are counted as clipped rather than ignored. A NaN is
-    /// not a quiet sample: `NaN > peak` is false, which is exactly how a NaN
-    /// storm reads to the engine's watchdog as silence today, and the whole
-    /// point of a separate capture meter is not to inherit that.
+    /// Non-finite samples are counted as clipped **and** separately as
+    /// non-finite. Folding them into the clip count is what stops a NaN storm
+    /// reading as silence — `NaN > peak` is false, which is exactly how the
+    /// engine's watchdog mistakes one for an unplugged source today, and not
+    /// inheriting that is the whole point of a separate capture meter.
+    ///
+    /// But they are not the same condition, and the diagnostic they raise
+    /// tells the user to turn the input gain down, which does nothing about a
+    /// NaN. [`Self::non_finite_samples`] lets a caller tell "your input is too
+    /// hot" from "something upstream is broken" before rendering that advice.
     pub fn observe(&mut self, block: &[f64]) -> Option<MeasurementDiagnostic> {
         self.blocks += 1;
         self.peak *= self.decay;
@@ -96,8 +104,14 @@ impl CaptureMeter {
             return None;
         }
         let mut clipped = 0u64;
+        let mut non_finite = 0u64;
         for &v in block {
-            if !v.is_finite() || v.abs() >= CLIP_THRESHOLD {
+            if !v.is_finite() {
+                non_finite += 1;
+                clipped += 1;
+                continue;
+            }
+            if v.abs() >= CLIP_THRESHOLD {
                 clipped += 1;
                 continue;
             }
@@ -107,6 +121,7 @@ impl CaptureMeter {
             }
         }
         self.clipped_samples += clipped;
+        self.non_finite_samples += non_finite;
         if clipped as f64 > CLIP_BLOCK_FRACTION * block.len() as f64 {
             self.clipped_blocks += 1;
             return Some(MeasurementDiagnostic::InputClipping);
@@ -124,9 +139,16 @@ impl CaptureMeter {
         self.clipped_blocks
     }
 
-    /// Clipped samples since the last [`Self::reset_clips`].
+    /// Clipped samples since the last [`Self::reset_clips`], including the
+    /// non-finite ones (see [`Self::observe`]).
     pub fn clipped_samples(&self) -> u64 {
         self.clipped_samples
+    }
+
+    /// Non-finite samples since the last [`Self::reset_clips`] — the subset of
+    /// [`Self::clipped_samples`] that is a defect rather than a hot input.
+    pub fn non_finite_samples(&self) -> u64 {
+        self.non_finite_samples
     }
 
     /// The decayed peak, dBFS. Digital silence reads `f64::NEG_INFINITY`
@@ -151,6 +173,7 @@ impl CaptureMeter {
     pub fn reset_clips(&mut self) {
         self.clipped_blocks = 0;
         self.clipped_samples = 0;
+        self.non_finite_samples = 0;
     }
 }
 

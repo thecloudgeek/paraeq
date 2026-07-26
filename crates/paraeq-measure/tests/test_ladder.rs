@@ -458,7 +458,8 @@ fn the_remedy_sequence_is_input_gain_then_length_then_refuse() {
 #[test]
 fn remedies_never_touch_the_output_level() {
     // REW's imperative, as a test: "If input levels are low DO NOT KEEP MAKING
-    // THE TEST SIGNAL LOUDER."
+    // THE TEST SIGNAL LOUDER." A remedy may invalidate the solve — raising the
+    // input gain does, see below — but it may never RAISE the emitted level.
     let class = TransducerClass::OverEar;
     let mut ladder = LevelLadder::new(&cal(class), 0.5, 2.0);
     ladder.accept_noise_floor(&floor_at(-80.0, 2.0)).unwrap();
@@ -468,12 +469,64 @@ fn remedies_never_touch_the_output_level() {
     let sweep = sweep_at_snr(&floor, 10.0, 0.0, 0);
     for _ in 0..MAX_REMEDIES + 1 {
         let _ = ladder.evaluate_snr(&sweep, &floor, snr_band_hz(class));
-        assert_eq!(
-            ladder.solved_level_dbfs_rms(),
-            Some(before),
-            "a remedy moved the output level"
-        );
+        if let Some(after) = ladder.solved_level_dbfs_rms() {
+            assert!(
+                after <= before,
+                "a remedy raised the output level: {before} -> {after}"
+            );
+        }
+        // Re-solving on the same chain must not drift upward either.
+        if ladder.solved_level_dbfs_rms().is_none() {
+            let again = ladder.solve(pilot_reading_for(104.0)).expect("re-solve");
+            assert!(again.solved_dbfs_rms <= before + 1e-9);
+        }
     }
+}
+
+#[test]
+fn raising_the_input_gain_invalidates_the_solve_and_re_pins() {
+    // Moving the input gain does not change the acoustic output, but it does
+    // change what the MIC reads — so the measured sensitivity, the projected
+    // SPL, every rung's projection and the MS-11 pin all now describe a chain
+    // that no longer exists. An SPL computed through a stale Sens Factor is a
+    // plausible number, not an obviously broken one, so nothing downstream can
+    // notice on its own: the ladder must drop the solve itself.
+    let class = TransducerClass::OverEar;
+    let mut ladder = LevelLadder::new(&cal(class), 0.5, 2.0);
+    ladder.accept_noise_floor(&floor_at(-80.0, 2.0)).unwrap();
+    ladder.solve(pilot_reading_for(104.0)).expect("in-envelope");
+    assert!(ladder.solved_level_dbfs_rms().is_some());
+
+    let floor = floor_at(-80.0, 2.0);
+    let sweep = sweep_at_snr(&floor, 10.0, 0.0, 0);
+    match ladder.evaluate_snr(&sweep, &floor, snr_band_hz(class)) {
+        Ok(SnrOutcome::Remedy {
+            remedy: Remedy::RaiseInputGain { .. },
+            ..
+        }) => {}
+        other => panic!("expected a gain remedy, got {other:?}"),
+    }
+    assert!(
+        ladder.solved_level_dbfs_rms().is_none(),
+        "the solve must be dropped, not silently reused"
+    );
+    assert!(
+        ladder.rungs().is_err(),
+        "and the rung plan with it — every projection was against the old \
+         sensitivity"
+    );
+
+    // The gain read-back the device actually settled on re-pins MS-11: the cal
+    // was captured at 1.0, the chain is now elsewhere, so the derate applies.
+    ladder.confirm_input_gain(0.6);
+    let re_solved = ladder.solve(pilot_reading_for(104.0)).expect("re-solve");
+    let caps = caps_for(class);
+    assert!(
+        (re_solved.projected_spl_db - (caps.spl_target_db - 6.0)).abs() < 1e-9,
+        "a gain that disagrees with the cal reference must carry the 6 dB \
+         MS-11 derate into the projection, got {}",
+        re_solved.projected_spl_db
+    );
 }
 
 #[test]
@@ -569,4 +622,95 @@ fn the_snr_band_starts_at_the_classs_sweep_start_where_one_exists() {
             None => assert_eq!(lo, 20.0, "{class:?} f_start is per-DUT; SNR uses 20 Hz"),
         }
     }
+}
+
+// ───────────────── the SNR gate's common scale (review regression) ───────────
+
+/// Deterministic pseudo-noise at a known amplitude, `n` samples long.
+fn noise(n: usize, amp: f64) -> Vec<f64> {
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    (0..n)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            amp * ((state >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0)
+        })
+        .collect()
+}
+
+#[test]
+fn the_floor_spectrum_is_capture_length_invariant() {
+    // SNR is a DIFFERENCE of two levels, so it is meaningless unless both were
+    // measured on one scale — and a raw FFT magnitude scales with capture
+    // length. Measured before `analyze_magnitude_db` normalized by sqrt(N):
+    // the same acoustic floor read 6.6 dB lower over 1 s than over 5 s
+    // (tracking 10*log10(5) = 7.0), so a 1 s floor against a 5 s sweep
+    // OVERSTATED SNR by that much — the direction that promotes a
+    // should-have-warned measurement into a clean accept.
+    let grid = LogGrid::standard();
+    let one = NoiseFloor::measure(&noise(48_000, 0.001), 48_000, &grid).expect("1 s");
+    let five = NoiseFloor::measure(&noise(240_000, 0.001), 48_000, &grid).expect("5 s");
+
+    let deltas: Vec<f64> = one
+        .spectrum_db()
+        .iter()
+        .zip(five.spectrum_db())
+        .map(|(a, b)| b - a)
+        .collect();
+    let mean = deltas.iter().sum::<f64>() / deltas.len() as f64;
+    assert!(
+        mean.abs() < 1.0,
+        "the floor spectrum is not length-invariant: {mean:.3} dB of shift for \
+         the same acoustic floor"
+    );
+    assert!(
+        (one.broadband_dbfs() - five.broadband_dbfs()).abs() < 0.1,
+        "the broadband figure was always length-invariant; it must stay so"
+    );
+}
+
+#[test]
+fn the_floor_estimate_sees_tonal_noise() {
+    // Real room floors are dominated by TONAL components — mains hum and its
+    // harmonics, fan whine — and they are exactly what the `min >= 20 dB`
+    // criterion exists to catch. `logf`'s AntiComb prefilter averages whatever
+    // values it is handed, so feeding it dB takes a geometric mean of
+    // amplitudes and buries peaks: measured, a 60 Hz hum read **13.4 dB low**
+    // that way. An understated floor OVERSTATES SNR, so the analysis feeds the
+    // resampler power instead, making the neighbourhood average an energy
+    // average.
+    let rate = 48_000u32;
+    let n = 96_000usize;
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let samples: Vec<f64> = (0..n)
+        .map(|i| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let broadband = 0.0002 * ((state >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0);
+            let hum =
+                0.002 * (2.0 * std::f64::consts::PI * 60.0 * i as f64 / f64::from(rate)).sin();
+            broadband + hum
+        })
+        .collect();
+    let grid = LogGrid::standard();
+    let spectrum =
+        paraeq_measure::ladder::analyze_magnitude_db(&samples, rate, &grid).expect("valid capture");
+    let at = |f: f64| {
+        let i = grid
+            .freqs()
+            .iter()
+            .enumerate()
+            .min_by(|a, b| (a.1 - f).abs().total_cmp(&(b.1 - f).abs()))
+            .map(|(i, _)| i)
+            .expect("bin");
+        spectrum[i]
+    };
+    assert!(
+        at(60.0) - at(2000.0) > 10.0,
+        "the floor estimate must SEE the hum: only {:.2} dB above the clean \
+         band at 2 kHz",
+        at(60.0) - at(2000.0)
+    );
 }

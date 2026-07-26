@@ -258,3 +258,17 @@ fn a_source_failure_propagates_rather_than_being_swallowed() {
     let mut meter = CaptureMeter::new();
     assert!(record(&mut source, 4096, &mut meter, &AbortHandle::new()).is_err());
 }
+
+#[test]
+fn non_finite_samples_are_counted_apart_from_hot_ones() {
+    // Folding NaN into the clip count is what stops a NaN storm reading as
+    // silence, but the two are not the same condition and the clipping
+    // diagnostic's advice ("turn the input gain down") does nothing about a
+    // NaN. A caller must be able to tell them apart before rendering it.
+    let mut meter = CaptureMeter::new();
+    meter.observe(&[f64::NAN, 1.0, 0.1, 0.1]);
+    assert_eq!(meter.clipped_samples(), 2, "both count as clipped");
+    assert_eq!(meter.non_finite_samples(), 1, "only one is a defect");
+    meter.reset_clips();
+    assert_eq!(meter.non_finite_samples(), 0);
+}

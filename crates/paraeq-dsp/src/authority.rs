@@ -242,11 +242,13 @@ impl AuthorityCurve {
         let n = self.freqs.len();
         // The `is_finite` arm is load-bearing, not defensive noise: a NaN
         // reaches `partition_point` with every predicate false, `j` is 0, and
-        // `j - 1` underflows. Clamping NaN to the first bin instead is the
-        // conservative direction (the lowest frequency has the *most*
-        // authority, so a caller that got here with a NaN sees a real ceiling
-        // rather than a panic — and `clamp_band` refuses non-finite bands
-        // before they ever reach here).
+        // `j - 1` underflows. It resolves to the first bin — which is the most
+        // PERMISSIVE answer on this curve, since the excursion envelope is
+        // widest at the lowest frequency. That is acceptable only because it
+        // is unreachable in practice: `clamp_band` refuses a non-finite band
+        // before calling this, and `auto_fit_room` only ever queries grid
+        // frequencies. It is a panic guard, not a safety policy — do not start
+        // relying on it as one.
         if n == 1 || !freq_hz.is_finite() || freq_hz <= self.freqs[0] {
             return (0, 0, 0.0);
         }
@@ -346,6 +348,34 @@ pub struct AuthorityAt {
     pub max_boost_db: f64,
     pub max_cut_db: f64,
     pub sigma_db: f64,
+}
+
+impl AuthorityAt {
+    /// Whether the σ gate — rather than the excursion envelope — is what
+    /// lowered the ceiling here.
+    ///
+    /// The attribution rule, in one place, because two callers need it and a
+    /// second copy is a second answer: [`clamp_band`] and
+    /// [`crate::autofit::auto_fit_room`]'s cumulative-headroom clamp both label
+    /// their `Clamp`s with it. Compared with a relative tolerance because both
+    /// sides are products of interpolations, so exact equality would
+    /// misattribute on roundoff.
+    pub fn throttled_by_sigma(&self) -> bool {
+        self.max_cut_db < self.excursion_db * (1.0 - 1e-12)
+    }
+
+    /// The `Clamp` variant describing a gain change at this frequency.
+    pub fn gain_clamp(&self, from: f64, to: f64) -> Clamp {
+        if self.throttled_by_sigma() {
+            Clamp::GainToSigma {
+                from,
+                to,
+                sigma_db: self.sigma_db,
+            }
+        } else {
+            Clamp::GainToExcursion { from, to }
+        }
+    }
 }
 
 /// Compose the ceiling. Order matters and is the spec's:
@@ -538,22 +568,7 @@ pub fn clamp_band(band: &EQBand, authority: &AuthorityCurve) -> (EQBand, Vec<Cla
     let at = authority.at(band.fc);
     let gain = band.gain_db.clamp(-at.max_cut_db, at.max_boost_db);
     if gain != band.gain_db {
-        // The σ gate bit iff it actually reduced the envelope here. Compared
-        // with a relative tolerance because both sides are products of
-        // interpolations, so exact equality would misattribute on roundoff.
-        let throttled = at.max_cut_db < at.excursion_db * (1.0 - 1e-12);
-        clamps.push(if throttled {
-            Clamp::GainToSigma {
-                from: band.gain_db,
-                to: gain,
-                sigma_db: at.sigma_db,
-            }
-        } else {
-            Clamp::GainToExcursion {
-                from: band.gain_db,
-                to: gain,
-            }
-        });
+        clamps.push(at.gain_clamp(band.gain_db, gain));
     }
     out.gain_db = gain;
 

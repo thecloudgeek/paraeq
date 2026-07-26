@@ -714,6 +714,86 @@ fn the_legacy_coupler_fit_is_untouched() {
     assert_eq!(legacy[0].filter_type, FilterType::Peaking);
 }
 
+/// The realized cascade at every grid bin, in dB.
+fn cascade_db(bands: &[EQBand], grid: &LogGrid) -> Vec<f64> {
+    paraeq_dsp::peq::ParametricEQ {
+        bands: bands.to_vec(),
+        sample_rate: SR,
+    }
+    .frequency_response(grid.freqs())
+}
+
+/// Assert the whole fit stays inside the curve everywhere — not band by band.
+fn assert_cascade_inside(report: &RoomFitReport, curve: &AuthorityCurve, grid: &LogGrid) {
+    let cascade = cascade_db(&report.bands, grid);
+    for (&f, &total) in grid.freqs().iter().zip(&cascade) {
+        let at = curve.at(f);
+        assert!(
+            total <= at.max_boost_db + 0.05 && total >= -at.max_cut_db - 0.05,
+            "cascade is {total:.3} dB at {f:.1} Hz, outside \
+             [{:.3}, {:.3}] — the excursion envelope bounds what the DRIVER \
+             sees, which is the sum, not any one band",
+            -at.max_cut_db,
+            at.max_boost_db
+        );
+    }
+}
+
+#[test]
+fn the_cascade_stays_inside_the_ceiling_not_just_each_band() {
+    // Review regression. A residual deeper than the ceiling stays the
+    // top-scoring candidate after being partially corrected, so a per-band
+    // clamp lets the greedy loop stack legal bands into an illegal cascade.
+    // Measured before the fix: -22.9 dB realized against a +-10 dB envelope,
+    // plus two spurious boosts on the shoulders it over-cut. Bounding only
+    // each band's own centre bin still gave -14.6 dB (neighbouring skirts).
+    let grid = LogGrid::standard();
+    let f0 = grid.freqs()[nearest_bin(&grid, 60.0)];
+    let residual: Vec<f64> = gaussian_residual(&grid, f0, 24.0, 0.5)
+        .iter()
+        .map(|v| -v)
+        .collect();
+    let curve = curve_at_sigma(0.5);
+    let report = fit(&residual, &curve, 6);
+
+    assert_cascade_inside(&report, &curve, &grid);
+    let cascade = cascade_db(&report.bands, &grid);
+    let deepest = cascade.iter().cloned().fold(f64::INFINITY, f64::min);
+    assert!(
+        deepest < -9.0,
+        "and it must still USE the authority it has, got {deepest:.3} dB"
+    );
+    assert!(
+        report.bands.iter().all(|b| b.gain_db < 0.0),
+        "a pure measured peak must not produce boosts: {:?}",
+        report.bands
+    );
+}
+
+#[test]
+fn a_spent_ceiling_does_not_burn_the_band_budget() {
+    // The other half: once the ceiling is used up at a feature, the loop must
+    // strike it rather than emitting near-zero-gain filters until max_bands
+    // runs out.
+    let grid = LogGrid::standard();
+    let f0 = grid.freqs()[nearest_bin(&grid, 60.0)];
+    let residual: Vec<f64> = gaussian_residual(&grid, f0, 30.0, 0.4)
+        .iter()
+        .map(|v| -v)
+        .collect();
+    let report = fit(&residual, &curve_at_sigma(0.5), 8);
+    assert!(
+        report.bands.len() <= 3,
+        "one feature at a spent ceiling should not consume 8 bands: {:?}",
+        report.bands
+    );
+    assert!(
+        report.bands.iter().all(|b| b.gain_db.abs() >= 1.0),
+        "no band may be emitted below min_gain_db: {:?}",
+        report.bands
+    );
+}
+
 // ──────────────────────────────── properties ─────────────────────────────────
 
 proptest! {
@@ -751,6 +831,17 @@ proptest! {
             );
         }
         prop_assert_eq!(report.dropped, 0, "the Q cap should make drops impossible");
+        // The invariant the per-band check above CANNOT see: the driver sees
+        // the sum. This is the property that caught the restacking bug.
+        let cascade = cascade_db(&report.bands, &grid);
+        for (&f, &total) in grid.freqs().iter().zip(&cascade) {
+            let at = curve.at(f);
+            prop_assert!(
+                total <= at.max_boost_db + 0.05 && total >= -at.max_cut_db - 0.05,
+                "cascade {} dB at {} Hz outside [{}, {}]",
+                total, f, -at.max_cut_db, at.max_boost_db
+            );
+        }
     }
 
     /// Termination and the band budget: vetoes and zero-authority bins must

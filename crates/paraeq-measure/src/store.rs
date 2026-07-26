@@ -164,6 +164,16 @@ pub enum StoreError {
     },
     #[error("impulse response is empty, or its peak index {peak} is outside its {len} samples")]
     PeakOutOfRange { len: usize, peak: usize },
+    #[error(
+        "stored WAV at {path} holds {found} samples but the manifest window \
+         describes {expected} — the manifest and the file disagree about which \
+         capture this is"
+    )]
+    WindowMismatch {
+        expected: usize,
+        found: usize,
+        path: PathBuf,
+    },
     #[error("WAV I/O at {path}: {source}")]
     Wav {
         path: PathBuf,
@@ -316,6 +326,18 @@ impl IrStore {
             path: path.clone(),
             source,
         })?;
+        // The window comes from the manifest and the samples from the file;
+        // if they disagree, `peak_in_store` points somewhere that is not the
+        // peak and every gate downstream is applied to the wrong time origin.
+        // A wrong t=0 produces a plausible correction, not a visible failure,
+        // so this refuses rather than trusting either side.
+        if samples.len() != window.len {
+            return Err(StoreError::WindowMismatch {
+                expected: window.len,
+                found: samples.len(),
+                path,
+            });
+        }
         Ok(StoredIr {
             channel,
             position,

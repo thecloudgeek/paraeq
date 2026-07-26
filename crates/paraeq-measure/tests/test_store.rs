@@ -308,3 +308,25 @@ fn a_stored_position_costs_what_the_spec_says_it_does() {
         "a stored position should be ~307 KB, got {bytes}"
     );
 }
+
+#[test]
+fn a_manifest_window_that_disagrees_with_the_file_refuses() {
+    // The window comes from the manifest and the samples from the file. If they
+    // disagree, `peak_in_store` points somewhere that is not the peak, and
+    // every gate downstream is applied to the wrong time origin — which
+    // produces a plausible correction, not a visible failure.
+    let store = IrStore::create(scratch("window_mismatch")).expect("create");
+    let written = store.write(&impulse(200.0, 3000.0), 0, 0).expect("write");
+    let wrong = StoredWindow {
+        len: written.window.len - 1,
+        ..written.window
+    };
+    assert!(matches!(
+        store.read(0, 0, wrong),
+        Err(StoreError::WindowMismatch { .. })
+    ));
+    assert!(
+        store.read(0, 0, written.window).is_ok(),
+        "the true one still reads"
+    );
+}

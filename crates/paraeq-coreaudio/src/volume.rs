@@ -301,12 +301,20 @@ pub fn restore_output_volume(dev: AudioObjectID, volume: &OutputVolume) -> Vec<C
 /// (`OutputDeviceChanged`) rather than a follow.
 pub struct DeviceVolume {
     device: AudioObjectID,
+    /// The first read-back, kept whole. See `set_volume` — restoring a
+    /// per-channel device from a single scalar would flatten a user's channel
+    /// imbalance, and flatten it *upward*. `OnceLock` because the trait's
+    /// reader takes `&self` and only the pre-measurement state may be cached.
+    pinned: std::sync::OnceLock<OutputVolume>,
 }
 
 impl DeviceVolume {
     /// Pin `device`'s volume control.
     pub fn new(device: AudioObjectID) -> Self {
-        Self { device }
+        Self {
+            device,
+            pinned: std::sync::OnceLock::new(),
+        }
     }
 
     /// The default output device at call time, pinned from then on.
@@ -323,30 +331,60 @@ impl paraeq_measure::VolumeControl for DeviceVolume {
     /// Read the pinned device's volume, as the seam's 0.0..=1.0 scalar.
     ///
     /// A device with per-channel controls and a user-set imbalance has no one
-    /// scalar, so this reports the **loudest** element: the seam's contract is
-    /// that the session pins a value and restores it, and reporting the quieter
-    /// channel would understate how loud the device actually is. Restoring is
-    /// not built on this number — [`Self::set_volume`] writes every element,
-    /// and a caller that must preserve an imbalance exactly uses
-    /// [`restore_output_volume`] with the full [`OutputVolume`] snapshot.
+    /// scalar, so this reports the **loudest** element ([`OutputVolume::scalar`]):
+    /// reporting the quieter channel would understate how loud the device
+    /// actually is, and every judgment built on this number is a safety
+    /// judgment.
+    ///
+    /// The **whole** read-back is cached for [`Self::set_volume`]'s restore
+    /// path — see there for why a single scalar is not enough to restore from.
+    /// Only the first successful read fills the cache: the session pins the
+    /// pre-measurement volume exactly once, at `begin`, and that is the state
+    /// every exit path must return the system to.
     fn volume(&self) -> Result<f64, MeasureError> {
         let volume = output_volume(self.device)
             .map_err(|e| MeasureError::Sink(e.to_string()))?
             .ok_or_else(|| MeasureError::Sink("device exposes no volume control".to_owned()))?;
-        let loudest = volume
-            .elements()
-            .iter()
-            .map(|e| e.scalar)
-            .fold(f32::NEG_INFINITY, f32::max);
-        Ok(f64::from(loudest))
+        let scalar = volume.scalar();
+        let _ = self.pinned.set(volume);
+        Ok(f64::from(scalar))
     }
 
-    /// Set every element of the pinned device's control.
+    /// Set the pinned device's volume.
+    ///
+    /// **A restore is not "write the pinned scalar to every element".** On a
+    /// device with per-channel controls and a user-set imbalance — say L at
+    /// 0.3 and R at 0.7 — [`Self::volume`] reports 0.7, and writing 0.7 to both
+    /// channels on the way out would leave the quiet channel **more than twice
+    /// as loud as the user set it**. The session calls this on every exit path
+    /// including panic, so that is a silent, permanent change to the user's
+    /// system made by a measurement they may well have aborted.
+    ///
+    /// So a restore is recognized — the requested scalar matching the cached
+    /// snapshot's reported scalar — and routed to [`restore_output_volume`],
+    /// which puts every element back to its own recorded value and collects
+    /// rather than short-circuits its failures. Any other value is a genuine
+    /// set and is written uniformly. A master-element device has no imbalance
+    /// to preserve, so it takes the plain path either way.
     ///
     /// Never panics, because this runs on the RAII restore path during
     /// unwinding: an out-of-range or non-finite scalar is refused as an `Err`
     /// the session records, not an assertion.
     fn set_volume(&mut self, scalar: f64) -> Result<(), MeasureError> {
+        if let Some(pinned) = self.pinned.get() {
+            let restoring =
+                (scalar - f64::from(pinned.scalar())).abs() <= f64::from(MAX_SCALAR_TOLERANCE);
+            if restoring && !pinned.is_master() {
+                let errors = restore_output_volume(self.device, pinned);
+                return match errors.first() {
+                    None => Ok(()),
+                    Some(first) => Err(MeasureError::Sink(format!(
+                        "{} volume element(s) failed to restore; first: {first}",
+                        errors.len()
+                    ))),
+                };
+            }
+        }
         set_output_volume(self.device, scalar as f32).map_err(|e| MeasureError::Sink(e.to_string()))
     }
 }

@@ -70,8 +70,8 @@ pub use cal::{
 pub use capture::{record, CaptureEnd, CaptureMeter, CaptureRun, CLIP_BLOCK_FRACTION};
 pub use diagnostic::{CalSensitivity, MeasurementDiagnostic, MicSensitivity, Refusal, Severity};
 pub use ladder::{
-    snr_band_hz, LadderError, LevelLadder, NoiseFloor, Remedy, Rung, SnrOutcome, MAX_REMEDIES,
-    MAX_RUNG_STEP_DB, NOISE_FLOOR_MAX_DBFS,
+    analyze_magnitude_db, snr_band_hz, LadderError, LevelLadder, NoiseFloor, Remedy, Rung,
+    SnrOutcome, MAX_REMEDIES, MAX_RUNG_STEP_DB, NOISE_FLOOR_MAX_DBFS,
 };
 pub use level::{caps_for, LevelError, SweepLevel, TransducerCaps, ABSOLUTE_MAX_DBFS_RMS};
 /// Re-exported: the enum lives in `paraeq-dsp` because that is the only crate
