@@ -88,7 +88,7 @@ fn export_with_preamp_db_writes_the_caller_s_preamp() {
     };
     let exported = peq.export_autoeq_format_with_preamp_db(-6.5);
     assert_eq!(exported.lines().next().unwrap(), "Preamp: -6.5 dB");
-    // Shares the -0.0 guard with the other two exports.
+    // Shares the -0.0 guard with the other two exports...
     assert_eq!(
         peq.export_autoeq_format_with_preamp_db(-0.04)
             .lines()
@@ -96,6 +96,25 @@ fn export_with_preamp_db_writes_the_caller_s_preamp() {
             .unwrap(),
         "Preamp: 0.0 dB"
     );
+    // ...and only that. The guard is bounded above at 0, so the positive half
+    // of the desktop's accepted range (eq.rs: PREAMP_MAX_DB = 10.0) is written
+    // verbatim rather than swallowed to "0.0".
+    for (preamp_db, want) in [
+        (0.1, "Preamp: 0.1 dB"),
+        (3.5, "Preamp: 3.5 dB"),
+        (6.0, "Preamp: 6.0 dB"),
+        (10.0, "Preamp: 10.0 dB"),
+        (-30.0, "Preamp: -30.0 dB"),
+    ] {
+        assert_eq!(
+            peq.export_autoeq_format_with_preamp_db(preamp_db)
+                .lines()
+                .next()
+                .unwrap(),
+            want,
+            "preamp {preamp_db}"
+        );
+    }
 }
 
 #[test]

@@ -301,9 +301,12 @@ impl ParametricEQ {
     /// exported text must carry *that* value — neither the oracle's `0.0`
     /// literal nor the cascade-derived [`Self::preamp_db`].
     ///
-    /// Shares the `-0.0` guard with the other two exports: a preamp in
-    /// `(-0.05, 0)` is zero to the precision the format carries, so it prints
-    /// as `0.0 dB`, never `-0.0 dB`.
+    /// Shares the `-0.0` guard with the other two exports, and only that: a
+    /// preamp in `(-0.05, 0]` is zero to the precision the format carries, so
+    /// it prints as `0.0 dB`, never `-0.0 dB`. Every other value — positive as
+    /// well as negative — is written verbatim, so the desktop's whole accepted
+    /// range (`PREAMP_MIN_DB..=PREAMP_MAX_DB`, i.e. -30..=+10) survives an
+    /// export/import round trip.
     pub fn export_autoeq_format_with_preamp_db(&self, preamp_db: f64) -> String {
         self.export_autoeq_lines(preamp_db)
     }
@@ -312,10 +315,17 @@ impl ParametricEQ {
     /// thing they differ in, so it is the only parameter. Line format is
     /// transcribed on [`Self::export_autoeq_format`].
     fn export_autoeq_lines(&self, preamp_db: f64) -> String {
-        // A preamp between -0.05 and 0 dB rounds to zero at one decimal and
-        // would print as "-0.0 dB", which reads as a defect. It is zero to the
-        // precision the format carries, so print it as zero.
-        let shown = if preamp_db > -0.05 { 0.0 } else { preamp_db };
+        // A preamp in (-0.05, 0] rounds to zero at one decimal and would print
+        // as "-0.0 dB", which reads as a defect. It is zero to the precision
+        // the format carries, so print it as zero. The upper bound is
+        // load-bearing: `export_autoeq_format_with_preamp_db` takes an
+        // arbitrary caller-supplied value, and a *positive* preamp must be
+        // written verbatim, not swallowed.
+        let shown = if preamp_db > -0.05 && preamp_db <= 0.0 {
+            0.0
+        } else {
+            preamp_db
+        };
         let mut lines = vec![format!("Preamp: {shown:.1} dB")];
         for (i, band) in self.bands.iter().enumerate() {
             lines.push(format!(

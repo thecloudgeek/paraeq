@@ -73,6 +73,17 @@ fn export_then_parse_roundtrip() {
     let parsed = parse_autoeq(&text);
 
     assert!((parsed.preamp_db - (-3.0)).abs() < 1e-12);
+    // Both signs survive: the desktop accepts a preamp anywhere in -30..=+10
+    // (eq.rs: PREAMP_MIN_DB/PREAMP_MAX_DB) and the export writes it verbatim,
+    // so an export -> import round trip inside the app is lossless.
+    for preamp_db in [-30.0_f64, -3.0, 2.5, 10.0] {
+        let again = parse_autoeq(&peq.export_autoeq_format_with_preamp_db(preamp_db));
+        assert!(
+            (again.preamp_db - preamp_db).abs() < 1e-12,
+            "preamp {preamp_db} round-tripped as {}",
+            again.preamp_db
+        );
+    }
     assert_eq!(parsed.bands.len(), bands.len());
     for (got, want) in parsed.bands.iter().zip(&bands) {
         assert_eq!(got.filter_type, want.filter_type);

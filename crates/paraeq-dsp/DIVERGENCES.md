@@ -118,11 +118,18 @@ differs from `prototype/paraeq/`, so a red parity test is always actionable.
     itself a `preamp_db: f64` parameter, which the 2026-09-16 integration merge
     reworked into this third, additive method so the oracle-parity export stays
     argument-free and fixture-pinned (see #15). All three share the `-0.0`
-    guard, so a desktop export with a preamp in `(-0.05, 0)` writes
-    `Preamp: 0.0 dB` where the shell branch wrote `Preamp: -0.0 dB`. The parser
-    accepts any of them, so cross-imports still work. Call site:
+    guard, and that guard is bounded at both ends (`(-0.05, 0]`): the *only*
+    divergence from the shell branch is that a preamp in that window writes
+    `Preamp: 0.0 dB` where the shell branch wrote `Preamp: -0.0 dB` — the same
+    number, spelled without the negative zero, and the parser accepts either
+    spelling. Every other value is written verbatim, including the whole
+    positive half of the desktop's accepted range (`eq.rs`:
+    `PREAMP_MIN_DB..=PREAMP_MAX_DB`, -30..=+10), so an export/import round trip
+    is lossless in both signs. Call site:
     `desktop/src-tauri/src/commands.rs::eq_export_autoeq`; pinned by
-    `test_peq.rs::export_with_preamp_db_writes_the_caller_s_preamp`.
+    `test_peq.rs::export_with_preamp_db_writes_the_caller_s_preamp` (which
+    covers -30, -6.5, -0.04, +0.1, +3.5, +6 and the +10 endpoint) and
+    `test_autoeq_parse.rs::export_then_parse_roundtrip`.
 
 17. **AutoEq INDEX.md hrefs are percent-DECODED on parse** (`desktop/src-tauri/src/autoeq.rs::parse_index`).
     The oracle (`autoeq_db.py`) stores the raw href verbatim and then
