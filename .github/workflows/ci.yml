@@ -16,7 +16,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # `serde` is an off-by-default feature on both paraeq-dsp and
+      # paraeq-measure, so the two default-feature runs never compile the
+      # wire-format derives that the three hand-mirrored tripwires pin
+      # (test_wire_format.rs, state.rs's app_state golden, ui/src/ipc/types.ts).
+      # Run both feature sets, exactly as the local gates G2-G5 do.
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace
+      - run: cargo test --workspace --all-features
       # MS-1 (2026-07-15 measurement-safety-design.md): the level policy stays
       # reachable from a future headless `paraeqd` and testable against mocks
       # only while it depends on neither Tauri nor CoreAudio. The hardware side
