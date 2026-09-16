@@ -1,6 +1,31 @@
 //! Hardware integration suite — every test is `#[ignore]` because CI has no
 //! audio devices. Run locally (TCC-granted terminal) with:
 //! `cargo test -p paraeq-coreaudio -- --ignored`
+//!
+//! Two tests here need a human at the keyboard and say so on stdout. Their
+//! `#[ignore]` reasons both start with `manual:`, but the suite's skip filter
+//! matches test NAMES, so an unattended sweep needs both
+//! `--skip manual_ --skip rate_change_`; otherwise
+//! `rate_change_keeps_the_band_at_its_designed_frequency` sits waiting for a
+//! rate change nobody is there to make.
+//!
+//! # MS-6's witness: only the `true` branch is reachable on hardware
+//!
+//! [`backend_witness_tracks_start_and_stop`] below, and
+//! `test_measure_hardware.rs`'s full-session run, assert that the witness
+//! reads `true` over a live tap and `false` with no tap. **The
+//! `self_excluded == false`-with-a-tap-up branch — MS-6's actual refusal
+//! condition — is mock-only, and permanently so.** Reaching it requires
+//! `properties::translate_pid(getpid())` to return 0 on a Mac where this
+//! process is registered with the HAL: a launch race that cannot be
+//! reproduced on demand, with no API to provoke it and no fault injection
+//! short of editing `tap.rs`. No hardware test asserts that branch and none
+//! can be written. Its coverage is, and will stay, mock-driven —
+//! `crates/paraeq-measure/tests/test_session.rs::ms6_refuses_before_any_sample_is_emitted`
+//! and `::ms6_rechecks_at_the_sweep_gate` over a mock `TapStatus`, plus the
+//! convention tests in `tests/test_exclusion_witness.rs`. Read a green
+//! `--ignored` run as "the witness tracks a real tap", never as "the refusal
+//! path has been exercised".
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
@@ -14,8 +39,16 @@ use paraeq_coreaudio::listeners::PropertyListener;
 use paraeq_coreaudio::properties;
 use paraeq_coreaudio::tap::TapSystem;
 use paraeq_coreaudio::volume;
-use paraeq_engine::controller::{EngineCommand, EngineConfig, EngineHandle, EngineState};
-use paraeq_engine::status::EngineStatus;
+use paraeq_dsp::biquad;
+use paraeq_dsp::peq::{EQBand, FilterType, ParametricEQ};
+use paraeq_engine::backend::AudioBackend;
+use paraeq_engine::chain::RealtimeChain;
+use paraeq_engine::controller::{
+    CorrectionConfig, EngineCommand, EngineConfig, EngineHandle, EngineState,
+};
+use paraeq_engine::shared::{links, RtProcessor, RtShared};
+use paraeq_engine::status::{EngineStatus, WatchdogConfig};
+use paraeq_measure::TapStatus;
 
 /// Keeps the system rendering audio for the guard's lifetime by looping
 /// `afplay` on a builtin sound. The tap aggregate's IOProc delivers NO
@@ -570,4 +603,373 @@ fn latency_delta_is_reported() {
     wait_for_stopped(&handle, Duration::from_secs(5));
     drop(handle);
     drop(playback);
+}
+
+// ───────────── Phase A: the MS-6 witness, the lease, the rate change ─────────
+// Three claims the post-merge Phase-A work cannot make for itself, because
+// their subjects have no software stand-in: a real `translate_pid` lookup
+// feeding a real tap description, a real tap surviving a real silent
+// measurement, and a real device changing its sample rate underneath a live
+// correction. Each mechanism is already pinned mock-driven in
+// `crates/paraeq-engine/tests/test_controller.rs`; what follows is the
+// hardware half only, and nothing below is a substitute for those.
+
+/// Poll published snapshots until `pred` holds; `None` on timeout.
+///
+/// Reads `state()` rather than `subscribe()` because these tests care about
+/// the CURRENT state, and a bounded subscriber channel drops updates when the
+/// subscriber falls behind ([`EngineHandle::subscribe`]).
+fn wait_until(
+    handle: &EngineHandle,
+    timeout: Duration,
+    pred: impl Fn(&EngineState) -> bool,
+) -> Option<Arc<EngineState>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let snap = handle.state();
+        if pred(&snap) {
+            return Some(snap);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// MS-6's witness over a REAL tap: `false` before `start`, `true` while the
+/// tap is up, `false` again after `stop` — the `AudioBackend::self_excluded`
+/// contract ("`false` whenever nothing is running") measured rather than
+/// asserted by construction. `tests/test_exclusion_witness.rs` pins the same
+/// convention against a hand-written witness; this is the only place the value
+/// comes from `TapSystem::create` and a real
+/// [`properties::translate_pid`] lookup. See the module header for why the
+/// `false`-with-a-tap-up branch is not, and cannot be, covered here.
+///
+/// Drives [`TapBackend`] directly rather than through [`EngineHandle::spawn`]:
+/// `start`/`stop` are the two edges the contract is written about, and the
+/// controller puts ticks, renegotiation and a watchdog between them
+/// (`tap_backend_full_engine_boot` covers that path).
+///
+/// Briefly mutes system audio (MutedWhenTapped). Every reading is taken and
+/// the backend stopped BEFORE anything is asserted, so a failed assert cannot
+/// leave a live tap behind — the same restore-before-assert shape as
+/// `buffer_frame_size_set_and_restore_roundtrip`. `TapBackend`'s field
+/// declaration order makes its bare `Drop` the backstop if a panic lands
+/// earlier anyway.
+#[test]
+#[ignore = "requires audio hardware"]
+fn backend_witness_tracks_start_and_stop() {
+    // The minimum a backend can be started with: this test never pumps a
+    // block, it only needs something to move into the IOProc closure.
+    let (_control, rt) = links(4);
+    let processor = RtProcessor::new(
+        Arc::new(RtShared::default()),
+        rt,
+        RealtimeChain::new(2, 512),
+    );
+
+    let mut backend = TapBackend::new();
+    let witness = backend.exclusion_witness();
+    let before = witness.self_excluded();
+
+    let stream = backend.start(processor, None).expect("TapBackend::start");
+    let during = witness.self_excluded();
+    let during_via_trait = backend.self_excluded();
+
+    backend.stop().expect("TapBackend::stop");
+    let after = witness.self_excluded();
+    backend.stop().expect("stop is idempotent");
+    let after_again = witness.self_excluded();
+
+    eprintln!("WITNESS: before={before} during={during} after={after} (stream {stream:?})");
+    assert!(
+        !before,
+        "a backend that has never started witnesses nothing"
+    );
+    assert!(
+        during,
+        "a registered process must be excluded from its own tap; `false` here is MS-6's \
+         refusal condition — every measurement would refuse SelfExclusionUnavailable"
+    );
+    assert_eq!(
+        during, during_via_trait,
+        "the clone the caller kept before the move and `AudioBackend::self_excluded` must \
+         be one fact, not two"
+    );
+    assert!(
+        !after,
+        "after teardown there is no tap, so nothing is excluded"
+    );
+    assert!(
+        !after_again,
+        "an idempotent second stop must not resurrect the witness"
+    );
+}
+
+/// **Owner: listen.** The wizard's fail-open scenario against a real tap
+/// (wizard § The fail-open watchdog): a measurement plays on the *untapped*
+/// measurement route, so ParaEQ's tap — which excludes ParaEQ's own process,
+/// which is MS-6's entire point — captures nothing but zeros for the whole
+/// run. Without a lease the watchdog reads that as the TCC silent-failure
+/// signature and tears the tap down mid-sweep.
+///
+/// What the owner should hear: the system goes quiet when the engine starts
+/// (MutedWhenTapped), STAYS quiet across the whole leased stretch — well past
+/// the fail-open window — and comes back by itself a few seconds after the
+/// lease is released. The return is fail-open doing its job; the silence
+/// before it is the lease doing its job. Nothing is played, deliberately:
+/// silence is the signature under test.
+///
+/// Both windows are shortened from their production defaults (5 s engage,
+/// 15 s fail-open), which keeps the system muted for ~15 s instead of the
+/// minute-plus the defaults would take.
+/// Shortening cannot make this pass falsely: the falsifier is the
+/// `AutoDisabledNoInput` wait AFTER the release, which is the same mechanism
+/// on the same clock — if the lease had not been suspending anything, the
+/// engine would already have disabled during the sleep.
+#[test]
+#[ignore = "requires audio hardware; mutes system audio for ~15 s"]
+fn lease_keeps_the_tap_alive_across_a_silent_measurement() {
+    const ENGAGE_MS: u64 = 2_000;
+    const FAIL_OPEN_MS: u64 = 3_000;
+
+    let handle = EngineHandle::spawn(
+        TapBackend::new(),
+        EngineConfig {
+            fail_open_after_ms: Some(FAIL_OPEN_MS),
+            watchdog: WatchdogConfig {
+                engage_tolerance_ms: ENGAGE_MS,
+                ..WatchdogConfig::default()
+            },
+            ..EngineConfig::default()
+        },
+    );
+
+    // A lease is only meaningful over a live tap, and `self_excluded` is the
+    // published field that names the TAP specifically -- it is read straight
+    // off the backend, whereas `stream` describes the controller's session.
+    let up = wait_until(&handle, Duration::from_secs(10), |s| s.self_excluded)
+        .expect("no live tap within 10 s — there is nothing for a lease to keep alive");
+    eprintln!("LEASE: tap up: {up:?}");
+
+    let lease = handle
+        .acquire_measurement_lease()
+        .expect("a fresh engine has no outstanding lease");
+    println!(">>> the system is muted now, and must STAY muted while the lease is held.");
+
+    // The lease suspends the auto-disable, never the diagnosis. Waiting for
+    // `NoInputDetected` first is what gives the sleep below its teeth:
+    // fail-open can fire from no other state, so a run that never reached it
+    // would prove nothing at all.
+    let silent = wait_until(&handle, Duration::from_secs(10), |s| {
+        matches!(s.status, EngineStatus::NoInputDetected { .. })
+    })
+    .expect(
+        "engine never reported NoInputDetected — something is playing into the tap; \
+         stop all playback and rerun",
+    );
+    eprintln!("LEASE: reported silent (the lease must not suppress this): {silent:?}");
+
+    let held_for = Duration::from_millis(FAIL_OPEN_MS * 3);
+    std::thread::sleep(held_for);
+    let leased = handle.state();
+
+    // Release BEFORE asserting: a failed assert must never leave the
+    // fail-open watchdog suspended over a muted system.
+    drop(lease);
+    println!(">>> lease released — audio should come back on its own within a few seconds.");
+
+    assert!(
+        !matches!(leased.status, EngineStatus::AutoDisabledNoInput { .. }),
+        "the lease did not suspend fail-open: the engine auto-disabled {held_for:?} into a \
+         leased measurement, which is the tap being torn down mid-sweep: {leased:?}"
+    );
+    assert!(
+        leased.stream.is_some(),
+        "the session is gone under the lease: {leased:?}"
+    );
+    assert!(
+        leased.self_excluded,
+        "the tap is gone under the lease — a session polling MS-6 here would refuse: \
+         {leased:?}"
+    );
+
+    let disabled = wait_until(&handle, Duration::from_secs(15), |s| {
+        matches!(s.status, EngineStatus::AutoDisabledNoInput { .. })
+    })
+    .expect(
+        "fail-open never re-armed after the release — the lease left the system muted with \
+         no auto-recovery, which is the failure D-20 calls the highest-severity one",
+    );
+    eprintln!("LEASE: auto-disabled after release: {disabled:?}");
+    assert!(
+        !disabled.self_excluded,
+        "a torn-down tap witnesses nothing: {disabled:?}"
+    );
+    assert!(
+        disabled.stream.is_none(),
+        "the aggregate must be gone with the session: {disabled:?}"
+    );
+
+    drop(handle);
+}
+
+/// R1-6's hardware checklist item, verbatim (engine-hardening § R1-6, Tests):
+/// "With a +12 dB 1 kHz band live, change the device's rate in Audio MIDI
+/// Setup; sweep the analyzer and confirm the band is still at 1 kHz, not
+/// 919 Hz."
+///
+/// **Manual.** Run it alone and watch stdout:
+///
+/// ```sh
+/// cargo test -p paraeq-coreaudio --test test_hardware -- --ignored --nocapture \
+///     rate_change_keeps_the_band_at_its_designed_frequency
+/// ```
+///
+/// What the software half asserts, once the human has changed the rate: the
+/// retained `Peq` intent was RE-DERIVED at the rate the backend just reported
+/// — `correction_rate_mismatch` stays `None` and `auto_preamp_db` comes back
+/// at −12 dB, which only a rebuilt cascade can produce. The `Iir`/`Fir` arms
+/// carry baked coefficients and refuse instead (flat pass-through plus the
+/// mismatch flag); that half needs no hardware and is pinned in
+/// `crates/paraeq-engine/tests/test_controller.rs`.
+///
+/// What the owner's analyzer confirms: the two frequencies this prints. The
+/// band must still sit at 1 kHz; the detuned frequency printed beside it is
+/// where stale coefficients would have put it, and is the number to be sure
+/// you do NOT see.
+///
+/// Fail-open is disabled for this run (`fail_open_after_ms: None`) because
+/// nothing is playing while the human works in Audio MIDI Setup, and a tap
+/// torn down by the watchdog would end the test before the rate change lands.
+/// The test does not restore the device's rate — it has no API to, and the
+/// change was the human's; it prints a reminder instead.
+#[test]
+#[ignore = "manual: requires changing the output device's sample rate in Audio MIDI Setup"]
+fn rate_change_keeps_the_band_at_its_designed_frequency() {
+    const FC_HZ: f64 = 1_000.0;
+    const GAIN_DB: f64 = 12.0;
+    const Q: f64 = 1.0;
+
+    let handle = EngineHandle::spawn(
+        TapBackend::new(),
+        EngineConfig {
+            fail_open_after_ms: None,
+            ..EngineConfig::default()
+        },
+    );
+    let started = wait_until(&handle, Duration::from_secs(10), |s| s.stream.is_some())
+        .expect("engine never reported a stream within 10 s");
+    let before = started.stream.clone().expect("just matched");
+
+    let band = EQBand {
+        filter_type: FilterType::Peaking,
+        fc: FC_HZ,
+        gain_db: GAIN_DB,
+        q: Q,
+    };
+    handle.send(EngineCommand::SetCorrection(CorrectionConfig::Peq {
+        bands: vec![vec![band.clone()]],
+        design_rate: before.sample_rate,
+    }));
+    let installed = wait_until(&handle, Duration::from_secs(5), |s| {
+        s.auto_preamp_db.is_some()
+    })
+    .expect("the band never installed (no auto_preamp_db published within 5 s)");
+    assert_eq!(installed.correction.as_deref(), Some("peq:1-band"));
+    assert_eq!(
+        installed.correction_rate_mismatch, None,
+        "the band was refused at its own design rate: {installed:?}"
+    );
+
+    println!(
+        ">>> a +{GAIN_DB} dB {FC_HZ} Hz band is live at {} Hz on '{}'.",
+        before.sample_rate, before.device_uid
+    );
+    println!(
+        ">>> now change THAT device's sample rate in Audio MIDI Setup (any other rate) \
+         within 120 s..."
+    );
+
+    let changed = wait_until(&handle, Duration::from_secs(120), |s| {
+        s.stream
+            .as_ref()
+            .is_some_and(|st| st.sample_rate != before.sample_rate)
+    })
+    .expect(
+        "no rate change reached the engine within 120 s. Either nobody changed the rate, \
+         or the change was made on a device that is not the current default output, or \
+         the tap's reported format did not follow the device — the last of those is a \
+         finding, not a mistake, and `properties::nominal_sample_rate` on the device will \
+         say which it was",
+    );
+    let after = changed.stream.clone().expect("just matched");
+
+    // Where the band is now, and where reusing the old rate's coefficients
+    // would have put it. A peaking biquad's magnitude peak sits exactly at its
+    // designed w0 = 2*pi*fc/rate, so running coefficients designed at
+    // `before` through a stream at `after` moves the peak to
+    // fc * after/before — the spec's 919 Hz for 48000 -> 44100.
+    let freqs: Vec<f64> = (0..=8_000)
+        .map(|i| FC_HZ / 8.0 * 64.0f64.powf(f64::from(i) / 8_000.0))
+        .collect();
+    let redesigned = ParametricEQ {
+        bands: vec![band.clone()],
+        sample_rate: after.sample_rate,
+    }
+    .frequency_response(&freqs);
+    let stale = biquad::sos_frequency_response_db(
+        &[band.to_sos(before.sample_rate)],
+        &freqs,
+        after.sample_rate,
+    );
+    let peak_hz = |mag_db: &[f64]| -> f64 {
+        let at = mag_db
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i)
+            .expect("non-empty grid");
+        freqs[at]
+    };
+    let designed_peak_hz = peak_hz(&redesigned);
+    let stale_peak_hz = peak_hz(&stale);
+
+    eprintln!(
+        "RATE CHANGE: {} Hz -> {} Hz; redesigned band peaks at {designed_peak_hz:.1} Hz, \
+         stale coefficients would peak at {stale_peak_hz:.1} Hz",
+        before.sample_rate, after.sample_rate
+    );
+    println!(
+        ">>> on the analyzer the band must STILL sit at {FC_HZ:.0} Hz. \
+         {stale_peak_hz:.0} Hz is the wrong answer to look for."
+    );
+
+    // The published half of "still at 1 kHz": the retained intent was
+    // re-derived at the new rate. A refusal would publish the mismatch and
+    // clear the preamp (flat pass-through) instead.
+    assert_eq!(
+        changed.correction_rate_mismatch, None,
+        "the Peq intent was refused at the new rate instead of being re-derived: {changed:?}"
+    );
+    assert_eq!(changed.correction.as_deref(), Some("peq:1-band"));
+    let preamp = changed
+        .auto_preamp_db
+        .expect("a rebuilt correction publishes the preamp it is applying");
+    assert!(
+        (f64::from(preamp) + GAIN_DB).abs() < 0.5,
+        "auto-preamp is {preamp} dB after the rate change; a rebuilt +{GAIN_DB} dB band \
+         must come back at -{GAIN_DB} dB, so this cascade is not the one that was designed"
+    );
+    assert!(
+        (designed_peak_hz - FC_HZ).abs() < FC_HZ * 0.01,
+        "the band redesigned at {} Hz peaks at {designed_peak_hz} Hz, not {FC_HZ} Hz",
+        after.sample_rate
+    );
+
+    println!(">>> done — you can put the device's sample rate back.");
+    handle.send(EngineCommand::Disable);
+    wait_for_stopped(&handle, Duration::from_secs(5));
+    drop(handle);
 }

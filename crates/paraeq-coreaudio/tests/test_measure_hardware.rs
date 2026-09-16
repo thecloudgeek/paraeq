@@ -414,14 +414,16 @@ fn two_clock_bracketed_sweep_skew() {
 // on real hardware. Together they are the software side of the stage's end
 // state — "a complete coupler measurement is testable end-to-end, headless".
 //
-// NOT yet a full `MeasurementSession` run: MS-6 refuses to open a session
-// without a `TapStatus` witness, and `TapSystem` still does not expose
-// `self_excluded`. That is no longer gated on anything: the `EngineState`
-// shape freeze lifted with the 2026-09-16 integration merge (the tauri-shell
-// branch is now in the trunk of this stack), so wiring `self_excluded` onto
-// `TapSystem` is ordinary, unblocked work. What these prove is everything
-// below that gap — that the sink plays, that it paces, and that play and
-// record really do share one clock.
+// These three run WITHOUT a session or an engine on purpose: they isolate the
+// sink (it plays, it paces, play and record share one clock) from everything
+// the session layers on top. The full run — a live `TapBackend`, its MS-6
+// witness, and a `MeasurementSession` driven begin → solve → acknowledge →
+// sweep against it — is
+// `a_full_measurement_session_runs_against_the_live_witness` at the bottom of
+// this file. The gap the previous comment here described (no `TapStatus`
+// witness, `TapSystem` not exposing `self_excluded`) closed with the
+// 2026-09-16 integration work: `TapSystem::self_excluded`,
+// `TapBackend::exclusion_witness` and `EngineState::self_excluded` all ship.
 
 /// **Owner: listen.** Plays the 300 Hz pilot at its fixed −40 dBFS RMS through
 /// the aggregate's own output route and captures it back on the mic, then
@@ -637,4 +639,248 @@ fn one_clock_skew_through_the_aggregates_own_output() {
              fallback path; check marker SNR and mic placement"
         ),
     }
+}
+
+/// **The first real headless measurement run**, and the first time both
+/// aggregates have ever been up at once.
+///
+/// The whole chain, live: a `TapBackend` under a real `EngineHandle` →
+/// `exclusion_witness()` → `MicCapture::create` → `take_stimulus_sink()` →
+/// `DeviceVolume::for_default_output()` → `MeasurementSession::begin` (which
+/// polls MS-6 through that witness before it touches the sink or the volume) →
+/// `install_solve` → `acknowledge` → `sweep`. Every gate the session enforces
+/// is exercised against hardware rather than mocks; `crates/paraeq-measure/
+/// tests/test_session.rs` remains the place the gates' *logic* is pinned.
+///
+/// **A measurement lease is held for the run.** The stimulus plays on the
+/// measurement aggregate, which the tap excludes by design (MS-6), so the tap
+/// sees nothing but zeros for the whole sweep and the fail-open watchdog would
+/// otherwise read that as a TCC silent failure and tear the tap down
+/// mid-sweep. That is the wizard's own scenario;
+/// `test_hardware.rs::lease_keeps_the_tap_alive_across_a_silent_measurement`
+/// is the test that isolates it.
+///
+/// **This is also plan item B0/E6's experiment**, ahead of schedule and by
+/// necessity. `tap.rs::create_aggregate` composes the default output into the
+/// tap aggregate and `measure_aggregate.rs` composes the same device again,
+/// and nothing has ever run both. A `MicCapture::create` failure here, or a
+/// silent mic with a healthy-looking session, is that question's answer — not
+/// a measurement bug. Both outcomes print what they mean.
+///
+/// **The cal and the solve are synthetic, and quiet on purpose.** No cal-file
+/// loader exists yet, and no Stage-5 ladder runs here, so the numbers cannot
+/// be earned — they are chosen. Choosing them fixed rather than solving them
+/// from a fabricated sensitivity is the safety decision: a solve driven by a
+/// fake cal against a distant mic asks for a LOUDER level, and the whole
+/// point of the caps is that no level reaches a sink unjustified. The emitted
+/// level is ~30 dB below the OverEar target, and the printed SPL is fiction —
+/// it is what the acknowledgement gate needs to be handed, not a measurement.
+///
+/// Teardown is RAII on every exit path, panic included:
+/// `MeasurementSession::drop` stops the sink and restores the pinned volume,
+/// `MicCapture::drop` tears the measurement aggregate down, dropping the lease
+/// re-arms fail-open, and `EngineHandle::drop` shuts the controller down,
+/// which stops the backend and destroys the tap. Nothing here leaves a tap or
+/// a volume change behind.
+#[test]
+#[ignore = "requires audio hardware + input device + mic TCC grant; plays a quiet sweep"]
+fn a_full_measurement_session_runs_against_the_live_witness() {
+    use paraeq_coreaudio::backend::TapBackend;
+    use paraeq_coreaudio::volume::DeviceVolume;
+    use paraeq_coreaudio::{devices, properties};
+    use paraeq_engine::controller::{EngineCommand, EngineConfig, EngineHandle};
+    use paraeq_measure::{
+        assemble_sweep, CalSensitivity, CalSummary, MeasurementSession, SessionEvent, SessionPhase,
+        SessionSeam, SolveOutcome, SweepOutcome, TapStatus, TransducerClass,
+    };
+
+    /// Deliberately quiet, deliberately fixed — see the doc comment. The three
+    /// numbers are self-consistent (projection = sensitivity + level) so the
+    /// log reads like a real run, but only the LEVEL is real: it is what
+    /// `SweepLevel::new` checks and what reaches the sink.
+    const SOLVE: SolveOutcome = SolveOutcome {
+        chain_sensitivity_spl_per_dbfs: 104.0,
+        projected_spl_db: 54.0,
+        solved_dbfs_rms: -50.0,
+    };
+    const SWEEP_S: f64 = 2.0;
+
+    // ── the engine, and the witness taken before the backend moves into it ──
+    let backend = TapBackend::new();
+    let witness = backend.exclusion_witness();
+    let engine = EngineHandle::spawn(backend, EngineConfig::default());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !witness.self_excluded() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        witness.self_excluded(),
+        "no self-excluding tap within 10 s: MS-6 would refuse this session before it \
+         touched the sink, which is the correct behaviour and makes the rest of this \
+         test unrunnable. Check the TCC grant and that no other ParaEQ is running."
+    );
+    let lease = engine
+        .acquire_measurement_lease()
+        .expect("a fresh engine has no outstanding lease");
+
+    // ── the measurement aggregate, on the same output device (B0/E6) ────────
+    let mut cap = match MicCapture::create(MeasureAggregateConfig {
+        mic: mic_selector_from_env(),
+        ..MeasureAggregateConfig::default()
+    }) {
+        Ok(cap) => cap,
+        Err(e) => panic!(
+            "MicCapture::create failed with the engine's tap aggregate live on the same \
+             output device: {e:?}\n\
+             This is plan item B0/E6 answering NO — the two aggregates do not coexist. \
+             Rerun this test with the engine stopped to confirm the aggregate itself is \
+             healthy; if it is, the fallback is a mic-only capture aggregate plus the \
+             two-clock marker path for t=0, which redesigns the verification capture side."
+        ),
+    };
+    let rate = cap.sample_rate_hz();
+    let sink = cap
+        .take_stimulus_sink()
+        .expect("the sink is available once");
+    let volume = DeviceVolume::for_default_output().expect("default output device");
+
+    // MS-18 wants the device NAMED, not identified by uid.
+    let device = properties::default_output_device().expect("default_output_device");
+    let uid = properties::device_uid(device).expect("device_uid");
+    let device_name = devices::list_output_devices()
+        .ok()
+        .and_then(|list| list.into_iter().find(|d| d.uid == uid).map(|d| d.name))
+        .unwrap_or_else(|| uid.clone());
+
+    // ── the session ─────────────────────────────────────────────────────────
+    let cal = CalSummary::validate(
+        TransducerClass::OverEar,
+        "synthetic (no cal-file loader exists yet)".to_owned(),
+        CalSensitivity::Parsed(-18.0),
+        1.0,
+    )
+    .expect("the synthetic cal validates");
+    let mut session = MeasurementSession::begin(
+        cal,
+        1.0,
+        SessionSeam {
+            sink: Box::new(sink),
+            tap: Box::new(witness.clone()),
+            volume: Box::new(volume),
+        },
+    )
+    .expect("MS-6 passes over a live self-excluding tap");
+    let level = session.install_solve(SOLVE).expect("the solve installs");
+    session
+        .acknowledge(&device_name, SOLVE.projected_spl_db)
+        .expect("the acknowledgement records");
+
+    let f_end_hz = (0.45 * rate).min(20_000.0);
+    let stimulus = assemble_sweep(SWEEP_S, rate as u32, 20.0, f_end_hz, level)
+        .expect("the sweep assembles at the decided level");
+    eprintln!(
+        "SESSION: '{device_name}' at {rate} Hz, mic '{}', {:.1} s sweep 20-{f_end_hz:.0} Hz at \
+         {:.1} dBFS RMS (projection {} dB SPL is SYNTHETIC)",
+        cap.mic_uid(),
+        stimulus.duration_s(),
+        level.dbfs_rms(),
+        SOLVE.projected_spl_db,
+    );
+
+    // Drain whatever the mic buffered before the sweep starts.
+    let mut scratch = vec![0.0f64; 8192];
+    while cap.capture(&mut scratch).expect("capture") > 0 {}
+
+    // Capture on a second thread: `sweep` is paced by the device and does not
+    // return until the last block has been consumed.
+    let capture_for_s = stimulus.duration_s() + 1.0;
+    let recorder = std::thread::spawn(move || {
+        let mut got = Vec::new();
+        let mut buf = vec![0.0f64; 8192];
+        let deadline = Instant::now() + Duration::from_secs_f64(capture_for_s);
+        while Instant::now() < deadline {
+            let n = cap.capture(&mut buf).expect("capture");
+            if n == 0 {
+                std::thread::sleep(Duration::from_millis(2));
+                continue;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        (got, cap)
+    });
+    let outcome = session.sweep(&stimulus).expect("the sweep gate opens");
+    let (captured, cap) = recorder.join().expect("capture thread");
+
+    // ── what happened ───────────────────────────────────────────────────────
+    let rms = (captured.iter().map(|v| v * v).sum::<f64>() / captured.len().max(1) as f64).sqrt();
+    eprintln!(
+        "SESSION: captured {} samples, RMS {:.6} ({:.1} dBFS); capture counters {:?}",
+        captured.len(),
+        rms,
+        20.0 * rms.max(1e-12).log10(),
+        cap.counters(),
+    );
+    match &outcome {
+        SweepOutcome::Completed { warnings } => {
+            eprintln!("SESSION: completed, warnings {warnings:?}");
+        }
+        SweepOutcome::Aborted {
+            diagnostic,
+            warnings,
+        } => panic!("the sweep aborted: {diagnostic:?} (warnings {warnings:?})"),
+    }
+    assert_eq!(session.phase(), SessionPhase::Swept);
+    assert!(
+        witness.self_excluded(),
+        "the tap went away during the measurement — the lease did not hold it, and a \
+         session that re-polled MS-6 here would refuse"
+    );
+    assert!(cap.counters().callbacks > 0, "the mic IOProc never engaged");
+
+    let log = session.finish();
+    eprintln!("SESSION LOG: {:#?}", log.events());
+    assert!(
+        matches!(
+            log.events().last(),
+            Some(SessionEvent::Terminated { diagnostic: None })
+        ),
+        "a clean run must end with an undiagnosed Terminated: {:?}",
+        log.events().last()
+    );
+    assert!(
+        log.events()
+            .iter()
+            .any(|e| matches!(e, SessionEvent::SweepCompleted)),
+        "no SweepCompleted in the log"
+    );
+    for event in log.events() {
+        assert!(
+            !matches!(
+                event,
+                SessionEvent::SinkFault { .. } | SessionEvent::VolumeRestoreFailed { .. }
+            ),
+            "the teardown collected a fault it did not mask, but a clean run must not \
+             produce one: {event:?}"
+        );
+    }
+
+    // Printed, never asserted: the level that comes back is a property of the
+    // rig (mic placement, output routing) AND of whether the tap's
+    // MutedWhenTapped posture silences the measurement aggregate as well —
+    // which is precisely B0/E6's open question. A threshold here would report
+    // an unanswered question as a broken measurement.
+    if rms <= 1e-5 {
+        eprintln!(
+            "SESSION: NOTHING CAME BACK ON THE MIC. Check mic placement and routing first; \
+             if `pilot_plays_through_the_aggregate_and_comes_back_on_the_mic` passes with \
+             the engine stopped and this does not, that is plan item B0/E6 answering NO — \
+             the tap aggregate silences the measurement aggregate's output, and the \
+             verification capture side needs redesigning."
+        );
+    }
+
+    drop(cap);
+    drop(lease);
+    engine.send(EngineCommand::Disable);
+    drop(engine);
 }
