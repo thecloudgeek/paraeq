@@ -42,6 +42,7 @@ fn all_variants() -> Vec<D> {
         D::OutputDeviceChanged,
         D::EngineFailed,
         D::SolvedLevelIllegal,
+        D::EngineNotRunning,
         D::LowSnr,
         D::FixedMaxVolume,
         D::TwoClock,
@@ -80,6 +81,7 @@ fn expected(d: &D) -> (u16, Severity) {
         D::OutputDeviceChanged => (21, Error),
         D::EngineFailed => (22, Error),
         D::SolvedLevelIllegal => (23, Error),
+        D::EngineNotRunning => (24, Error),
         D::LowSnr => (100, Warning),
         D::FixedMaxVolume => (101, Warning),
         D::TwoClock => (102, Warning),
@@ -93,7 +95,7 @@ fn expected(d: &D) -> (u16, Severity) {
 #[test]
 fn every_wire_code_of_the_initial_set_is_pinned() {
     let variants = all_variants();
-    assert_eq!(variants.len(), 28, "all_variants() lags the enum");
+    assert_eq!(variants.len(), 29, "all_variants() lags the enum");
     for d in &variants {
         let (code, _) = expected(d);
         assert_eq!(d.code(), code, "{d:?} renumbered — wire contract broken");
@@ -193,8 +195,9 @@ fn escalation_aborts_are_blocking() {
 }
 
 /// The § Abort Guards trigger rows appended for the session runtime
-/// (codes 19–22): each terminates the run, so each is blocking and can travel
-/// as the terminating diagnostic of an aborted session.
+/// (codes 19–22, plus `EngineNotRunning = 24` for the engine leaving
+/// `Running` by request): each terminates the run, so each is blocking and
+/// can travel as the terminating diagnostic of an aborted session.
 #[test]
 fn abort_triggers_are_blocking() {
     for d in [
@@ -202,10 +205,44 @@ fn abort_triggers_are_blocking() {
         D::MicDisconnected,
         D::OutputDeviceChanged,
         D::EngineFailed,
+        D::EngineNotRunning,
     ] {
         assert!(d.is_blocking(), "{d:?} must terminate the run");
         assert_eq!(Refusal::new(d).diagnostic(), d);
     }
+}
+
+/// "The EQ is switched off" is a **different condition** from "the engine
+/// broke" and from "self-exclusion could not be established", and the whole
+/// point of code 24 is that the user is told something different. Without a
+/// distinct diagnostic a stopped engine surfaces as
+/// `SelfExclusionUnavailable` (no tap ⇒ no witness), whose remedy is "Restart
+/// ParaEQ" — the wrong instruction for a switch the user can flip. MS-20's
+/// "plain-language fix (easy mode) and an explanation (guided mode)" is only
+/// worth anything if the strings actually differ.
+#[test]
+fn engine_not_running_is_distinct_from_engine_failed_and_self_exclusion() {
+    assert_eq!(D::EngineNotRunning.code(), 24);
+    assert!(D::EngineNotRunning.is_blocking());
+    for other in [D::EngineFailed, D::SelfExclusionUnavailable] {
+        assert_ne!(
+            D::EngineNotRunning.fix_easy(),
+            other.fix_easy(),
+            "{other:?} and EngineNotRunning give the same easy-mode remedy"
+        );
+        assert_ne!(
+            D::EngineNotRunning.explain_guided(),
+            other.explain_guided(),
+            "{other:?} and EngineNotRunning give the same guided explanation"
+        );
+    }
+    // The specific failure this diagnostic exists to prevent: telling someone
+    // whose EQ is merely switched off to restart the app (or their Mac).
+    let fix = D::EngineNotRunning.fix_easy();
+    assert!(
+        !fix.contains("Restart"),
+        "a stopped engine must not be given the restart remedy: {fix:?}"
+    );
 }
 
 /// A `Refusal` cannot be built from a warning: a refusal that could be waved
