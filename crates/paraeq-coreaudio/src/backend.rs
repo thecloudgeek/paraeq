@@ -20,7 +20,9 @@
 //! bare `Drop` respect the same order as a backup.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
 
 use objc2_core_audio::{
     kAudioDevicePropertyDeviceIsAlive, kAudioDevicePropertyNominalSampleRate,
@@ -79,6 +81,59 @@ pub fn deinterleave_sanitize_channel(
     invalid
 }
 
+/// MS-6's witness (docs/specs/2026-07-15-measurement-safety-design.md:333) as a
+/// cloneable handle: a live read-back of whether the backend's current tap
+/// excludes ParaEQ's own process.
+///
+/// Why a shared cell and not a field read off `EngineState`: once a
+/// [`TapBackend`] is handed to `EngineHandle::spawn` it lives inside the
+/// controller thread and nothing outside can reach its [`TapSystem`]. A caller
+/// takes a clone *before* that move (see [`TapBackend::exclusion_witness`]) and
+/// keeps reading the same cell afterwards. `paraeq-measure` requires exactly
+/// that: [`TapStatus`](paraeq_measure::TapStatus) "reports the tap's *current*
+/// state, not the state at construction; the session polls it at every gate
+/// that precedes emission" (`crates/paraeq-measure/src/seam.rs:96-98`). An
+/// `EngineState` snapshot is published at most once per controller tick and is
+/// additionally filtered by `effectively_equal` — up to a quarter second stale
+/// on a safety gate.
+///
+/// **`false` whenever no tap is live** — before start, after stop, during a
+/// device-change rebuild, and on a failed start. The invariant is not being
+/// witnessed then, and a tap can come up on the very next controller tick, so
+/// reporting `true` would be a claim about a topology that is not there.
+///
+/// Inherits the honest limit of [`TapSystem::self_excluded`]: the HAL has no
+/// read-back for a tap's exclusion list, so this witnesses that we looked up
+/// our own process object and passed it to the tap description — strictly
+/// weaker than "the HAL is excluding us".
+#[derive(Clone, Debug, Default)]
+pub struct ExclusionWitness(Arc<AtomicBool>);
+
+impl ExclusionWitness {
+    /// Publish the live tap's self-exclusion. [`TapBackend`] calls this at the
+    /// two points that change the answer: once the [`TapSystem`] is up, and
+    /// with `false` after teardown.
+    ///
+    /// Public because the witness's authority never came from this method being
+    /// private — [`TapStatus`](paraeq_measure::TapStatus) is a public trait any
+    /// caller can implement, so a session is only as honest as the handle the
+    /// wiring hands it. What makes *this* witness trustworthy is that it is the
+    /// backend's own cell, obtained from [`TapBackend::exclusion_witness`].
+    ///
+    /// The contract that keeps it trustworthy: **`TapBackend` is the only
+    /// writer.** Anything else that writes here is lying to the MS-6 gate about
+    /// a live audio topology, with a full-level stimulus armed.
+    pub fn set(&self, self_excluded: bool) {
+        self.0.store(self_excluded, Ordering::Release);
+    }
+}
+
+impl paraeq_measure::TapStatus for ExclusionWitness {
+    fn self_excluded(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 /// Production tap backend. One instance drives at most one live
 /// tap/aggregate/IOProc set at a time; the engine controller starts/stops
 /// it (including one stop+start renegotiation cycle when the reported
@@ -89,8 +144,13 @@ pub fn deinterleave_sanitize_channel(
 /// destroy IOProc), then `system` (destroy aggregate → destroy tap). Rust
 /// drops fields in declaration order, so even a bare `Drop` — without
 /// [`stop`](AudioBackend::stop) — tears down in the validated sequence.
+/// `exclusion` is deliberately declared FIRST, ahead of that ordered tail: it
+/// owns no HAL object, so dropping it early cannot disturb the sequence, and
+/// keeping it out of the tail stops a later reader from mistaking it for a
+/// teardown step.
 #[derive(Default)]
 pub struct TapBackend {
+    exclusion: ExclusionWitness,
     listeners: Vec<PropertyListener>,
     events: Option<Receiver<ListenerEvent>>,
     /// Mapped-but-unreturned events (the per-poll dedup buffer).
@@ -104,6 +164,16 @@ impl TapBackend {
         TapBackend::default()
     }
 
+    /// Take a clone of this backend's MS-6 witness.
+    ///
+    /// Call it **before** the backend is moved into `EngineHandle::spawn` —
+    /// after that move the backend is owned by the controller thread and
+    /// unreachable. The returned handle tracks the backend's start/stop for as
+    /// long as the backend lives, and reads `false` once it does not.
+    pub fn exclusion_witness(&self) -> ExclusionWitness {
+        self.exclusion.clone()
+    }
+
     /// The 8-step start, with partial state stashed in `self` as it is
     /// created so the caller's cleanup (`stop`) can unwind any prefix.
     fn start_inner(
@@ -114,6 +184,10 @@ impl TapBackend {
         // 1. Tap + private aggregate (spike-validated composition).
         self.system = Some(TapSystem::create()?);
         let system = self.system.as_ref().expect("just stored");
+        // MS-6: publish the live tap's self-exclusion as soon as there is a
+        // tap. Any later failure in this function unwinds through `stop`,
+        // which clears it again.
+        self.exclusion.set(system.self_excluded);
         let aggregate = system.aggregate;
         let device = system.device;
         let device_uid = system.device_uid.clone();
@@ -356,6 +430,12 @@ impl AudioBackend for TapBackend {
             Some(mut system) => system.teardown(),
             None => Vec::new(),
         };
+        // MS-6: no tap, nothing witnessed. After the teardown, so the witness
+        // never reads `false` while a tap is still up. This is also the
+        // failed-start unwind path (`start` calls `stop` on error) and the
+        // first half of a device-change rebuild.
+        self.exclusion.set(false);
+
         if errors.is_empty() {
             Ok(())
         } else {
