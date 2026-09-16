@@ -42,7 +42,9 @@ cargo run --release --manifest-path spikes/tap-spike/Cargo.toml -- run
 
 # Python oracle (only for fixtures / verifying prototype behavior)
 source .venv/bin/activate
-# First-time setup: python3 -m venv .venv && .venv/bin/pip install -e "./prototype[dev,gui]"
+# First-time setup: python3 -m venv .venv && .venv/bin/pip install -e "./prototype[dev,fixtures]"
+# (the `fixtures` extra pins numpy/scipy exactly; generate_fixtures.py refuses to run without
+#  those pins. Add `gui` only to run the old PyQt6 prototype app.)
 pytest prototype/tests -v
 python prototype/tools/generate_fixtures.py   # regenerates fixtures/ — commit the diff deliberately
 ```
