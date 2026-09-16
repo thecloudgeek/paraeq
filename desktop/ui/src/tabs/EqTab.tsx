@@ -67,6 +67,7 @@ import {
 } from "@/ipc/commands";
 import type { AppState, EQBand, EngineState, FilterType } from "@/ipc/types";
 import { BAND_PALETTE, EQ_PLOT_RANGE, logspace, qWheelStep } from "@/plot/FreqPlotRenderer";
+import { rateMismatchNotice } from "./statusStrip";
 import type { PlotHandle, Trace } from "@/plot/FreqPlotRenderer";
 
 // The plot's frequency grid (prototype parity: 512 log-spaced points 20..20k).
@@ -648,6 +649,7 @@ function StatusStrip({
   onToggleEnabled: (enable: boolean) => void;
 }): JSX.Element {
   const { label, hint } = describeStatus(engine.status);
+  const rateNotice = rateMismatchNotice(engine.correction_rate_mismatch);
 
   const parts: string[] = [label];
   if (engine.latency_ms != null) parts.push(`${engine.latency_ms.toFixed(1)} ms`);
@@ -667,6 +669,10 @@ function StatusStrip({
   return (
     <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-t pt-2 text-sm">
       <span className="font-medium">Engine: {parts.join(" · ")}</span>
+      {/* R1-6: the engine failed OPEN and is running flat. Safe, but it must
+          never be silent -- an un-disclosed fail-open is the invisible
+          failure the hardening work exists to prevent. */}
+      {rateNotice ? <span className="font-medium text-destructive">{rateNotice}</span> : null}
       {hint ? <span className="text-muted-foreground">{hint}</span> : null}
       <div className="flex-1" />
       <Tooltip>

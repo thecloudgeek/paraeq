@@ -71,6 +71,10 @@ fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
 /// A memoryless gain-`g` IIR correction (`y = g * x`) for `channels`.
 fn iir_gain(g: f64, channels: usize) -> CorrectionConfig {
     CorrectionConfig::Iir {
+        // The MockBackend reports 48 kHz, so the baked arm's R1-6 rate
+        // compare passes. Rate independence itself is covered in
+        // `test_rate_independence.rs`.
+        design_rate: 48_000.0,
         sos_per_channel: vec![vec![[g, 0.0, 0.0, 1.0, 0.0, 0.0]]; channels],
     }
 }
@@ -297,6 +301,7 @@ fn buffer_frames_renegotiation() {
     // FIR requires exactly block_size frames: corrected output at 256
     // proves the chain was rebuilt for the effective size, not the request.
     handle.send(EngineCommand::SetCorrection(CorrectionConfig::Fir {
+        design_rate: 48_000.0,
         firs: vec![vec![2.0]; 2],
     }));
     assert!(wait_until(WAIT, || pump_matches(&backend, 256, 0.2, 0.4)));
@@ -378,6 +383,7 @@ fn shifting_geometry_renegotiation_converges_on_final_report() {
     // The final chain matches the FINAL report: a FIR (which demands
     // exactly block_size frames) corrects a mono 128-frame block.
     handle.send(EngineCommand::SetCorrection(CorrectionConfig::Fir {
+        design_rate: 48_000.0,
         firs: vec![vec![2.0]],
     }));
     assert!(wait_until(WAIT, || {
@@ -422,12 +428,15 @@ fn malformed_correction_is_ignored_not_fatal() {
     // Degenerate configs would panic build_correction; the controller must
     // validate and ignore them (no state change, thread stays alive).
     handle.send(EngineCommand::SetCorrection(CorrectionConfig::Fir {
+        design_rate: 48_000.0,
         firs: vec![],
     }));
     handle.send(EngineCommand::SetCorrection(CorrectionConfig::Fir {
+        design_rate: 48_000.0,
         firs: vec![vec![]],
     }));
     handle.send(EngineCommand::SetCorrection(CorrectionConfig::Iir {
+        design_rate: 48_000.0,
         sos_per_channel: vec![],
     }));
 
@@ -725,6 +734,7 @@ fn frame_mismatch_blocks_reach_snapshots() {
     // corrects ONLY exact-block_size frames, so pumping half-blocks (256)
     // flags frame_mismatch on every block and grows the snapshot counter.
     handle.send(EngineCommand::SetCorrection(CorrectionConfig::Fir {
+        design_rate: 48_000.0,
         firs: vec![vec![1.0]; 2],
     }));
     assert!(wait_until(WAIT, || {

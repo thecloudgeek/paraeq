@@ -253,7 +253,8 @@ mod tests {
         };
         let engine = EngineState {
             bypass: false,
-            correction: Some("iir:1-band".into()),
+            correction: Some("peq:1-band".into()),
+            correction_rate_mismatch: None,
             enabled: true,
             frame_mismatch_blocks: 0,
             gain_db: -3.0,
@@ -278,7 +279,8 @@ mod tests {
                 ],
                 "engine": {
                     "bypass": false,
-                    "correction": "iir:1-band",
+                    "correction": "peq:1-band",
+                    "correction_rate_mismatch": null,
                     "enabled": true,
                     "frame_mismatch_blocks": 0,
                     "gain_db": -3.0,

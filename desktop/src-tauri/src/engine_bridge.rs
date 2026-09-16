@@ -8,11 +8,12 @@
 //!   1. NEVER hold the [`AppShared::data`] lock across an `EngineHandle::send`
 //!      or a Tauri `emit` -- lock, copy what is needed, drop the guard, THEN
 //!      send/emit.
-//!   2. NEVER design coefficients from bands that were not [`eq::validate_bands`]
-//!      -validated at the *target* stream rate. The forwarder re-validates on
-//!      every rate change (a band legal at 96/48 kHz can be >= Nyquist at
-//!      44.1 kHz), sending `ClearCorrection` (flat passthrough) rather than
-//!      letting a NaN/Inf coefficient reach the realtime chain.
+//!   2. NEVER send bands that were not [`eq::validate_bands`]-validated, so the
+//!      user gets a named reason instead of a silently dropped band. Since
+//!      R1-6 this is feedback, not the safety wall: `paraeq-engine` re-derives
+//!      every band at the LIVE stream rate at install time and drops (or, if
+//!      nothing survives, refuses) anything at or above the new Nyquist, so no
+//!      NaN/Inf coefficient can reach the realtime chain by any route.
 
 use crate::eq;
 use crate::settings::{self, Settings};
@@ -118,9 +119,11 @@ pub fn publish_current(app: &tauri::AppHandle) {
 /// BEFORE the handle was stored so no early snapshot is missed) and reconciles
 /// each published snapshot:
 ///
-/// 1. On a sample-rate change (or the first stream), re-validate the bands at
-///    the NEW rate and re-send the correction (or `ClearCorrection` on
-///    failure) -- the stage-3 rate-change carry-forward.
+/// 1. On an engine-published redesign refusal (or the first stream),
+///    re-validate the bands at the live rate and re-send the correction (or
+///    `ClearCorrection` on failure) -- the R1-6 fallback path. A bare rate
+///    change does NOT come through here any more: the engine re-derives a
+///    `Peq` correction at the new rate itself.
 /// 2. On a device change, refresh the selectable device list.
 /// 3. Publish the snapshot (emit + persist).
 ///
@@ -130,6 +133,8 @@ pub fn start_forwarder(app: tauri::AppHandle, rx: Receiver<Arc<EngineState>>) {
     std::thread::Builder::new()
         .name("paraeq-forwarder".into())
         .spawn(move || {
+            // "Have we seen a stream yet", since R1-6: the rate it carries is
+            // bookkeeping, not the redesign trigger.
             let mut last_rate: Option<f64> = None;
             let mut last_device_uid: Option<String> = None;
             loop {
@@ -137,7 +142,10 @@ pub fn start_forwarder(app: tauri::AppHandle, rx: Receiver<Arc<EngineState>>) {
                     Ok(snapshot) => {
                         let shared = app.state::<AppShared>();
 
-                        // 1. Rate-change re-send (re-validate at the NEW rate).
+                        // 1. Redesign re-send: the engine refused the config
+                        //    it holds, or this is the first stream we have
+                        //    seen. Same shape as before, re-pointed at the
+                        //    engine's own verdict.
                         let bands = { shared.data.lock().unwrap().bands.clone() };
                         let have_bands = !bands.is_empty();
                         if let Some(rate) = eq::resend_decision(last_rate, &snapshot, have_bands) {
@@ -149,8 +157,8 @@ pub fn start_forwarder(app: tauri::AppHandle, rx: Receiver<Arc<EngineState>>) {
                                 }
                                 Err(e) => {
                                     log::warn!(
-                                        "bands invalid at {rate} Hz after rate change: {e}; \
-                                         clearing correction (flat passthrough)"
+                                        "bands invalid at {rate} Hz: {e}; clearing correction \
+                                         (flat passthrough)"
                                     );
                                     send_cmd(&shared, EngineCommand::ClearCorrection);
                                 }
@@ -203,6 +211,7 @@ fn stopped_state() -> EngineState {
     EngineState {
         bypass: false,
         correction: None,
+        correction_rate_mismatch: None,
         enabled: false,
         frame_mismatch_blocks: 0,
         gain_db: 0.0,

@@ -7,7 +7,12 @@ version.workspace = true
 [dependencies]
 arc-swap = { workspace = true }
 log = { workspace = true }
-paraeq-dsp = { path = "../paraeq-dsp" }
+# `serde`: R1-6 put design INTENT on the wire -- `CorrectionConfig::Peq`
+# carries `EQBand`, and the enum is Serialize/Deserialize (the daemon seam).
+# The feature is off by default on paraeq-dsp so the pure-math crate stays
+# serde-free, so this consumer asks for it explicitly (same as
+# paraeq-decide/Cargo.toml).
+paraeq-dsp = { path = "../paraeq-dsp", features = ["serde"] }
 realfft = { workspace = true }
 rtrb = { workspace = true }
 rustfft = { workspace = true }

@@ -4,9 +4,11 @@
 //! -- the `data`-side change (bands, preamp, devices) is visible at once, and
 //! the engine-side change follows on the next forwarder snapshot.
 //!
-//! Validation is the enforcement wall: no band or preamp reaches the engine
-//! without passing [`eq::validate_bands`] / [`eq::validate_preamp`] at the live
-//! stream rate first.
+//! Validation here is USER-FACING FEEDBACK, not the enforcement wall: every
+//! band and preamp still passes [`eq::validate_bands`] / [`eq::validate_preamp`]
+//! at the live stream rate so a bad edit is rejected with a named reason, but
+//! since R1-6 the wall itself is `paraeq-engine`, which re-derives every band
+//! at whatever rate the stream is actually running (see `eq.rs`'s header).
 
 use crate::autoeq::{self, AutoEqClient, IndexEntry, ParsedPresetDto, ReqwestFetch};
 use crate::engine_bridge;
@@ -40,7 +42,12 @@ fn autoeq_client(app: &tauri::AppHandle) -> Result<AutoEqClient<ReqwestFetch>, S
 }
 
 /// The live stream sample rate, or the 48 kHz fallback when no stream is up.
-/// Bands are validated and designed at this rate.
+///
+/// Since R1-6 this is PROVENANCE plus the rate a band edit is checked against
+/// for the user's benefit -- it is no longer the rate coefficients are designed
+/// at. The engine designs at the rate its own stream reports, so the 48 kHz
+/// no-stream fallback is harmless: a correction stamped `design_rate = 48000`
+/// while nothing was playing still installs correctly on a 44.1 kHz stream.
 fn live_rate(shared: &AppShared) -> f64 {
     engine_bridge::current_engine_state(shared)
         .stream
@@ -49,8 +56,9 @@ fn live_rate(shared: &AppShared) -> f64 {
 }
 
 /// The shared apply path for every band edit (set/add/remove): validate at the
-/// live rate, send the designed correction (or `ClearCorrection` when empty),
-/// store the bands, then publish. `bands` is the FULL new band set.
+/// live rate (user feedback), send the correction intent (or `ClearCorrection`
+/// when empty), store the bands, then publish. `bands` is the FULL new band
+/// set.
 fn apply_bands(app: &tauri::AppHandle, bands: Vec<EQBand>) -> Result<(), String> {
     let shared = app.state::<AppShared>();
     let rate = live_rate(&shared);
@@ -281,6 +289,9 @@ pub fn profiles_save(app: tauri::AppHandle, name: String) -> Result<(), String> 
 /// `eq_set_bands` path (validate at the live rate, then `SetCorrection`/
 /// `ClearCorrection`) and its preamp through the `engine_set_preamp_db` path,
 /// mark it active, then publish once. Errors if no profile matches `name`.
+///
+/// As in `apply_bands`, the live rate is provenance + user feedback: the
+/// engine re-derives the profile's bands at the stream's own rate.
 #[tauri::command]
 pub fn profiles_activate(app: tauri::AppHandle, name: String) -> Result<(), String> {
     let shared = app.state::<AppShared>();

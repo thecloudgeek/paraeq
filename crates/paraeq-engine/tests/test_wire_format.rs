@@ -12,6 +12,7 @@ fn engine_state_wire_format_is_pinned() {
     let state = EngineState {
         bypass: false,
         correction: Some("iir:2-band".into()),
+        correction_rate_mismatch: None,
         enabled: true,
         frame_mismatch_blocks: 0,
         gain_db: -3.0,
@@ -30,6 +31,7 @@ fn engine_state_wire_format_is_pinned() {
         serde_json::json!({
             "bypass": false,
             "correction": "iir:2-band",
+            "correction_rate_mismatch": null,
             "enabled": true,
             "frame_mismatch_blocks": 0,
             "gain_db": -3.0,

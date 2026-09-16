@@ -1,73 +1,57 @@
 //! Pure EQ correctness layer for the command surface: band/preamp validation,
-//! SOS design, the rate-change re-send decision, and the plot response grid.
+//! correction-config assembly, the redesign re-send decision, and the plot
+//! response grid.
 //!
-//! This is the enforcement wall that keeps NaN/Inf coefficients out of the
-//! realtime chain. `paraeq-dsp` and `paraeq-engine` validate nothing about the
-//! *values* of a band -- `validate_correction` in the controller only rejects
-//! structurally empty configs, so a degenerate band (`q = 0`, `fc >= Nyquist`)
-//! would design NaN/Inf biquad coefficients and hand them straight to the tap.
-//! Every command that accepts bands (Task 7) calls [`validate_bands`] first,
-//! and the forwarder's rate-resend path re-validates at the NEW stream rate --
-//! a band that is legal at 96/48 kHz can be `>= Nyquist` at 44.1 kHz.
+//! **This is no longer the enforcement wall -- `paraeq-engine` is.** R1-6 moved
+//! the invariant into the engine: `CorrectionConfig::Peq` carries design INTENT
+//! (bands + a provenance `design_rate`) and `build_correction` re-derives
+//! coefficients at the LIVE stream rate on every rebuild, dropping any band
+//! that is at or above the new Nyquist and refusing (flat pass-through) only
+//! when nothing survives. So a band can no longer reach `to_sos` at a rate it
+//! was not checked against, whatever call site sends it -- a future `paraeqd`
+//! or the auto front-end included. The owner-decided home of the band guard
+//! itself is `paraeq_engine::controller::{validate_band, validate_band_at}`
+//! (`docs/decisions/2026-07-22-owner-value-calls.md`).
+//!
+//! What stays here is USER-FACING feedback: [`validate_bands`] wraps the
+//! engine's per-band guard to produce the indexed, human-readable strings the
+//! UI shows, so an edit is rejected with an explanation instead of silently
+//! losing a band inside the engine.
 //!
 //! No Tauri types live here: it is pure functions over dsp/engine types, fully
 //! unit-tested.
 
 use paraeq_dsp::peq::{parse_autoeq, EQBand, ParametricEQ};
-use paraeq_engine::controller::{CorrectionConfig, EngineState};
+use paraeq_engine::controller::{validate_band_at, CorrectionConfig, EngineState};
 
-/// Maximum absolute per-band gain, in dB. `|gain_db|` above this is rejected.
-pub const GAIN_LIMIT_DB: f64 = 30.0;
+// The per-band limits (`GAIN_LIMIT_DB`, `Q_MAX`, `Q_MIN`) moved to
+// `paraeq_engine::controller` -- one source of truth for every consumer, the
+// daemon seam included. Nothing here reads them any more; the tests import
+// them from the engine directly.
+
 /// Upper bound of the accepted preamp range, in dB.
 pub const PREAMP_MAX_DB: f64 = 10.0;
 /// Lower bound of the accepted preamp range, in dB.
 pub const PREAMP_MIN_DB: f64 = -30.0;
-/// Minimum band Q. Q below this is rejected. Set far above the subnormal
-/// overflow floor (~1e-309, where `alpha = sin(w0)/(2*q)` overflows to +inf and
-/// yields NaN SOS coefficients) while still admitting the full realistic audio
-/// Q range (~0.1-100). NOTE: the UI clamp list (later batch) must mirror this.
-pub const Q_MIN: f64 = 0.1;
-/// Maximum band Q. Q above this (or `< Q_MIN`) is rejected.
-pub const Q_MAX: f64 = 100.0;
 
-/// Reject a band set before ANY coefficient design. A band is invalid when:
-/// its `fc` is not finite or lies outside the open interval
+/// Reject a band set before it reaches the engine, with a message naming the
+/// offending band index and field -- they surface verbatim in the UI. A band
+/// is invalid when: its `fc` is not finite or lies outside the open interval
 /// `(0, sample_rate / 2)` (both ends exclusive -- `fc = 0` and `fc = Nyquist`
 /// are rejected); its `q` is not finite, `< Q_MIN`, or `> Q_MAX`; or its
-/// `gain_db` is not finite or `|gain_db| > GAIN_LIMIT_DB`. Error strings name
-/// the offending band index and field -- they surface verbatim in the UI.
+/// `gain_db` is not finite or `|gain_db| > GAIN_LIMIT_DB`.
+///
+/// A thin wrapper over `paraeq_engine::controller::validate_band_at`: the
+/// engine owns the rules, this owns the wording and the index. It is
+/// user-facing feedback at the rate the stream happens to be running now, NOT
+/// the safety guarantee -- the engine re-checks every band at the live rate at
+/// install time, so a rate change between this call and the install cannot
+/// slip a NaN coefficient through.
 ///
 /// An empty band set is valid (`Ok(())`); the caller clears the correction.
 pub fn validate_bands(bands: &[EQBand], sample_rate: f64) -> Result<(), String> {
-    let nyquist = sample_rate / 2.0;
     for (i, band) in bands.iter().enumerate() {
-        if !band.fc.is_finite() {
-            return Err(format!("band {i}: fc must be a finite number"));
-        }
-        if band.fc <= 0.0 || band.fc >= nyquist {
-            return Err(format!(
-                "band {i}: fc {} Hz must be between 0 and Nyquist ({nyquist} Hz), exclusive",
-                band.fc
-            ));
-        }
-        if !band.q.is_finite() {
-            return Err(format!("band {i}: q must be a finite number"));
-        }
-        if band.q < Q_MIN || band.q > Q_MAX {
-            return Err(format!(
-                "band {i}: q {} must be between {Q_MIN} and {Q_MAX}",
-                band.q
-            ));
-        }
-        if !band.gain_db.is_finite() {
-            return Err(format!("band {i}: gain_db must be a finite number"));
-        }
-        if band.gain_db.abs() > GAIN_LIMIT_DB {
-            return Err(format!(
-                "band {i}: gain_db {} must be within +/-{GAIN_LIMIT_DB} dB",
-                band.gain_db
-            ));
-        }
+        validate_band_at(band, sample_rate).map_err(|reason| format!("band {i}: {reason}"))?;
     }
     Ok(())
 }
@@ -86,37 +70,51 @@ pub fn validate_preamp(db: f64) -> Result<(), String> {
     Ok(())
 }
 
-/// Design the engine correction for a validated band set. Returns `None` for an
-/// empty band set (the caller sends `ClearCorrection` -- flat passthrough).
+/// Assemble the engine correction for a band set. Returns `None` for an empty
+/// band set (the caller sends `ClearCorrection` -- flat passthrough).
 ///
-/// Otherwise returns a single SOS set (`sos_per_channel` of length 1); the
-/// engine broadcasts one entry across both stereo channels. Callers MUST have
-/// run [`validate_bands`] at this same `sample_rate` first -- this function
-/// designs coefficients unconditionally and does not itself guard against
-/// `fc >= Nyquist` / `q = 0` producing NaN/Inf.
+/// It no longer DESIGNS anything: under R1-6 it hands the engine the bands
+/// themselves as `CorrectionConfig::Peq`, and the engine derives coefficients
+/// at whatever rate the stream is actually running. `sample_rate` becomes the
+/// config's `design_rate`, which is **provenance only** -- it records the rate
+/// the user was looking at, and the engine never compares it. That is what
+/// lets a correction survive an AirPods 44.1<->48 kHz handoff with its bands
+/// still where the user put them.
+///
+/// Otherwise returns a single band set (`bands` of length 1); the engine
+/// broadcasts one entry across both stereo channels.
 pub fn design_correction(bands: &[EQBand], sample_rate: f64) -> Option<CorrectionConfig> {
     if bands.is_empty() {
         return None;
     }
-    let peq = ParametricEQ {
-        bands: bands.to_vec(),
-        sample_rate,
-    };
-    Some(CorrectionConfig::Iir {
-        sos_per_channel: vec![peq.combined_sos()],
+    Some(CorrectionConfig::Peq {
+        bands: vec![bands.to_vec()],
+        design_rate: sample_rate,
     })
 }
 
-/// The forwarder's redesign trigger, pure and unit-tested.
+/// The forwarder's redesign trigger, pure and unit-tested -- now a FALLBACK,
+/// not the rate-change mechanism.
 ///
-/// Returns `Some(new_rate)` iff the snapshot carries a live stream, there are
-/// bands to apply, and the stream's sample rate differs from `last_rate`. The
-/// first-ever stream (`last_rate == None`) also triggers -- it is how a
-/// correction queued before the stream geometry was known (and how the
-/// persisted, hand-editable `settings.json` bands) get validated and designed
-/// at the real rate before reaching `to_sos`.
+/// R1-6 moved the rate handling into the engine, so a bare rate change no
+/// longer needs anything from the desktop: the engine re-derives a `Peq`
+/// correction at the new rate inside the very start that used to install
+/// stale coefficients. What is left are the two cases the engine cannot
+/// handle by itself:
 ///
-/// Returns `None` when there is no stream, no bands, or the rate is unchanged.
+/// 1. **The engine published a refusal** (`correction_rate_mismatch` is set).
+///    The config it holds cannot be re-derived at the live rate, and the
+///    desktop is the only layer still holding the design intent, so it
+///    re-sends. This is the field the spec says to key off (`:424`).
+/// 2. **The first-ever stream** (`last_rate == None`), which is how a
+///    correction queued before the stream geometry was known -- and the
+///    persisted, hand-editable `settings.json` bands -- get validated at a
+///    real rate and stamped with a real `design_rate`.
+///
+/// `last_rate` has correspondingly narrowed to "have we seen a stream yet";
+/// the rate it carries is only echoed back for the caller's bookkeeping.
+///
+/// Returns `None` when there is no stream, no bands, or neither case applies.
 pub fn resend_decision(
     last_rate: Option<f64>,
     snapshot: &EngineState,
@@ -126,10 +124,12 @@ pub fn resend_decision(
         return None;
     }
     let rate = snapshot.stream.as_ref()?.sample_rate;
-    if last_rate == Some(rate) {
-        None
-    } else {
+    // Always redesign at the LIVE rate, whatever rate the flag names -- they
+    // are equal by construction, and the stream is the authority.
+    if snapshot.correction_rate_mismatch.is_some() || last_rate.is_none() {
         Some(rate)
+    } else {
+        None
     }
 }
 
@@ -215,6 +215,7 @@ mod tests {
     use super::*;
     use paraeq_dsp::peq::FilterType;
     use paraeq_engine::backend::StreamInfo;
+    use paraeq_engine::controller::{GAIN_LIMIT_DB, Q_MAX, Q_MIN};
     use paraeq_engine::status::EngineStatus;
 
     fn peaking(fc: f64, gain_db: f64, q: f64) -> EQBand {
@@ -232,6 +233,7 @@ mod tests {
         EngineState {
             bypass: false,
             correction: None,
+            correction_rate_mismatch: None,
             enabled: true,
             frame_mismatch_blocks: 0,
             gain_db: 0.0,
@@ -431,22 +433,41 @@ mod tests {
         assert!(design_correction(&[], 48_000.0).is_none());
     }
 
+    /// Replaces `design_matches_combined_sos_directly`, whose
+    /// `panic!("PEQ design must be Iir, not Fir")` inverted under R1-6: the
+    /// desktop must now hand over INTENT, not coefficients, or the engine has
+    /// nothing to re-derive from on a rate change.
     #[test]
-    fn design_matches_combined_sos_directly() {
+    fn design_emits_peq_with_live_design_rate() {
         let bands = [peaking(1_000.0, 3.0, 1.0), peaking(4_000.0, -2.0, 2.0)];
-        let cfg = design_correction(&bands, 48_000.0).expect("non-empty bands design a config");
+        let cfg = design_correction(&bands, 44_100.0).expect("non-empty bands make a config");
+        match cfg {
+            CorrectionConfig::Peq {
+                bands: sets,
+                design_rate,
+            } => {
+                assert_eq!(sets.len(), 1, "single broadcast band set");
+                assert_eq!(sets[0], bands.to_vec(), "bands pass through untouched");
+                assert_eq!(design_rate, 44_100.0, "provenance is the live rate");
+            }
+            other => panic!("PEQ design must be Peq, got {other:?}"),
+        }
+    }
+
+    /// ...and the bands it hands over still design to exactly the
+    /// coefficients the old direct path produced, when the engine builds them
+    /// at the same rate. Guards against a silent numeric change hiding inside
+    /// the shape change.
+    #[test]
+    fn peq_config_designs_to_the_same_coefficients_as_before() {
+        let bands = [peaking(1_000.0, 3.0, 1.0), peaking(4_000.0, -2.0, 2.0)];
         let expected = ParametricEQ {
             bands: bands.to_vec(),
             sample_rate: 48_000.0,
         }
         .combined_sos();
-        match cfg {
-            CorrectionConfig::Iir { sos_per_channel } => {
-                assert_eq!(sos_per_channel.len(), 1, "single broadcast SOS set");
-                assert_eq!(sos_per_channel[0], expected, "no drift from combined_sos");
-            }
-            CorrectionConfig::Fir { .. } => panic!("PEQ design must be Iir, not Fir"),
-        }
+        let derived: Vec<[f64; 6]> = bands.iter().map(|b| b.to_sos(48_000.0)).collect();
+        assert_eq!(derived, expected, "no drift from combined_sos");
     }
 
     // ---- resend_decision ----
@@ -463,10 +484,32 @@ mod tests {
         assert_eq!(resend_decision(Some(48_000.0), &snap, true), None);
     }
 
+    /// THE ONE INVERTED ASSERTION (R1-6). This test was
+    /// `resend_changed_rate_triggers`; a bare rate change no longer needs a
+    /// desktop re-send, because the engine re-derived the correction at the
+    /// new rate inside the same start. Re-pointed, not deleted -- the spec
+    /// requires this suite to survive (`:434`).
     #[test]
-    fn resend_changed_rate_triggers() {
+    fn changed_rate_alone_no_longer_triggers() {
         let snap = snapshot_with_stream(Some(stream_at(44_100.0)));
-        assert_eq!(resend_decision(Some(48_000.0), &snap, true), Some(44_100.0));
+        assert_eq!(resend_decision(Some(48_000.0), &snap, true), None);
+    }
+
+    /// ...and this is what replaces it: the engine's published refusal is the
+    /// trigger now (spec `:424`).
+    #[test]
+    fn mismatch_flag_triggers() {
+        let mut snap = snapshot_with_stream(Some(stream_at(44_100.0)));
+        snap.correction_rate_mismatch = Some(44_100.0);
+        assert_eq!(resend_decision(Some(44_100.0), &snap, true), Some(44_100.0));
+    }
+
+    /// A refusal with no bands to redesign from is still nothing to do.
+    #[test]
+    fn mismatch_flag_without_bands_is_none() {
+        let mut snap = snapshot_with_stream(Some(stream_at(44_100.0)));
+        snap.correction_rate_mismatch = Some(44_100.0);
+        assert_eq!(resend_decision(Some(44_100.0), &snap, false), None);
     }
 
     #[test]

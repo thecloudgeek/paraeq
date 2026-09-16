@@ -138,9 +138,16 @@ fn correction_for(cli: &Cli, sample_rate: f64, channels: usize) -> CorrectionCon
         let response_db = biquad::sos_frequency_response_db(&[sos], &freqs, sample_rate);
         let fir = design_fir_correction(&response_db, FIR_TAPS, FirPhase::Minimum);
         // One FIR: the convolver reuses the last filter for extra channels.
-        CorrectionConfig::Fir { firs: vec![fir] }
+        // Baked taps cannot be re-derived, so `design_rate` is the R1-6
+        // compare key: a device rate change refuses this config and the
+        // engine fails open to flat until the example re-designs it.
+        CorrectionConfig::Fir {
+            design_rate: sample_rate,
+            firs: vec![fir],
+        }
     } else {
         CorrectionConfig::Iir {
+            design_rate: sample_rate,
             sos_per_channel: vec![vec![sos]; channels],
         }
     }
@@ -244,11 +251,16 @@ fn main() {
             if let Some(stream) = &state.stream {
                 let config = correction_for(&cli, stream.sample_rate, stream.channels);
                 let what = match &config {
-                    CorrectionConfig::Fir { firs } => {
+                    CorrectionConfig::Fir { firs, .. } => {
                         format!("min-phase FIR, {} taps", firs[0].len())
                     }
-                    CorrectionConfig::Iir { sos_per_channel } => {
+                    CorrectionConfig::Iir {
+                        sos_per_channel, ..
+                    } => {
                         format!("IIR, {} band(s) per channel", sos_per_channel[0].len())
+                    }
+                    CorrectionConfig::Peq { bands, .. } => {
+                        format!("PEQ intent, {} band(s) per channel", bands[0].len())
                     }
                 };
                 println!(

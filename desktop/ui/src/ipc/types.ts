@@ -49,6 +49,10 @@ export interface StreamInfo {
 export interface EngineState {
   bypass: boolean;
   correction: string | null;
+  /** R1-6: the stream rate the correction must be redesigned for, when the
+   *  engine could not build it for the live stream and is running flat.
+   *  `null` whenever a correction is installed (or none is retained). */
+  correction_rate_mismatch: number | null;
   enabled: boolean;
   frame_mismatch_blocks: number;
   gain_db: number;

@@ -30,10 +30,17 @@ struct Inner {
     fail_next_starts: usize,
     /// The realtime processor moved in by the last successful `start`.
     processor: Option<RtProcessor>,
+    /// Per-start sample-rate overrides: each successful `start` pops the
+    /// front one; when empty, the sticky `reported_sample_rate` applies.
+    /// Lets ONE session be scripted 44.1 -> 48 -> 96 kHz across three
+    /// `FormatChanged` rebuilds (R1-6).
+    rates: VecDeque<f64>,
     /// `Some(n)`: report `buffer_frames = n` regardless of the request.
     /// `None`: honor the request (default 512).
     reported_buffer_frames: Option<usize>,
     reported_channels: usize,
+    /// Sample rate reported by every `start` once `rates` is exhausted.
+    reported_sample_rate: f64,
     /// Per-start `(channels, buffer_frames)` overrides: each successful
     /// `start` pops the front one; when empty, the sticky
     /// `reported_channels` / `reported_buffer_frames` apply.
@@ -64,8 +71,10 @@ impl MockBackend {
                 events: VecDeque::new(),
                 fail_next_starts: 0,
                 processor: None,
+                rates: VecDeque::new(),
                 reported_buffer_frames: None,
                 reported_channels: 2,
+                reported_sample_rate: 48_000.0,
                 reports: VecDeque::new(),
                 sample_time_delta: 512.0,
                 stream_channels: 2,
@@ -86,6 +95,21 @@ impl MockBackend {
     /// Report this channel count from every `start` (renegotiation trigger).
     pub fn set_reported_channels(&self, channels: usize) {
         self.lock().reported_channels = channels;
+    }
+
+    /// Report this sample rate from every `start` (sticky), once any queued
+    /// per-start rates are exhausted. The real backend gets this from the
+    /// device; R1-6 turns it into the rate corrections are DESIGNED at.
+    pub fn set_reported_sample_rate(&self, sample_rate: f64) {
+        self.lock().reported_sample_rate = sample_rate;
+    }
+
+    /// Queue a per-start sample rate: the NEXT successful `start` reports
+    /// exactly this rate (then the queue advances; when empty the sticky
+    /// `set_reported_sample_rate` value applies). Scripts an AirPods-style
+    /// 44.1 <-> 48 kHz handoff across rebuilds.
+    pub fn queue_sample_rate(&self, sample_rate: f64) {
+        self.lock().rates.push_back(sample_rate);
     }
 
     /// Queue a per-start `(channels, buffer_frames)` report: the NEXT
@@ -151,6 +175,39 @@ impl MockBackend {
         }
         Some(output)
     }
+
+    /// Drive one synchronous realtime callback with EXPLICIT per-channel
+    /// input samples. `pump`'s constant block cannot discriminate a filter
+    /// (a peaking band's DC response is 0 dB at every rate), so rate-
+    /// independence tests feed an impulse through here instead. `input`
+    /// must carry one buffer per stream channel, all the same length.
+    /// Returns the per-channel output, or `None` when the backend is not
+    /// running.
+    pub fn pump_samples(&self, input: &[Vec<f32>]) -> Option<Vec<Vec<f32>>> {
+        let mut inner = self.lock();
+        let channels = inner.stream_channels;
+        let delta = inner.sample_time_delta;
+        assert_eq!(
+            input.len(),
+            channels,
+            "pump_samples needs one buffer per stream channel"
+        );
+        let frames = input[0].len();
+        assert!(
+            input.iter().all(|c| c.len() == frames),
+            "every channel must supply the same frame count"
+        );
+        let processor = inner.processor.as_mut()?;
+
+        let input_views: Vec<&[f32]> = input.iter().map(Vec::as_slice).collect();
+        let mut output: Vec<Vec<f32>> = vec![vec![0.0; frames]; channels];
+        {
+            let mut output_views: Vec<&mut [f32]> =
+                output.iter_mut().map(Vec::as_mut_slice).collect();
+            processor.process_block(&input_views, &mut output_views, delta);
+        }
+        Some(output)
+    }
 }
 
 impl AudioBackend for MockBackend {
@@ -177,13 +234,17 @@ impl AudioBackend for MockBackend {
                     .unwrap_or(512),
             ),
         };
+        let sample_rate = inner
+            .rates
+            .pop_front()
+            .unwrap_or(inner.reported_sample_rate);
         inner.stream_channels = channels;
         inner.processor = Some(processor);
         Ok(StreamInfo {
             buffer_frames,
             channels,
             device_uid: "mock-device".into(),
-            sample_rate: 48_000.0,
+            sample_rate,
         })
     }
 
