@@ -69,11 +69,22 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// Why a run stopped — the § Abort Guards trigger table, minus panic (which
-/// arrives through unwinding, not through a flag).
+/// arrives through unwinding, not through a flag), plus [`Self::EngineStopped`]
+/// for the engine leaving `Running` by request (the spec's table has only the
+/// `Failed` row; the wizard's fail-open watchdog section supplies the other
+/// way a live session loses its engine).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AbortReason {
     /// The engine entered `Failed` (`EngineStatus::Failed`, controller-owned).
     EngineFailed,
+    /// The engine left `Running` *by request* — a user `Disable`, or the
+    /// fail-open watchdog auto-disabling after `NoInputDetected` (wizard
+    /// § The fail-open watchdog: the tap is torn down mid-session). The run
+    /// cannot continue without the engine, but nothing failed, so this
+    /// publishes [`MeasurementDiagnostic::EngineNotRunning`] and **not**
+    /// [`MeasurementDiagnostic::EngineFailed`] — a "restart ParaEQ" remedy
+    /// for a switch the user flipped is a wrong answer, not a vaguer one.
+    EngineStopped,
     /// >30% of samples in an input block clipped (capture metering).
     InputClipping,
     /// The measurement mic disconnected (`paraeq-coreaudio` listener).
@@ -91,6 +102,7 @@ impl AbortReason {
     pub fn diagnostic(self) -> MeasurementDiagnostic {
         match self {
             Self::EngineFailed => MeasurementDiagnostic::EngineFailed,
+            Self::EngineStopped => MeasurementDiagnostic::EngineNotRunning,
             Self::InputClipping => MeasurementDiagnostic::InputClipping,
             Self::MicDisconnected => MeasurementDiagnostic::MicDisconnected,
             Self::OutputDeviceChanged => MeasurementDiagnostic::OutputDeviceChanged,

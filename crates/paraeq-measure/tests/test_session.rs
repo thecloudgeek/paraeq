@@ -673,6 +673,7 @@ fn ms14_abort_ramps_to_zero_then_restores_in_order() {
 fn abort_reasons_map_to_their_trigger_diagnostics() {
     for (reason, diagnostic) in [
         (AbortReason::EngineFailed, D::EngineFailed),
+        (AbortReason::EngineStopped, D::EngineNotRunning),
         (AbortReason::InputClipping, D::InputClipping),
         (AbortReason::MicDisconnected, D::MicDisconnected),
         (AbortReason::OutputDeviceChanged, D::OutputDeviceChanged),
@@ -681,6 +682,37 @@ fn abort_reasons_map_to_their_trigger_diagnostics() {
     ] {
         assert_eq!(reason.diagnostic(), diagnostic);
     }
+}
+
+/// The engine being switched off mid-run is **not** an engine failure. A
+/// `Disable` from the user, or the fail-open watchdog auto-disabling after
+/// `NoInputDetected` (wizard § The fail-open watchdog: "15 s in, the
+/// controller tears the tap down mid-session"), tears the tap down while the
+/// session is live — but nothing is broken, so reporting `EngineFailed` would
+/// send the user off to restart the app instead of switching the EQ back on.
+/// The terminating log entry must name `EngineNotRunning`.
+#[test]
+fn a_mid_run_engine_stop_terminates_as_not_running_not_as_failed() {
+    let journal = Journal::default();
+    let sink = MockSink::with_journal(journal.clone());
+    let volume = MockVolume::new(PRE_VOLUME, journal.clone());
+    let mut session = acknowledged_session(sink.clone(), MockTap::new(true), volume.clone());
+
+    session.abort_now(AbortReason::EngineStopped);
+
+    assert_eq!(sink.emit_calls(), 0);
+    assert_eq!(session.phase(), SessionPhase::Terminated);
+    let log = session.finish();
+    assert_eq!(
+        log.events().last(),
+        Some(&SessionEvent::Terminated {
+            diagnostic: Some(D::EngineNotRunning)
+        }),
+        "a mid-run Disable/auto-disable must not be misreported as EngineFailed"
+    );
+    // The restore sequence still ran, in order, exactly once.
+    assert_eq!(journal.calls(), vec!["stop", "set_volume"]);
+    assert_eq!(volume.sets(), vec![PRE_VOLUME]);
 }
 
 /// First trigger wins: a second trigger cannot re-label the abort.

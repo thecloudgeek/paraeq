@@ -34,6 +34,13 @@
 //! split into its two causes ([`MeasurementDiagnostic::SensitivityMissing`] /
 //! [`MeasurementDiagnostic::SensitivityUnparseable`]) because the user's
 //! remedy differs; both refuse (MS-9).
+//!
+//! The one variant sourced elsewhere is
+//! [`MeasurementDiagnostic::EngineNotRunning`], which comes from
+//! `docs/specs/2026-07-15-wizard-design.md` (§ The fail-open hazard and § The
+//! fail-open watchdog, plus "engine lease" in the `Probe` box of the spine):
+//! the wizard requires a running engine, and the safety spec never names the
+//! condition because it assumes one.
 
 /// The blocking/non-blocking split the spec draws between "Refuse — do not
 /// warn, do not degrade, do not escalate" and "proceed, with a warning".
@@ -139,6 +146,17 @@ pub enum MeasurementDiagnostic {
     /// dBFS level) — a very insensitive chain can project an in-cap SPL yet
     /// demand a level ParaEQ will not emit.
     SolvedLevelIllegal = 23,
+    /// ParaEQ's engine is not running — switched off by the user, or
+    /// auto-disabled by the fail-open watchdog (wizard § The fail-open
+    /// watchdog). Distinct from [`Self::EngineFailed`]: nothing is broken.
+    /// Distinct from [`Self::SelfExclusionUnavailable`] too, which is what a
+    /// stopped engine would otherwise surface as — with no session there is
+    /// no tap and therefore no exclusion witness — and whose remedy is
+    /// "Restart ParaEQ", the wrong instruction for a switch the user can
+    /// flip. Measurement needs the engine: the MS-6 witness only exists while
+    /// a tap does, and the verification pass plays through the correction
+    /// chain (MS-19).
+    EngineNotRunning = 24,
 
     // ── Non-blocking warnings: 100… ─────────────────────────────────────────
     /// SNR accepted on the degraded row (median ≥ 30 dB but below the
@@ -191,6 +209,7 @@ impl MeasurementDiagnostic {
             Self::OutputDeviceChanged => 21,
             Self::EngineFailed => 22,
             Self::SolvedLevelIllegal => 23,
+            Self::EngineNotRunning => 24,
             Self::LowSnr => 100,
             Self::FixedMaxVolume => 101,
             Self::TwoClock => 102,
@@ -205,6 +224,7 @@ impl MeasurementDiagnostic {
         match self {
             Self::CapExceedsMicFullScale
             | Self::EngineFailed
+            | Self::EngineNotRunning
             | Self::InputClipping
             | Self::MicDisconnected
             | Self::MicUnidentified
@@ -327,6 +347,10 @@ impl MeasurementDiagnostic {
                 "This device needs an unsafe output level to reach a usable \
                  measurement volume. Turn up the device's own volume (or use a \
                  more sensitive one) and try again."
+            }
+            Self::EngineNotRunning => {
+                "ParaEQ's EQ is switched off. Turn it on with Enable, then \
+                 start the measurement again."
             }
             Self::LowSnr => {
                 "The measurement is usable, but a quieter room would make it \
@@ -509,6 +533,17 @@ impl MeasurementDiagnostic {
                  is too insensitive to measure safely at this device volume; no \
                  sample was emitted and the pre-measurement state was restored."
                 .to_owned(),
+            Self::EngineNotRunning => {
+                "ParaEQ's engine is not running — either it was switched off, \
+                 or it disabled itself after a spell with no audio playing \
+                 (15 seconds by default). Nothing is broken; measuring simply \
+                 needs the engine on. While it is off there is no system tap, \
+                 so ParaEQ cannot prove it is keeping its own sound out of \
+                 the measurement, and there is no correction chain for the \
+                 verification pass to play through. If a measurement was \
+                 already running it was stopped and your volume put back."
+                    .to_owned()
+            }
             Self::LowSnr => "The measurement cleared the reduced signal-to-noise bar \
                  (median ≥ 30 dB) but not the preferred one (median ≥ 40 dB \
                  with every band ≥ 20 dB). It is usable; the quiet parts of \
