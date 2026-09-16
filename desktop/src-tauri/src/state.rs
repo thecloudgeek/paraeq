@@ -13,6 +13,7 @@
 //! source of truth.
 
 use crate::settings::Settings;
+use paraeq_coreaudio::backend::ExclusionWitness;
 use paraeq_dsp::peq::EQBand;
 use paraeq_engine::controller::{EngineHandle, EngineState};
 use std::path::PathBuf;
@@ -55,6 +56,25 @@ pub struct AppState {
 pub struct AppShared {
     pub data: Mutex<AppData>,
     pub engine: Mutex<Option<EngineHandle>>,
+    /// The MS-6 self-exclusion witness, cloned off the `TapBackend` in
+    /// [`engine_bridge::spawn_engine`](crate::engine_bridge::spawn_engine)
+    /// BEFORE the backend was moved into the controller thread -- the only
+    /// moment it can be taken. It stays live and truthful for the life of that
+    /// backend, tracking every start and stop, so the measurement runtime can
+    /// poll the tap's CURRENT state at every gate that precedes emission
+    /// instead of reading a snapshot that is up to a controller tick stale.
+    /// No lock: it is an atomic cell behind an `Arc`.
+    ///
+    /// `dead_code` is allowed because the field is parked here for a STRUCTURAL
+    /// reason, not a stylistic one: the witness can only be taken at spawn, and
+    /// its first reader (the wizard's `Probe` precondition, which hands it to
+    /// `MeasurementSession::begin` as the `TapStatus` half of `SessionSeam`)
+    /// arrives with the measurement lease. Taking it later is not an option, so
+    /// storing it early is not premature. Same reason `TapSystem::desc` carries
+    /// the attribute (`crates/paraeq-coreaudio/src/tap.rs`). Delete the
+    /// attribute, not the field, when the wizard lands.
+    #[allow(dead_code)]
+    pub exclusion_witness: ExclusionWitness,
     /// In-memory mirror of the durable [`Settings`] currently on disk, seeded at
     /// setup from the loaded file. `publish` compares the freshly-composed
     /// durable subset against this to decide whether to write, so a snapshot
@@ -265,6 +285,7 @@ mod tests {
             invalid_samples: 2,
             latency_ms: Some(62.3),
             output_peak: 1.5,
+            self_excluded: true,
             status: EngineStatus::Running,
             stream: Some(StreamInfo {
                 buffer_frames: 512,
@@ -296,6 +317,7 @@ mod tests {
                     "invalid_samples": 2,
                     "latency_ms": 62.3,
                     "output_peak": 1.5,
+                    "self_excluded": true,
                     "status": { "kind": "running" },
                     "stream": {
                         "buffer_frames": 512,

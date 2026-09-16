@@ -74,6 +74,11 @@ export interface EngineState {
   /** R1-8: the maximum output sample, taken PRE-clamp, so an overshoot reads
    *  as (say) 1.99 rather than saturating at 1.0. */
   output_peak: number;
+  /** wizard/1 (MS-6): whether the engine's live capture excludes ParaEQ's own
+   *  audio right now. `false` with `stream != null` is the documented
+   *  fail-open path -- the measurement wizard refuses and asks for a restart.
+   *  `false` with `stream == null` just means nothing is running. */
+  self_excluded: boolean;
   status: EngineStatus;
   stream: StreamInfo | null;
 }

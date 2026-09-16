@@ -40,7 +40,7 @@ pub fn run() {
 
             // Spawn honoring persisted enabled/setup state; subscribe BEFORE
             // the handle is stored so the forwarder misses no early snapshot.
-            let handle = engine_bridge::spawn_engine(&settings);
+            let (handle, exclusion_witness) = engine_bridge::spawn_engine(&settings);
             let rx = handle.subscribe();
 
             // Restore the persisted preamp: clamp the (hand-editable) value
@@ -70,6 +70,7 @@ pub fn run() {
             app.manage(AppShared {
                 data: Mutex::new(data),
                 engine: Mutex::new(Some(handle)),
+                exclusion_witness,
                 // Seed the persisted-settings cache with the file as read from
                 // disk (NOT the possibly-clamped in-memory model): the first
                 // publish then still corrects an out-of-range on-disk preamp,

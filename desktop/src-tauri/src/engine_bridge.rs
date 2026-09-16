@@ -18,7 +18,7 @@
 use crate::eq;
 use crate::settings::{self, Settings};
 use crate::state::{AppShared, OutputDeviceInfo};
-use paraeq_coreaudio::backend::TapBackend;
+use paraeq_coreaudio::backend::{ExclusionWitness, TapBackend};
 use paraeq_coreaudio::devices;
 use paraeq_engine::controller::{EngineCommand, EngineConfig, EngineHandle, EngineState};
 use paraeq_engine::status::EngineStatus;
@@ -36,14 +36,26 @@ const RECV_TIMEOUT: Duration = Duration::from_millis(500);
 /// completed setup and left the EQ enabled. Called ONCE from `.setup`, AFTER
 /// [`settings::load`] -- never spawn before reading persisted state, or the tap
 /// mutes system audio pre-wizard until fail-open.
-pub fn spawn_engine(settings: &Settings) -> EngineHandle {
-    EngineHandle::spawn(
-        TapBackend::new(),
+///
+/// Returns the MS-6 [`ExclusionWitness`] alongside the handle. THIS IS THE ONLY
+/// PLACE it can be taken: `EngineHandle::spawn` moves the backend into the
+/// controller thread, after which nothing outside that thread can reach its
+/// `TapSystem`. So the backend is constructed into a binding, the witness is
+/// cloned off it, and only then is it moved. The measurement runtime reads that
+/// clone directly (`paraeq_measure::TapStatus`) rather than
+/// `EngineState.self_excluded`, which is the same fact up to a controller tick
+/// stale -- too stale for a gate that arms a full-level stimulus.
+pub fn spawn_engine(settings: &Settings) -> (EngineHandle, ExclusionWitness) {
+    let backend = TapBackend::new();
+    let exclusion_witness = backend.exclusion_witness();
+    let handle = EngineHandle::spawn(
+        backend,
         EngineConfig {
             enabled: settings.engine_enabled && settings.setup_complete,
             ..EngineConfig::default()
         },
-    )
+    );
+    (handle, exclusion_witness)
 }
 
 /// THE choke point every command and the forwarder call after a mutation:
@@ -222,6 +234,10 @@ fn stopped_state() -> EngineState {
         invalid_samples: 0,
         latency_ms: None,
         output_peak: 0.0,
+        // No handle, so no tap, so nothing is witnessed. Paired with
+        // `stream: None` this reads as "the engine is not running", never as
+        // the fail-open path having fired.
+        self_excluded: false,
         status: EngineStatus::Stopped,
         stream: None,
     }

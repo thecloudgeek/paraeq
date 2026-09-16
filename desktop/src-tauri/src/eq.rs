@@ -244,6 +244,7 @@ mod tests {
             invalid_samples: 0,
             latency_ms: None,
             output_peak: 0.0,
+            self_excluded: false,
             status: EngineStatus::Stopped,
             stream,
         }

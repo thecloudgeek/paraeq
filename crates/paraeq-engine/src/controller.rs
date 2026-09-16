@@ -523,6 +523,39 @@ pub struct EngineState {
     /// [`crate::chain::ChainOutcome::peak_out`] for the spec-text
     /// reconciliation this pins).
     pub output_peak: f32,
+    /// The MS-6 self-exclusion witness: whether the LIVE capture currently
+    /// keeps ParaEQ's own audio out of ParaEQ's own tap, exactly as the
+    /// backend reports it (measurement-safety `:336`, wizard `:412`). The
+    /// measurement wizard refuses to begin a `Direct` capture when it is
+    /// `false` -- an "uncorrected" baseline that was silently corrected is
+    /// worse than no baseline, and feedback is live into a coupler that may be
+    /// on someone's head.
+    ///
+    /// Read it as a PAIR with `stream`, never alone:
+    /// - `false` + `stream == None` -- nothing is running, so nothing is
+    ///   witnessed. The remedy is to enable the EQ.
+    /// - `false` + `stream == Some(_)` -- the documented fail-open path fired
+    ///   (`tap.rs`: `translate_pid` returned 0 twice, the tap's exclusion list
+    ///   went out empty, and ParaEQ's own audio IS being captured). The remedy
+    ///   is to restart ParaEQ.
+    ///
+    /// That pair is why the spec's literal `bool` suffices and no
+    /// `Option<bool>` is needed.
+    ///
+    /// **The rebuild window is a legitimate `false`.** `rebuild` is
+    /// `stop_session` + `try_start`, and `start_once` may stop+start up to
+    /// three times while renegotiating geometry, so a device change drops this
+    /// to `false` for a moment. A `SelfExclusionUnavailable` refusal right
+    /// after a device swap is that window, not a bug -- and in practice the
+    /// same [`BackendEvent`] that forces the rebuild is already an
+    /// `OutputDeviceChanged` abort for any session in flight.
+    ///
+    /// Telemetry, not the gate. This is published at most once per tick and is
+    /// what the UI renders; `paraeq-measure` polls the backend's own live
+    /// witness (`paraeq_coreaudio::backend::ExclusionWitness`) at every gate
+    /// that precedes emission, so a safety check is never up to a tick stale.
+    /// Both come from the same cell, so they cannot disagree.
+    pub self_excluded: bool,
     pub status: EngineStatus,
     pub stream: Option<StreamInfo>,
 }
@@ -607,6 +640,7 @@ impl EngineHandle {
             invalid_samples: 0,
             latency_ms: None,
             output_peak: 0.0,
+            self_excluded: false,
             status: EngineStatus::Stopped,
             stream: None,
         });
@@ -1199,6 +1233,11 @@ impl<B: AudioBackend> Controller<B> {
             invalid_samples: self.invalid_samples,
             latency_ms,
             output_peak,
+            // Straight from the backend -- the controller never infers this.
+            // A backend with no live capture answers `false` (trait contract),
+            // which is what makes the `(self_excluded, stream)` pair honest
+            // through a teardown and through a rebuild window.
+            self_excluded: self.backend.0.self_excluded(),
             status: self.effective_status(),
             stream,
         };
@@ -1259,6 +1298,9 @@ fn effectively_equal(a: &EngineState, b: &EngineState) -> bool {
         && a.invalid_samples == b.invalid_samples
         && q_latency(a.latency_ms) == q_latency(b.latency_ms)
         && q_peak(a.output_peak) == q_peak(b.output_peak)
+        // EXACT, unlike the quantized meters above: a safety witness must
+        // reach the UI on every change, and it only ever has two values.
+        && a.self_excluded == b.self_excluded
         && a.status == b.status
         && a.stream == b.stream
 }

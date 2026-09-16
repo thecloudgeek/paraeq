@@ -465,6 +465,15 @@ impl AudioBackend for TapBackend {
         }
         self.pending.pop_front()
     }
+
+    /// The engine's half of the MS-6 witness, forwarding the same cell
+    /// [`TapStatus`](paraeq_measure::TapStatus) reads. One source of truth:
+    /// `EngineState.self_excluded` and a live measurement session can never
+    /// disagree about the same tap, they only differ in staleness (the
+    /// snapshot is published at most once per controller tick).
+    fn self_excluded(&self) -> bool {
+        paraeq_measure::TapStatus::self_excluded(&self.exclusion)
+    }
 }
 
 impl Drop for TapBackend {

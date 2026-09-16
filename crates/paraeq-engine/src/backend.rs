@@ -48,6 +48,8 @@ pub enum BackendEvent {
 /// - `poll_event` is non-blocking; the controller drains it once per tick.
 ///   Backends queue events from listener callbacks (control plane), never
 ///   from the realtime path.
+/// - `self_excluded` reports the LIVE capture's self-exclusion and MUST be
+///   `false` whenever nothing is running -- see the method's own contract.
 pub trait AudioBackend: Send {
     fn start(
         &mut self,
@@ -58,4 +60,24 @@ pub trait AudioBackend: Send {
     fn stop(&mut self) -> Result<(), EngineError>;
 
     fn poll_event(&mut self) -> Option<BackendEvent>;
+
+    /// Whether the backend's LIVE capture excludes this process's own audio
+    /// right now -- the MS-6 witness (measurement-safety `:336`). The
+    /// controller publishes it as
+    /// [`EngineState::self_excluded`](crate::controller::EngineState), and the
+    /// measurement wizard refuses to begin a `Direct` capture when it is
+    /// `false` (wizard `:412`): an "uncorrected" baseline that was silently
+    /// corrected is worse than no baseline, and feedback is live.
+    ///
+    /// Contract: `false` whenever nothing is running -- before the first
+    /// `start`, after `stop`, after a failed `start`, and between the two
+    /// halves of a rebuild. The invariant is not being *witnessed* then, and a
+    /// capture can come up on the very next controller tick, so reporting
+    /// `true` would be a claim about a topology that is not there.
+    ///
+    /// No default implementation, deliberately. A `true` default would be a
+    /// silent lie about exactly the safety fact this method carries, and a
+    /// `false` default would make every measurement refuse; either way the
+    /// compiler would stop telling a new backend that it owes an answer.
+    fn self_excluded(&self) -> bool;
 }

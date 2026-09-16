@@ -43,14 +43,14 @@
 //! per-position IR store ([`store`]), without which every row of the
 //! decision engine's `Reanalyze` tier collapses into `Recapture`.
 //!
-//! Still outstanding, but no longer blocked: the [`seam::TapStatus`]
-//! implementation over the live `TapSystem`. MS-6 requires `TapSystem` to
-//! expose `self_excluded: bool`, which is an `EngineState` shape change; the
-//! rescope plan froze that shape until `feature/rust-port-tauri-shell` merged,
-//! and that merge landed on 2026-09-16, so changing the shape is now ordinary
-//! work. Until the wiring exists a real session still runs only against a mock
-//! witness — which is why [`session::MeasurementSession::begin`] takes the
-//! trait and not a `TapSystem`.
+//! The live [`seam::TapStatus`] witness now exists: `TapSystem` records its
+//! self-exclusion at create time, `TapBackend` mirrors it into a cloneable
+//! `ExclusionWitness` across every start and stop, and the desktop takes that
+//! clone before the backend is moved into the controller thread. A real
+//! session therefore no longer needs a mock — pass the witness. It is still a
+//! trait and not a `TapSystem` in [`session::MeasurementSession::begin`],
+//! deliberately: MS-1 keeps this crate free of CoreAudio, and the witness must
+//! be readable from outside the thread that owns the tap.
 
 #![forbid(unsafe_code)]
 

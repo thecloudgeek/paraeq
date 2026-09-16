@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 use common::mock_backend::{Call, MockBackend};
 use paraeq_engine::backend::BackendEvent;
-use paraeq_engine::controller::{CorrectionConfig, EngineCommand, EngineConfig, EngineHandle};
+use paraeq_engine::controller::{
+    CorrectionConfig, EngineCommand, EngineConfig, EngineHandle, EngineState,
+};
 use paraeq_engine::status::{EngineStatus, WatchdogConfig};
 
 const ENGAGE_MS: u64 = 200;
@@ -757,4 +759,88 @@ fn frame_mismatch_blocks_reach_snapshots() {
         backend.pump(512, 0.5);
         handle.state().frame_mismatch_blocks == 0
     }));
+}
+
+// ---------------------------------------------------------------------------
+// wizard/1, half 1: the MS-6 self-exclusion witness on the wire.
+//
+// `EngineState.self_excluded` answers one question -- is the audio ParaEQ's own
+// process emits kept out of ParaEQ's own capture right now? The measurement
+// wizard refuses to begin a `Direct` capture when it is false
+// (`docs/specs/2026-07-15-wizard-design.md:412`), because the "uncorrected"
+// baseline would silently be a corrected one and feedback would be live into a
+// coupler that may be on someone's head.
+//
+// The controller invents nothing here: it publishes exactly what the backend
+// reports, so the field and `paraeq-measure`'s live `TapStatus` witness cannot
+// disagree about the same tap.
+// ---------------------------------------------------------------------------
+
+/// The snapshot follows the backend, in both directions. A live stream with
+/// `self_excluded == false` is the fail-open signature the wizard refuses on
+/// (`tap.rs`'s empty exclusion list after `translate_pid` returned 0 twice).
+#[test]
+fn self_excluded_is_published_from_the_backend() {
+    let (backend, handle) = spawn_engine();
+    assert!(wait_until(WAIT, || backend.is_running()));
+    // The mock reports an excluding tap by default -- a healthy `TapSystem`.
+    assert!(wait_until(WAIT, || handle.state().self_excluded));
+
+    backend.set_self_excluded(false);
+    assert!(wait_until(WAIT, || !handle.state().self_excluded));
+    assert!(
+        handle.state().stream.is_some(),
+        "false WITH a live stream is the fail-open signature, not 'engine off'"
+    );
+}
+
+/// A safety witness must reach the UI on EVERY change, so `effectively_equal`
+/// compares it exactly -- unlike `input_peak` (quantized at 1e-3) or
+/// `latency_ms` (quantized at 0.1 ms), whose deltas are meter noise.
+#[test]
+fn self_excluded_change_always_publishes() {
+    let (backend, handle) = spawn_engine();
+    // Settle into a steady state where nothing else moves: never pumping
+    // parks the watchdog in `NoInputDetected` (fast_config disables
+    // fail-open, and with zero callbacks it never reaches `Idle`), and every
+    // metered field stays at its start value.
+    assert!(wait_until(WAIT, || matches!(
+        handle.state().status,
+        EngineStatus::NoInputDetected { .. }
+    )));
+    let before = (*handle.state()).clone();
+    let snapshots = handle.subscribe();
+
+    backend.set_self_excluded(false);
+    let published = snapshots
+        .recv_timeout(WAIT)
+        .expect("a self_excluded change must publish a snapshot");
+
+    // This snapshot differs from the previous one in `self_excluded` and in
+    // NOTHING else -- so any tolerance on the compare would have swallowed it
+    // and the wizard would be reading a stale safety fact.
+    assert_eq!(
+        *published,
+        EngineState {
+            self_excluded: false,
+            ..before
+        }
+    );
+}
+
+/// No session, nothing witnessed. The `(self_excluded, stream)` PAIR is what
+/// lets the UI tell "the engine is off" (`false`, `None`) from "the fail-open
+/// path fired" (`false`, `Some`) -- which is why the spec's literal `bool` is
+/// enough and no `Option<bool>` is needed.
+#[test]
+fn self_excluded_is_false_when_no_session() {
+    let (backend, handle) = spawn_engine();
+    assert!(wait_until(WAIT, || handle.state().self_excluded));
+
+    handle.send(EngineCommand::Disable);
+    assert!(wait_until(WAIT, || {
+        let state = handle.state();
+        !state.self_excluded && state.stream.is_none()
+    }));
+    assert!(!backend.is_running());
 }

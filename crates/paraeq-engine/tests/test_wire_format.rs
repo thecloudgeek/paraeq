@@ -23,6 +23,7 @@ fn engine_state_wire_format_is_pinned() {
         invalid_samples: 2,
         latency_ms: Some(62.3),
         output_peak: 1.5,
+        self_excluded: true,
         status: EngineStatus::NoInputDetected { since_ms: 1200 },
         stream: Some(StreamInfo {
             buffer_frames: 512,
@@ -47,6 +48,7 @@ fn engine_state_wire_format_is_pinned() {
             "invalid_samples": 2,
             "latency_ms": 62.3,
             "output_peak": 1.5,
+            "self_excluded": true,
             "status": { "kind": "no_input_detected", "since_ms": 1200 },
             "stream": {
                 "buffer_frames": 512,
