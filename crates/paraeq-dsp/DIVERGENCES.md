@@ -142,4 +142,23 @@ differs from `prototype/paraeq/`, so a red parity test is always actionable.
     "git error" to the owner. Regression test:
     `preset_url_from_encoded_index_href_is_single_encoded`.
 
+18. **A band that becomes illegal at a new sample rate is dropped, not fatal
+    to the whole correction.** Not an oracle divergence — the prototype has no
+    rate-change path at all — but a deliberate, user-visible divergence from
+    the behaviour the `feature/rust-port-tauri-shell` branch shipped, recorded
+    here for the same reason as #16 and #17. On that branch the desktop
+    forwarder (`eq::resend_decision`, called from `engine_bridge.rs`)
+    re-validates the **whole** band set at the new rate and issues
+    `ClearCorrection` if any single band fails, so an AirPods 48 → 44.1 kHz
+    handoff carrying one band above the new 22.05 kHz Nyquist removes the
+    user's **entire** EQ. Engine-hardening R1-6 moves that check into
+    `paraeq-engine`'s `build_correction`, which instead **drops only the
+    offending bands, counts them, and publishes the count** for the Advanced
+    drawer, refusing the whole configuration only when nothing survives. The
+    rationale is R1-3's own DECIDED text for the identical question one layer
+    up: *"the auto front-end must never be bricked by one bad band… An error
+    would mean no correction at all from one bad row."* Flagged `OPEN [OWNER]`
+    — a reversal is one branch in one function. See
+    `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md` §D-10.
+
 (add entries here as they are discovered during implementation)

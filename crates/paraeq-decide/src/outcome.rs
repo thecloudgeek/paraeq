@@ -61,8 +61,15 @@ pub struct CorrectionPlan {
     /// The rate the bands were fitted at. Provenance only — never the rate the
     /// engine designs at.
     pub design_rate: f64,
-    /// `-max(0, peak of the REALIZED cascade)`. No headroom constant. Applied
-    /// to the engine's gain stage, not just the export text.
+    /// `-max(0, peak of the REALIZED cascade)`. No headroom constant.
+    ///
+    /// Reaches the engine as `Correction.preamp_lin` — inside the correction,
+    /// applied on the **corrected path only** — not as a separate
+    /// `EngineCommand::SetGainDb`, which is applied on both chain paths and
+    /// would leave the bypassed side of an A/B quieter by the whole preamp. It
+    /// is not just the export text either. See
+    /// `docs/specs/2026-07-15-engine-hardening-design.md` R1-1 and
+    /// `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md` section D-1.
     pub preamp_db: f64,
 }
 

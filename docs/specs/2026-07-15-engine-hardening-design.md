@@ -258,7 +258,7 @@ The distinction that survives adversarial review and that this fix encodes: **mo
 let score = if residual[i] < 0.0 { -residual[i] } else { residual[i] * BOOST_WEIGHT };
 ```
 
-`BOOST_WEIGHT ≈ 0.5` — **OPEN [OWNER]:** needs the owner's ears; the interim safe default (symmetric Trinnov curve, reject boosts above Q=3) stands. Plus a hard rule: **reject any positive-gain candidate whose estimated Q exceeds a narrow-dip threshold** (skip it and zero that residual bin so the greedy loop moves on). Narrow dips are interference; wide dips may be real response. Proposed threshold `Q > 3.0` — **OPEN [OWNER]:** needs the owner's ears; the interim safe default (symmetric Trinnov curve, reject boosts above Q=3) stands.
+`BOOST_WEIGHT ≈ 0.5` — **OPEN [OWNER]:** needs the owner's ears; the interim safe default (symmetric Trinnov curve, reject boosts above Q=3) stands. Plus a hard rule: **reject any positive-gain candidate whose estimated Q exceeds a narrow-dip threshold** (skip it and zero that residual bin so the greedy loop moves on). Narrow dips are interference; wide dips may be real response. The threshold **ships as a width, not a Q**: `DEFAULT_MIN_DIP_WIDTH_OCT = 1/6` octave in `crates/paraeq-dsp/src/authority.rs`, because two of the three specs state the veto as a width and `AuthorityCurve::min_dip_width_oct()` is typed that way. This section's proposed `Q > 3.0` is the losing form — see the RESOLVED block below, `docs/plans/2026-07-16-rescope-implementation.md` item 16, and `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md` §D-F. The **value** stays **OPEN [OWNER]:** it needs the owner's ears; the reversal, if the stricter one wins, is `DEFAULT_MIN_DIP_WIDTH_OCT = width_oct_for_q(3.0)`.
 
 *2. Frequency-indexed excursion curve* — Trinnov's shipped values: **±10 dB at or below 150 Hz, tapering to ±2 dB by 500 Hz, ±2 dB above.** Implemented as `authority::excursion_db(f) -> f64`, linear-in-dB over log-f between 150 and 500 Hz. Applied as `gain_db = peak_gain.clamp(-cut_limit, excursion_db(fc))`.
 
@@ -417,6 +417,33 @@ pub struct CorrectionConfig {
 }
 ```
 
+> **RESOLVED (2026-09-16) — this section's API shape is superseded.**
+> The struct printed above still carries **baked coefficients** with a shared
+> `design_rate` field, which is precisely the shape the 2026-07-21 record's §Q1
+> rejected and this section's own DECIDED block defers to. The shipped shape is
+> `CorrectionConfig::Peq { bands, design_rate }` — design *intent*, with
+> `design_rate` **per variant**, not a shared struct field. A shared field would
+> force the same refusal compare on `Peq`, which §Q1 says must *not* refuse;
+> `paraeq_decide::CorrectionPlan.design_rate` is already documented as
+> "Provenance only — never the rate the engine designs at"; and the name
+> `CorrectionKind` is already taken by `paraeq_decide::decisions`. See
+> `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md` §D-9.
+>
+> **The FIR arm ships as `Fir { design_rate, firs }` under the refusal net**,
+> not as a re-derivable variant: `fir::design_fir_correction(correction_db,
+> n_taps, phase)` is *positional* — no Hz grid, no rate — so re-derivation is
+> new DSP, `CorrectionPlan` carries no FIR shape at all, and this section itself
+> says "stage 4 has no FIR path". Building the re-derivable FIR variant is
+> deferred to the Stage-6 FIR room path (§D-11), so a future session does not
+> re-derive the question.
+>
+> A **band that becomes illegal at the new rate is dropped**, counted and the
+> count published; the whole configuration is refused only when nothing
+> survives. That is R1-3's own rule ("the auto front-end must never be bricked
+> by one bad band") one rate-change later. It is a user-visible change from the
+> shell's whole-set `ClearCorrection` — `crates/paraeq-dsp/DIVERGENCES.md` #18,
+> §D-10.
+
 2. `build_correction(config, channels, block_size, stream_rate) -> Result<Correction, EngineError>`, refusing on `config.design_rate != stream_rate`. **Exact comparison**, not a tolerance: these are device-reported f64s (`48000.0`, `44100.0`) that round-trip exactly, and a fuzzy compare would silently accept a genuinely different rate. Extend `validate_correction` (`controller.rs:80`) with the same check.
 
 3. On refusal the controller sends **no** correction — flat pass-through. Audibly un-EQ'd is always better than audibly wrong-EQ'd, and it is the same fail-open philosophy as the existing `AutoDisabledNoInput` path (`controller.rs:474–487`).
@@ -574,9 +601,9 @@ Two extra compares per sample on a loop that already does a clamp (itself two co
 
 | Test | Location | Asserts |
 |---|---|---|
-| Full-scale 1 kHz sine, gain +6 dB | `paraeq-engine` synthetic | `clipped_samples > 0`; `output_peak == 1.0` |
+| Full-scale 1 kHz sine, gain +6 dB | `paraeq-engine` synthetic | `clipped_samples > 0`; `output_peak ≈ 2.0` (**pre-clamp** — the fix snippet above takes `let a = v.abs();` *before* `*o = v.clamp(-1.0, 1.0)`, and this row previously read `== 1.0`, which is only reachable post-clamp; see `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md` §D-4) |
 | Same, gain −6 dB | `paraeq-engine` synthetic | `clipped_samples == 0`; `output_peak ≈ 0.5` |
-| 10 full-scale blocks then 100 silent | `paraeq-engine` synthetic | `input_peak` decays monotonically and crosses 0.1 (−20 dB) within `1.7 s / block_duration` blocks ±1; `input_peak_session` stays 1.0 |
+| 10 full-scale blocks then `ceil(1.7 · rate / block) + 2` silent | `paraeq-engine` synthetic | `input_peak` decays monotonically and crosses 0.1 (−20 dB) within `1.7 s / block_duration` blocks ±1; `input_peak_session` stays 1.0. The stimulus length must be written **as that formula**, not a literal: this row previously said "100 silent", but at 512/48 kHz the crossing is at 159.4 blocks and 100 blocks only decay to `0.98565^100 = 0.236`, so the assertion was unreachable. See `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md` §D-7 |
 | R1-1's +12 dB band, full-scale sine at `fc`, auto-preamp live | `paraeq-engine` synthetic | `clipped_samples == 0` — **the test that makes R1-1's claim falsifiable** |
 
 **Effort:** ~1 day. **Blocks release: the clip counter YES** (as R1-1's falsifier — without it R1-1 is an unverified assertion). **The decaying meter NO** — it is a UI-quality improvement and could slip to stage 5 without endangering anything.

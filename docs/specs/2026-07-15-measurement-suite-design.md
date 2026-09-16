@@ -159,8 +159,16 @@ The rescope adds four things, all new workspace members or additive modules: a
 crate **`paraeq-decide`** (depends on `paraeq-dsp` only — see the decision-engine
 spec), a **measurement runtime** in a new crate **`paraeq-measure`** (level solve,
 capture orchestration; no Tauri, no CoreAudio FFI — see the measurement-safety
-spec), and the thin **Tauri/UI wiring** plus the **`paraeq-stimulus`** helper
-binary in `desktop/`. It changes nothing below the `AudioSource` seam.
+spec), the **`paraeq-stimulus`** helper binary as its own workspace member
+**`crates/paraeq-stimulus`** (one `[[bin]]`; may depend on `paraeq-coreaudio`,
+must not depend on `paraeq-measure`, `paraeq-decide` or Tauri), and the thin
+**Tauri/UI wiring** in `desktop/`, whose bundler config only copies the helper
+into `Contents/MacOS/paraeq-stimulus`. The helper is **not** sourced in
+`desktop/`: Stage 6 must be testable end-to-end on the rig **headless**, before
+any wizard UI exists, and a `desktop/`-owned binary cannot be spawned from a
+headless `paraeq-measure` test. See
+`docs/decisions/2026-09-16-post-merge-and-stage6-calls.md` §D-I. It changes
+nothing below the `AudioSource` seam.
 
 ```
 Every app on the Mac
@@ -296,8 +304,14 @@ which is exactly what self-exclusion prevents. Two resolutions were considered:
   with an `afplay` child process for exactly this reason. The *measurement* sweep
   keeps playing from ParaEQ's own process (excluded → uncorrected); the
   *verification* sweep plays from the helper (not excluded → corrected). Same
-  sweep, same deconvolution, two processes, and the difference between them is the
-  measured correction.
+  sweep and the same deconvolution, two processes, and the difference between them
+  is the measured correction — but **not the same level**: the verification path
+  traverses `RealtimeChain` and inherits the correction's positive gain, so
+  measurement-safety **MS-19** requires
+  `L_verify = L_measure − max(0, peak_correction_gain_db)`. That is a hard spec
+  requirement, not a tunable default, and the level difference is compensated
+  exactly (by `−preamp_db`) in the analysis rather than by re-running `align_spl`.
+  See `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md` §D-X.
 
 One caveat must be carried into the implementation plan: self-exclusion has a
 **documented fail-open fallback**. If `translate_pid` returns 0 after a 200 ms
@@ -537,7 +551,7 @@ contract — follow the companion.
 | Defect | Location | Note |
 |---|---|---|
 | No boost cap in autofit | `autofit.rs` — picks bands by symmetric `residual[i].abs()`, global Q clamp `0.5..=20.0` at `:71`, **no gain limit**, hardcoded `20.0..=20000.0` mask at `:13` | The genuinely actionable neighbour of the averaging question. The dB-averaging issue is **latent** (`fr.rs::average_measurements` has **zero non-test callers in Rust** — verified; the prototype call site at `measurement_wizard.py:481-484` smooths 1/6-octave *before* averaging, which is REW's *endorsed* regime for dB averaging). The missing boost cap is not latent. |
-| Hardcoded preamp | `peq.rs:112` emits the literal `"Preamp: 0.0 dB"` | Must become computed, and must drive **the engine gain stage**, not just the export text. Get AutoEQ's convention right: `ParametricEQ.txt` preamp is exactly `−compound.max_gain` with **no headroom** (`frequency_response.py:211`). `PREAMP_HEADROOM = 0.2` applies **only** to the GraphicEQ string and the min/linear-phase FIR impulse responses, and subtracts from the normalized equalization *curve*. The README-quoted parametric preamp uses a **hardcoded 0.1**, not the constant. |
+| Hardcoded preamp | `peq.rs:112` emits the literal `"Preamp: 0.0 dB"` | Must become computed, and must drive **the engine's gain**, not just the export text — carried as `Correction.preamp_lin` on the corrected path only, not as a second `SetGainDb` (engine-hardening R1-1 §4; `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md` §D-1). Get AutoEQ's convention right: `ParametricEQ.txt` preamp is exactly `−compound.max_gain` with **no headroom** (`frequency_response.py:211`). `PREAMP_HEADROOM = 0.2` applies **only** to the GraphicEQ string and the min/linear-phase FIR impulse responses, and subtracts from the normalized equalization *curve*. The README-quoted parametric preamp uses a **hardcoded 0.1**, not the constant. |
 | No runtime stability guard | `biquad.rs` designers return `[f64; 6]` infallibly — no Q clamp, no Nyquist/fc validation, no `Result` | The Jury test `|a2| < 1 && |a1| < a2 + 1` exists **only** as build-time proptests (`tests/test_props.rs:7-42`, 4 tests × 64 cases). It must also exist at runtime, in library code, the moment autofit places high-Q filters near DC in the modal region. REW's boost-Q cap `Q_max = 0.227·f₀/A` with `A = 10^(G/40)` (from a 500 ms T60 rule, verified against ParaEQ's own `biquad.rs` coefficients) doubles as this guard. |
 | Brittle cal parser | `compensation.rs:11` dispatches on a leading double-quote; `:60` hardcodes `.skip(2)` | UMIK-1 0-degree files have **one** header line; 90-degree files have **two**. On a single-header file `skip(2)` silently drops the first data row and `linear_interp_edge_hold` then edge-holds from the wrong point. Do **not** state a failure rate — verifiers disagreed on whether real files ship quoted or bare, and the "80%" statistic is not established. The robust fix is REW's own documented rule: **"Only lines which begin with a number are loaded, others are ignored."** The oracle (`prototype/paraeq/measurement/compensation.py`, `np.loadtxt(skiprows=2)`) shares the flaw — **both must change together** or you manufacture a divergence, and the Tier-1 fixture regenerates in lockstep. |
 | Stale coefficients on rate change | `controller.rs:105` `build_correction(config, channels, block_size)` takes no sample rate | A 48 → 44.1 kHz switch (AirPods, routine) silently shifts every filter ~8.8%. A product that certifies its own residual cannot have this. |

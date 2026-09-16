@@ -282,12 +282,25 @@ impl ParametricEQ {
     /// Formatted to one decimal, matching AutoEQ's own `ParametricEQ.txt`.
     ///
     /// **A preamp that lives only in exported text protects other people's EQ
-    /// software and not ParaEQ.** The engine-side half of this — sending
-    /// `SetGainDb(preamp_db)` alongside `SetCorrection` so the gain stage at
-    /// `chain.rs` carries it — is the Tauri backend's. That plumbing now exists
-    /// (`engine_set_preamp_db` in `desktop/src-tauri/src/commands.rs`), but it
-    /// carries a *user-typed* number; auto-sending this computed value arrives
-    /// with the decision-engine wiring.
+    /// software and not ParaEQ.** The engine-side half of this is the
+    /// controller's, not the Tauri backend's: the computed number is carried as
+    /// a `preamp_lin` field **inside** `paraeq_engine::Correction` and applied
+    /// on the **corrected path only**, so it swaps atomically with the
+    /// correction it protects and leaves the pass-through path un-attenuated.
+    ///
+    /// It is deliberately **not** sent as a second
+    /// `EngineCommand::SetGainDb(preamp_db)` alongside `SetCorrection`, which is
+    /// what an earlier draft of the decision-engine spec and of this comment
+    /// said. `gain_bits` is read once and applied on *both* chain paths, so that
+    /// carrier would leave the bypassed side quieter than the corrected side by
+    /// the whole preamp — up to ~10 dB of silent bias in the product's headline
+    /// A/B control — and the correction and the gain would swap
+    /// non-atomically, opening a window of un-preamped boost. The user's manual
+    /// trim keeps `SetGainDb` (`engine_set_preamp_db` in
+    /// `desktop/src-tauri/src/commands.rs`, both paths, persisted); the two
+    /// compose, multiplying in linear and adding in dB. See
+    /// `docs/specs/2026-07-15-engine-hardening-design.md` R1-1 and
+    /// `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md` section D-1.
     pub fn export_autoeq_format_with_preamp(&self) -> String {
         self.export_autoeq_lines(self.preamp_db())
     }
