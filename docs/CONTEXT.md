@@ -136,6 +136,28 @@ Next: stage 5 — Target editor + profiles (tab UI, WAV impulse storage, target 
 
 **Integration merge (2026-09-16).** `feature/rust-port-tauri-shell` was merged **as-is** into the rescope stack on `feature/integration` (merge parents: rescope tip `c180658` + shell tip `2752c44`, base `179cd34`). Nothing above was reverted: the desktop app, its Tauri commands and the shell's DSP additions land whole, and the rescope stack's measurement crates (`paraeq-decide`, `paraeq-measure`, room DSP, authority, level ladder, CoreAudio volume + measure aggregate) land whole beside them. Conflict resolutions that changed behavior are recorded in the merge commit and in `crates/paraeq-dsp/DIVERGENCES.md` (#15/#16): `paraeq-dsp`'s `serde` stays an OPTIONAL feature that `desktop/src-tauri` and `paraeq-decide` opt into, `FilterType` keeps the UI's snake_case wire format, and the desktop's AutoEQ export moved to the additive `export_autoeq_format_with_preamp_db` so the oracle-parity `export_autoeq_format()` stays argument-free and fixture-pinned. **The `EngineState`/`CorrectionConfig` shape freeze** that the rescope plan's branch strategy imposed while the shell branch was outstanding **is lifted on this branch** — the shell's shapes are now in the trunk of the stack, so changing them is an ordinary change. Still open: the owner's ears-on 12-point acceptance run (above), which gates promotion of this branch to `main`. Rescope staging continues per `docs/plans/2026-07-16-rescope-implementation.md`.
 
+**Hardware checklist addition (2026-09-16), from engine-hardening R1-6.** Add to
+the outstanding manual owner checklist above: **with a +12 dB 1 kHz band live,
+change the device's sample rate in Audio MIDI Setup, sweep the analyzer, and
+confirm the band is still centred at 1 kHz — not 919 Hz.** 44.1 vs 48 kHz is a
+1.088× ratio, so a stale-coefficient install detunes every filter by ~8% and a
+1 kHz band lands at 919 Hz. This is the only check that can falsify R1-6's
+rate-independence claim end to end — the synthetic `paraeq-engine` tests pin the
+refusal and the published `correction_rate_mismatch` flag, but nothing headless
+can hear the detune. Record the result next to the 12-point acceptance run. See
+`docs/specs/2026-07-15-engine-hardening-design.md` R1-6 and
+`docs/decisions/2026-09-16-post-merge-and-stage6-calls.md`.
+
+**Post-merge and Stage-6 calls (2026-09-16).** The post-merge queue and Stage 6
+carried ~49 unresolved shape/value questions across the six 2026-07-15 specs.
+They are ruled in `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md`,
+which also reproduces the seven items **escalated to the owner** (the
+verification residual threshold; in-session TCC-failure detection; MMM scope and
+sequencing; the MMM level-safety row; MS-17's chain-sensitivity envelope; the
+tap-aggregate/measure-aggregate coexistence spike; and the `fixtures/decide/`
+freeze sign-off). The losing spec text each ruling supersedes was corrected in
+the same commit. Read that record before reopening any decision in those specs.
+
 ## How to Pick Up the Work
 
 1. Read this document, `CLAUDE.md`, the Rust-port spec at `docs/specs/2026-07-02-rust-port-design.md`, and (for Phase-1 history) the original design at `docs/specs/2026-04-22-paraeq-design.md`.

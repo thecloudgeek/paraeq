@@ -294,7 +294,7 @@ Every failure returns a typed `Diagnostic { code, evidence, remedy_key, severity
 | Harmonic distortion | Energy integrated in windows at `peak − T·ln(N)/ln(f_end/f_start)`, N = 2,3 | **Warn** | Integrate *energy*; never compare peaks. Annotates the result; at extreme levels suggests a lower sweep level |
 | Device / rate changed mid-session | Property listener fires | **Refuse** session | `Recapture` tier. The bundle's `DeviceIdentity` no longer matches. Offer "start over with the new device" |
 | Cancelled mid-sweep | User abort | **Neither** | Not an error. Drop the in-flight capture, keep the cohort, return to `Capture[i]` |
-| Verification residual over threshold | `residual_vs_prediction` RMS > threshold over the authority band | **Refuse to ship silently** | The single most important refusal in the product — see below |
+| Verification residual over threshold | `residual_vs_prediction` RMS over the authority band `> 2 · flatness_target_db` — the multiplier is **OPEN [OWNER + NEEDS DATA]** | **Refuse to ship silently** | The single most important refusal in the product — see below |
 
 ## Results Presentation
 
@@ -348,7 +348,7 @@ The band is labelled in the user's language ("how much your 9 mic positions disa
 
 Every `(?)` renders the corresponding `rationale_key` — the same strings guided mode shows inline. One `DecisionSet`, two renderings, one vocabulary.
 
-**The preamp disclosure is mandatory**, not decorative. `peq.rs:112` currently emits a hardcoded `"Preamp: 0.0 dB"` literal; the moment modal boosts exist that is a clipping bug. The computed preamp must drive the engine gain stage, not only the export text, and the user must be told the number and why — because "it got quieter" is the second reaction after "it lost bass", and it has a one-line true answer.
+**The preamp disclosure is mandatory**, not decorative. `peq.rs:112` currently emits a hardcoded `"Preamp: 0.0 dB"` literal; the moment modal boosts exist that is a clipping bug. The computed preamp must drive the engine's gain, not only the export text (the carrier is `Correction.preamp_lin`, applied on the corrected path only — engine-hardening R1-1 §4, §D-1 of the 2026-09-16 decision record — not a second `SetGainDb`), and the user must be told the number and why — because "it got quieter" is the second reaction after "it lost bass", and it has a one-line true answer.
 
 ## Closed-Loop Verification
 
@@ -379,8 +379,8 @@ The repo precedent is `crates/paraeq-coreaudio/tests/test_hardware.rs:19-51`, wh
 
 Verification sequence, per position (auto mode runs it at **one** position — the primary listening seat / the last coupler seating):
 
-1. Engine is `Running`, `bypass = false`, the designed correction installed, the computed preamp on the gain stage.
-2. Spawn the helper with the same sweep WAV used for the baseline at that position.
+1. Engine is `Running`, `bypass = false`, the designed correction installed, **the computed preamp carried on that installed `Correction`** (`Correction.preamp_lin`, corrected path only — not the `gain_bits` trim, which is applied on both paths; see engine-hardening R1-1 §4 and `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md` §D-1).
+2. Spawn the helper with the same sweep WAV used for the baseline at that position, **re-levelled** per measurement-safety MS-19 to `L_verify = L_measure − max(0, peak_correction_gain_db)` — the verification path traverses `RealtimeChain` and therefore inherits the correction's positive gain, so the two captures are the same stimulus at *different* levels. MS-19 is a hard spec requirement, not a tunable default; the level difference is compensated exactly (by `−preamp_db`) in the analysis rather than by re-running `align_spl`.
 3. Helper plays → tap captures → `RealtimeChain` corrects → engine output stream → device → mic.
 4. Deconvolve against the same inverse sweep. Compare.
 
@@ -401,7 +401,9 @@ It catches, concretely: wrong coefficients installed; preamp applied to the expo
 
 ### When verification fails
 
-`residual_vs_prediction` RMS over the authority band exceeding threshold means **auto mode refuses to ship silently**. It surfaces the failure and offers the guided path, with the residual curve as evidence. This is the specific mechanism by which "the app decides everything" stops being a promise about our confidence and starts being a claim we test.
+The threshold is `2 · flatness_target_db`, read off `decisions.flatness_target_db.value` as one named constant — and the multiplier is **OPEN [OWNER + NEEDS DATA]**, not settled. The results screen above renders a *passing* verification as "to within **1.8 dB RMS**"; against the coupler's `flatness_target_db = 1.0` the gate is 2.0 dB, so that success story passes by 0.2 dB, while against the room's 3.0 the gate is 6.0 dB and the same expectation is more than 3× looser. The retune signal is stated: *the first EARS run where a correction that A/Bs correctly still refuses.* See `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md` §D-G and §E1 (plan cross-spec Open Question 5).
+
+The band is `correction_range ∩ { f : authority.at(f).max_boost_db > 0 || max_cut_db > 0 }`, taken on `Analysis::freqs_hz` so the RMS is octave-weighted. `residual_vs_prediction` RMS over that band exceeding the threshold means **auto mode refuses to ship silently**. It surfaces the failure and offers the guided path, with the residual curve as evidence. This is the specific mechanism by which "the app decides everything" stops being a promise about our confidence and starts being a claim we test.
 
 ### The fail-open hazard — a hard interlock
 
@@ -526,7 +528,7 @@ The wizard cannot be built on the current tree. These are owned elsewhere but ar
 ## Open Questions
 
 1. **Two-clock topology.** **DECIDED (method) [NEEDS DATA]:** adopt REW's bracketed-timing-marker skew estimate + resample, default on, with `Warn(TwoClock)` as the fallback when no estimate can be formed — see docs/decisions/2026-07-21-decision-engine-open-questions.md §Q6. A UMIK-1 runs on its own fixed clock against the output device's, and the existing spec's *"the Farina method tolerates their small clock skew (prototype proved it)"* was proven only for an **ungated coupler magnitude** measurement; gating needs a trustworthy t = 0 and an undistorted IR shape, so that claim does not transfer. This was called the largest unscheduled cost in the rescope — it is now a port of a known technique with a known ~12 ppm magnitude, not open research. A shared clock stays rejected (it kills USB mics, our wedge against Sonarworks). The **[NEEDS DATA]** part: run measurement-suite/9 the moment the Stage-4 aggregate exists to confirm the magnitude on the owner's own EARS/UMIK rig and set the clock-adjust reject bound from it.
-2. **Verification at N positions or 1?** **OPEN [DESIGN — blocks Stage 6]:** this is the verification-gate reconciliation (docs/plans/2026-07-16-rescope-implementation.md cross-spec question 5) — the gate definition (`residual_vs_target` vs `residual_vs_prediction`) and the helper packaging location must be settled as one. Auto mode runs one position (the primary seat); is a single-position verification a sufficient gate for a 9-position spatial average? `residual_vs_prediction` is rig-independent and largely position-independent (it tests the DSP chain, not the room), which argues for 1. But a position-dependent failure — e.g. a channel swap that only shows off-axis — would hide. Leaning: 1-position `residual_vs_prediction` in auto, all-N offered in guided.
+2. **Verification at N positions or 1?** **DECIDED (2026-09-16):** **1 position in auto, all-N offered in guided.** See docs/decisions/2026-09-16-post-merge-and-stage6-calls.md §D-H. This was the verification-gate reconciliation (docs/plans/2026-07-16-rescope-implementation.md **cross-spec question 5**), and all three of its parts are now settled together: the gate is `residual_vs_prediction` (§D-G), the helper lives in `crates/paraeq-stimulus` (§D-I), and the position count is this. `residual_vs_prediction` is rig-independent and largely position-independent (it tests the DSP chain, not the room), which argues for 1, and the shipped type agrees — `Verification::position_index` (`crates/paraeq-decide/src/bundle.rs`) is **singular**. The known cost is that a position-dependent failure — e.g. a channel swap that only shows off-axis — hides in auto; that is what the guided all-N option is for, and N-position is additive later as `Vec<Verification>`. The **threshold** remains OPEN — see §E1.
 3. **Stored window (1500 ms post).** **OPEN [NEEDS DATA]:** re-derive against real room-IR decay before implementation; it sets the drawer's `n_c` ceiling (§Persistence).
 4. **Coupler smoothing default: `Fixed(6)` or `Fixed(12)`?** **DECIDED `Fixed(6)` [OWNER may revisit]:** `Fixed(6)` matches the pinned oracle and is what makes the coupler path's dB averaging sit inside REW's endorsed dB-averaging regime. The corpus's 1/12 + 6–8 kHz sigmoid-taper alternative is recorded, and lives on as a drawer domain value. Changing the default would need the averaging argument re-made.
 5. **Preamp convention.** **DECIDED (2026-07-21):** AutoEQ-exact — `−max_gain`, no headroom constant, clamped ≤ 0 — per DIVERGENCES.md #14, landed in Stage 1 (the realized-cascade `ParametricEQ::preamp_db()`). AutoEQ parametric is `−max_gain` with no headroom; the 0.2 dB constant is GraphicEQ/FIR-only. The inter-sample-peak-safety alternative (carrying ~0.2–0.5 dB against the ±1.0 clamp) is recorded but not taken.
