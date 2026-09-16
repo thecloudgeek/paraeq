@@ -1107,20 +1107,39 @@ fn self_excluded_change_always_publishes() {
     let snapshots = handle.subscribe();
 
     backend.set_self_excluded(false);
-    let published = snapshots
-        .recv_timeout(WAIT)
-        .expect("a self_excluded change must publish a snapshot");
 
-    // This snapshot differs from the previous one in `self_excluded` and in
-    // NOTHING else -- so any tolerance on the compare would have swallowed it
-    // and the wizard would be reading a stale safety fact.
-    assert_eq!(
-        *published,
-        EngineState {
-            self_excluded: false,
-            ..before
+    // Take snapshots until the change arrives, rather than asserting on the
+    // first one: a snapshot IDENTICAL to `before` can legitimately arrive
+    // first, because `publish` stores the new snapshot into the `state()`
+    // cell BEFORE it locks the subscriber list. A `state()` read followed by
+    // a `subscribe()` can straddle one publish and see it twice -- once as
+    // `before`, once on the channel. That is a delivery race in the test's
+    // own setup, not a change in the engine, and it fails a loaded
+    // `cargo test --workspace` often enough to matter.
+    //
+    // The teeth are unchanged: every snapshot that arrives BEFORE the change
+    // must still equal `before` EXACTLY, and the changed one must differ in
+    // `self_excluded` and NOTHING else -- so any tolerance on the compare
+    // would still be caught, and the wizard could still not read a stale
+    // safety fact.
+    let expected = EngineState {
+        self_excluded: false,
+        ..before.clone()
+    };
+    loop {
+        let published = snapshots
+            .recv_timeout(WAIT)
+            .expect("a self_excluded change must publish a snapshot");
+        if published.self_excluded {
+            assert_eq!(
+                *published, before,
+                "nothing but `self_excluded` may move in this steady state"
+            );
+            continue;
         }
-    );
+        assert_eq!(*published, expected);
+        break;
+    }
 }
 
 /// No session, nothing witnessed. The `(self_excluded, stream)` PAIR is what

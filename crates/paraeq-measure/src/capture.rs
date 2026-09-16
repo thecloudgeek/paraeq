@@ -10,13 +10,22 @@
 //! # Why measurement cannot reuse the engine's metering
 //!
 //! Verified in the tree, and the reason MS-21 exists as a separate
-//! requirement: `RtShared::peak_in` is a **monotonic session maximum with no
-//! decay**, and there is **no clip counter at all**. A monotonic maximum
-//! cannot answer "is the signal clipping *now*", which is the only question
-//! the abort path asks. And in any case those counters observe the **tap**
-//! path, which by construction never sees the stimulus — self-exclusion is the
-//! design goal, so the one signal that can injure a person is the one signal
-//! the engine's meters never see.
+//! requirement. Two grounds; only the first has moved since it was written:
+//!
+//! * **Shape.** `RtShared::peak_in` WAS a monotonic session maximum with no
+//!   decay, and there was no clip counter at all. R1-8 has since given the
+//!   engine both: `peak_in` is now a meter (the broadcast 20 dB / 1.7 s
+//!   release, applied per block at a coefficient the controller derives from
+//!   the stream geometry) and `clipped_samples` counts. It still cannot serve
+//!   here. The release law is MS-21's own [`PEAK_DECAY_DB_PER_BLOCK`], not
+//!   broadcast's; this clip count must RESET per attempt, where the engine's
+//!   is a cumulative session disclosure that deliberately survives a
+//!   teardown; and the abort path asks "did more than 30% of THIS block
+//!   clip", which no held peak of either kind can answer.
+//! * **Signal.** Decisively, and unchanged: those counters observe the
+//!   **tap** path, which by construction never sees the stimulus --
+//!   self-exclusion is the design goal, so the one signal that can injure a
+//!   person is the one signal the engine's meters never see.
 //!
 //! # The 30% rule
 //!

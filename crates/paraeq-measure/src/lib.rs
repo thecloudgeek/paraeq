@@ -39,7 +39,9 @@
 //! (MS-7/MS-8/MS-13/MS-17 — [`ladder`]), which enters the session through
 //! [`session::SolveOutcome`] and computes without ever emitting; the capture
 //! runtime and its own metering (MS-21, MS-4's boundary 2 — [`capture`]),
-//! which the engine's monotonic `peak_in` cannot substitute for; and the
+//! which the engine's meters cannot substitute for even now that R1-8 has
+//! made them decay (different signal path, different release law, and no
+//! per-attempt reset -- see [`capture`]'s header); and the
 //! per-position IR store ([`store`]), without which every row of the
 //! decision engine's `Reanalyze` tier collapses into `Recapture`.
 //!

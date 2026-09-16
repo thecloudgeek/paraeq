@@ -59,9 +59,12 @@ impl CaptureSource for MockSource {
 // ─────────────────────────────── the meter ───────────────────────────────────
 
 #[test]
-fn the_peak_decays_between_blocks_unlike_the_engines() {
-    // The whole reason MS-21 exists: `RtShared::peak_in` is a monotonic
-    // session maximum with no decay, which cannot answer "how hot is it now".
+fn the_peak_decays_between_blocks_at_ms21s_own_rate() {
+    // MS-21's release law is this crate's, not the engine's. (The name used to
+    // say "unlike the engine's"; R1-8 has since made `RtShared::peak_in` decay
+    // too, at the broadcast 20 dB / 1.7 s. The reasons MS-21 is still separate
+    // are in `capture.rs`'s header -- a different signal path, a different
+    // rate, and a clip count that resets per attempt.)
     let mut meter = CaptureMeter::new();
     meter.observe(&[0.5, -0.5]);
     let loud = meter.peak_dbfs();

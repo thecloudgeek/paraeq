@@ -18,9 +18,14 @@
 //!   information the clip counter does not (it saturates at exactly 1.0
 //!   precisely when `clipped_samples > 0`), and pre-clamp is the number that
 //!   proves the preamp is right -- which `:571` says is the drawer's job.
-//! * The decaying-`input_peak` row (`:579`) is NOT here: R1-8's release gate
-//!   (`:582`) splits the clip counter (blocks release) from the decaying
-//!   meter (does not), and the decay lands with its own item.
+//! * The decaying-`input_peak` row (`:579`) asks for a stimulus that cannot
+//!   reach its own assertion: "10 full-scale blocks then 100 silent" only
+//!   decays to `0.98565^100 = 0.236`, while the -20 dB crossing it asserts is
+//!   at 159.4 blocks. The assertion is kept (it pins the broadcast release
+//!   rate) and the silent-block count is written as the formula
+//!   `ceil(1.7 * rate / block) + 2`. Section 7 below; it landed after the
+//!   clip counter because R1-8's release gate (`:582`) splits the two -- the
+//!   counter blocks release as R1-1's falsifier, the meter does not.
 //!
 //! One measured finding the falsifier surfaced, recorded here because the
 //! next reader will otherwise rediscover it: with `preamp_db() == -12` the
@@ -42,7 +47,7 @@ use common::mock_backend::MockBackend;
 use paraeq_dsp::peq::{EQBand, FilterType};
 use paraeq_engine::chain::{build_fir, build_iir, Correction, RealtimeChain};
 use paraeq_engine::controller::{
-    build_correction, CorrectionConfig, EngineCommand, EngineConfig, EngineHandle,
+    build_correction, decay_per_block, CorrectionConfig, EngineCommand, EngineConfig, EngineHandle,
 };
 use paraeq_engine::shared::{links, ControlLink, RtProcessor, RtShared};
 use paraeq_engine::status::WatchdogConfig;
@@ -96,6 +101,14 @@ fn pump_with(rig: &mut Rig, input: &[Vec<f32>]) -> Vec<Vec<f32>> {
         rig.proc_.process_block(&views, &mut out_views, 512.0);
     }
     out
+}
+
+/// One block of CONSTANT `amplitude` on every channel. The decay tests need a
+/// flat block, not a sine: a sine's own zero crossings make the per-block peak
+/// depend on where the block boundary falls, and the meter under test is
+/// exactly "the largest sample in this block versus the decayed hold".
+fn flat_block(amplitude: f32) -> Vec<Vec<f32>> {
+    vec![vec![amplitude; BLOCK]; CHANNELS]
 }
 
 /// `frames` samples of a full-scale sine at `fc`, phase-continuous from
@@ -558,4 +571,166 @@ fn auto_preamp_db_rides_the_published_snapshot() {
 
     handle.send(EngineCommand::ClearCorrection);
     assert!(wait_until(WAIT, || handle.state().auto_preamp_db.is_none()));
+}
+
+// ---------------------------------------------------------------------------
+// 7: R1-8's decaying `input_peak` -- the meter half (spec `:515-528`, `:579`)
+// ---------------------------------------------------------------------------
+
+/// The coefficient itself. It is the one piece of arithmetic in R1-8 that can
+/// be silently wrong: the control plane computes it once per start and the
+/// realtime lane then applies it blindly, one multiply per block, for the
+/// life of the session.
+///
+/// Spec `:525`: `decay = 10^( -(20/1.7) * (block_size/sample_rate) / 20 )` --
+/// the broadcast-standard 20 dB / 1.7 s release, computed from the REPORTED
+/// geometry so the release is the same WALL-CLOCK rate at every buffer size
+/// and sample rate, which a hardcoded constant would not be (spec `:528`).
+#[test]
+fn the_decay_coefficient_is_the_broadcast_release_rate() {
+    // Spec `:528`: "At 512 frames / 48 kHz (10.67 ms/block) that is 0.1255
+    // dB/block -> decay = 0.98565." Exactly: (20/1.7) * (512/48000) =
+    // 0.1254902 dB/block, and 10^(-0.1254902/20) = 0.9856563.
+    let d = decay_per_block(BLOCK, RATE);
+    assert!(
+        (d - 0.985_656_3).abs() < 1e-6,
+        "512 frames / 48 kHz must give 0.9856563, got {d}"
+    );
+
+    // The property the number encodes, at three geometries: 1.7 s worth of
+    // blocks is 20 dB down, whatever the block size and rate.
+    for (block, rate) in [(512usize, 48_000.0f64), (64, 44_100.0), (2048, 96_000.0)] {
+        let blocks = 1.7 * rate / block as f64;
+        let db = 20.0 * f64::from(decay_per_block(block, rate)).powf(blocks).log10();
+        assert!(
+            (db + 20.0).abs() < 1e-3,
+            "{block} frames / {rate} Hz releases {db} dB in 1.7 s, not -20"
+        );
+    }
+
+    // Degenerate geometry must leave the meter a plain peak hold rather than
+    // emptying it instantly or producing a NaN the RT lane would then store.
+    assert_eq!(decay_per_block(0, RATE), 1.0, "0 frames must not decay");
+    assert_eq!(decay_per_block(BLOCK, 0.0), 1.0, "0 Hz must not decay");
+}
+
+/// Spec `:579`, with this plan's reconciliation of its stimulus. The row asks
+/// for "10 full-scale blocks then 100 silent" and a crossing of 0.1 (-20 dB)
+/// within `1.7 s / block_duration` blocks +-1 -- but at 512/48 kHz the
+/// crossing is at 159.4 blocks and 100 blocks only reach `0.98565^100 =
+/// 0.236`, so the stated stimulus cannot reach its own assertion. The
+/// ASSERTION is the meaningful half (it pins the broadcast release rate), so
+/// it is kept verbatim and the silent-block count is written as the formula
+/// `ceil(1.7 * rate / block) + 2`, which also survives a geometry change.
+#[test]
+fn input_peak_decays_at_the_broadcast_release_rate() {
+    let mut r = rig(None, 0.0, false);
+    r.shared.set_decay_per_block(decay_per_block(BLOCK, RATE));
+
+    for _ in 0..10 {
+        pump_with(&mut r, &flat_block(1.0));
+    }
+    assert_eq!(
+        r.shared.peak_in(),
+        1.0,
+        "ten full-scale blocks pin the meter at full scale"
+    );
+
+    let block_duration = BLOCK as f64 / RATE;
+    let expected_crossing = 1.7 / block_duration;
+    let silent_blocks = expected_crossing.ceil() as usize + 2;
+
+    let mut previous = r.shared.peak_in();
+    let mut crossing: Option<usize> = None;
+    for n in 1..=silent_blocks {
+        pump_with(&mut r, &flat_block(0.0));
+        let now = r.shared.peak_in();
+        assert!(
+            now < previous,
+            "silent block {n}: the meter must fall monotonically ({previous} -> {now})"
+        );
+        if crossing.is_none() && now < 0.1 {
+            crossing = Some(n);
+        }
+        previous = now;
+    }
+
+    let crossing = crossing.expect("the meter must cross -20 dB within the release window");
+    assert!(
+        ((crossing as f64) - expected_crossing).abs() <= 1.0,
+        "crossed 0.1 at silent block {crossing}, expected {expected_crossing} +-1"
+    );
+    assert_eq!(
+        r.shared.peak_in_session(),
+        1.0,
+        "the session statistic never decays (spec `:552`)"
+    );
+}
+
+/// The concrete regression the hoist exists for. A literal transcription of
+/// spec `:518`'s snippet leaves the store inside `process_block`'s
+/// `if peak == 0.0 { .. } else { .. }` else-branch, so SILENCE -- the exact
+/// case a decaying meter exists for -- never decays at all: the meter would
+/// hold full scale forever after the music stopped. The spec does not mention
+/// this; it is an implementation consequence, so it gets its own test rather
+/// than riding on the release-rate one above.
+#[test]
+fn decay_runs_on_all_zero_blocks_too() {
+    let decay = decay_per_block(BLOCK, RATE);
+    let mut r = rig(None, 0.0, false);
+    r.shared.set_decay_per_block(decay);
+
+    pump_with(&mut r, &flat_block(1.0));
+    assert_eq!(r.shared.peak_in(), 1.0);
+
+    for n in 1..=5i32 {
+        pump_with(&mut r, &flat_block(0.0));
+        let expected = decay.powi(n);
+        let now = r.shared.peak_in();
+        assert!(
+            (now - expected).abs() < 1e-6,
+            "after {n} all-zero blocks the meter reads {now}, expected {expected} \
+             (1.0 means the decay is still trapped in the nonzero branch)"
+        );
+    }
+    assert_eq!(
+        r.shared.zero_blocks.load(Ordering::Relaxed),
+        5,
+        "the five decaying blocks are still counted as silence"
+    );
+    assert_eq!(r.shared.peak_in_session(), 1.0);
+}
+
+/// The control-plane half: `start_with` must install the coefficient from the
+/// NEGOTIATED `StreamInfo` before the meter is read, or every field above is
+/// correct in isolation and dead in production. `RtShared::default()` is
+/// deliberately 1.0 (no decay), so a missing store does not fail loudly --
+/// the meter just silently goes back to being a session statistic. This is
+/// the test that notices.
+#[test]
+fn start_installs_the_decay_coefficient_from_the_negotiated_geometry() {
+    let backend = MockBackend::new();
+    let handle = EngineHandle::spawn(backend.clone(), fast_config());
+
+    assert!(
+        wait_until(WAIT, || {
+            backend.pump(BLOCK, 1.0);
+            handle.state().input_peak > 0.99
+        }),
+        "full-scale blocks must drive the published meter to full scale"
+    );
+    assert!(
+        wait_until(WAIT, || {
+            backend.pump(BLOCK, 0.0);
+            handle.state().input_peak < 0.1
+        }),
+        "silence must release the published meter past -20 dB \
+         (it never does if the coefficient is left at the 1.0 default)"
+    );
+
+    let state = handle.state();
+    assert!(
+        (state.input_peak_session - 1.0).abs() < 1e-6,
+        "the session statistic stays at full scale while the meter falls"
+    );
 }

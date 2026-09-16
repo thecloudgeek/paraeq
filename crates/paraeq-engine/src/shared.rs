@@ -40,6 +40,21 @@ pub struct RtShared {
     /// falsifier, and a nonzero count while `auto_preamp_db` is active is a
     /// BUG SIGNAL, not a user error (spec `:571`).
     pub clipped_samples: AtomicU64,
+    /// Per-block multiplicative release coefficient for `peak_in_bits` and
+    /// `peak_out_bits`, as f32 bits (control writes ONCE per start, rt reads
+    /// every block). R1-8's decay without a clock on the realtime lane: the
+    /// controller computes it from the negotiated `StreamInfo` at
+    /// `start_with`, the rt lane spends one multiply per block applying it
+    /// (spec `:515-530`).
+    ///
+    /// DEFAULTS TO 1.0 -- no decay, i.e. the monotonic peak hold this field
+    /// replaces. 0.0 would look like a safer default and is not: it turns the
+    /// meter into a PER-BLOCK peak on every path that builds
+    /// `RtShared::default()` without going through the controller (every
+    /// synthetic-block test in `tests/`, and any future headless driver), so
+    /// the defect would surface as "the meter reads right in production and
+    /// wrong everywhere else".
+    pub decay_per_block_bits: AtomicU32,
     /// Blocks passed through because the frame count did not fit the active
     /// correction (rt writes).
     pub frame_mismatch_blocks: AtomicU64,
@@ -54,21 +69,32 @@ pub struct RtShared {
     /// Blocks with at least one nonzero input sample (rt writes) -- the
     /// watchdog's raw "audio is flowing" signal.
     pub nonzero_blocks: AtomicU64,
-    /// Maximum input |sample| seen, as f32 bits (rt writes).
+    /// Input METER, as f32 bits (rt writes): the largest input |sample| in
+    /// this block, or the previous value released by `decay_per_block_bits`,
+    /// whichever is larger. R1-8's decaying half (spec `:515`) -- it falls at
+    /// the broadcast-standard 20 dB / 1.7 s, so it answers "how loud is the
+    /// music right now", which a session maximum cannot. The session maximum
+    /// lives on in `peak_in_session_bits`.
     pub peak_in_bits: AtomicU32,
     /// Maximum input |sample| seen SINCE THE SESSION STARTED, as f32 bits
     /// (rt writes) -- the monotonic session statistic, kept because it is
-    /// genuinely useful and free (spec `:552`). It is deliberately a
-    /// duplicate of `peak_in_bits` today: R1-8's decaying meter, which turns
-    /// `peak_in_bits` into a real meter and leaves this one monotonic, is the
-    /// non-release-blocking half of the item (spec `:582`) and lands
-    /// separately. Each field then means exactly one thing.
+    /// genuinely useful and free (spec `:552`). It is the ONLY monotonic
+    /// peak: `peak_in_bits` decays, so each field now means exactly one
+    /// thing (spec `:532`).
     pub peak_in_session_bits: AtomicU32,
-    /// Maximum output |sample| seen, as f32 bits (rt writes), taken PRE-clamp
-    /// (see [`crate::chain::ChainOutcome::peak_out`]) so it reports the real
-    /// overshoot instead of saturating at 1.0. Monotonic today, for the same
-    /// reason `peak_in_session_bits` is: the decay coefficient arrives with
-    /// R1-8's meter half.
+    /// Output METER, as f32 bits (rt writes), taken PRE-clamp (see
+    /// [`crate::chain::ChainOutcome::peak_out`]) so it reports the real
+    /// overshoot instead of saturating at 1.0. Released by the SAME
+    /// `decay_per_block_bits` coefficient as `peak_in_bits`.
+    ///
+    /// The spec specifies decay only for the input peak, and this applies its
+    /// own reasoning to the output one: R1-8's defect statement is that a
+    /// non-decaying peak is "a session statistic wearing a meter's clothes"
+    /// (spec `:505`), and `:571` makes "the Advanced drawer shows output peak"
+    /// a meter's job. One coefficient also means the two numbers read
+    /// comparably, which is the whole point of showing them together. There
+    /// is no output session maximum: nothing asks for one, and
+    /// `clipped_samples` already answers "did it ever go over".
     pub peak_out_bits: AtomicU32,
     /// Latest output-vs-input sample-time delta as f64 bits (rt writes).
     pub sample_time_delta_bits: AtomicU64,
@@ -85,6 +111,7 @@ impl Default for RtShared {
             bypass: AtomicBool::new(false),
             callbacks: AtomicU64::new(0),
             clipped_samples: AtomicU64::new(0),
+            decay_per_block_bits: AtomicU32::new(1.0f32.to_bits()),
             frame_mismatch_blocks: AtomicU64::new(0),
             gain_bits: AtomicU32::new(1.0f32.to_bits()),
             invalid_samples: AtomicU64::new(0),
@@ -100,6 +127,19 @@ impl Default for RtShared {
 }
 
 impl RtShared {
+    /// Per-block release coefficient (1.0 = no decay).
+    pub fn decay_per_block(&self) -> f32 {
+        f32::from_bits(self.decay_per_block_bits.load(Ordering::Relaxed))
+    }
+
+    /// Set the per-block release coefficient (control plane). Called once
+    /// per start, from the negotiated stream geometry, before the meters are
+    /// read; see [`crate::controller::decay_per_block`] for the arithmetic.
+    pub fn set_decay_per_block(&self, decay: f32) {
+        self.decay_per_block_bits
+            .store(decay.to_bits(), Ordering::Relaxed);
+    }
+
     /// Linear trim gain.
     pub fn gain(&self) -> f32 {
         f32::from_bits(self.gain_bits.load(Ordering::Relaxed))
@@ -287,18 +327,31 @@ impl RtProcessor {
             shared.zero_blocks.fetch_add(1, Ordering::Relaxed);
         } else {
             shared.nonzero_blocks.fetch_add(1, Ordering::Relaxed);
-            // Single writer (this thread): load-compare-store is race-free.
-            if peak > shared.peak_in() {
-                shared.peak_in_bits.store(peak.to_bits(), Ordering::Relaxed);
-            }
             // The session statistic, with the monotonic logic unchanged
-            // (spec `:552`).
+            // (spec `:552`). This one stays inside the branch: an all-zero
+            // block can never raise a maximum.
             if peak > shared.peak_in_session() {
                 shared
                     .peak_in_session_bits
                     .store(peak.to_bits(), Ordering::Relaxed);
             }
         }
+        // R1-8's meter (spec `:518`), HOISTED OUT of the zero/nonzero branch
+        // on purpose: the spec's snippet replaces a store that sat in the
+        // `else`, and transcribing it there leaves SILENCE never decaying --
+        // the meter would hold full scale forever after the music stopped,
+        // which is the exact case it exists for. Pinned by
+        // `tests/test_meters.rs::decay_runs_on_all_zero_blocks_too`.
+        //
+        // Single writer (this thread): load-compute-store is race-free, the
+        // same invariant the monotonic store above relies on. One multiply
+        // and one max per block; the coefficient is a plain relaxed load
+        // (control writes it once per start, before the meters are read).
+        let decay = shared.decay_per_block();
+        shared.peak_in_bits.store(
+            (peak.max(decay * shared.peak_in())).to_bits(),
+            Ordering::Relaxed,
+        );
 
         self.link.poll(&mut self.chain);
 
@@ -323,11 +376,13 @@ impl RtProcessor {
                 .clipped_samples
                 .fetch_add(u64::from(outcome.clipped), Ordering::Relaxed);
         }
-        // Single writer (this thread): load-compare-store is race-free.
-        if outcome.peak_out > shared.peak_out() {
-            shared
-                .peak_out_bits
-                .store(outcome.peak_out.to_bits(), Ordering::Relaxed);
-        }
+        // The output meter, released by the same coefficient (see
+        // `peak_out_bits`). `ChainOutcome::peak_out` is produced on BOTH chain
+        // paths and on every block, so this store is unconditional -- there is
+        // no block whose peak is "unknown" and must be held.
+        shared.peak_out_bits.store(
+            (outcome.peak_out.max(decay * shared.peak_out())).to_bits(),
+            Ordering::Relaxed,
+        );
     }
 }

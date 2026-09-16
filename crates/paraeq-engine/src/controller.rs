@@ -505,6 +505,19 @@ pub struct EngineState {
     /// every start.
     pub frame_mismatch_blocks: u64,
     pub gain_db: f32,
+    /// Input METER: the largest recent input |sample|, released at the
+    /// broadcast-standard 20 dB / 1.7 s (R1-8, spec `:515`). It answers "how
+    /// loud is the music right now"; `input_peak_session` answers "how loud
+    /// did it ever get".
+    ///
+    /// Consequence, priced and accepted: this changes on nearly every tick
+    /// while audio plays, so `publish` fires at the full tick rate (4 Hz by
+    /// default) instead of going quiet a few seconds into a session. That is
+    /// a Tauri `app-state` event and a React re-render 4x/s; it does NOT
+    /// touch disk (`desktop/src-tauri/src/state.rs` compares the durable
+    /// subset first, so engine-only deltas never reach `settings.json`, reads
+    /// included). If it bites, the fix is a separate lighter meters event,
+    /// not a slower meter.
     pub input_peak: f32,
     /// Maximum input |sample| since this session started (R1-8's session
     /// statistic, spec `:552`). `input_peak` is the meter; this one never
@@ -517,11 +530,14 @@ pub struct EngineState {
     pub invalid_samples: u64,
     /// `sample_time_delta / sample_rate * 1000` for the live stream.
     pub latency_ms: Option<f64>,
-    /// Maximum output |sample|, taken PRE-clamp, so "we peaked at 0.87, 1.2 dB
-    /// of margin" is answerable and a preamp that is not working reads as a
+    /// Output METER, taken PRE-clamp, so "we peaked at 0.87, 1.2 dB of
+    /// margin" is answerable and a preamp that is not working reads as a
     /// number over 1.0 rather than as a saturated 1.0 (see
     /// [`crate::chain::ChainOutcome::peak_out`] for the spec-text
-    /// reconciliation this pins).
+    /// reconciliation this pins). Released by the same coefficient as
+    /// `input_peak` so the two read comparably; see
+    /// [`crate::shared::RtShared::peak_out_bits`] for why the spec's
+    /// input-only decay is applied here too.
     pub output_peak: f32,
     /// The MS-6 self-exclusion witness: whether the LIVE capture currently
     /// keeps ParaEQ's own audio out of ParaEQ's own tap, exactly as the
@@ -1262,6 +1278,20 @@ impl<B: AudioBackend> Controller<B> {
 
         let processor = RtProcessor::new(Arc::clone(&shared), rt, chain);
         let stream = self.backend.0.start(processor, request)?;
+        // R1-8's release coefficient, from the geometry the backend just
+        // REPORTED -- the same reason the correction is built below rather
+        // than above: only `start` knows the effective rate and buffer size.
+        //
+        // The spec (`:521`) says "before the backend starts -- so the RT
+        // thread is not yet running and there is no race"; that ordering is
+        // not achievable for a number derived from the negotiated stream, and
+        // it does not need to be. This is a single relaxed store to a FRESH
+        // `RtShared` whose default is 1.0, so the worst case is the handful of
+        // callbacks between `start` returning and this line metering with no
+        // release -- the meter reads a touch high for a few milliseconds and
+        // then converges. Nothing else reads the coefficient, so there is no
+        // cross-variable invariant to tear.
+        shared.set_decay_per_block(decay_per_block(stream.buffer_frames, stream.sample_rate));
         self.session = Some(Session {
             block_size,
             channels,
@@ -1456,6 +1486,36 @@ impl<B: AudioBackend> Controller<B> {
             Err(TrySendError::Disconnected(_)) => false,
         });
     }
+}
+
+/// R1-8's per-block meter release coefficient for one stream geometry:
+///
+/// ```text
+/// decay = 10 ^ ( -(20.0 / 1.7) * (buffer_frames / sample_rate) / 20.0 )
+/// ```
+///
+/// the broadcast-standard 20 dB / 1.7 s release (spec `:525`), expressed per
+/// BLOCK so the realtime lane applies it with one multiply and never needs a
+/// clock -- which `shared.rs`'s realtime-lane contract forbids it, and which
+/// the spec's own Decisions Log (`:28`) rejects by name along with the
+/// alternative of decaying on the controller thread ("needs an atomic
+/// swap-on-read that races the RT store").
+///
+/// Computed from the REPORTED geometry, not hardcoded, so the release is the
+/// same wall-clock rate at every buffer size and sample rate: at 512 frames /
+/// 48 kHz (10.67 ms/block) it is 0.1254902 dB/block -> 0.9856563, which is the
+/// spec's stated 0.98565; at 64 frames / 44.1 kHz it is 0.9980363, and 1.7 s
+/// of either is 20 dB.
+///
+/// Returns 1.0 (no decay -- a plain peak hold) for a degenerate geometry, so
+/// a backend reporting 0 Hz or 0 frames leaves a meter that is merely stale
+/// rather than one that empties instantly or reads NaN forever.
+pub fn decay_per_block(buffer_frames: usize, sample_rate: f64) -> f32 {
+    if buffer_frames == 0 || sample_rate <= 0.0 {
+        return 1.0;
+    }
+    let db_per_block = (20.0 / 1.7) * (buffer_frames as f64 / sample_rate);
+    10f64.powf(-db_per_block / 20.0) as f32
 }
 
 /// Change detection for `publish`, with the jittery telemetry quantized:
