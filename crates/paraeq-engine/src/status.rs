@@ -135,6 +135,28 @@ impl Watchdog {
         self.status = EngineStatus::Stopped;
     }
 
+    /// Restamp the fail-open baseline: when the machine is sitting in
+    /// [`EngineStatus::NoInputDetected`], move its `since_ms` to `now_ms`.
+    /// No-op in every other state.
+    ///
+    /// This is NOT a transition -- the status the UI reads stays
+    /// `NoInputDetected` throughout, and nothing about the machine's own rules
+    /// changes. It only resets how long the *controller* believes that state
+    /// has persisted, which is the input to the fail-open auto-disable window.
+    /// The published `since_ms` moves forward with it, and that is the honest
+    /// value: it is when the un-suspended window started.
+    ///
+    /// The one caller is the controller, on releasing a
+    /// `MeasurementLease`. During a measurement the tap is *supposed* to see
+    /// zeros (the wizard's `Direct` captures are tap-excluded by design), so
+    /// the time accrued under the lease is not evidence of a TCC failure and
+    /// must not be spent against the window.
+    pub fn rebaseline_no_input(&mut self, now_ms: u64) {
+        if let EngineStatus::NoInputDetected { since_ms } = &mut self.status {
+            *since_ms = now_ms;
+        }
+    }
+
     /// Current status without feeding a new observation (for snapshot
     /// publication between observes).
     pub fn status(&self) -> &EngineStatus {

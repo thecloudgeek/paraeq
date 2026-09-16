@@ -35,7 +35,7 @@
 //! then moved through the ring; retired processors come back through the
 //! retire ring and are dropped here.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -615,6 +615,11 @@ impl Default for EngineConfig {
 pub struct EngineHandle {
     cmd_tx: Sender<EngineCommand>,
     join: Option<JoinHandle<()>>,
+    /// The fail-open suspension cell shared with the controller thread:
+    /// `true` while a [`MeasurementLease`] is outstanding. Deliberately a
+    /// shared atomic rather than an [`EngineCommand`] -- see
+    /// [`EngineHandle::acquire_measurement_lease`].
+    measurement_lease: Arc<AtomicBool>,
     state: Arc<ArcSwap<EngineState>>,
     subscribers: Arc<Mutex<Vec<SyncSender<Arc<EngineState>>>>>,
 }
@@ -644,10 +649,12 @@ impl EngineHandle {
             status: EngineStatus::Stopped,
             stream: None,
         });
+        let measurement_lease = Arc::new(AtomicBool::new(false));
         let state = Arc::new(ArcSwap::new(Arc::clone(&initial)));
         let subscribers: Arc<Mutex<Vec<SyncSender<Arc<EngineState>>>>> =
             Arc::new(Mutex::new(Vec::new()));
 
+        let thread_lease = Arc::clone(&measurement_lease);
         let thread_state = Arc::clone(&state);
         let thread_subscribers = Arc::clone(&subscribers);
         let join = std::thread::Builder::new()
@@ -671,6 +678,9 @@ impl EngineHandle {
                     gain_db: 0.0,
                     invalid_samples: 0,
                     last_tick: Instant::now(),
+                    measurement_lease: thread_lease,
+                    measurement_lease_seen: false,
+                    measurement_lease_warned: false,
                     published: initial,
                     requested_buffer_frames: config.requested_buffer_frames,
                     ring_capacity: config.ring_capacity,
@@ -688,6 +698,7 @@ impl EngineHandle {
         EngineHandle {
             cmd_tx,
             join: Some(join),
+            measurement_lease,
             state,
             subscribers,
         }
@@ -717,6 +728,139 @@ impl EngineHandle {
             .expect("subscriber list lock")
             .push(tx);
         rx
+    }
+
+    /// Suspend the fail-open auto-disable for the duration of a measurement
+    /// run. `None` when a lease is already outstanding -- one measurement at a
+    /// time. See [`MeasurementLease`] for what is and is not suspended, and
+    /// for the (important) question of what "a measurement" means here.
+    ///
+    /// Lock-free and immediate (one compare-exchange on a cell shared with the
+    /// controller thread), deliberately NOT an [`EngineCommand`]: commands are
+    /// fire-and-forget with no reply plumbing anywhere in the engine, and the
+    /// caller needs the answer before it emits a single sample. The controller
+    /// reads the cell once per tick on the control thread; the realtime lane
+    /// never sees it.
+    ///
+    /// It knows nothing about engine status: acquiring against a stopped,
+    /// disabled or `Failed` engine succeeds. Callers gate on
+    /// [`EngineState::status`] / [`EngineState::stream`] themselves, because
+    /// "the engine is not running" is a different refusal, with a different
+    /// remedy, than "a measurement is already running".
+    pub fn acquire_measurement_lease(&self) -> Option<MeasurementLease> {
+        if self
+            .measurement_lease
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            log::warn!("measurement lease refused: one is already outstanding");
+            return None;
+        }
+        log::warn!(
+            "measurement lease acquired -- fail-open auto-disable is suspended until it is \
+             released"
+        );
+        Some(MeasurementLease {
+            acquired: Instant::now(),
+            held: Arc::clone(&self.measurement_lease),
+        })
+    }
+}
+
+/// RAII token that suspends the fail-open auto-disable for the duration of a
+/// measurement run (`docs/specs/2026-07-15-wizard-design.md:418`). Obtained
+/// from [`EngineHandle::acquire_measurement_lease`].
+///
+/// # Why it exists
+///
+/// [`EngineConfig::fail_open_after_ms`] auto-disables the engine when
+/// [`EngineStatus::NoInputDetected`] persists -- no nonzero sample has EVER
+/// been captured since start, which is the TCC silent-failure signature. A
+/// measurement walks straight into that uncovered case: the wizard's `Direct`
+/// captures are tap-excluded **by design**, so the tap sees nothing but zeros,
+/// and 15 s in the controller would tear the tap down *mid-session* -- leaving
+/// the `Helper` verification capture with no engine to run through.
+///
+/// # What it suspends, and what it deliberately does not
+///
+/// Exactly one branch: the fail-open auto-disable (`enabled = false`,
+/// `stop_session()`, [`EngineStatus::AutoDisabledNoInput`]). Everything else
+/// runs untouched:
+///
+/// - **The chain.** It must -- closed-loop verification needs the designed
+///   correction installed and running while the `Helper` stimulus plays.
+/// - **Rebuilds on backend events.** A device change still rebuilds; the
+///   measurement aborts on that event on its own evidence, and suppressing the
+///   rebuild would only strand the engine on a dead device.
+/// - **[`EngineCommand::Disable`] and [`EngineCommand::Shutdown`].** User
+///   intent and app exit outrank a measurement; blocking `Shutdown` would hang
+///   quit.
+/// - **`try_start` and the start-failure `Failed` latch.**
+/// - **The watchdog's *reporting*.** `NoInputDetected` is still produced and
+///   still published -- wizard:418 says so in as many words. A genuine TCC
+///   denial during a measurement is still a refusal; it just must not race the
+///   wizard to the teardown.
+///
+/// # Hold it ABOVE `MeasurementSession`, never inside one
+///
+/// A `paraeq_measure::MeasurementSession` is **one sweep**: its phase machine
+/// runs `Preflight -> Solved -> Acknowledged -> Swept -> Terminated` and never
+/// loops back, so a 9-position capture is **nine sessions** and one lease spans
+/// all of them. "For the duration of a session" in wizard:418 means the
+/// duration of the *wizard run*: acquire at the spine's `Probe` step
+/// (wizard:39-40 lists "engine lease" there, beside the device/rate/TCC
+/// checks), and release at Result/Save, at cancel, and on every error exit.
+/// A token parked inside a session seam is released between positions and
+/// re-arms fail-open in the middle of a capture.
+///
+/// Declare it **after** the sessions it covers, so declaration-order drop
+/// releases it last -- strictly after MS-14's restore sequence (abort ramp,
+/// sink stop, volume restore). That is the same ordering trick `TapBackend`
+/// uses for its own teardown.
+///
+/// # Release
+///
+/// Dropping the token re-arms fail-open and **re-baselines** the window: if the
+/// watchdog is sitting in `NoInputDetected`, the controller restamps `since_ms`
+/// to now, so the auto-disable can only fire after a further FULL window. The
+/// time accrued under the lease is not evidence of a TCC failure -- the tap was
+/// *supposed* to see zeros -- and firing on release would auto-disable the
+/// engine immediately after every successful measurement, which is exactly
+/// backwards.
+///
+/// `Drop` runs during unwinding, so a panicking wizard run releases the lease.
+/// The token holds only the shared cell, never the [`EngineHandle`], so it is
+/// also safe to outlive the engine: the release is then a plain store nothing
+/// reads.
+///
+/// # The hazard this type is shaped around
+///
+/// A token parked in long-lived state and never dropped disables fail-open
+/// **forever**, and a TCC denial then holds the user's system muted with no
+/// auto-recovery. That is the highest-severity failure mode in this feature.
+/// Mitigations, all present: keep the token scope-local to the wizard run (a
+/// field in a long-lived struct is not released by a panic); `WARN` on acquire
+/// and on release with the held duration; and one `WARN` per lease at the
+/// moment the suspended window would have fired. There is deliberately no
+/// maximum hold time in v1 -- a `MEASUREMENT_LEASE_MAX_MS` break is additive
+/// later and re-arming a safety net under a running measurement is an owner
+/// call, not an implementation default.
+pub struct MeasurementLease {
+    acquired: Instant,
+    held: Arc<AtomicBool>,
+}
+
+impl Drop for MeasurementLease {
+    fn drop(&mut self) {
+        // Release BEFORE logging: the store is the safety-relevant half, and
+        // it must happen even if the log line cannot be emitted. Control plane
+        // only -- a lease is never acquired or dropped on the realtime lane.
+        self.held.store(false, Ordering::Release);
+        log::warn!(
+            "measurement lease released after {} ms -- fail-open re-armed (window \
+             re-baselined from now)",
+            self.acquired.elapsed().as_millis()
+        );
     }
 }
 
@@ -804,6 +948,18 @@ struct Controller<B: AudioBackend> {
     /// (watchdog, event poll, retired drain, swap retry); `run` checks this
     /// after every command and runs the tick when it is due.
     last_tick: Instant,
+    /// Fail-open suspension cell shared with [`EngineHandle`]: `true` while a
+    /// [`MeasurementLease`] is outstanding. Read once per tick, on this
+    /// thread; never touched by the realtime lane.
+    measurement_lease: Arc<AtomicBool>,
+    /// `measurement_lease` as of the last tick, so the release can be seen as
+    /// an EDGE (that is what re-baselines the fail-open window). A lease taken
+    /// and dropped entirely between two ticks is invisible here, which is
+    /// correct: nothing was suspended, so nothing needs re-baselining.
+    measurement_lease_seen: bool,
+    /// One `WARN` per lease when the suspended window elapses, not one per
+    /// tick. Reset on every observed edge.
+    measurement_lease_warned: bool,
     published: Arc<EngineState>,
     requested_buffer_frames: Option<usize>,
     ring_capacity: usize,
@@ -950,18 +1106,46 @@ impl<B: AudioBackend> Controller<B> {
         // disable the EQ. It does not touch the start-failure counter, and
         // there is no auto-retry (re-engaging would re-mute the system);
         // an explicit Enable starts again.
+        //
+        // A live `MeasurementLease` (wizard/1) suspends THIS BRANCH AND
+        // NOTHING ELSE -- not the chain, not rebuilds, not Disable/Shutdown,
+        // not the reporting above. A measurement legitimately drives the tap
+        // to all zeros (the wizard's `Direct` captures are tap-excluded by
+        // design), so without the lease the watchdog would tear the tap down
+        // mid-session and the verification capture would have no engine to run
+        // through.
+        let lease_held = self.measurement_lease.load(Ordering::Acquire);
+        if lease_held != self.measurement_lease_seen {
+            // A RELEASE re-baselines the window instead of firing the disable
+            // it deferred: the time accrued under the lease is not evidence of
+            // a TCC failure, and firing here would auto-disable the engine
+            // immediately after every successful measurement. This must run
+            // BEFORE the branch below, or the very tick that observes the
+            // release fires it.
+            if !lease_held {
+                let now = self.now_ms();
+                self.watchdog.rebaseline_no_input(now);
+            }
+            self.measurement_lease_seen = lease_held;
+            self.measurement_lease_warned = false;
+        }
+
         if let (Some(window), &EngineStatus::NoInputDetected { since_ms }) =
             (self.fail_open_after_ms, self.watchdog.status())
         {
             let waited = self.now_ms().saturating_sub(since_ms);
             if waited >= window {
-                log::warn!(
-                    "fail-open: no input captured for {waited} ms -- auto-disabling \
-                     (tap destroyed, un-EQ'd audio restored); send Enable to retry"
-                );
-                self.enabled = false;
-                self.stop_session();
-                self.auto_disabled = Some(waited);
+                if lease_held {
+                    self.warn_fail_open_suspended(waited);
+                } else {
+                    log::warn!(
+                        "fail-open: no input captured for {waited} ms -- auto-disabling \
+                         (tap destroyed, un-EQ'd audio restored); send Enable to retry"
+                    );
+                    self.enabled = false;
+                    self.stop_session();
+                    self.auto_disabled = Some(waited);
+                }
             }
         }
 
@@ -977,6 +1161,23 @@ impl<B: AudioBackend> Controller<B> {
         } else if self.swap_pending {
             self.send_correction();
         }
+    }
+
+    /// One `WARN` per lease, at the moment the fail-open window elapses while
+    /// a [`MeasurementLease`] is held: the safety net is off and it just would
+    /// have fired. Once per lease rather than once per tick, and the wording
+    /// names the cost the spec accepts -- if this really IS a TCC denial, the
+    /// device stays muted until the lease is released.
+    fn warn_fail_open_suspended(&mut self, waited: u64) {
+        if self.measurement_lease_warned {
+            return;
+        }
+        self.measurement_lease_warned = true;
+        log::warn!(
+            "fail-open suspended: no input captured for {waited} ms, but a measurement lease \
+             is held -- the tap stays up (and the device stays muted if this is a TCC denial) \
+             until the lease is released"
+        );
     }
 
     /// Start the backend if enabled, not running, and not failed. Two

@@ -53,6 +53,36 @@ pub struct AppState {
 /// Everything mutable the app owns, behind ONE Mutex (commands are rare and
 /// cheap; no lock ordering to get wrong). The `EngineHandle` lives in its own
 /// slot so `RunEvent::Exit` can `.take()` it and drive teardown to completion.
+///
+/// # There is deliberately no `MeasurementLease` slot here
+///
+/// `paraeq_engine::controller::MeasurementLease` (wizard-design.md:418)
+/// suspends the engine's fail-open auto-disable so the 15 s watchdog cannot
+/// tear the tap down mid-measurement -- a measurement legitimately drives the
+/// tap to all zeros, because `Direct` captures are tap-excluded by design.
+/// It is not a field of `AppShared` and should not become one: a token parked
+/// in long-lived state is not released by a panic, and a leaked token disables
+/// fail-open **forever**, so a TCC denial then holds the user's system muted
+/// with no auto-recovery. It is an RAII token; it belongs to the wizard-run
+/// scope, which does not exist in this crate yet. When it lands:
+///
+/// - **Acquire** at the spine's `Probe` step, beside the device/rate/TCC checks
+///   (wizard:39-40 lists "engine lease" there), from the `EngineHandle` in
+///   [`AppShared::engine`]: `handle.acquire_measurement_lease()`. `None` means
+///   a measurement is already running -- refuse this one and say so.
+/// - **Check engine status first, and separately.** The lease knows nothing
+///   about status, so it succeeds against a stopped engine. A stopped engine is
+///   `paraeq_measure::MeasurementDiagnostic::EngineNotRunning` (wire code 24),
+///   whose remedy is "turn ParaEQ on" -- not "wait for the other measurement",
+///   and not `EngineFailed`'s "restart". The same diagnostic is what
+///   `AbortReason::EngineStopped` maps to when the engine goes away mid-run.
+/// - **Release** by letting the token drop: at Result/Save, at cancel, and on
+///   every error exit. Declare it AFTER the `MeasurementSession`s it covers, so
+///   declaration-order drop releases it last -- strictly after MS-14's restore
+///   sequence (abort ramp, sink stop, volume restore).
+///
+/// One lease spans the whole run, not one per sweep: a session is one sweep, so
+/// a nine-position capture is nine sessions under a single lease.
 pub struct AppShared {
     pub data: Mutex<AppData>,
     pub engine: Mutex<Option<EngineHandle>>,
@@ -69,7 +99,9 @@ pub struct AppShared {
     /// reason, not a stylistic one: the witness can only be taken at spawn, and
     /// its first reader (the wizard's `Probe` precondition, which hands it to
     /// `MeasurementSession::begin` as the `TapStatus` half of `SessionSeam`)
-    /// arrives with the measurement lease. Taking it later is not an option, so
+    /// arrives with the wizard spine -- the same scope that takes the
+    /// measurement lease, per this struct's own doc comment above. Taking the
+    /// witness later than spawn is not an option, so
     /// storing it early is not premature. Same reason `TapSystem::desc` carries
     /// the attribute (`crates/paraeq-coreaudio/src/tap.rs`). Delete the
     /// attribute, not the field, when the wizard lands.

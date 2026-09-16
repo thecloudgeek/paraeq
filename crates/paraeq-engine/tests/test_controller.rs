@@ -6,6 +6,7 @@
 
 mod common;
 
+use std::panic::{self, AssertUnwindSafe};
 use std::time::{Duration, Instant};
 
 use common::mock_backend::{Call, MockBackend};
@@ -651,6 +652,300 @@ fn fail_open_none_disables_the_behavior() {
     assert_eq!(backend.stop_count(), 0, "None must mean no auto-disable");
     assert_eq!(backend.start_count(), 1);
     assert!(backend.is_running());
+}
+
+// --- MeasurementLease (wizard/1) -------------------------------------------
+//
+// wizard-design.md:418, verbatim: "the wizard acquires a `MeasurementLease`
+// from the controller for the duration of a session. The lease suspends the
+// fail-open watchdog and is released on **every** exit path including panic
+// -- the same invariant, and the same discipline, as tap teardown. The lease
+// must not suppress the watchdog's *reporting*: a genuine TCC silent failure
+// during a measurement session is still a `Refuse`, it just must not race the
+// wizard to the teardown."
+//
+// These tests park the watchdog in `NoInputDetected` by NOT pumping at all --
+// callbacks frozen at 0, the slow-engage signature `slow_first_callback_does_
+// not_rebuild` and `enable_after_fail_open_restarts` already use, and the
+// latter proves this exact configuration DOES auto-disable without a lease.
+//
+// Pumping silent zeros is the more faithful wizard signature (a `Direct`
+// capture is tap-excluded BY DESIGN, so callbacks flow and every sample is
+// zero), but it cannot be used for a long sit here: one stall of this thread
+// past `idle_window_ms` takes the watchdog Idle -> InputSilent, which the
+// fail-open branch can never fire from at all, and the falsifier below would
+// then pass for entirely the wrong reason. Frozen callbacks gate Idle off
+// (`Watchdog::callbacks_seen`), so `NoInputDetected` is stable for as long as
+// a test needs it.
+
+#[test]
+fn measurement_lease_suspends_fail_open() {
+    let backend = MockBackend::new();
+    let handle = EngineHandle::spawn(backend.clone(), fail_open_config());
+    let lease = handle
+        .acquire_measurement_lease()
+        .expect("a fresh engine hands out the first lease");
+
+    assert!(wait_until(WAIT, || matches!(
+        handle.state().status,
+        EngineStatus::NoInputDetected { .. }
+    )));
+
+    // Sit far past the window. Without the lease this is exactly
+    // `enable_after_fail_open_restarts`, which latches AutoDisabledNoInput.
+    let deadline = Instant::now() + Duration::from_millis(FAIL_OPEN_MS * 3);
+    while Instant::now() < deadline {
+        assert!(
+            !matches!(
+                handle.state().status,
+                EngineStatus::AutoDisabledNoInput { .. }
+            ),
+            "fail-open fired while a measurement lease was held"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    // The tap is still up and the session was never torn down mid-run --
+    // wizard:416's named failure ("the controller tears the tap down
+    // mid-session, and the subsequent Helper verification capture has no
+    // engine to run through").
+    assert_eq!(
+        backend.start_count(),
+        1,
+        "the lease must not restart anything"
+    );
+    assert_eq!(
+        backend.stop_count(),
+        0,
+        "a held lease must never reach stop_session"
+    );
+    assert!(backend.is_running());
+    assert!(handle.state().enabled, "the lease must not clear `enabled`");
+    assert!(matches!(
+        handle.state().status,
+        EngineStatus::NoInputDetected { .. }
+    ));
+
+    drop(lease);
+}
+
+#[test]
+fn lease_does_not_suppress_reporting() {
+    let backend = MockBackend::new();
+    let handle = EngineHandle::spawn(backend.clone(), fail_open_config());
+    let snapshots = handle.subscribe();
+    let lease = handle.acquire_measurement_lease().expect("first lease");
+
+    // wizard:418's second clause. The status machine keeps producing
+    // `NoInputDetected` under the lease, and it keeps being PUBLISHED -- a
+    // genuine TCC denial mid-measurement is still visible to the wizard, which
+    // refuses on its own evidence. Only the teardown is deferred.
+    assert!(wait_until(WAIT, || matches!(
+        handle.state().status,
+        EngineStatus::NoInputDetected { .. }
+    )));
+    let mut published = false;
+    assert!(
+        wait_until(WAIT, || {
+            published |= std::iter::from_fn(|| snapshots.try_recv().ok())
+                .any(|s| matches!(s.status, EngineStatus::NoInputDetected { .. }));
+            published
+        }),
+        "NoInputDetected was never published while a lease was held"
+    );
+
+    // Still reported well past the window it is suspending.
+    std::thread::sleep(Duration::from_millis(FAIL_OPEN_MS * 2));
+    assert!(matches!(
+        handle.state().status,
+        EngineStatus::NoInputDetected { .. }
+    ));
+
+    drop(lease);
+}
+
+#[test]
+fn lease_release_rearms_fail_open_from_zero() {
+    let backend = MockBackend::new();
+    let handle = EngineHandle::spawn(backend.clone(), fail_open_config());
+    let lease = handle.acquire_measurement_lease().expect("first lease");
+
+    assert!(wait_until(WAIT, || matches!(
+        handle.state().status,
+        EngineStatus::NoInputDetected { .. }
+    )));
+    // Accrue three full windows under the lease.
+    std::thread::sleep(Duration::from_millis(FAIL_OPEN_MS * 3));
+    assert!(matches!(
+        handle.state().status,
+        EngineStatus::NoInputDetected { .. }
+    ));
+
+    let released_at = Instant::now();
+    drop(lease);
+
+    // Fail-open re-arms FROM ZERO, not from the accrued time: the tap is
+    // supposed to see zeros during a measurement (`Direct` captures are
+    // tap-excluded by design), so that time is not evidence of a TCC failure.
+    // A fire-on-release implementation auto-disables the engine immediately
+    // after every successful measurement -- exactly backwards -- and fails
+    // here on both assertions.
+    assert!(wait_until(WAIT, || matches!(
+        handle.state().status,
+        EngineStatus::AutoDisabledNoInput { .. }
+    )));
+    let elapsed = released_at.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(FAIL_OPEN_MS),
+        "fired {elapsed:?} after release; a full {FAIL_OPEN_MS} ms window must elapse first"
+    );
+    match handle.state().status {
+        // The window the controller reports is the re-baselined one (~one
+        // window), not the ~four windows that actually elapsed in
+        // NoInputDetected.
+        EngineStatus::AutoDisabledNoInput { after_ms } => assert!(
+            (FAIL_OPEN_MS..FAIL_OPEN_MS * 2).contains(&after_ms),
+            "after_ms {after_ms} should be about one window ({FAIL_OPEN_MS} ms); \
+             the time accrued under the lease must not count"
+        ),
+        ref other => panic!("expected AutoDisabledNoInput, got {other:?}"),
+    }
+    assert!(
+        !backend.is_running(),
+        "the re-armed fail-open must stop the backend"
+    );
+}
+
+#[test]
+fn lease_does_not_block_rebuild() {
+    let backend = MockBackend::new();
+    let handle = EngineHandle::spawn(backend.clone(), fail_open_config());
+    let lease = handle.acquire_measurement_lease().expect("first lease");
+    assert!(wait_until(WAIT, || backend.start_count() == 1));
+
+    // A device change must still rebuild under a lease. The measurement
+    // aborts on it on its own evidence (AbortReason::OutputDeviceChanged),
+    // so suppressing the rebuild would only leave the engine on a dead device.
+    backend.queue_event(BackendEvent::DefaultOutputChanged);
+    assert!(
+        wait_until(WAIT, || backend.start_count() == 2),
+        "a held lease blocked the rebuild"
+    );
+    assert!(wait_until(WAIT, || backend.is_running()));
+    assert_eq!(
+        backend.calls(),
+        vec![
+            Call::Start {
+                requested_buffer_frames: None
+            },
+            Call::Stop,
+            Call::Start {
+                requested_buffer_frames: None
+            },
+        ],
+        "rebuild must still be stop-then-start under a lease"
+    );
+
+    drop(lease);
+}
+
+#[test]
+fn lease_does_not_block_disable_or_shutdown() {
+    let backend = MockBackend::new();
+    let handle = EngineHandle::spawn(backend.clone(), fail_open_config());
+    let lease = handle.acquire_measurement_lease().expect("first lease");
+    assert!(wait_until(WAIT, || backend.is_running()));
+
+    // Explicit user intent outranks a measurement.
+    handle.send(EngineCommand::Disable);
+    assert!(
+        wait_until(WAIT, || {
+            !backend.is_running() && handle.state().status == EngineStatus::Stopped
+        }),
+        "a held lease blocked EngineCommand::Disable"
+    );
+
+    // ...and so does app exit: dropping the handle sends Shutdown and JOINS
+    // the controller thread. A lease that blocked Shutdown would hang quit.
+    let started = Instant::now();
+    drop(handle);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "dropping the EngineHandle under a lease must still join the controller thread"
+    );
+    assert!(backend.stop_count() >= 1);
+
+    drop(lease);
+}
+
+#[test]
+fn second_lease_is_refused() {
+    let backend = MockBackend::new();
+    let handle = EngineHandle::spawn(backend.clone(), fail_open_config());
+
+    let first = handle.acquire_measurement_lease().expect("first lease");
+    assert!(
+        handle.acquire_measurement_lease().is_none(),
+        "one measurement at a time: a second lease must be refused, not queued"
+    );
+
+    drop(first);
+    let second = handle
+        .acquire_measurement_lease()
+        .expect("the cell is free again once the first lease is released");
+    drop(second);
+}
+
+#[test]
+fn lease_is_released_on_panic() {
+    let backend = MockBackend::new();
+    let handle = EngineHandle::spawn(backend.clone(), fail_open_config());
+
+    let unwind = panic::catch_unwind(AssertUnwindSafe(|| {
+        let _lease = handle.acquire_measurement_lease().expect("first lease");
+        panic!("wizard run blew up mid-measurement");
+    }));
+    assert!(unwind.is_err(), "the injected panic must propagate");
+
+    // Drop ran during unwinding, so the cell is free...
+    let again = handle
+        .acquire_measurement_lease()
+        .expect("a panicked holder must not strand the lease");
+    drop(again);
+
+    // ...and the safety net is genuinely back on, not merely the flag: the
+    // configuration that sat suspended in `measurement_lease_suspends_fail_open`
+    // now fails open.
+    assert!(
+        wait_until(WAIT, || matches!(
+            handle.state().status,
+            EngineStatus::AutoDisabledNoInput { .. }
+        )),
+        "fail-open must be re-armed after a panicked lease holder"
+    );
+}
+
+#[test]
+fn lease_outliving_the_handle_is_harmless() {
+    let backend = MockBackend::new();
+    let handle = EngineHandle::spawn(backend.clone(), fail_open_config());
+    let lease = handle.acquire_measurement_lease().expect("first lease");
+    assert!(wait_until(WAIT, || backend.is_running()));
+
+    // App exit with a lease still outstanding. The handle drops first
+    // (Shutdown + join + backend stop), the token after -- the reverse of the
+    // wizard's own drop order, and the order a caller gets wrong by accident.
+    drop(handle);
+    assert!(
+        !backend.is_running(),
+        "shutdown must stop the backend even with a lease outstanding"
+    );
+
+    // The token holds only the shared cell, never the handle, so this is a
+    // plain store into an `Arc<AtomicBool>` nothing reads any more.
+    let started = Instant::now();
+    drop(lease);
+    assert!(started.elapsed() < Duration::from_secs(2));
 }
 
 #[test]
