@@ -4,15 +4,18 @@
 **Specs covered:** the six `docs/specs/2026-07-15-*.md` rescope specs
 (decision-engine, engine-hardening, measurement-safety, measurement-suite,
 room-dsp, wizard).
-**Status:** Stages 1–5 implemented (`feature/rescope-stage1` → `-stage2` →
-`-stage3` → `-stage4` → `-stage5`, stacked, unmerged). Stage 2's merge-gated
-items (engine-hardening R1-1 engine half, R1-8, R1-6) and the Tier-4 REW
-corpus remain open — see the gates below. Stage 5 closed cross-spec question 2
-(the autofit shape) and is complete except for one open item: the
-`TapStatus` implementation over the live `TapSystem`, which needs
-`self_excluded` on `TapSystem` — an `EngineState` shape change that the shell
-merge unfroze when it landed on 2026-09-16, so the item is now unblocked.
-Next: Stage 6.
+**Status (updated 2026-09-16):** Stages 1–5 are implemented
+(`feature/rescope-stage1` → `-stage2` → `-stage3` → `-stage4` → `-stage5`) and
+the shell branch is merged on top of them. **The merge landed on
+`feature/integration`, not on `main`** (merge commit `8334583`, parents
+`c180658` + `2752c44`, forked from `main` at `179cd34`); `main` is untouched by
+rescope work, and promoting `feature/integration` to it still waits on the
+owner's ears-on 12-point acceptance run. Stage 2's merge-gated remainder
+(engine-hardening R1-1's engine half, R1-8, R1-6) and wizard/1 are unblocked
+and **in flight on `feature/integration`** as short-lived worktree branches;
+item 21 (`TapStatus` over the live `TapSystem`) is unblocked and closed as a
+question. Stage 5 closed cross-spec question 2 (the autofit shape). Still open
+from Stage 2: the Tier-4 REW characterization corpus. Next: Stage 6.
 
 This plan sequences the six specs into seven stages. It exists because the
 specs cross-reference each other heavily (shared deliverables, ordering
@@ -24,25 +27,50 @@ the authoritative requirements are always the spec text itself.
 
 ## Branch strategy
 
-**Status (2026-09-16): the gating merge has landed.**
-`feature/rust-port-tauri-shell` was merged as-is into the rescope stack on
-`feature/integration` (parents `c180658` + `2752c44`, base `179cd34`), so the
-`CorrectionConfig`/`EngineState` shape freeze below is **lifted** and every
-"post-merge" item in this plan is unblocked. The bullets record the strategy
-as it stood while the shell branch was outstanding.
+**Status (2026-09-16): the gating merge has landed — on
+`feature/integration`, not on `main`.** `feature/rust-port-tauri-shell` was
+merged into the rescope stack exactly as it stood (merge `8334583`, parents
+`c180658` + `2752c44`, base `179cd34`): the measurement-suite spec's "do not
+reopen" ruling held, and the 27-commit branch was never rebased onto new work.
+The `CorrectionConfig`/`EngineState` shape freeze this section used to impose
+is **struck** — not softened — and every item this plan deferred behind the
+merge is unblocked.
 
-- **`feature/rust-port-tauri-shell` merges first, as-is** ("do not reopen" per
-  the measurement-suite spec). It is CI-green and gated only on the owner's
-  ears-on 12-point acceptance run — scheduling that run is the single
-  cheapest unblock in the program. Do not rebase the 27-commit branch onto
-  new work.
-- Until that merge lands, work proceeds on `main` via short-lived worktree
-  branches (`.worktrees/<name>`), restricted to `crates/` + `prototype/` +
-  docs. **Any `CorrectionConfig` or `EngineState` shape change is frozen**
-  until the merge (the branch pins the snapshot wire format and reworks
-  `eq.rs`/`engine_bridge.rs`/`controller.rs`; engine-hardening R1-6 is
-  explicitly sequenced post-merge for this reason).
-- All wizard/renderer/desktop work is unconditionally post-merge.
+- **Where the work happens now.** Short-lived worktree branches
+  (`.worktrees/<name>`) forked from **`feature/integration`** and merged back
+  into it. `main` stays at `179cd34` until promotion. The owner's ears-on
+  12-point acceptance run now gates **promoting `feature/integration` to
+  `main`** — it no longer gates doing the work. It is still the single cheapest
+  unblock in the program, because nothing ships to `main` without it.
+- **Shape changes are not frozen; they are serialized.** `CorrectionConfig` /
+  `EngineState` changes land in this order, one branch at a time:
+  (1) R1-6 — `CorrectionConfig::Peq { bands, design_rate }` + re-derive at the
+  live rate + `EngineState.correction_rate_mismatch`;
+  (2) R1-8's meters (`clipped_samples`, `input_peak_session`,
+  `invalid_samples`, `output_peak`) together with R1-1's engine half
+  (`auto_preamp_db`, `Correction.preamp_lin`);
+  (3) wizard/1's `EngineState.self_excluded` + `MeasurementLease`.
+  The reason is mechanical, not stylistic: every one of them edits
+  `crates/paraeq-engine/src/controller.rs`, so concurrent worktrees collide in
+  `EngineState`, `publish()`, `effectively_equal()` and `start_with()`.
+  Merged `EngineState` field order, alphabetical per CLAUDE.md, on top of the
+  shell's frozen shape: `auto_preamp_db, bypass, clipped_samples, correction,
+  correction_rate_mismatch, enabled, frame_mismatch_blocks, gain_db,
+  input_peak, input_peak_session, invalid_samples, latency_ms, output_peak,
+  self_excluded, status, stream`.
+- **All three hand-mirrored wire tripwires move in the same commit** as any
+  `EngineState` change. There is no codegen, so a partial change is red CI in a
+  file that reads as unrelated to the change:
+  `crates/paraeq-engine/tests/test_wire_format.rs::engine_state_wire_format_is_pinned`,
+  `desktop/src-tauri/src/state.rs::app_state_wire_format_is_pinned`, and the
+  hand-written `desktop/ui/src/ipc/types.ts`.
+- **Wizard / renderer / desktop work is unblocked**, along with every other
+  item this plan parked behind the merge.
+- **Two merged-shape properties must survive all of the above:** the shell's
+  `#[serde(rename_all = "snake_case", tag = "kind")]` on `EngineStatus` (the TS
+  union is keyed on `kind`) and `#[serde(rename_all = "snake_case")]` on
+  `FilterType` — or every persisted `settings.json` profile breaks the moment
+  `CorrectionConfig::Peq` puts `EQBand` on the wire.
 
 ## Fixture plan (the four-tier oracle convention)
 
@@ -85,7 +113,9 @@ Codified in Stage 1 before anything regenerates:
 Everything here is merge-independent except the merge itself and the two
 `EngineState` shape changes (deferred to Stage 2):
 
-- ~~measurement-suite/4~~ — **owner-gated:** ears-on acceptance → merge shell branch
+- ~~measurement-suite/4~~ — **done 2026-09-16:** the shell branch is merged
+  into `feature/integration`. The owner's ears-on acceptance run now gates
+  promoting that branch to `main`, not the merge itself.
 - measurement-suite/1 — oracle pins + fail-loud generator + `fir.rs` comment
 - measurement-suite/2 — the two verbatim CLAUDE.md edits (four-tier oracle)
 - measurement-suite/3 — retire stale 2026-07-02 spec text in place
@@ -97,10 +127,11 @@ Everything here is merge-independent except the merge itself and the two
 - engine-hardening/7 — R1-5 `kAudioSubDeviceInputChannelsKey: 0` on the tap
   aggregate (+ delete backend.rs KNOWN LIMITATION; owner fresh-TCC check)
 - engine-hardening/9 — R1-7a `IIRProcessor::adopt_state_from`
-- **Deferred to post-merge** (EngineState wire shape frozen at the time;
-  freeze lifted 2026-09-16):
-  engine-hardening/2 (R1-8 meters) and wizard/1
-  (`EngineState.self_excluded` + `MeasurementLease`).
+- ~~Deferred to post-merge~~ — **unblocked 2026-09-16 and in flight on
+  `feature/integration`:** engine-hardening/2 (R1-8 meters) and wizard/1
+  (`EngineState.self_excluded` + `MeasurementLease`). These are ordinary
+  sequenced work now, not deferrals; the order they land in is in
+  § Branch strategy.
 
 ### Stage 2 — Test-first infrastructure, hardening completion, crate scaffolds
 
@@ -168,6 +199,13 @@ R7 ship (signed DMG, notarization, PLD 2024/2853 posture decision).
    (1) (re-derive), with R1-6's refuse-and-fail-open as the last-resort guard
    for configs that cannot be re-derived; see
    `docs/decisions/2026-07-21-decision-engine-open-questions.md` §Q1.
+   **Closed 2026-09-16.** No owner input is outstanding: the implementation is
+   post-merge work in flight on `feature/integration` (R1-6, the first of the
+   three shape commits). `design_rate` sits on the `Peq` variant rather than on
+   a shared `CorrectionConfig` field — a shared field would force the same
+   refusal compare on `Peq`, which §Q1 says must *not* refuse. The spec text
+   that still prints the baked-SOS struct is the losing text; see
+   `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md`.
 2. **Authority-limited autofit shape (blocked Stage 5): RESOLVED
    (2026-07-25).** Three shapes were proposed — mutate `auto_fit_parametric_eq`
    in place (decision-engine), add a mono
@@ -199,11 +237,44 @@ R7 ship (signed DMG, notarization, PLD 2024/2853 posture decision).
    with `Warn(TwoClock)` as the fallback when no estimate can be formed — REW
    already ships this and reports the drift is only ~12 ppm, so this is a
    port, not open research.
-5. **Verification gate definition (blocks Stage 6):** residual RMS >
-   2×flatness_target over the authority band (decision-engine,
-   measurement-safety) vs. residual_vs_prediction with threshold unstated
-   (wizard); helper packaging location also differs. One gate, one
-   threshold, one location.
+5. **Verification gate definition (blocks Stage 6): quantity, band, location
+   and packaging RULED 2026-09-16; the threshold is ESCALATED.**
+
+   *First, a correction to this question as it was written.* It attributed the
+   `> 2·flatness_target_db` gate to "(decision-engine, **measurement-safety**)".
+   That attribution is wrong: `grep -n "flatness"
+   docs/specs/2026-07-15-measurement-safety-design.md` returns **nothing** —
+   measurement-safety states no verification gate at all. So the vote was
+   1–1–abstain, not the 2-of-3 majority this plan uses as a tie-break (item 16).
+
+   - **Quantity: `residual_vs_prediction`.** Rig error cancels in the
+     difference, so this is the only claim that is about ParaEQ rather than
+     about the rig (wizard:396, :400 — "Report it, plot it, never gate on it").
+     The shipped type already decided it: `crates/paraeq-decide/src/bundle.rs`
+     carries `Verification { ir, installed, position_index }` with `installed`
+     present **only** so the prediction can be re-derived, and no target at all.
+     `residual_vs_target` is computed and attached as evidence, never gated.
+   - **Band:** `correction_range` ∩ `{ f : authority.at(f).max_boost_db > 0 ||
+     max_cut_db > 0 }`, RMS taken on `Analysis::freqs_hz` so it is
+     octave-weighted. Neither spec defines "the authority band" and both use
+     it; without this sentence the gate is not computable.
+   - **Location:** `paraeq_decide::decide()`. The code
+     (`outcome.rs`'s `VerificationResidual`), the input slot and all three
+     inputs (`flatness_target_db`, `correction_range`, `authority`) are already
+     there.
+   - **Positions:** 1 in auto (the primary seat), all-N offered in guided —
+     wizard:529's own lean, and `Verification::position_index` is singular.
+     N-position is additive later as a `Vec<Verification>`.
+   - **Helper packaging:** a new workspace member `crates/paraeq-stimulus` with
+     one `[[bin]]`, installed to `Contents/MacOS/paraeq-stimulus`. Decisive
+     ground: Stage 6 must be testable headless before any wizard UI exists, and
+     a `desktop/`-owned binary cannot be spawned from a headless
+     `paraeq-measure` test. measurement-suite:162 ("in `desktop/`") is the
+     losing text.
+   - **Threshold: ESCALATED [OWNER + NEEDS DATA], not decided.** Ship the
+     mechanism as `VERIFICATION_RESIDUAL_MULTIPLE = 2.0` read off
+     `decisions.flatness_target_db.value`, and rule the number separately — it
+     collides with the spec's own passing example. See escalation **E1**.
 
 Also record before R7: the PLD 2024/2853 commercial-posture decision
 (appears in three specs).
@@ -227,6 +298,19 @@ type or in a test on the branch; none is invented policy.
    threshold for sweeps, or DC-block in MS-4's stimulus assembly — but do not
    inflate the fade-in. `apply_fade` implements the spec's envelope exactly;
    `test_sweep.rs::fade_is_not_a_dc_blocker` documents the gap.
+   **Status (2026-09-16): implemented in the sanctioned direction, OWNER
+   RATIFICATION PENDING — not closed.** `crates/paraeq-measure/src/stimulus.rs`
+   takes the second of the spec's two sanctioned resolutions: an
+   envelope-shaped DC block (`x -= c·env` with `c = mean(x_faded)/mean(env)`,
+   applied between fade and scale). Because the faded signal is `s·env`, the
+   result factors as `env·(s − c)`, so the endpoints stay exactly 0.0 and the
+   fade-out stays monotone while the mean goes to zero — all three MS-3
+   properties from one identity, and the fade-in is not inflated.
+   `test_stimulus.rs` pins the spec's measured worst case passing 1e-4 at both
+   −20 and −12 dBFS. What is still owed: the owner's ratification, and the spec
+   edit at `docs/specs/2026-07-15-measurement-safety-design.md:237`, which
+   still reads OPEN \[OWNER + NEEDS DATA\]. This is **not** the same open item
+   as the MMM level-safety gap in the same spec (escalation E4 below).
 7. **MS-2's per-class dBFS column: cap, or starting point?** The spec calls
    the −20 dBFS coupler / −12 dBFS room "sweep level" column "a starting
    point for the solve, not the emitted level — the solve overrides it", yet
@@ -249,11 +333,31 @@ type or in a test on the branch; none is invented policy.
    invariant is not mechanically checkable for it. Either the domain becomes
    a `Choice` over the two path policies, or `QCapPolicy` splits into a
    decided ceiling scalar plus a profile-owned shape.
+   **Resolved 2026-09-16: the `Choice` option** —
+   `Domain::Choice(vec![Ceiling(5.0), LogLinear { hi: (10000.0, 3.0), lo: (200.0, 10.0) }])`.
+   It is the smaller of the two options the spec itself sanctions and the only
+   one with no `Decisions`/`Overrides` shape churn: the drawer's control
+   becomes a two-item select over the two path policies, which is what the
+   value actually is. decision-engine:334 is the losing text. **Must land
+   before the `fixtures/decide/` freeze** — domains are serialized into
+   `expected.json`, so ruling this afterwards is a fixture-invalidating
+   change. Rationale in
+   `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md`.
 10. **`authority`'s domain is unexpressible as typed.** Spec: "Choice:
     Standard, Conservative(×0.5), Custom(curve)" but `Decision<AuthorityCurve>`
     — so `Domain::Choice` can hold only concrete curves and the preset NAMES
     (what the drawer labels its control with, and what an override would
     round-trip) have nowhere to live.
+    **Resolved 2026-09-16:** re-type to `Decision<AuthorityPreset>` with
+    `{ Conservative, Custom(AuthorityCurve), Standard }`, and put the
+    **resolved** curve in `Analysis`. This matches decision-engine:333's domain
+    text verbatim, keeps `Decisions` at 21 fields so the exhaustiveness test
+    stays green, keeps `AuthorityCurve` sealed, and makes an override
+    round-trip a **name** rather than a 957-point curve. It is what the
+    owner-directed must-expose list below ("authority preset + max-boost
+    ceiling") needs in order to be presentable. **Must land before the
+    `fixtures/decide/` freeze**, same reason as item 9. Rationale in
+    `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md`.
 11. **Type reconciliations due when Stage 3 lands** (all flagged in-source):
     `SmoothingMode` {Fixed, None, Variable} in paraeq-decide vs room-dsp's
     `Smoothing` incl. `Gaussian { fraction }`; `CorrectionKind`
@@ -268,7 +372,8 @@ type or in a test on the branch; none is invented policy.
     **Decided (owner, 2026-07-22): do not pin** `rust-toolchain.toml`;
     regenerate with `TRYBUILD=overwrite` on drift. See
     docs/decisions/2026-07-22-owner-value-calls.md.
-13. **Room-target shelf default: two specs, two numbers.** **OPEN [OWNER]** —
+13. **Room-target shelf default: two specs, two numbers.** **Shape closed
+    2026-09-16; the value is still OPEN [OWNER]** —
     surfaced by the Stage-3 review. room-dsp's Room target generator says
     `shelf_gain_db` default **+4.0** (implemented as
     `RoomTargetSpec::default()`); the decision-engine spec's decision table
@@ -278,7 +383,16 @@ type or in a test on the branch; none is invented policy.
     Q5). When ruled, update the losing spec and add a cross-crate test
     asserting the `decide()` default equals `RoomTargetSpec::default()`
     field-for-field.
-14. **`align_spl` default band: two specs, two numbers.** **OPEN [OWNER]** —
+    **Shape resolved 2026-09-16; the value stays an ears call.** `decide()`'s
+    room `Parametric` default **reads `RoomTargetSpec::default()`** instead of
+    carrying a literal of its own, so there is exactly one source — which ships
+    **+4.0** today and sits inside decision-engine's own `0.0..=6.0` domain, so
+    nothing is invalidated by shipping it. decision-engine:371 is the losing
+    text. The number itself remains **OPEN \[OWNER\]**: a ruling costs one line
+    at `crates/paraeq-dsp/src/targets.rs:515`, and the cross-crate test above
+    keeps `decide()` in step with it automatically.
+14. **`align_spl` default band: two specs, two numbers.** **CLOSED
+    2026-09-16** —
     surfaced by the Stage-4 review. `fr.rs`'s `DEFAULT_SPL_ALIGN_BAND` is
     **(200, 2000) Hz** per room-dsp; the decision-engine spec's `align_spl_band`
     decision default is **(500, 2000) Hz**. The constant has zero consumers
@@ -288,6 +402,13 @@ type or in a test on the branch; none is invented policy.
     the losing spec, and let the `decide()` default be the single source. Lower
     stakes than the shelf (both bands sit above the modal region and below
     directivity); a desk call, not an ears call.
+    **Resolved 2026-09-16: (200, 2000) Hz** — the owning module's constant wins
+    (`fr::DEFAULT_SPL_ALIGN_BAND`), the same layering rule decision-engine
+    states for the σ endpoints. Extra support: the spec's own midband reference
+    `M` — what `low_corner_hz` is measured against — is defined over
+    200 Hz–2 kHz, so this makes the alignment band and the midband reference
+    the same band. decision-engine:328 is the losing text. **Closed**; no owner
+    input needed.
 
 ## Open questions raised by implementing Stage 5
 
@@ -302,6 +423,13 @@ type or in a test on the branch; none is invented policy.
     value, not a second default. **Still OPEN \[OWNER\]:** the number itself
     needs ears on real measurements. One named constant; a ruling costs one
     line.
+    **Layer split resolved 2026-09-16 into a concrete value:** `decide()`
+    passes `boost_ratio = 0.0` on the room **auto** path and
+    `authority::DEFAULT_BOOST_RATIO` (0.5) on the coupler path, both as one
+    named `PathProfile` field — decision-engine § Authority 5 states the policy
+    ("cuts are free, boosts cost headroom and can damage drivers") and
+    `paraeq-dsp` keeps 0.5 as the mechanism default. The **number** is
+    unchanged and still **OPEN \[OWNER\]**.
 16. **Narrow-dip veto: 1/6 octave wins, on a 2-of-3 majority.** room-dsp types
     it as a width (`min_dip_width_oct`, default 1/6 oct) and decision-engine
     § Authority 4 words it identically; engine-hardening words the same veto as
@@ -324,7 +452,9 @@ type or in a test on the branch; none is invented policy.
     `test_ladder.rs::the_envelope_admits_every_chain_that_can_reach_target`:
     the envelope must contain `spl_target_db − sweep_level_dbfs_rms` (104
     coupler, 87 room), or this table would refuse chains the caps table calls
-    legal.
+    legal. **Escalated 2026-09-16 — see E5 below:** the *shape* ships on a
+    default (mirror the ranges onto `PathProfile` with a cross-crate equality
+    test), but the *numbers* need the owner's rig.
 18. **The input-gain SNR remedy cannot be expressed in dB.** MS-8's first
     remedy is "raise the input gain", but a CoreAudio gain scalar is a
     normalized 0..=1 register position, not dB, and the HAL exposes no way to
@@ -362,16 +492,219 @@ type or in a test on the branch; none is invented policy.
     same plan or Reanalyze is not deterministic. Enabled workspace-wide; costs
     ~2× on float parsing, nowhere near a hot path. Nothing further needed —
     recorded because it would have surfaced in Stage 6 as flaky fixtures.
-21. **`TapStatus` over the live `TapSystem` — was blocked, now unblocked.**
-    MS-6 requires `TapSystem` to expose `self_excluded: bool`, and
-    `MeasurementSession::begin` refuses without that witness — so no real
-    headless run is possible regardless of what else exists. It is an
+21. **`TapStatus` over the live `TapSystem` — CLOSED as a question
+    (2026-09-16).** MS-6 requires `TapSystem` to expose `self_excluded: bool`,
+    and `MeasurementSession::begin` refuses without that witness — so no real
+    headless run is possible regardless of what else exists
+    (`crates/paraeq-measure/src/session.rs` already calls
+    `tap.self_excluded()`; only the engine side is missing). It is an
     `EngineState` shape change, which the branch strategy above froze until
-    `feature/rust-port-tauri-shell` merged (it was the same deferral as
-    wizard/1). That merge landed on 2026-09-16, so the freeze is lifted and
-    this is ordinary work now. It no longer rides on the owner's ears-on
-    acceptance run — that run gates promoting `feature/integration` to `main`,
-    not this item.
+    `feature/rust-port-tauri-shell` merged (the same deferral as wizard/1).
+    That merge landed on 2026-09-16, so the freeze is struck and this is
+    ordinary sequenced work: it ships with wizard/1's `self_excluded`, the
+    third of the three shape commits. **Nothing here needs an owner** — the
+    ears-on acceptance run gates promoting `feature/integration` to `main`, not
+    this item.
+
+## Open questions raised by planning the post-merge work and Stage 6
+
+Surfaced 2026-09-16 while sequencing the post-merge items and Stage 6 against
+the spec text. Each one below ships on a stated default; the rulings and their
+grounds are in `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md`.
+
+22. **An override that lands outside its `Domain` has no defined behaviour.**
+    **OPEN \[DESIGN\]** — genuinely new policy; no precedent exists anywhere in
+    the specs. `decide()` has no `Result` (its own Decisions Log: "no `Result`;
+    a refusal must still carry the decisions and evidence that produced it"),
+    so there are exactly two candidates: clamp-and-warn, or ignore-and-keep-Auto.
+    **Default shipped: clamp into the domain, set `source: UserOverride` with
+    the clamped value, and emit `DiagnosticCode::OverrideOutOfDomain` at
+    `Severity::Warn`, naming the decision and both numbers.** Silently ignoring
+    the user's intent would recreate exactly the "second, lying source of truth
+    about what the app did" that the `Decision<T>` design exists to prevent.
+23. **`positions_n` is `Recapture` "increase only" — what tier is a decrease?**
+    **OPEN \[DESIGN\]**. **Default: keep `Recapture` in both directions.**
+    `Invalidation` is a single value on a `Decision`, so it cannot be
+    direction-dependent, and the conservative reading never under-invalidates.
+    A decrease is arguably a subset selection the spec does not model. Record
+    the UX cost in the doc comment; the clean fix later is a separate
+    "positions used" selection that is not a `Decision` at all.
+24. **`LowSnrSoft` says "Warn + de-weight" but nothing in `fr.rs` accepts
+    weights.** **Default: additive** —
+    `fr::average_measurements_rms_weighted(&AlignedSet, &[f64])` and
+    `fr::sigma_db_weighted`, leaving the unweighted, fixture-frozen functions
+    untouched (this plan's standing rule that new room behaviour arrives as
+    additive functions). Interim if it slips: emit the Warn and do **not**
+    de-weight — **and say so in the rationale string**. A documented no-op
+    beats an undocumented one.
+25. **`DiagnosticCode` has no numbering contract while `MeasurementDiagnostic`
+    has one.** `paraeq-measure`'s `MeasurementDiagnostic` carries MS-20's
+    stable numbered, append-only contract (measurement-safety:347; the
+    implementation's own header states numbers are "never reused and never
+    reordered" and that "additions are cheap — that is the point of the
+    contract"). MS-21, the adjacent row at :348, is the separate capture
+    peak/clip metering requirement and is already implemented in
+    `crates/paraeq-measure/src/capture.rs`. `paraeq-decide`'s `DiagnosticCode`
+    has no such contract, yet `fixtures/decide/expected.json` and every session
+    log will key on it. **Default: adopt the same contract** — explicit
+    discriminants, a `code()` method, the same append-only header comment —
+    plus a doc-comment mapping between the two vocabularies. One commit now; a
+    breaking change to recorded sessions later. The mapping comment also guards
+    against a future "cleanup" that merges the two enums and drags
+    `paraeq-measure` into `paraeq-decide`, which would break the crate boundary
+    and daemon-readiness.
+26. **MMM is the room easy-mode default, but it is in no stage and its
+    level-safety row does not exist.** **ESCALATED — see E3 and E4 below.** The
+    owner decided on 2026-07-22 that MMM is the room easy-mode default with
+    discrete sweeps as the precision option; three specs still list MMM as Out
+    of Scope and were never updated (wizard:557, room-dsp:1054,
+    measurement-suite:598); none of the seven stages contains MMM work; and
+    measurement-safety:145 explicitly forbids reusing the sweep caps for it.
+    Two consequences bite immediately: `CaptureMethod` changes `bundle.json`,
+    so **`fixtures/decide/` cannot be frozen until the scope call is made**,
+    and the level-safety gap sits on the *default* room journey rather than on
+    a corner case.
+
+## Escalations for the owner (2026-09-16)
+
+Seven items that no precedent in this plan can settle. Everything else the
+post-merge / Stage-6 planning pass surfaced ships on a documented default (the
+numbered items above, plus
+`docs/decisions/2026-09-16-post-merge-and-stage6-calls.md`). Each item below is
+**OPEN \[OWNER\]**, states the recommended option, and is written so it can be
+ruled from this file.
+
+**E1. The verification residual threshold — the `2×` multiplier.**
+**OPEN \[OWNER + NEEDS DATA\].** Blocks the constant behind cross-spec question
+5, and the credibility of what wizard:297 calls "the single most important
+refusal in the product" — but it does **not** block building the gate. The
+mechanism ships either way. `2 · flatness_target_db` evaluates to **2.0 dB** on
+the coupler (`flatness_target_db = 1.0`) and **6.0 dB** in a room (3.0). Set
+against that, wizard:337's own results-screen example of a *passing*
+verification is "to within **1.8 dB RMS** across 20–240 Hz". So the coupler gate
+refuses the spec's own success story by 0.2 dB, and the room gate is more than
+3× looser than the spec's own expectation of a good result. The number was
+almost certainly chosen with the *target* residual in mind, where rig error
+dominates; it does not transfer to the *prediction* residual unexamined.
+Options: (a) ship 2.0 as `VERIFICATION_RESIDUAL_MULTIPLE` and retune on the
+first EARS run; (b) ship an absolute dB gate instead of a multiple, since the
+prediction residual is a property of the DSP chain rather than of the path's
+flatness ambition; (c) per-path multiples. **Recommended: (a)** — one named
+constant read off `decisions.flatness_target_db.value` so an override moves the
+gate with it, with the retune signal stated (*the first EARS run where a
+correction that A/Bs correctly still refuses*). But the owner should see the
+2.0-vs-1.8 collision **before** the first ears-on verification run, not after.
+
+**E2. How a genuine TCC silent failure is detected *during* a measurement
+session.** **OPEN \[OWNER\].** Blocks Stage 6's verification wiring and the
+wizard's refusal table; does not block the post-merge lease work, which ships
+either way. wizard:416 requires that "a genuine TCC silent failure during a
+measurement session is still a `Refuse`". But the same section explains why the
+tap legitimately sees zeros throughout — `Direct` captures are tap-excluded **by
+design** — and `EngineStatus::NoInputDetected` means exactly "no nonzero sample
+since start". Read literally, that sentence refuses 100% of wizard runs.
+**Recommended split:** the measurement lease suspends only the auto-disable;
+`NoInputDetected` keeps being reported and logged but is not blocking during a
+`Direct` capture; and the TCC witness moves to the **verify** gate, where it is
+falsifiable — the helper process is tap-*included* and is playing, so the tap
+**must** see nonzero blocks within about a second (the hardware tests record 0
+callbacks/s idle against ~94/s during playback). No nonzero blocks while the
+helper plays ⇒ TCC silent failure ⇒ `Refuse`. Escalated because it
+reinterprets a safety sentence in the spec, not because the engineering is
+unclear.
+
+**E3. MMM scope and sequencing.** **OPEN \[OWNER\].** Blocks the
+`MeasurementBundle` shape, and therefore the `fixtures/decide/` freeze. MMM is
+the owner-decided room easy-mode default (2026-07-22), yet three specs still
+call it Out of Scope, no stage contains any MMM work, and pink noise is
+explicitly absent from the stimulus module ("a later stage and deliberately
+absent here"). There is no safe default: a `decide()` written without
+`CaptureMethod` is throwaway if MMM ships, and one written with it is
+speculative if MMM slips. Options: (a) MMM in v1 — add `CaptureMethod` now and
+branch `decide()`'s authority model on it; (b) MMM deferred past v1 — say so
+here and correct the three Out-of-Scope sections so they say the right thing
+for the right reason; (c) ship `CaptureMethod { DiscreteSweep }` as a
+one-variant enum now, so adding `MovingMic` later is additive and
+`bundle.json`'s shape is stable. **Recommended: (c)** — the cheapest hedge; it
+costs one enum and unblocks the freeze without committing the schedule.
+Natural companion call: measurement-suite:571's schedule contingency ("correct
+below the transition only if the date slips"), which is also OPEN \[OWNER\].
+
+**E4. The MMM level-safety row.** **OPEN \[OWNER + NEEDS DATA\].** Blocks any
+MMM capture actually running; contingent on E3. measurement-safety:145,
+verbatim: the per-class caps table "has no row for the **Moving Microphone
+Method (MMM)** … MMM plays continuous pink noise — continuous energy with a
+different crest factor than a sweep — so hearing-exposure and driver-heating
+limits differ; the sweep caps above must **not** be reused unexamined. MMM
+needs its own level-safety row, derived from real pink-noise measurements." The
+spec therefore forbids the only available default, and MMM is now the *default*
+room journey — so this is a safety gap on the path most novices will take.
+**Recommended: refuse the MMM path entirely until the row exists** (quiet is
+the safe direction), and make the gap visible as an explicit
+OPEN \[NEEDS DATA\] MMM row *inside* the per-class caps table rather than only
+in the prose beneath it. This is the one item where proceeding on a default is
+a safety regression rather than rework. Distinct from item 6's MS-3 DC-gate
+item, which is a different open item in the same spec.
+
+**E5. MS-17's chain-sensitivity envelope.** **OPEN \[OWNER + NEEDS DATA\]** —
+this is item 17 above, escalated. Blocks the class cross-check and the
+`WrongTransducer` refusal, and in practice every real headless run on unusual
+hardware: a chain outside the envelope is refused **before any sweep is
+emitted**. No spec states any values; `crates/paraeq-measure/src/level.rs`
+ships engineering estimates (coupler 85–130, room 65–120 dB SPL per dBFS RMS).
+One end is pinned and is not a guess —
+`test_ladder.rs::the_envelope_admits_every_chain_that_can_reach_target` forces
+the envelope to contain `spl_target_db − sweep_level_dbfs_rms` (104 coupler, 87
+room); the other end is a guess. **Recommended:** ship the *shape* on a default
+— mirror the same ranges onto `PathProfile` (because `paraeq-decide` may not
+depend on `paraeq-measure`) with a cross-crate test asserting the two tables
+agree field-for-field — and have the owner settle the **numbers** by measuring
+`S` on the EARS rig and on a real room system. Wrong values surface to users as
+"ParaEQ won't measure my headphones", which is a user-visible failure
+attributable to a guessed constant.
+
+**E6. Hardware spike: can the tap aggregate and the measurement aggregate
+coexist?** **OPEN \[OWNER — rig action, not a decision\].** Blocks the
+verification loop's capture-side design. Nobody has ever run both at once:
+`tap.rs` composes the default output as a tap-aggregate sub-device and
+`measure_aggregate.rs` composes it again ("mirrors `tap.rs::create_aggregate`
+key-for-key, minus the tap list"). Verification is the first operation that
+needs both live, and the Stage-5 hardware tests deliberately run without a
+session or engine. No spec addresses coexistence. **Recommended:** schedule the
+spike **before** the verification capture path is designed around an
+assumption. Fallback if they cannot coexist: capture the verification mic
+through a mic-only aggregate and lean entirely on the two-clock marker path for
+t=0, accepting the two-clock warning — which redesigns the capture side, so
+finding out late is expensive.
+
+**E7. The `fixtures/decide/` freeze sign-off.** **OPEN \[OWNER\].** Blocks the
+freeze by definition: decision-engine:574 says the expected values "are
+reviewed by the owner once and then frozen", which is an owner gate an agent
+cannot default. What the owner is being asked to sign: eight `notes.md` files
+(one paragraph each — what the case exercises, the expected verdict, the
+diagnostics it should raise), written **before** the bless, plus the eight
+`expected.json` the bless produces. Without the notes, "reviewed once" means
+reading several hundred KB of `Analysis` curves. **Recommended: do not schedule
+this until** items 9, 10, 13, 14 and 15, item 11's type reconciliations,
+cross-spec question 5 and E3's `CaptureMethod` call are all settled. A freeze
+that re-blesses twice in its first week trains everyone to rubber-stamp the
+diff, which is exactly what the mechanism exists to stop.
+
+**Adjacent owner *actions* (not decisions, listed so they are not lost).**
+The **Tier-4 REW characterization corpus** — no `fixtures/rew/` exists; it was a
+Stage-2 gate and has slipped past Stage 5, so the whole room pipeline ships
+validated only against its own analytic invariants and never against the
+field-standard tool. The **two-clock magnitude run** — the harness is written
+and `#[ignore]`d in `crates/paraeq-coreaudio/tests/test_measure_hardware.rs`;
+it unfreezes the provisional 5.5 s sweep-length cap, sets the clock-adjust
+reject bound, and closes the IR-perturbation question, and measurement-safety
+gates the gated room path's *ship* on it. **Counsel** on the EN 50332 /
+IEC 62368-1 cl. 10.6 and PLD 2024/2853 article numbers, which the safety spec
+records as "corpus-sourced and unverified" — the posture is already decided
+(stay FOSS/non-commercial); only the published claim waits, so this blocks R7
+rather than code, and the 85 dB warn / 100 dB refuse thresholds stand as
+engineering thresholds regardless. Pair the REW capture, the two-clock run and
+E6's spike into **one rig session** so all three land together.
 
 ## REW comparison and the automate-with-an-override principle
 
