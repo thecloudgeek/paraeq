@@ -8,10 +8,13 @@ version.workspace = true
 # Wire derives for the types that cross into paraeq-decide's serializable
 # bundle (TargetCurve, TransducerClass) and its CorrectionPlan (EQBand,
 # FilterType). Off by default: the realtime crates never serialize these.
+# desktop/src-tauri turns it on — its AppState envelope, profile store and
+# settings file all persist/IPC `EQBand` (wire format: snake_case).
 serde = ["dep:serde"]
 
 [dependencies]
 realfft = { workspace = true }
+regex = "1"
 rustfft = { workspace = true }
 serde = { workspace = true, optional = true }
 thiserror = { workspace = true }

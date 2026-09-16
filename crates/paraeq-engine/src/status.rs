@@ -19,7 +19,13 @@
 //! death arrives as backend listener events, handled by the controller.
 
 /// Engine lifecycle status, serialized into every state snapshot.
+///
+/// Internally tagged (`{"kind":"stopped"}`, `{"kind":"failed","reason":…}`)
+/// so the desktop TS layer sees a clean discriminated union keyed on `kind`.
+/// Variant names and struct fields are snake_case on the wire; the shape is
+/// pinned by `tests/test_wire_format.rs`.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
 pub enum EngineStatus {
     Stopped,
     Starting {

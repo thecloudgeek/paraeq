@@ -13,8 +13,10 @@
     "windows": [
       {
         "title": "ParaEQ",
-        "width": 800,
-        "height": 600,
+        "width": 1024,
+        "height": 768,
+        "minWidth": 900,
+        "minHeight": 640,
         "resizable": true,
         "fullscreen": false
       }
@@ -33,9 +35,6 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "android": {
-      "debugApplicationIdSuffix": ".debug"
-    },
     "macOS": {
       "minimumSystemVersion": "14.4"
     }

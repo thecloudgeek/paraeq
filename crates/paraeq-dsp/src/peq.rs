@@ -3,9 +3,16 @@
 
 use crate::biquad;
 use crate::DspError;
+use regex::Regex;
+use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// snake_case is the WIRE FORMAT, not a style choice: the desktop UI's
+// hand-written contract pins `"high_shelf" | "low_shelf" | "notch" | "peaking"`
+// (desktop/ui/src/ipc/types.ts), the same spelling `as_str`/`from_str` and the
+// AutoEQ fixtures use. Renaming these variants renames the JSON.
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum FilterType {
     HighShelf,
     LowShelf,
@@ -66,6 +73,73 @@ impl EQBand {
             FilterType::Peaking => biquad::peaking(self.fc, self.gain_db, self.q, sample_rate),
         }
     }
+}
+
+/// A parsed AutoEQ/EqualizerAPO ParametricEq preset: the preamp gain plus the
+/// ON filter bands. Mirrors the oracle `ParsedPreset` (autoeq_db.py:48-51).
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct ParsedPreset {
+    pub bands: Vec<EQBand>,
+    pub preamp_db: f64,
+}
+
+fn preamp_re() -> &'static Regex {
+    // autoeq_db.py:23 — `Preamp\s*:\s*([-\d.]+)\s*dB`, IGNORECASE, searched.
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)Preamp\s*:\s*([-\d.]+)\s*dB").unwrap())
+}
+
+fn filter_re() -> &'static Regex {
+    // autoeq_db.py:24-27 — only literal `ON` matches; the filter number and any
+    // trailing text are ignored; IGNORECASE, searched (not anchored).
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)Filter\s+\d+\s*:\s*ON\s+(\w+)\s+Fc\s+([\d.]+)\s+Hz\s+Gain\s+([-\d.]+)\s+dB\s+Q\s+([\d.]+)",
+        )
+        .unwrap()
+    })
+}
+
+/// AutoEQ short code → filter type. Accepts both EqualizerAPO shelf spellings
+/// (LSC/HSC) and the legacy LS/HS aliases; unknown codes fall back to peaking.
+/// Mirrors autoeq_db.py:30-37 + the `.get(short.upper(), "peaking")` default.
+fn filter_type_from_code(code: &str) -> FilterType {
+    match code.to_ascii_uppercase().as_str() {
+        "HS" | "HSC" => FilterType::HighShelf,
+        "LS" | "LSC" => FilterType::LowShelf,
+        "NO" => FilterType::Notch,
+        "PK" => FilterType::Peaking,
+        _ => FilterType::Peaking,
+    }
+}
+
+/// Parse AutoEQ ParametricEq text into a [`ParsedPreset`]. Infallible: zero
+/// bands is a valid result (callers decide whether that's a warning).
+///
+/// Oracle: autoeq_db.py:82-110 `parse_parametric_eq`. Preamp defaults to 0.0
+/// when absent; two Preamp lines are last-wins (each match overwrites and the
+/// line is consumed via `continue`). Only `ON` filter lines are captured;
+/// non-matching lines are skipped without error.
+pub fn parse_autoeq(text: &str) -> ParsedPreset {
+    let mut preamp_db = 0.0;
+    let mut bands = Vec::new();
+    for line in text.lines() {
+        if let Some(caps) = preamp_re().captures(line) {
+            preamp_db = caps[1].parse().unwrap_or(0.0);
+            continue;
+        }
+        if let Some(caps) = filter_re().captures(line) {
+            bands.push(EQBand {
+                filter_type: filter_type_from_code(&caps[1]),
+                fc: caps[2].parse().unwrap_or(0.0),
+                gain_db: caps[3].parse().unwrap_or(0.0),
+                q: caps[4].parse().unwrap_or(0.0),
+            });
+        }
+    }
+    ParsedPreset { bands, preamp_db }
 }
 
 pub struct ParametricEQ {
@@ -210,15 +284,33 @@ impl ParametricEQ {
     /// **A preamp that lives only in exported text protects other people's EQ
     /// software and not ParaEQ.** The engine-side half of this — sending
     /// `SetGainDb(preamp_db)` alongside `SetCorrection` so the gain stage at
-    /// `chain.rs` carries it — is the Tauri backend's, and is sequenced
-    /// post-merge with the rest of the desktop wiring.
+    /// `chain.rs` carries it — is the Tauri backend's. That plumbing now exists
+    /// (`engine_set_preamp_db` in `desktop/src-tauri/src/commands.rs`), but it
+    /// carries a *user-typed* number; auto-sending this computed value arrives
+    /// with the decision-engine wiring.
     pub fn export_autoeq_format_with_preamp(&self) -> String {
         self.export_autoeq_lines(self.preamp_db())
     }
 
-    /// The shared body of the two public exports; the preamp is the only thing
-    /// they differ in, so it is the only parameter. Line format is transcribed
-    /// on [`Self::export_autoeq_format`].
+    /// [`Self::export_autoeq_format`] with a **caller-supplied** preamp in the
+    /// header.
+    ///
+    /// For the desktop app's manual-preamp export (`eq_export_autoeq` in
+    /// `desktop/src-tauri/src/commands.rs`): there the preamp is a number the
+    /// user typed and the engine is already running at (`SetGainDb`), so the
+    /// exported text must carry *that* value — neither the oracle's `0.0`
+    /// literal nor the cascade-derived [`Self::preamp_db`].
+    ///
+    /// Shares the `-0.0` guard with the other two exports: a preamp in
+    /// `(-0.05, 0)` is zero to the precision the format carries, so it prints
+    /// as `0.0 dB`, never `-0.0 dB`.
+    pub fn export_autoeq_format_with_preamp_db(&self, preamp_db: f64) -> String {
+        self.export_autoeq_lines(preamp_db)
+    }
+
+    /// The shared body of the three public exports; the preamp is the only
+    /// thing they differ in, so it is the only parameter. Line format is
+    /// transcribed on [`Self::export_autoeq_format`].
     fn export_autoeq_lines(&self, preamp_db: f64) -> String {
         // A preamp between -0.05 and 0 dB rounds to zero at one decimal and
         // would print as "-0.0 dB", which reads as a defect. It is zero to the

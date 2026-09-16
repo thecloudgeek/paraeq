@@ -14,7 +14,21 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+log = { workspace = true }
+paraeq-coreaudio = { path = "../../crates/paraeq-coreaudio" }
+# `serde`: this crate persists and IPCs `EQBand` (state.rs, profiles.rs,
+# settings.rs). The feature is off by default on paraeq-dsp so the realtime
+# crates never pull serde in, so this consumer asks for it explicitly.
+paraeq-dsp = { path = "../../crates/paraeq-dsp", features = ["serde"] }
 paraeq-engine = { path = "../../crates/paraeq-engine" }
+percent-encoding = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt"] }

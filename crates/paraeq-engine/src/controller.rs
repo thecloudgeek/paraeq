@@ -145,6 +145,18 @@ pub struct EngineState {
     pub bypass: bool,
     /// Short descriptor of the retained correction, e.g. `"iir:5-band"`.
     pub correction: Option<String>,
+    /// The controller's current enabled flag: `true` between an
+    /// [`EngineCommand::Enable`] (or an enabled spawn) and the next
+    /// [`EngineCommand::Disable`]/fail-open auto-disable. Lets the UI tell a
+    /// user-disabled `Stopped` apart from a pre-start or failed one.
+    pub enabled: bool,
+    /// Cumulative count of realtime blocks the chain passed through instead
+    /// of correcting because their frame count did not match the built
+    /// geometry (degraded pass-through telemetry). Read from `RtShared` at
+    /// snapshot time; retains the last observed count after a `Disable`
+    /// tears the session down, and is re-zeroed by the fresh `RtShared` on
+    /// every start.
+    pub frame_mismatch_blocks: u64,
     pub gain_db: f32,
     pub input_peak: f32,
     /// `sample_time_delta / sample_rate * 1000` for the live stream.
@@ -157,6 +169,13 @@ pub struct EngineState {
 /// suite runs in real time without real waits.
 #[derive(Clone, Copy, Debug)]
 pub struct EngineConfig {
+    /// Whether the controller starts the backend on spawn. `true` (the
+    /// [`Default`]) preserves the historical spawn-and-start behavior; the
+    /// desktop passes `false` pre-wizard so the tap is not engaged (and the
+    /// system not muted) until the user explicitly enables the EQ. Either
+    /// way, [`EngineCommand::Enable`]/[`EngineCommand::Disable`] flip it at
+    /// runtime.
+    pub enabled: bool,
     /// Fail-open window: how long [`EngineStatus::NoInputDetected`] may
     /// persist before the controller auto-disables (same path as
     /// [`EngineCommand::Disable`]: backend stopped, tap destroyed, device
@@ -184,6 +203,7 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             fail_open_after_ms: Some(15_000),
             requested_buffer_frames: None,
             ring_capacity: 4,
@@ -205,13 +225,17 @@ pub struct EngineHandle {
 }
 
 impl EngineHandle {
-    /// Spawn the controller thread and immediately start the backend.
+    /// Spawn the controller thread; it starts the backend immediately when
+    /// `config.enabled` (the default), or waits for [`EngineCommand::Enable`]
+    /// when spawned disabled.
     pub fn spawn<B: AudioBackend + 'static>(backend: B, config: EngineConfig) -> EngineHandle {
         assert!(config.ring_capacity >= 1, "ring_capacity must be >= 1");
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let initial = Arc::new(EngineState {
             bypass: false,
             correction: None,
+            enabled: config.enabled,
+            frame_mismatch_blocks: 0,
             gain_db: 0.0,
             input_peak: 0.0,
             latency_ms: None,
@@ -234,10 +258,11 @@ impl EngineHandle {
                     cmd_rx,
                     consecutive_start_failures: 0,
                     correction: None,
-                    enabled: true,
+                    enabled: config.enabled,
                     epoch: Instant::now(),
                     fail_open_after_ms: config.fail_open_after_ms,
                     failed: None,
+                    frame_mismatch_blocks: 0,
                     gain_db: 0.0,
                     last_tick: Instant::now(),
                     published: initial,
@@ -345,6 +370,11 @@ struct Controller<B: AudioBackend> {
     /// (`None` = behavior disabled).
     fail_open_after_ms: Option<u64>,
     failed: Option<String>,
+    /// Last `RtShared::frame_mismatch_blocks` observed at snapshot time.
+    /// Retained across a torn-down session (so a `Disable` does not reset
+    /// the surfaced count to 0); re-zeroed when the fresh `RtShared` of the
+    /// next start reports 0.
+    frame_mismatch_blocks: u64,
     gain_db: f32,
     /// When `on_tick` last ran. A command flood keeps `recv_timeout`
     /// returning `Ok` and would otherwise starve the tick work entirely
@@ -690,18 +720,26 @@ impl<B: AudioBackend> Controller<B> {
 
     /// Publish a snapshot iff it differs from the last published one.
     fn publish(&mut self) {
-        let (stream, latency_ms, input_peak) = match &self.session {
+        let (stream, latency_ms, input_peak, mismatch) = match &self.session {
             Some(s) => (
                 Some(s.stream.clone()),
                 (s.stream.sample_rate > 0.0)
                     .then(|| s.shared.sample_time_delta() / s.stream.sample_rate * 1000.0),
                 s.shared.peak_in(),
+                Some(s.shared.frame_mismatch_blocks.load(Ordering::Relaxed)),
             ),
-            None => (None, None, 0.0),
+            None => (None, None, 0.0, None),
         };
+        // A live session owns the current count (fresh RtShared -> 0 on each
+        // start); a torn-down session retains the last observed count.
+        if let Some(count) = mismatch {
+            self.frame_mismatch_blocks = count;
+        }
         let next = EngineState {
             bypass: self.bypass,
             correction: self.correction.as_ref().map(CorrectionConfig::descriptor),
+            enabled: self.enabled,
+            frame_mismatch_blocks: self.frame_mismatch_blocks,
             gain_db: self.gain_db,
             input_peak,
             latency_ms,
@@ -727,11 +765,17 @@ impl<B: AudioBackend> Controller<B> {
 /// Change detection for `publish`, with the jittery telemetry quantized:
 /// `latency_ms` compares at 0.1 ms and `input_peak` at 1e-3 resolution, so
 /// HAL sample-time jitter does not publish a fresh snapshot every tick.
+/// `frame_mismatch_blocks` is compared only as `> 0` (the boolean the UI
+/// needs, Task 14): a degraded stretch increments it once per block, and
+/// comparing it raw would emit a fresh snapshot + Tauri event every tick for
+/// the whole stretch. `enabled` compares exactly so a flip alone publishes.
 fn effectively_equal(a: &EngineState, b: &EngineState) -> bool {
     let q_latency = |l: Option<f64>| l.map(|v| (v * 10.0).round() as i64);
     let q_peak = |p: f32| (f64::from(p) * 1000.0).round() as i64;
     a.bypass == b.bypass
         && a.correction == b.correction
+        && a.enabled == b.enabled
+        && (a.frame_mismatch_blocks > 0) == (b.frame_mismatch_blocks > 0)
         && a.gain_db == b.gain_db
         && q_peak(a.input_peak) == q_peak(b.input_peak)
         && q_latency(a.latency_ms) == q_latency(b.latency_ms)

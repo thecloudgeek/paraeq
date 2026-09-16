@@ -47,6 +47,57 @@ fn autoeq_export_matches_oracle_exactly() {
     );
 }
 
+/// The EQBand wire format the UI hand-mirrors (desktop/ui/src/ipc/types.ts):
+/// snake_case field names AND snake_case `filter_type` values, pinned in BOTH
+/// directions — serialize to the golden JSON, and deserialize that same golden
+/// JSON back. `serde` is an optional feature on this crate (off for the
+/// realtime path); the workspace build turns it on through paraeq-decide and
+/// desktop/src-tauri, so this test runs in `cargo test --workspace`.
+#[cfg(feature = "serde")]
+#[test]
+fn band_serde_roundtrip_and_golden_json() {
+    use serde_json::json;
+
+    let band = EQBand {
+        filter_type: FilterType::Peaking,
+        fc: 1000.0,
+        gain_db: 3.0,
+        q: 1.41,
+    };
+    let golden = json!({"filter_type": "peaking", "fc": 1000.0, "gain_db": 3.0, "q": 1.41});
+    assert_eq!(serde_json::to_value(&band).unwrap(), golden);
+    // Deserialize direction: the golden JSON's "peaking" must map back, and a
+    // PascalCase spelling must NOT be accepted (it would mean the rename was
+    // dropped and the UI's contract silently re-pinned).
+    let from_golden: EQBand = serde_json::from_value(golden).unwrap();
+    assert_eq!(from_golden, band);
+    assert!(serde_json::from_value::<EQBand>(
+        json!({"filter_type": "Peaking", "fc": 1000.0, "gain_db": 3.0, "q": 1.41})
+    )
+    .is_err());
+}
+
+/// The desktop's manual-preamp export writes the number it is handed (the
+/// value the engine is running at via `SetGainDb`), unlike the oracle-pinned
+/// `export_autoeq_format`.
+#[test]
+fn export_with_preamp_db_writes_the_caller_s_preamp() {
+    let peq = ParametricEQ {
+        bands: Vec::new(),
+        sample_rate: 48000.0,
+    };
+    let exported = peq.export_autoeq_format_with_preamp_db(-6.5);
+    assert_eq!(exported.lines().next().unwrap(), "Preamp: -6.5 dB");
+    // Shares the -0.0 guard with the other two exports.
+    assert_eq!(
+        peq.export_autoeq_format_with_preamp_db(-0.04)
+            .lines()
+            .next()
+            .unwrap(),
+        "Preamp: 0.0 dB"
+    );
+}
+
 #[test]
 fn empty_bands_returns_exact_zeros() {
     // parametric_eq.py:79-90 special-cases `not self.bands` to return exact

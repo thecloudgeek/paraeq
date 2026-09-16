@@ -109,4 +109,30 @@ differs from `prototype/paraeq/`, so a red parity test is always actionable.
     `test_peq.rs::the_two_exports_differ_only_in_the_preamp_line` and
     `::a_pure_cut_export_never_prints_negative_zero`.
 
+16. **`ParametricEQ::export_autoeq_format_with_preamp_db` has no oracle
+    counterpart either.** The prototype exporter hardcodes `Preamp: 0.0 dB`
+    (parametric_eq.py:92-106) and never round-trips a preamp; the desktop app
+    must export the preamp the user set and the engine is running at
+    (`SetGainDb`). Deliberate UX fix, owner-approved 2026-07-13 — originally
+    landed on `feature/rust-port-tauri-shell` by giving `export_autoeq_format`
+    itself a `preamp_db: f64` parameter, which the 2026-09-16 integration merge
+    reworked into this third, additive method so the oracle-parity export stays
+    argument-free and fixture-pinned (see #15). All three share the `-0.0`
+    guard, so a desktop export with a preamp in `(-0.05, 0)` writes
+    `Preamp: 0.0 dB` where the shell branch wrote `Preamp: -0.0 dB`. The parser
+    accepts any of them, so cross-imports still work. Call site:
+    `desktop/src-tauri/src/commands.rs::eq_export_autoeq`; pinned by
+    `test_peq.rs::export_with_preamp_db_writes_the_caller_s_preamp`.
+
+17. **AutoEq INDEX.md hrefs are percent-DECODED on parse** (`desktop/src-tauri/src/autoeq.rs::parse_index`).
+    The oracle (`autoeq_db.py`) stores the raw href verbatim and then
+    `urllib.parse.quote`s it again at fetch time — so a real href like
+    `Sennheiser%20HD%20650` becomes `Sennheiser%2520HD%2520650` and 404s every
+    preset. The oracle's tests never caught it (network is mocked). The Rust
+    port decodes the href on parse so `IndexEntry::path` is the literal path and
+    the fetch layer (`encode_path`) encodes exactly once. Deliberate bug fix;
+    the surfaced fallback URL (`raw.githubusercontent.com/...`) is what read as a
+    "git error" to the owner. Regression test:
+    `preset_url_from_encoded_index_href_is_single_encoded`.
+
 (add entries here as they are discovered during implementation)

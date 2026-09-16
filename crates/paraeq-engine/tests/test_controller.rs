@@ -28,6 +28,7 @@ const WAIT: Duration = Duration::from_secs(5);
 /// `fail_open_*` tests opt in via [`fail_open_config`].
 fn fast_config() -> EngineConfig {
     EngineConfig {
+        enabled: true,
         fail_open_after_ms: None,
         requested_buffer_frames: None,
         ring_capacity: 4,
@@ -632,4 +633,111 @@ fn fail_open_none_disables_the_behavior() {
     assert_eq!(backend.stop_count(), 0, "None must mean no auto-disable");
     assert_eq!(backend.start_count(), 1);
     assert!(backend.is_running());
+}
+
+#[test]
+fn spawn_disabled_does_not_start_until_enable() {
+    let backend = MockBackend::default();
+    let probe = backend.clone();
+    let handle = EngineHandle::spawn(
+        backend,
+        EngineConfig {
+            enabled: false,
+            tick_ms: TICK_MS,
+            ..fast_config()
+        },
+    );
+    // Disabled spawn: the backend is never touched, and the snapshot reports
+    // enabled: false, status: Stopped.
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        probe.start_count(),
+        0,
+        "disabled spawn must not touch the backend"
+    );
+    let s = handle.state();
+    assert!(!s.enabled);
+    assert_eq!(s.status, EngineStatus::Stopped);
+
+    // Enable starts the backend and flips enabled: true.
+    handle.send(EngineCommand::Enable);
+    assert!(wait_until(WAIT, || probe.start_count() == 1));
+    assert!(wait_until(WAIT, || handle.state().enabled));
+
+    // Disable flips it back and tears the session down.
+    handle.send(EngineCommand::Disable);
+    assert!(wait_until(WAIT, || {
+        !probe.is_running() && !handle.state().enabled
+    }));
+}
+
+#[test]
+fn enabled_flip_alone_publishes() {
+    // Guards the hand-rolled `effectively_equal`: spawn disabled, make the
+    // Enable-time start fail so `status` stays Stopped and EVERY other
+    // compared field is unchanged -- only `enabled` flips to true. If the
+    // comparison omits `enabled`, publish() returns early and no subscriber
+    // ever sees the flip.
+    //
+    // The tick is set far beyond the test's runtime on purpose. The
+    // Enable-time start is only DEFERRED by `fail_next_starts(1)`: the next
+    // `on_tick` retries it and, on success, advances Stopped -> Starting.
+    // `run`'s tick-starvation guard runs `on_tick` in the SAME loop iteration
+    // as `handle(Enable)` -- before the flip's `publish` -- whenever
+    // `last_tick.elapsed() >= tick`, which would coalesce the transient
+    // {enabled: true, status: Stopped} frame this test waits for into a
+    // {enabled: true, status: Starting} one. A tick that cannot elapse before
+    // Enable arrives keeps the guard from ever firing here, so the
+    // lone-`enabled` publish is emitted deterministically. (The deferred
+    // start's retry is pushed past teardown; the handle's Shutdown wakes the
+    // blocked `recv_timeout` immediately, so the long tick never delays
+    // anything.)
+    let backend = MockBackend::default();
+    let probe = backend.clone();
+    let handle = EngineHandle::spawn(
+        backend,
+        EngineConfig {
+            enabled: false,
+            // Far larger than the whole test; see the note above.
+            tick_ms: 600_000,
+            ..fast_config()
+        },
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!handle.state().enabled);
+    assert_eq!(handle.state().status, EngineStatus::Stopped);
+
+    probe.fail_next_starts(1);
+    let snapshots = handle.subscribe();
+    handle.send(EngineCommand::Enable);
+
+    assert!(wait_until(WAIT, || handle.state().enabled));
+    let saw_flip = std::iter::from_fn(|| snapshots.try_recv().ok())
+        .any(|s| s.enabled && s.status == EngineStatus::Stopped);
+    assert!(saw_flip, "enabled flip alone did not publish a snapshot");
+}
+
+#[test]
+fn frame_mismatch_blocks_reach_snapshots() {
+    let (backend, handle) = spawn_engine();
+
+    // A FIR is built for the session's block size (the mock reports 512) and
+    // corrects ONLY exact-block_size frames, so pumping half-blocks (256)
+    // flags frame_mismatch on every block and grows the snapshot counter.
+    handle.send(EngineCommand::SetCorrection(CorrectionConfig::Fir {
+        firs: vec![vec![1.0]; 2],
+    }));
+    assert!(wait_until(WAIT, || {
+        backend.pump(256, 0.5);
+        handle.state().frame_mismatch_blocks > 0
+    }));
+
+    // A rebuild builds a fresh RtShared (counter zeroed); conforming
+    // full-block pumps flag no new mismatch, so the snapshot re-zeroes.
+    backend.queue_event(BackendEvent::DefaultOutputChanged);
+    assert!(wait_until(WAIT, || backend.start_count() == 2));
+    assert!(wait_until(WAIT, || {
+        backend.pump(512, 0.5);
+        handle.state().frame_mismatch_blocks == 0
+    }));
 }

@@ -29,8 +29,10 @@ for the engine, the tap architecture and packaging. Current plan:
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 
-# Desktop app (dev)
-cd desktop/ui && npx tauri dev
+# Desktop app (dev) — the CLI finds tauri.conf.json in desktop/src-tauri, so it
+# must run from desktop/ (a subfolder search from desktop/ui would miss its sibling).
+# The `tauri` npm script anchors cwd at desktop/ for you.
+cd desktop/ui && npm run tauri dev
 
 # Frontend only
 cd desktop/ui && npx tsc -b && npm run build
