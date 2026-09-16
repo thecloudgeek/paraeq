@@ -8,10 +8,11 @@ room-dsp, wizard).
 `-stage3` → `-stage4` → `-stage5`, stacked, unmerged). Stage 2's merge-gated
 items (engine-hardening R1-1 engine half, R1-8, R1-6) and the Tier-4 REW
 corpus remain open — see the gates below. Stage 5 closed cross-spec question 2
-(the autofit shape) and is complete except for one blocked item: the
+(the autofit shape) and is complete except for one open item: the
 `TapStatus` implementation over the live `TapSystem`, which needs
-`self_excluded` on `TapSystem` — an `EngineState` shape change frozen until
-the shell merge. Next: Stage 6.
+`self_excluded` on `TapSystem` — an `EngineState` shape change that the shell
+merge unfroze when it landed on 2026-09-16, so the item is now unblocked.
+Next: Stage 6.
 
 This plan sequences the six specs into seven stages. It exists because the
 specs cross-reference each other heavily (shared deliverables, ordering
@@ -22,6 +23,13 @@ the authoritative requirements are always the spec text itself.
 ---
 
 ## Branch strategy
+
+**Status (2026-09-16): the gating merge has landed.**
+`feature/rust-port-tauri-shell` was merged as-is into the rescope stack on
+`feature/integration` (parents `c180658` + `2752c44`, base `179cd34`), so the
+`CorrectionConfig`/`EngineState` shape freeze below is **lifted** and every
+"post-merge" item in this plan is unblocked. The bullets record the strategy
+as it stood while the shell branch was outstanding.
 
 - **`feature/rust-port-tauri-shell` merges first, as-is** ("do not reopen" per
   the measurement-suite spec). It is CI-green and gated only on the owner's
@@ -89,7 +97,8 @@ Everything here is merge-independent except the merge itself and the two
 - engine-hardening/7 — R1-5 `kAudioSubDeviceInputChannelsKey: 0` on the tap
   aggregate (+ delete backend.rs KNOWN LIMITATION; owner fresh-TCC check)
 - engine-hardening/9 — R1-7a `IIRProcessor::adopt_state_from`
-- **Deferred to post-merge** (EngineState wire shape frozen):
+- **Deferred to post-merge** (EngineState wire shape frozen at the time;
+  freeze lifted 2026-09-16):
   engine-hardening/2 (R1-8 meters) and wizard/1
   (`EngineState.self_excluded` + `MeasurementLease`).
 
@@ -353,14 +362,16 @@ type or in a test on the branch; none is invented policy.
     same plan or Reanalyze is not deterministic. Enabled workspace-wide; costs
     ~2× on float parsing, nowhere near a hot path. Nothing further needed —
     recorded because it would have surfaced in Stage 6 as flaky fixtures.
-21. **`TapStatus` over the live `TapSystem` is BLOCKED, not skipped.** MS-6
-    requires `TapSystem` to expose `self_excluded: bool`, and
+21. **`TapStatus` over the live `TapSystem` — was blocked, now unblocked.**
+    MS-6 requires `TapSystem` to expose `self_excluded: bool`, and
     `MeasurementSession::begin` refuses without that witness — so no real
     headless run is possible regardless of what else exists. It is an
-    `EngineState` shape change, which the branch strategy above freezes until
-    `feature/rust-port-tauri-shell` merges (it is the same deferral as
-    wizard/1). This is one more item riding on the owner's ears-on acceptance
-    run, which remains the single cheapest unblock in the program.
+    `EngineState` shape change, which the branch strategy above froze until
+    `feature/rust-port-tauri-shell` merged (it was the same deferral as
+    wizard/1). That merge landed on 2026-09-16, so the freeze is lifted and
+    this is ordinary work now. It no longer rides on the owner's ears-on
+    acceptance run — that run gates promoting `feature/integration` to `main`,
+    not this item.
 
 ## REW comparison and the automate-with-an-override principle
 

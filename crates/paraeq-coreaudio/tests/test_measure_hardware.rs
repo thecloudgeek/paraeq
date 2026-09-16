@@ -415,10 +415,13 @@ fn two_clock_bracketed_sweep_skew() {
 // state — "a complete coupler measurement is testable end-to-end, headless".
 //
 // NOT yet a full `MeasurementSession` run: MS-6 refuses to open a session
-// without a `TapStatus` witness, and `TapSystem` cannot expose `self_excluded`
-// until the `EngineState` shape unfreezes at the tauri-shell merge. What these
-// prove is everything below that gate — that the sink plays, that it paces,
-// and that play and record really do share one clock.
+// without a `TapStatus` witness, and `TapSystem` still does not expose
+// `self_excluded`. That is no longer gated on anything: the `EngineState`
+// shape freeze lifted with the 2026-09-16 integration merge (the tauri-shell
+// branch is now in the trunk of this stack), so wiring `self_excluded` onto
+// `TapSystem` is ordinary, unblocked work. What these prove is everything
+// below that gap — that the sink plays, that it paces, and that play and
+// record really do share one clock.
 
 /// **Owner: listen.** Plays the 300 Hz pilot at its fixed −40 dBFS RMS through
 /// the aggregate's own output route and captures it back on the mic, then

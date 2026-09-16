@@ -43,14 +43,14 @@
 //! per-position IR store ([`store`]), without which every row of the
 //! decision engine's `Reanalyze` tier collapses into `Recapture`.
 //!
-//! Still outstanding, and blocked rather than skipped: the
-//! [`seam::TapStatus`] implementation over the live `TapSystem`. MS-6 requires
-//! `TapSystem` to expose `self_excluded: bool`, which is an `EngineState`
-//! shape change, and the rescope plan freezes that shape until
-//! `feature/rust-port-tauri-shell` merges (the branch pins the snapshot wire
-//! format). Until then a real session can only run against a mock witness —
-//! which is why [`session::MeasurementSession::begin`] takes the trait and not
-//! a `TapSystem`.
+//! Still outstanding, but no longer blocked: the [`seam::TapStatus`]
+//! implementation over the live `TapSystem`. MS-6 requires `TapSystem` to
+//! expose `self_excluded: bool`, which is an `EngineState` shape change; the
+//! rescope plan froze that shape until `feature/rust-port-tauri-shell` merged,
+//! and that merge landed on 2026-09-16, so changing the shape is now ordinary
+//! work. Until the wiring exists a real session still runs only against a mock
+//! witness — which is why [`session::MeasurementSession::begin`] takes the
+//! trait and not a `TapSystem`.
 
 #![forbid(unsafe_code)]
 
