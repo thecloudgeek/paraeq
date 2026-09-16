@@ -6,6 +6,7 @@ use paraeq_dsp::gating::ImpulseResponse;
 use paraeq_measure::store::{
     IrStore, StoreError, StoredWindow, STORE_POST_MS, STORE_PRE_MS, STORE_TAPER_MS,
 };
+use std::sync::atomic::{AtomicU32, Ordering};
 
 const RATE: u32 = 48_000;
 
@@ -13,12 +14,52 @@ fn samples_at(ms: f64) -> usize {
     (ms / 1000.0 * f64::from(RATE)).round() as usize
 }
 
-/// A scratch directory under the crate's own `target/`, so the test needs no
-/// tempfile dependency and leaves nothing in the user's tmp.
-fn scratch(name: &str) -> std::path::PathBuf {
-    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+/// A scratch directory under the crate's own `target/`, unique to one test in
+/// one process, removed when that test ends.
+///
+/// The directory needs no `tempfile` dependency and leaves nothing in the
+/// user's tmp. Uniqueness is the load-bearing part: `CARGO_TARGET_TMPDIR` is a
+/// single directory shared by every integration-test binary of this crate, and
+/// the same binary is built and run twice — once per feature set (G4 and G5
+/// locally, the two `cargo test` steps in CI). Under a fixed directory name
+/// two concurrent runs of the same test raced: one process's
+/// `remove_dir_all` deleted the WAV the other had just written, and the
+/// refusal tests went red claiming the store had accepted a stereo or 16-bit
+/// file. Reproduced before this guard existed — two copies of the test binary
+/// in parallel, 5 failures in 24 runs across
+/// `reading_a_multichannel_wav_refuses`,
+/// `reading_a_non_float32_wav_refuses_rather_than_reinterpreting_it` and
+/// `a_rewritten_position_replaces_rather_than_appends`.
+///
+/// The name carries the test's own name so a leftover directory is legible,
+/// the process id so two processes cannot collide, and a counter so two calls
+/// inside one process cannot either.
+struct Scratch {
+    path: std::path::PathBuf,
+}
+
+impl Scratch {
+    fn new(test: &str) -> Self {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let seq = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("{test}-{}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        Self { path }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for Scratch {
+    /// Best effort: a test that has already failed should not fail a second
+    /// time over a directory, and the name is unique, so a leftover cannot
+    /// affect any later run.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
 }
 
 /// An IR whose peak sits `peak_ms` in, with a decaying tail, so the taper has
@@ -116,7 +157,8 @@ fn the_taper_can_never_reach_the_peak() {
 
 #[test]
 fn an_ir_round_trips_through_the_store() {
-    let store = IrStore::create(scratch("round_trip")).expect("create");
+    let dir = Scratch::new("an_ir_round_trips_through_the_store");
+    let store = IrStore::create(dir.path()).expect("create");
     let ir = impulse(200.0, 3000.0);
     let written = store.write(&ir, 3, 1).expect("write");
     let read = store.read(3, 1, written.window).expect("read");
@@ -133,7 +175,8 @@ fn an_ir_round_trips_through_the_store() {
 
 #[test]
 fn the_stored_peak_is_where_the_window_says_it_is() {
-    let store = IrStore::create(scratch("peak_position")).expect("create");
+    let dir = Scratch::new("the_stored_peak_is_where_the_window_says_it_is");
+    let store = IrStore::create(dir.path()).expect("create");
     let ir = impulse(200.0, 3000.0);
     let written = store.write(&ir, 0, 0).expect("write");
     let argmax = written
@@ -151,7 +194,8 @@ fn the_stored_peak_is_where_the_window_says_it_is() {
 
 #[test]
 fn the_stored_edges_are_tapered_to_zero() {
-    let store = IrStore::create(scratch("taper")).expect("create");
+    let dir = Scratch::new("the_stored_edges_are_tapered_to_zero");
+    let store = IrStore::create(dir.path()).expect("create");
     let ir = impulse(200.0, 3000.0);
     let written = store.write(&ir, 0, 0).expect("write");
     let s = &written.samples;
@@ -167,7 +211,8 @@ fn the_stored_edges_are_tapered_to_zero() {
 
 #[test]
 fn every_position_and_channel_gets_its_own_file() {
-    let store = IrStore::create(scratch("layout")).expect("create");
+    let dir = Scratch::new("every_position_and_channel_gets_its_own_file");
+    let store = IrStore::create(dir.path()).expect("create");
     let ir = impulse(100.0, 2000.0);
     for position in 0..3 {
         for channel in 0..2 {
@@ -195,7 +240,8 @@ fn every_position_and_channel_gets_its_own_file() {
 
 #[test]
 fn a_rewritten_position_replaces_rather_than_appends() {
-    let store = IrStore::create(scratch("rewrite")).expect("create");
+    let dir = Scratch::new("a_rewritten_position_replaces_rather_than_appends");
+    let store = IrStore::create(dir.path()).expect("create");
     let first = store.write(&impulse(100.0, 2000.0), 0, 0).expect("write");
     let second = store.write(&impulse(100.0, 1000.0), 0, 0).expect("rewrite");
     let read = store.read(0, 0, second.window).expect("read");
@@ -207,7 +253,8 @@ fn a_rewritten_position_replaces_rather_than_appends() {
 
 #[test]
 fn an_empty_or_out_of_range_ir_refuses() {
-    let store = IrStore::create(scratch("bad_peak")).expect("create");
+    let dir = Scratch::new("an_empty_or_out_of_range_ir_refuses");
+    let store = IrStore::create(dir.path()).expect("create");
     let empty = ImpulseResponse {
         peak: 0.0,
         sample_rate: RATE,
@@ -232,7 +279,8 @@ fn an_empty_or_out_of_range_ir_refuses() {
 fn reading_a_non_float32_wav_refuses_rather_than_reinterpreting_it() {
     // Misreading an IR's sample format produces a *plausible* wrong
     // correction, not an obvious failure — so the store refuses.
-    let store = IrStore::create(scratch("wrong_format")).expect("create");
+    let dir = Scratch::new("reading_a_non_float32_wav_refuses_rather_than_reinterpreting_it");
+    let store = IrStore::create(dir.path()).expect("create");
     let path = store.path_for(0, 0);
     let spec = hound::WavSpec {
         bits_per_sample: 16,
@@ -255,7 +303,8 @@ fn reading_a_non_float32_wav_refuses_rather_than_reinterpreting_it() {
 
 #[test]
 fn reading_a_multichannel_wav_refuses() {
-    let store = IrStore::create(scratch("stereo_file")).expect("create");
+    let dir = Scratch::new("reading_a_multichannel_wav_refuses");
+    let store = IrStore::create(dir.path()).expect("create");
     let path = store.path_for(0, 0);
     let spec = hound::WavSpec {
         bits_per_sample: 32,
@@ -278,7 +327,8 @@ fn reading_a_multichannel_wav_refuses() {
 
 #[test]
 fn reading_a_missing_position_is_an_error() {
-    let store = IrStore::create(scratch("missing")).expect("create");
+    let dir = Scratch::new("reading_a_missing_position_is_an_error");
+    let store = IrStore::create(dir.path()).expect("create");
     let window = StoredWindow::plan(100, 10, RATE);
     assert!(matches!(
         store.read(7, 0, window),
@@ -294,7 +344,8 @@ fn a_stored_position_costs_what_the_spec_says_it_does() {
     // two window figures — assert it rather than trusting arithmetic in a
     // comment. 1.6 s x 48 kHz x 4 B is ~307 KB per position per channel, so a
     // 9-position stereo room profile is ~5.5 MB.
-    let store = IrStore::create(scratch("size")).expect("create");
+    let dir = Scratch::new("a_stored_position_costs_what_the_spec_says_it_does");
+    let store = IrStore::create(dir.path()).expect("create");
     let written = store.write(&impulse(200.0, 3000.0), 0, 0).expect("write");
     let bytes = std::fs::metadata(store.path_for(0, 0)).expect("stat").len();
     let expected = written.samples.len() as u64 * 4;
@@ -315,7 +366,8 @@ fn a_manifest_window_that_disagrees_with_the_file_refuses() {
     // disagree, `peak_in_store` points somewhere that is not the peak, and
     // every gate downstream is applied to the wrong time origin — which
     // produces a plausible correction, not a visible failure.
-    let store = IrStore::create(scratch("window_mismatch")).expect("create");
+    let dir = Scratch::new("a_manifest_window_that_disagrees_with_the_file_refuses");
+    let store = IrStore::create(dir.path()).expect("create");
     let written = store.write(&impulse(200.0, 3000.0), 0, 0).expect("write");
     let wrong = StoredWindow {
         len: written.window.len - 1,
