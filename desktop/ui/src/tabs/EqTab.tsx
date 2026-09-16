@@ -67,7 +67,7 @@ import {
 } from "@/ipc/commands";
 import type { AppState, EQBand, EngineState, FilterType } from "@/ipc/types";
 import { BAND_PALETTE, EQ_PLOT_RANGE, logspace, qWheelStep } from "@/plot/FreqPlotRenderer";
-import { rateMismatchNotice } from "./statusStrip";
+import { clippedNotice, rateMismatchNotice } from "./statusStrip";
 import type { PlotHandle, Trace } from "@/plot/FreqPlotRenderer";
 
 // The plot's frequency grid (prototype parity: 512 log-spaced points 20..20k).
@@ -650,6 +650,9 @@ function StatusStrip({
 }): JSX.Element {
   const { label, hint } = describeStatus(engine.status);
   const rateNotice = rateMismatchNotice(engine.correction_rate_mismatch);
+  // R1-8's minimum viable surfacing until the Advanced drawer exists: the
+  // +-1.0 clamp engaged invisibly before this.
+  const clipNotice = clippedNotice(engine.clipped_samples, engine.auto_preamp_db);
 
   const parts: string[] = [label];
   if (engine.latency_ms != null) parts.push(`${engine.latency_ms.toFixed(1)} ms`);
@@ -658,6 +661,7 @@ function StatusStrip({
     parts.push(engine.stream.channels === 2 ? "stereo" : `${engine.stream.channels} ch`);
   }
   if (engine.frame_mismatch_blocks > 0) parts.push("degraded (frame mismatch)");
+  if (clipNotice) parts.push(clipNotice);
   if (engine.bypass) parts.push("bypassed");
 
   // A user-disabled engine, an auto-disable fail-open, or a hard failure all

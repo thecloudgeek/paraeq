@@ -10,7 +10,7 @@
 //! Realtime lane rules: [`RtLink::poll`] and [`RtProcessor::process_block`]
 //! never lock, never allocate, never deallocate, never log. A swap is a
 //! by-value move through a preallocated ring slot (a small memcpy -- the
-//! [`Correction`] enum is shallow).
+//! [`Correction`] value is shallow).
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -33,6 +33,13 @@ pub struct RtShared {
     /// audio" off this counter; if skips stopped it, a persistently broken
     /// session would misreport as benign `Idle`.
     pub callbacks: AtomicU64,
+    /// Output samples the +-1.0 clamp engaged on (rt writes), summed over
+    /// both chain paths and counted PER SAMPLE PER CHANNEL -- a fully-clipped
+    /// stereo block of 512 frames counts 1024, so the drawer must not divide
+    /// by the channel count. R1-8's release-blocking half: it is R1-1's
+    /// falsifier, and a nonzero count while `auto_preamp_db` is active is a
+    /// BUG SIGNAL, not a user error (spec `:571`).
+    pub clipped_samples: AtomicU64,
     /// Blocks passed through because the frame count did not fit the active
     /// correction (rt writes).
     pub frame_mismatch_blocks: AtomicU64,
@@ -49,6 +56,20 @@ pub struct RtShared {
     pub nonzero_blocks: AtomicU64,
     /// Maximum input |sample| seen, as f32 bits (rt writes).
     pub peak_in_bits: AtomicU32,
+    /// Maximum input |sample| seen SINCE THE SESSION STARTED, as f32 bits
+    /// (rt writes) -- the monotonic session statistic, kept because it is
+    /// genuinely useful and free (spec `:552`). It is deliberately a
+    /// duplicate of `peak_in_bits` today: R1-8's decaying meter, which turns
+    /// `peak_in_bits` into a real meter and leaves this one monotonic, is the
+    /// non-release-blocking half of the item (spec `:582`) and lands
+    /// separately. Each field then means exactly one thing.
+    pub peak_in_session_bits: AtomicU32,
+    /// Maximum output |sample| seen, as f32 bits (rt writes), taken PRE-clamp
+    /// (see [`crate::chain::ChainOutcome::peak_out`]) so it reports the real
+    /// overshoot instead of saturating at 1.0. Monotonic today, for the same
+    /// reason `peak_in_session_bits` is: the decay coefficient arrives with
+    /// R1-8's meter half.
+    pub peak_out_bits: AtomicU32,
     /// Latest output-vs-input sample-time delta as f64 bits (rt writes).
     pub sample_time_delta_bits: AtomicU64,
     /// Blocks the backend skipped before reaching the chain (e.g. oversize
@@ -63,11 +84,14 @@ impl Default for RtShared {
         Self {
             bypass: AtomicBool::new(false),
             callbacks: AtomicU64::new(0),
+            clipped_samples: AtomicU64::new(0),
             frame_mismatch_blocks: AtomicU64::new(0),
             gain_bits: AtomicU32::new(1.0f32.to_bits()),
             invalid_samples: AtomicU64::new(0),
             nonzero_blocks: AtomicU64::new(0),
             peak_in_bits: AtomicU32::new(0),
+            peak_in_session_bits: AtomicU32::new(0),
+            peak_out_bits: AtomicU32::new(0),
             sample_time_delta_bits: AtomicU64::new(0),
             skipped_blocks: AtomicU64::new(0),
             zero_blocks: AtomicU64::new(0),
@@ -89,6 +113,16 @@ impl RtShared {
     /// Maximum input |sample| observed so far.
     pub fn peak_in(&self) -> f32 {
         f32::from_bits(self.peak_in_bits.load(Ordering::Relaxed))
+    }
+
+    /// Maximum input |sample| observed since this session started.
+    pub fn peak_in_session(&self) -> f32 {
+        f32::from_bits(self.peak_in_session_bits.load(Ordering::Relaxed))
+    }
+
+    /// Maximum output |sample| observed so far, pre-clamp.
+    pub fn peak_out(&self) -> f32 {
+        f32::from_bits(self.peak_out_bits.load(Ordering::Relaxed))
     }
 
     /// Latest output-vs-input sample-time delta (frames).
@@ -257,6 +291,13 @@ impl RtProcessor {
             if peak > shared.peak_in() {
                 shared.peak_in_bits.store(peak.to_bits(), Ordering::Relaxed);
             }
+            // The session statistic, with the monotonic logic unchanged
+            // (spec `:552`).
+            if peak > shared.peak_in_session() {
+                shared
+                    .peak_in_session_bits
+                    .store(peak.to_bits(), Ordering::Relaxed);
+            }
         }
 
         self.link.poll(&mut self.chain);
@@ -273,6 +314,20 @@ impl RtProcessor {
             shared
                 .invalid_samples
                 .fetch_add(u64::from(outcome.nonfinite_outputs), Ordering::Relaxed);
+        }
+        // R1-8's fold, in the shape the frame-mismatch fold above already
+        // uses. Both meters come off the chain's single pre-clamp scan, so
+        // they cannot disagree with each other.
+        if outcome.clipped > 0 {
+            shared
+                .clipped_samples
+                .fetch_add(u64::from(outcome.clipped), Ordering::Relaxed);
+        }
+        // Single writer (this thread): load-compare-store is race-free.
+        if outcome.peak_out > shared.peak_out() {
+            shared
+                .peak_out_bits
+                .store(outcome.peak_out.to_bits(), Ordering::Relaxed);
         }
     }
 }

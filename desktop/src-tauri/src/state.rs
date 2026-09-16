@@ -252,14 +252,19 @@ mod tests {
             setup_complete: true,
         };
         let engine = EngineState {
+            auto_preamp_db: Some(-9.5),
             bypass: false,
+            clipped_samples: 3,
             correction: Some("peq:1-band".into()),
             correction_rate_mismatch: None,
             enabled: true,
             frame_mismatch_blocks: 0,
             gain_db: -3.0,
             input_peak: 0.25,
+            input_peak_session: 0.75,
+            invalid_samples: 2,
             latency_ms: Some(62.3),
+            output_peak: 1.5,
             status: EngineStatus::Running,
             stream: Some(StreamInfo {
                 buffer_frames: 512,
@@ -278,14 +283,19 @@ mod tests {
                     { "name": "MacBook Pro Speakers", "uid": "uid-1" }
                 ],
                 "engine": {
+                    "auto_preamp_db": -9.5,
                     "bypass": false,
+                    "clipped_samples": 3,
                     "correction": "peq:1-band",
                     "correction_rate_mismatch": null,
                     "enabled": true,
                     "frame_mismatch_blocks": 0,
                     "gain_db": -3.0,
                     "input_peak": 0.25,
+                    "input_peak_session": 0.75,
+                    "invalid_samples": 2,
                     "latency_ms": 62.3,
+                    "output_peak": 1.5,
                     "status": { "kind": "running" },
                     "stream": {
                         "buffer_frames": 512,

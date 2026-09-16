@@ -213,25 +213,35 @@ pub fn eq_response(app: tauri::AppHandle, freqs: Vec<f64>) -> Result<ResponseDat
     Ok(eq::response(&bands, &freqs, rate))
 }
 
-/// Export the current bands + preamp to an AutoEQ ParametricEq text file. The
-/// path comes from the native save dialog (capability-safe). Format is the
-/// DSP-owned `export_autoeq_format_with_preamp_db` — the user-chosen preamp the
-/// engine is already running at, not the oracle's `0.0` literal
-/// (`export_autoeq_format`) and not the cascade-derived
-/// `export_autoeq_format_with_preamp`. The sample rate is irrelevant to export.
+/// Export the current bands + computed preamp to an AutoEQ ParametricEq text
+/// file. The path comes from the native save dialog (capability-safe). Format
+/// is the DSP-owned `export_autoeq_format_with_preamp` — the CASCADE-DERIVED
+/// preamp (R1-1), i.e. the same number `build_correction` applies in the
+/// engine, not the oracle's `0.0` literal (`export_autoeq_format`) and no
+/// longer the user's manual trim (`export_autoeq_format_with_preamp_db`,
+/// which is still the right call for a caller-supplied number). The sample
+/// rate matters: `preamp_db()` evaluates the realized cascade at it.
 #[tauri::command]
 pub fn eq_export_autoeq(app: tauri::AppHandle, path: String) -> Result<(), String> {
     let shared = app.state::<AppShared>();
-    let (bands, preamp_db) = {
+    let bands = {
         let data = shared.data.lock().unwrap();
-        (data.bands.clone(), data.preamp_db)
+        data.bands.clone()
     };
     let rate = live_rate(&shared);
+    // R1-1 (spec `:117`): the exported preamp is the COMPUTED one -- the same
+    // `ParametricEQ::preamp_db()` the engine hands `build_correction`, so the
+    // text names the number the engine is applying (`EngineState`'s
+    // `auto_preamp_db`). It is deliberately NOT `data.preamp_db`, the user's
+    // manual trim: that number rides `gain_bits`, applies on both chain paths
+    // including bypass, and says nothing about the headroom this band set's
+    // boosts need. Other people's EQ software gets the same protection ParaEQ
+    // gives itself, which is the whole point of the item.
     let text = ParametricEQ {
         bands,
         sample_rate: rate,
     }
-    .export_autoeq_format_with_preamp_db(preamp_db);
+    .export_autoeq_format_with_preamp();
     std::fs::write(&path, text).map_err(|e| format!("failed to write {path}: {e}"))
 }
 

@@ -5,7 +5,9 @@ use std::f64::consts::PI;
 
 use paraeq_dsp::biquad;
 use paraeq_dsp::biquad::peaking;
-use paraeq_engine::chain::{build_fir, build_iir, ChainOutcome, Correction, RealtimeChain};
+use paraeq_engine::chain::{
+    build_fir, build_iir, ChainOutcome, Correction, CorrectionKind, RealtimeChain,
+};
 use paraeq_engine::convolver::OverlapAddConvolver;
 use paraeq_engine::iir::IIRProcessor;
 use proptest::prelude::*;
@@ -85,7 +87,7 @@ fn no_correction_is_identity_with_gain_and_clamp() {
 #[test]
 fn iir_path_matches_direct_processor_across_blocks() {
     let mut chain = RealtimeChain::new(2, BLOCK);
-    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK).0));
+    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK, 1.0).0));
 
     let mut direct = IIRProcessor::new();
     direct.set_sos(0, vec![SOS]);
@@ -128,7 +130,12 @@ fn iir_path_matches_direct_processor_across_blocks() {
 fn fir_path_matches_direct_convolver() {
     let fir = vec![0.5f64, 0.25, -0.125];
     let mut chain = RealtimeChain::new(2, BLOCK);
-    chain.set_correction(Some(build_fir(vec![fir.clone(), fir.clone()], 2, BLOCK)));
+    chain.set_correction(Some(build_fir(
+        vec![fir.clone(), fir.clone()],
+        2,
+        BLOCK,
+        1.0,
+    )));
 
     let mut direct = OverlapAddConvolver::new(vec![fir.clone(), fir], BLOCK);
 
@@ -167,7 +174,7 @@ fn fir_path_matches_direct_convolver() {
 #[test]
 fn bypass_passes_through_and_edge_resets_state() {
     let mut chain = RealtimeChain::new(2, BLOCK);
-    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK).0));
+    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK, 1.0).0));
     let gain = 0.5f32;
 
     // Block 0: loud, correction active -- builds internal filter state.
@@ -221,7 +228,7 @@ fn mono_iir_config_broadcasts_to_both_channels() {
     // ONE SOS set on a 2-channel chain: the last (only) set is broadcast,
     // so both channels are corrected identically.
     let mut chain = RealtimeChain::new(2, BLOCK);
-    chain.set_correction(Some(build_iir(vec![vec![SOS]], 2, BLOCK).0));
+    chain.set_correction(Some(build_iir(vec![vec![SOS]], 2, BLOCK, 1.0).0));
 
     let mut direct = IIRProcessor::new();
     direct.set_sos(0, vec![SOS]);
@@ -256,7 +263,7 @@ fn mono_iir_config_broadcasts_to_both_channels() {
 #[test]
 fn fir_frame_mismatch_passes_through() {
     let mut chain = RealtimeChain::new(2, BLOCK);
-    chain.set_correction(Some(build_fir(vec![vec![0.5f64, 0.25]], 2, BLOCK)));
+    chain.set_correction(Some(build_fir(vec![vec![0.5f64, 0.25]], 2, BLOCK, 1.0)));
 
     // The convolver requires exactly BLOCK frames; half a block must NOT
     // panic -- pass through with gain + clamp instead.
@@ -277,7 +284,12 @@ fn frame_mismatch_resets_correction_state() {
     let fir = vec![0.5f64, 0.25, -0.125];
     let gain = 1.0f32;
     let mut chain = RealtimeChain::new(2, BLOCK);
-    chain.set_correction(Some(build_fir(vec![fir.clone(), fir.clone()], 2, BLOCK)));
+    chain.set_correction(Some(build_fir(
+        vec![fir.clone(), fir.clone()],
+        2,
+        BLOCK,
+        1.0,
+    )));
 
     // Block 0: conforming -- builds overlap state in the convolver.
     let (_, outcome) = chain_process(&mut chain, &make_block(0, 2, BLOCK), false, gain);
@@ -345,12 +357,12 @@ fn identical_coefficient_swap_is_bit_exact_noop() {
     // block boundary must be sample-for-sample identical to never swapping.
     let sos = peaking(100.0, 12.0, 10.0, 48000.0);
     let mut swapped = RealtimeChain::new(2, BLOCK);
-    swapped.set_correction(Some(build_iir(vec![vec![sos]], 2, BLOCK).0));
+    swapped.set_correction(Some(build_iir(vec![vec![sos]], 2, BLOCK, 1.0).0));
     let mut unswapped = RealtimeChain::new(2, BLOCK);
-    unswapped.set_correction(Some(build_iir(vec![vec![sos]], 2, BLOCK).0));
+    unswapped.set_correction(Some(build_iir(vec![vec![sos]], 2, BLOCK, 1.0).0));
     for b in 0..64 {
         if b == 32 {
-            swapped.set_correction(Some(build_iir(vec![vec![sos]], 2, BLOCK).0));
+            swapped.set_correction(Some(build_iir(vec![vec![sos]], 2, BLOCK, 1.0).0));
         }
         let input = sine100(b * BLOCK, BLOCK, 2);
         let (out_s, outcome) = chain_process(&mut swapped, &input, false, 1.0);
@@ -381,19 +393,19 @@ fn gain_only_swap_with_transplant_has_no_step() {
     let sos_b = peaking(100.0, 11.0, 10.0, 48000.0);
 
     let mut chain = RealtimeChain::new(2, BLOCK);
-    chain.set_correction(Some(build_iir(vec![vec![sos_a]], 2, BLOCK).0));
+    chain.set_correction(Some(build_iir(vec![vec![sos_a]], 2, BLOCK, 1.0).0));
     let mut y = Vec::new();
     for b in 0..WARM {
         let input = sine100(b * BLOCK, BLOCK, 2);
         let (out, _) = chain_process(&mut chain, &input, false, 1.0);
         y.extend_from_slice(&out[0]);
     }
-    chain.set_correction(Some(build_iir(vec![vec![sos_b]], 2, BLOCK).0));
+    chain.set_correction(Some(build_iir(vec![vec![sos_b]], 2, BLOCK, 1.0).0));
 
     // Zero-state control: the same continuation through a fresh chain --
     // exactly what every swap sounded like before the transplant existed.
     let mut fresh = RealtimeChain::new(2, BLOCK);
-    fresh.set_correction(Some(build_iir(vec![vec![sos_b]], 2, BLOCK).0));
+    fresh.set_correction(Some(build_iir(vec![vec![sos_b]], 2, BLOCK, 1.0).0));
     let mut y_zero_state = y.clone();
     for b in WARM..WARM + TAIL {
         let input = sine100(b * BLOCK, BLOCK, 2);
@@ -422,12 +434,17 @@ fn iir_to_fir_swap_is_safe_noop() {
     // Cross-kind swap: no state can carry over (a FIR overlap tail cannot
     // be transplanted). Must not panic; the FIR behaves exactly as fresh.
     let mut chain = RealtimeChain::new(2, BLOCK);
-    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK).0));
+    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK, 1.0).0));
     for b in 0..2 {
         chain_process(&mut chain, &make_block(b, 2, BLOCK), false, 1.0);
     }
     let fir = vec![0.5f64, 0.25, -0.125];
-    chain.set_correction(Some(build_fir(vec![fir.clone(), fir.clone()], 2, BLOCK)));
+    chain.set_correction(Some(build_fir(
+        vec![fir.clone(), fir.clone()],
+        2,
+        BLOCK,
+        1.0,
+    )));
 
     let mut direct = OverlapAddConvolver::new(vec![fir.clone(), fir], BLOCK);
     for b in 2..4 {
@@ -460,11 +477,11 @@ fn fir_to_iir_swap_starts_fresh() {
     // state (fresh), not from anything scavenged off the FIR.
     let fir = vec![0.5f64, 0.25, -0.125];
     let mut chain = RealtimeChain::new(2, BLOCK);
-    chain.set_correction(Some(build_fir(vec![fir.clone(), fir], 2, BLOCK)));
+    chain.set_correction(Some(build_fir(vec![fir.clone(), fir], 2, BLOCK, 1.0)));
     for b in 0..2 {
         chain_process(&mut chain, &make_block(b, 2, BLOCK), false, 1.0);
     }
-    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK).0));
+    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK, 1.0).0));
 
     let mut fresh = IIRProcessor::new();
     fresh.set_sos(0, vec![SOS]);
@@ -506,15 +523,15 @@ fn extra_sos_sets_do_not_defeat_the_transplant() {
     let sos = peaking(100.0, 12.0, 10.0, 48000.0);
     let mut swapped = RealtimeChain::new(2, BLOCK);
     swapped.set_correction(Some(
-        build_iir(vec![vec![sos], vec![sos], vec![sos]], 2, BLOCK).0,
+        build_iir(vec![vec![sos], vec![sos], vec![sos]], 2, BLOCK, 1.0).0,
     ));
     let mut unswapped = RealtimeChain::new(2, BLOCK);
     unswapped.set_correction(Some(
-        build_iir(vec![vec![sos], vec![sos], vec![sos]], 2, BLOCK).0,
+        build_iir(vec![vec![sos], vec![sos], vec![sos]], 2, BLOCK, 1.0).0,
     ));
     for b in 0..64 {
         if b == 32 {
-            swapped.set_correction(Some(build_iir(vec![vec![sos], vec![sos]], 2, BLOCK).0));
+            swapped.set_correction(Some(build_iir(vec![vec![sos], vec![sos]], 2, BLOCK, 1.0).0));
         }
         let input = sine100(b * BLOCK, BLOCK, 2);
         let (out_s, outcome) = chain_process(&mut swapped, &input, false, 1.0);
@@ -538,11 +555,11 @@ fn channel_count_change_swap_starts_fresh() {
     // no-op across a channel-count change (spec R1-7a), so the incoming
     // processor behaves exactly as fresh and nothing panics.
     let mut chain = RealtimeChain::new(2, BLOCK);
-    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK).0));
+    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK, 1.0).0));
     for b in 0..2 {
         chain_process(&mut chain, &make_block(b, 2, BLOCK), false, 1.0);
     }
-    chain.set_correction(Some(build_iir(vec![vec![SOS]], 1, BLOCK).0));
+    chain.set_correction(Some(build_iir(vec![vec![SOS]], 1, BLOCK, 1.0).0));
 
     let mut fresh = IIRProcessor::new();
     fresh.set_sos(0, vec![SOS]);
@@ -574,7 +591,7 @@ fn channel_count_change_swap_starts_fresh() {
 #[test]
 fn nan_input_zeroes_poisoned_output_and_self_heals() {
     let mut chain = RealtimeChain::new(2, BLOCK);
-    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK).0));
+    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK, 1.0).0));
 
     let mut direct = IIRProcessor::new();
     direct.set_sos(0, vec![SOS]);
@@ -698,7 +715,10 @@ fn nonfinite_correction_output_fires_backstop_and_resets() {
     let mut chain = RealtimeChain::new(1, BLOCK);
     let mut unstable = IIRProcessor::new();
     unstable.set_sos(0, vec![UNSTABLE]);
-    chain.set_correction(Some(Correction::Iir(unstable)));
+    chain.set_correction(Some(Correction {
+        kind: CorrectionKind::Iir(unstable),
+        preamp_lin: 1.0,
+    }));
 
     let input = vec![vec![0.9f32; BLOCK]];
     let (out0, outcome0) = chain_process(&mut chain, &input, false, 1.0);
@@ -723,7 +743,7 @@ fn nonfinite_correction_output_fires_backstop_and_resets() {
 #[test]
 fn oversized_frames_pass_through_for_any_correction() {
     let mut chain = RealtimeChain::new(2, BLOCK);
-    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK).0));
+    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK, 1.0).0));
 
     // 2x block_size exceeds the preallocated scratch; must NOT panic (the
     // HAL occasionally resizes) -- pass through with gain + clamp.
@@ -741,7 +761,7 @@ fn oversized_frames_pass_through_for_any_correction() {
 
 #[test]
 fn stable_sections_install_without_substitution() {
-    let (_, substituted) = build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK);
+    let (_, substituted) = build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK, 1.0);
     assert_eq!(substituted, 0);
 }
 
@@ -750,7 +770,7 @@ fn stable_sections_install_without_substitution() {
 /// instead of exploding.
 #[test]
 fn unstable_section_is_substituted_and_passes_audio_unchanged() {
-    let (correction, substituted) = build_iir(vec![vec![UNSTABLE_SOS]], 2, BLOCK);
+    let (correction, substituted) = build_iir(vec![vec![UNSTABLE_SOS]], 2, BLOCK, 1.0);
     assert_eq!(substituted, 1);
     let mut chain = RealtimeChain::new(2, BLOCK);
     chain.set_correction(Some(correction));
@@ -776,7 +796,7 @@ fn unstable_section_is_substituted_and_passes_audio_unchanged() {
 /// row alone.
 #[test]
 fn mixed_cascade_substitutes_only_the_unstable_row() {
-    let (correction, substituted) = build_iir(vec![vec![SOS, UNSTABLE_SOS]], 2, BLOCK);
+    let (correction, substituted) = build_iir(vec![vec![SOS, UNSTABLE_SOS]], 2, BLOCK, 1.0);
     assert_eq!(substituted, 1);
     let mut chain = RealtimeChain::new(2, BLOCK);
     chain.set_correction(Some(correction));
@@ -818,15 +838,15 @@ fn mixed_cascade_substitutes_only_the_unstable_row() {
 #[test]
 fn q_zero_design_is_substituted_and_counted_once() {
     let sos = biquad::peaking(1000.0, 6.0, 0.0, 48000.0);
-    let (correction, substituted) = build_iir(vec![vec![sos]], 2, BLOCK);
+    let (correction, substituted) = build_iir(vec![vec![sos]], 2, BLOCK, 1.0);
     assert_eq!(substituted, 1);
-    match &correction {
-        Correction::Iir(p) => {
+    match &correction.kind {
+        CorrectionKind::Iir(p) => {
             for ch in 0..2 {
                 assert_eq!(p.sos(ch), Some(&[IDENTITY][..]), "channel {ch}");
             }
         }
-        Correction::Fir(_) => panic!("expected an Iir correction"),
+        CorrectionKind::Fir(_) => panic!("expected an Iir correction"),
     }
 }
 
@@ -836,13 +856,13 @@ fn nyquist_and_supra_nyquist_designs_are_substituted() {
     // fc == sr/2 exactly: w0 = pi, alpha ~ 0 -- the poles land ON the unit
     // circle in f64 and the strict Jury form rejects them.
     let at_nyquist = biquad::peaking(24000.0, 6.0, 1.0, 48000.0);
-    let (_, substituted) = build_iir(vec![vec![at_nyquist]], 1, BLOCK);
+    let (_, substituted) = build_iir(vec![vec![at_nyquist]], 1, BLOCK, 1.0);
     assert_eq!(substituted, 1, "fc == sr/2 must be substituted");
 
     // fc > sr/2: finite but aliased math; this design has a pole outside
     // the unit circle.
     let above_nyquist = biquad::peaking(30000.0, 6.0, 1.0, 48000.0);
-    let (_, substituted) = build_iir(vec![vec![above_nyquist]], 1, BLOCK);
+    let (_, substituted) = build_iir(vec![vec![above_nyquist]], 1, BLOCK, 1.0);
     assert_eq!(substituted, 1, "fc > sr/2 must be substituted");
 }
 
@@ -867,10 +887,10 @@ proptest! {
             biquad::notch(fc, q, sr),
         ];
         let unstable = designed.iter().filter(|sos| !biquad::is_stable(sos)).count();
-        let (correction, substituted) = build_iir(vec![designed], 2, 32);
+        let (correction, substituted) = build_iir(vec![designed], 2, 32, 1.0);
         prop_assert_eq!(substituted, unstable);
-        match &correction {
-            Correction::Iir(p) => {
+        match &correction.kind {
+            CorrectionKind::Iir(p) => {
                 for ch in 0..2 {
                     let sos = p.sos(ch).expect("broadcast installs every channel");
                     prop_assert_eq!(sos.len(), 4);
@@ -879,7 +899,7 @@ proptest! {
                     }
                 }
             }
-            Correction::Fir(_) => prop_assert!(false, "expected an Iir correction"),
+            CorrectionKind::Fir(_) => prop_assert!(false, "expected an Iir correction"),
         }
     }
 }

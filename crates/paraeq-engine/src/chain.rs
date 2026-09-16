@@ -12,10 +12,39 @@ use paraeq_dsp::biquad::{is_stable, IDENTITY};
 use crate::convolver::OverlapAddConvolver;
 use crate::iir::IIRProcessor;
 
-/// A ready-to-run correction processor (built + warmed up off-thread).
-pub enum Correction {
+/// The correction processor itself, one variant per arm. Formerly the whole
+/// of `Correction`; R1-1 moved it inside so the preamp can ride along.
+pub enum CorrectionKind {
     Fir(OverlapAddConvolver),
     Iir(IIRProcessor),
+}
+
+/// A ready-to-run correction (built + warmed up off-thread) TOGETHER WITH the
+/// preamp that protects it.
+///
+/// R1-1 (spec `:85-99`): the preamp must swap **atomically with the correction
+/// it protects**. Routing it through `RtShared::gain_bits` would not -- the
+/// correction arrives through the `rtrb` swap ring and the gain through a
+/// relaxed store, with no ordering between them, so a +12 dB boost could run
+/// un-preamped for a window. Carrying it here makes the swap one move.
+///
+/// The engine-hardening Decisions Log (`:20`) records the same call and the
+/// alternative it rejected, verbatim: *"Preamp carrier | A `preamp_lin` field
+/// **inside** `Correction`, applied only on the corrected path | (rejected) A
+/// second atomic alongside `gain_bits` (correction and preamp would swap
+/// non-atomically -> a window of un-preamped boost -> clipping)"*.
+pub struct Correction {
+    pub kind: CorrectionKind,
+    /// Linear auto-preamp, `10^(preamp_db/20)` with `preamp_db <= 0`, so it
+    /// is always in `(0, 1]`. Applied ONLY on the corrected path
+    /// ([`RealtimeChain::process`]) -- spec `:99`, verbatim: "Critically,
+    /// **the preamp applies only on the corrected path** -- ... the
+    /// pass-through ... must not attenuate, because there is no boost to
+    /// compensate." It composes with the user's trim (`RtShared::gain_bits`)
+    /// as a product, i.e. they add in dB; the two are never folded into one
+    /// number, so the user can move their trim without removing the headroom
+    /// the boosts need.
+    pub preamp_lin: f32,
 }
 
 impl Correction {
@@ -33,7 +62,7 @@ impl Correction {
     /// Realtime-safe: a bounded memcpy over already-sized state, no
     /// allocation.
     pub fn adopt_state_from(&mut self, old: &Correction, channels: usize) {
-        if let (Correction::Iir(new), Correction::Iir(old)) = (self, old) {
+        if let (CorrectionKind::Iir(new), CorrectionKind::Iir(old)) = (&mut self.kind, &old.kind) {
             if new.channels().min(channels) == old.channels().min(channels) {
                 new.adopt_state_from(old);
             }
@@ -43,16 +72,27 @@ impl Correction {
     /// Clear filter state (overlap tails / biquad delay lines). Does not
     /// deallocate; realtime-safe.
     pub fn reset(&mut self) {
-        match self {
-            Correction::Fir(c) => c.reset(),
-            Correction::Iir(p) => p.reset(),
+        match &mut self.kind {
+            CorrectionKind::Fir(c) => c.reset(),
+            CorrectionKind::Iir(p) => p.reset(),
         }
     }
 }
 
 /// What [`RealtimeChain::process`] did with the block.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+///
+/// No `Eq`: `peak_out` is an f32 (R1-8). Nothing compares this struct whole --
+/// every assertion in `tests/test_chain.rs` is per field -- so the derive was
+/// free to drop.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ChainOutcome {
+    /// Samples (per channel, not per frame: a fully-clipped stereo block of
+    /// 512 frames counts 1024) whose value exceeded the +-1.0 clamp on THIS
+    /// block, measured before the clamp. Counted on both paths -- the
+    /// pass-through clamps too (spec `:554`: "**both** of them"). Non-finite
+    /// correction outputs are zeroed by the backstop BEFORE this scan and are
+    /// never counted here; they are `nonfinite_outputs`.
+    pub clipped: u32,
     /// The correction processor ran on this block.
     pub corrected: bool,
     /// A correction was active but the HAL-supplied frame count did not fit
@@ -64,6 +104,19 @@ pub struct ChainOutcome {
     /// path (its clamp handles +-inf; input NaN is zeroed upstream at the
     /// capture boundary).
     pub nonfinite_outputs: u32,
+    /// Largest `|sample|` this block produced, taken PRE-clamp, so it reports
+    /// the real overshoot rather than saturating at 1.0.
+    ///
+    /// The spec contradicts itself here and this is the reconciliation: its
+    /// fix snippet (`:558`) takes `let a = v.abs();` before the clamp, while
+    /// its test row (`:577`) asserts `output_peak == 1.0` for a full-scale
+    /// sine at +6 dB, which is only true post-clamp (pre-clamp it is ~2.0).
+    /// Pre-clamp wins on three grounds: a post-clamp peak carries no
+    /// information [`ChainOutcome::clipped`] does not (it saturates at exactly
+    /// 1.0 precisely when `clipped > 0`); pre-clamp is the number that proves
+    /// the preamp is right, which `:571` makes the Advanced drawer's job; and
+    /// both then derive from the one quantity `a`, so they cannot disagree.
+    pub peak_out: f32,
 }
 
 /// Per-stream realtime chain state. Owned by the realtime side; the control
@@ -168,9 +221,9 @@ impl RealtimeChain {
             && output.iter().all(|ch| ch.len() == frames);
         let fits = uniform
             && frames > 0
-            && match &self.correction {
-                Some(Correction::Fir(_)) => frames == self.block_size,
-                Some(Correction::Iir(_)) => frames <= self.block_size,
+            && match self.correction.as_ref().map(|c| &c.kind) {
+                Some(CorrectionKind::Fir(_)) => frames == self.block_size,
+                Some(CorrectionKind::Iir(_)) => frames <= self.block_size,
                 None => true,
             };
 
@@ -184,6 +237,8 @@ impl RealtimeChain {
                 ..
             } = self;
             let channels = *channels;
+            // R1-1: read the preamp off the correction it swapped in with.
+            let preamp_lin = correction.as_ref().map_or(1.0, |c| c.preamp_lin);
 
             for (dst, src) in in_f64.iter_mut().zip(input.iter()) {
                 dst.resize(frames, 0.0); // within preallocated capacity
@@ -202,20 +257,35 @@ impl RealtimeChain {
                 in_f64.first().map_or(empty, |v| v.as_slice()),
                 in_f64.get(1).map_or(empty, |v| v.as_slice()),
             ];
-            match correction.as_mut().expect("checked is_some above") {
-                Correction::Fir(c) => c.process(&views[..channels], &mut out_f64[..channels]),
-                Correction::Iir(p) => p.process(&views[..channels], &mut out_f64[..channels]),
+            match &mut correction.as_mut().expect("checked is_some above").kind {
+                CorrectionKind::Fir(c) => c.process(&views[..channels], &mut out_f64[..channels]),
+                CorrectionKind::Iir(p) => p.process(&views[..channels], &mut out_f64[..channels]),
             }
 
             // Output backstop: the gain+clamp loop also zeroes non-finite
             // correction outputs and counts them (f32::clamp propagates NaN,
             // so the clamp alone is not a sanitizer). Finite samples take
             // the identical downcast -> gain -> clamp path bit-for-bit.
+            //
+            // R1-8 fuses the meter scan into the same loop (two extra compares
+            // per sample). ORDER IS LOAD-BEARING: the R1-2 `is_finite` backstop
+            // runs FIRST, so a zeroed non-finite sample is neither counted as a
+            // clip nor allowed into `peak_out` -- it is already reported as
+            // `nonfinite_outputs`, and a NaN would poison the peak fold.
+            let mut clipped = 0u32;
             let mut nonfinite = 0u32;
+            let mut peak_out = 0.0f32;
             for (out_ch, y_ch) in output.iter_mut().zip(out_f64.iter()) {
                 for (o, y) in out_ch.iter_mut().zip(y_ch.iter()) {
-                    let v = (*y as f32) * gain;
+                    let v = (*y as f32) * preamp_lin * gain;
                     if v.is_finite() {
+                        let a = v.abs();
+                        if a > peak_out {
+                            peak_out = a;
+                        }
+                        if a > 1.0 {
+                            clipped += 1;
+                        }
                         *o = v.clamp(-1.0, 1.0);
                     } else {
                         nonfinite += 1;
@@ -240,16 +310,36 @@ impl RealtimeChain {
                 }
             }
             ChainOutcome {
+                clipped,
                 corrected: true,
                 frame_mismatch: false,
                 nonfinite_outputs: nonfinite,
+                peak_out,
             }
         } else {
             // Pass-through: gain + clamp, pure f32 path, no scratch needed.
             // Tolerates ANY input/output shape (zip stops at the shorter).
+            //
+            // The same meter scan, because this path clamps too (spec `:554`:
+            // "fuse into the gain/clamp loops -- **both** of them"), but NO
+            // preamp multiply: spec `:99` -- bypass / frame-mismatch / no
+            // correction "must not attenuate, because there is no boost to
+            // compensate." Applying it here would make the bypassed side of
+            // the product's headline A/B control quieter than the corrected
+            // side by the whole preamp.
+            let mut clipped = 0u32;
+            let mut peak_out = 0.0f32;
             for (out_ch, in_ch) in output.iter_mut().zip(input.iter()) {
                 for (o, s) in out_ch.iter_mut().zip(in_ch.iter()) {
-                    *o = (*s * gain).clamp(-1.0, 1.0);
+                    let v = *s * gain;
+                    let a = v.abs();
+                    if a > peak_out {
+                        peak_out = a;
+                    }
+                    if a > 1.0 {
+                        clipped += 1;
+                    }
+                    *o = v.clamp(-1.0, 1.0);
                 }
             }
             let frame_mismatch = !bypass && self.correction.is_some() && !fits;
@@ -264,9 +354,11 @@ impl RealtimeChain {
                 }
             }
             ChainOutcome {
+                clipped,
                 corrected: false,
                 frame_mismatch,
                 nonfinite_outputs: 0,
+                peak_out,
             }
         }
     }
@@ -280,22 +372,38 @@ fn warm_up(correction: &mut Correction, channels: usize, block_size: usize) {
     let silent = vec![0.0f64; block_size];
     let inputs: Vec<&[f64]> = (0..channels).map(|_| silent.as_slice()).collect();
     let mut outputs = vec![vec![0.0f64; block_size]; channels];
-    match correction {
-        Correction::Fir(c) => c.process(&inputs, &mut outputs),
-        Correction::Iir(p) => p.process(&inputs, &mut outputs),
+    match &mut correction.kind {
+        CorrectionKind::Fir(c) => c.process(&inputs, &mut outputs),
+        CorrectionKind::Iir(p) => p.process(&inputs, &mut outputs),
     }
     correction.reset();
 }
 
 /// Build + warm up a FIR correction. Control plane only (allocates).
-pub fn build_fir(firs: Vec<Vec<f64>>, channels: usize, block_size: usize) -> Correction {
-    let mut c = Correction::Fir(OverlapAddConvolver::new(firs, block_size));
+///
+/// `preamp_lin` is R1-1's auto-preamp for this correction, computed by the
+/// caller ([`crate::preamp::fir_preamp_db`]) and carried through so it swaps
+/// atomically with the coefficients it protects.
+pub fn build_fir(
+    firs: Vec<Vec<f64>>,
+    channels: usize,
+    block_size: usize,
+    preamp_lin: f32,
+) -> Correction {
+    let mut c = Correction {
+        kind: CorrectionKind::Fir(OverlapAddConvolver::new(firs, block_size)),
+        preamp_lin,
+    };
     warm_up(&mut c, channels, block_size);
     c
 }
 
 /// Build + warm up an IIR correction. Control plane only (allocates).
 /// Returns the correction and the count of substituted (dropped) sections.
+///
+/// `preamp_lin` is R1-1's auto-preamp for this correction, computed by the
+/// caller from the SAME realized cascade that reaches this funnel, and carried
+/// through so it swaps atomically with the coefficients it protects.
 ///
 /// Stability backstop (spec R1-3): this is the single funnel every SOS row
 /// passes through on its way to the realtime thread. Rows failing the
@@ -315,6 +423,7 @@ pub fn build_iir(
     sos_per_channel: Vec<Vec<[f64; 6]>>,
     channels: usize,
     block_size: usize,
+    preamp_lin: f32,
 ) -> (Correction, usize) {
     assert!(
         !sos_per_channel.is_empty(),
@@ -341,7 +450,10 @@ pub fn build_iir(
         let sos = sos_per_channel[ch.min(sos_per_channel.len() - 1)].clone();
         p.set_sos(ch, sos);
     }
-    let mut c = Correction::Iir(p);
+    let mut c = Correction {
+        kind: CorrectionKind::Iir(p),
+        preamp_lin,
+    };
     warm_up(&mut c, channels, block_size);
     (c, substituted)
 }

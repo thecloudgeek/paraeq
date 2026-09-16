@@ -58,6 +58,7 @@ fn swap_under_churn_is_clean() {
                             vec![scale_sos(0.5).remove(0), scale_sos(0.5).remove(0)],
                             2,
                             BLOCK,
+                            1.0,
                         )
                         .0,
                     ))
@@ -123,14 +124,18 @@ fn swap_defers_when_retire_ring_full() {
     let mut proc_ = RtProcessor::new(shared, rt, chain);
 
     // Send #1 (0.5x) -> pump: swap #1 lands, retire ring now 1/1 full.
-    ctl.send(RtMsg::Correction(Some(build_iir(scale_sos(0.5), 1, 8).0)))
-        .expect("send #1 fits an empty ring");
+    ctl.send(RtMsg::Correction(Some(
+        build_iir(scale_sos(0.5), 1, 8, 1.0).0,
+    )))
+    .expect("send #1 fits an empty ring");
     let out = pump(&mut proc_, 1, 8, 0.8);
     assert_eq!(out[0][0], 0.4, "correction #1 (0.5x) must be active");
 
     // Send #2 (0.25x) fits -- the control->rt ring was drained by the pump.
-    ctl.send(RtMsg::Correction(Some(build_iir(scale_sos(0.25), 1, 8).0)))
-        .expect("send #2 fits: control ring was drained by the pump");
+    ctl.send(RtMsg::Correction(Some(
+        build_iir(scale_sos(0.25), 1, 8, 1.0).0,
+    )))
+    .expect("send #2 fits: control ring was drained by the pump");
 
     // Pump: swap #2 is DEFERRED -- the retire ring is full, and the rt side
     // must never be forced to drop (deallocate) a processor.
@@ -197,8 +202,10 @@ fn output_guard_feeds_invalid_samples_and_output_stays_finite() {
     let shared = Arc::new(RtShared::default());
     let chain = RealtimeChain::new(1, 8);
     let mut proc_ = RtProcessor::new(shared.clone(), rt, chain);
-    ctl.send(RtMsg::Correction(Some(build_iir(scale_sos(0.5), 1, 8).0)))
-        .expect("send fits an empty ring");
+    ctl.send(RtMsg::Correction(Some(
+        build_iir(scale_sos(0.5), 1, 8, 1.0).0,
+    )))
+    .expect("send fits an empty ring");
 
     // Clean block: the output guard counts nothing (zero-cost happy path).
     let out = pump(&mut proc_, 1, 8, 0.8);

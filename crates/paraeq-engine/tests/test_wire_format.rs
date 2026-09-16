@@ -10,14 +10,19 @@ use paraeq_engine::status::EngineStatus;
 #[test]
 fn engine_state_wire_format_is_pinned() {
     let state = EngineState {
+        auto_preamp_db: Some(-9.5),
         bypass: false,
+        clipped_samples: 3,
         correction: Some("iir:2-band".into()),
         correction_rate_mismatch: None,
         enabled: true,
         frame_mismatch_blocks: 0,
         gain_db: -3.0,
         input_peak: 0.25,
+        input_peak_session: 0.75,
+        invalid_samples: 2,
         latency_ms: Some(62.3),
+        output_peak: 1.5,
         status: EngineStatus::NoInputDetected { since_ms: 1200 },
         stream: Some(StreamInfo {
             buffer_frames: 512,
@@ -29,14 +34,19 @@ fn engine_state_wire_format_is_pinned() {
     assert_eq!(
         serde_json::to_value(&state).unwrap(),
         serde_json::json!({
+            "auto_preamp_db": -9.5,
             "bypass": false,
+            "clipped_samples": 3,
             "correction": "iir:2-band",
             "correction_rate_mismatch": null,
             "enabled": true,
             "frame_mismatch_blocks": 0,
             "gain_db": -3.0,
             "input_peak": 0.25,
+            "input_peak_session": 0.75,
+            "invalid_samples": 2,
             "latency_ms": 62.3,
+            "output_peak": 1.5,
             "status": { "kind": "no_input_detected", "since_ms": 1200 },
             "stream": {
                 "buffer_frames": 512,

@@ -231,14 +231,19 @@ mod tests {
     /// `resend_decision` cases. Only `stream` is load-bearing here.
     fn snapshot_with_stream(stream: Option<StreamInfo>) -> EngineState {
         EngineState {
+            auto_preamp_db: None,
             bypass: false,
+            clipped_samples: 0,
             correction: None,
             correction_rate_mismatch: None,
             enabled: true,
             frame_mismatch_blocks: 0,
             gain_db: 0.0,
             input_peak: 0.0,
+            input_peak_session: 0.0,
+            invalid_samples: 0,
             latency_ms: None,
+            output_peak: 0.0,
             status: EngineStatus::Stopped,
             stream,
         }
@@ -552,5 +557,50 @@ mod tests {
                 "composite {c} != per-band sum {sum} at freq index {k}"
             );
         }
+    }
+    /// R1-1 spec `:117` (the "Export/engine agreement" test row): the number
+    /// in the exported text equals `EngineState.auto_preamp_db`. This is the
+    /// test that catches a preamp recomputed on a different grid -- the whole
+    /// reason `build_correction` calls `ParametricEQ::preamp_db()` verbatim
+    /// rather than re-deriving a peak of its own.
+    ///
+    /// Compared through the exporter's own formatter, not as raw numbers: the
+    /// engine publishes an f32 and `export_autoeq_lines` rewrites any preamp
+    /// in `(-0.05, 0]` as `0.0`, so the agreement that matters is the agreement
+    /// of the rendered line.
+    #[test]
+    fn exported_preamp_equals_engine_state_auto_preamp_db() {
+        let bands = vec![
+            peaking(45.0, 9.0, 2.0),
+            peaking(1_000.0, 12.0, 1.0),
+            peaking(6_000.0, -4.0, 1.5),
+        ];
+        let rate = 48_000.0;
+
+        let exported = ParametricEQ {
+            bands: bands.clone(),
+            sample_rate: rate,
+        }
+        .export_autoeq_format_with_preamp();
+        let exported_preamp = exported.lines().next().expect("a Preamp line");
+        assert_ne!(
+            exported_preamp, "Preamp: 0.0 dB",
+            "a boosting band set must export a real preamp, or this test is vacuous"
+        );
+
+        let config = design_correction(&bands, rate).expect("a valid band set designs");
+        let (_, report) = paraeq_engine::controller::build_correction(&config, 2, 512, rate)
+            .expect("and builds at the live rate");
+        assert!(report.preamp_db < 0.0, "boosts must pull the output down");
+
+        let engine_preamp = ParametricEQ {
+            bands: Vec::new(),
+            sample_rate: rate,
+        }
+        .export_autoeq_format_with_preamp_db(f64::from(report.preamp_db as f32));
+        assert_eq!(
+            engine_preamp, exported_preamp,
+            "the engine applied a preamp the export does not name"
+        );
     }
 }

@@ -209,14 +209,19 @@ fn to_device_info(list: Vec<devices::OutputDevice>) -> Vec<OutputDeviceInfo> {
 /// absent (only after Exit teardown has taken it).
 fn stopped_state() -> EngineState {
     EngineState {
+        auto_preamp_db: None,
         bypass: false,
+        clipped_samples: 0,
         correction: None,
         correction_rate_mismatch: None,
         enabled: false,
         frame_mismatch_blocks: 0,
         gain_db: 0.0,
         input_peak: 0.0,
+        input_peak_session: 0.0,
+        invalid_samples: 0,
         latency_ms: None,
+        output_peak: 0.0,
         status: EngineStatus::Stopped,
         stream: None,
     }

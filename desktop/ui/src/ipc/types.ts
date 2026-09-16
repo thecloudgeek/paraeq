@@ -47,7 +47,16 @@ export interface StreamInfo {
 }
 
 export interface EngineState {
+  /** R1-1: the computed auto-preamp the engine is applying to the corrected
+   *  path right now, in dB and never positive; `null` when no correction is
+   *  running. Distinct from `EqState.preamp_db` (the user's manual trim,
+   *  which rides `gain_db` and applies on both paths) -- the two compose. */
+  auto_preamp_db: number | null;
   bypass: boolean;
+  /** R1-8: output samples the +-1.0 clamp engaged on, counted per sample per
+   *  channel and retained across a teardown. Nonzero while `auto_preamp_db`
+   *  is set is a BUG SIGNAL, not a user error. */
+  clipped_samples: number;
   correction: string | null;
   /** R1-6: the stream rate the correction must be redesigned for, when the
    *  engine could not build it for the live stream and is running flat.
@@ -57,7 +66,14 @@ export interface EngineState {
   frame_mismatch_blocks: number;
   gain_db: number;
   input_peak: number;
+  /** R1-8: the monotonic session maximum of the input peak. */
+  input_peak_session: number;
+  /** R1-2/R1-8: non-finite samples zeroed at the capture and output guards. */
+  invalid_samples: number;
   latency_ms: number | null;
+  /** R1-8: the maximum output sample, taken PRE-clamp, so an overshoot reads
+   *  as (say) 1.99 rather than saturating at 1.0. */
+  output_peak: number;
   status: EngineStatus;
   stream: StreamInfo | null;
 }

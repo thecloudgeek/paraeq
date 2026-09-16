@@ -42,10 +42,11 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use paraeq_dsp::peq::EQBand;
+use paraeq_dsp::peq::{EQBand, ParametricEQ};
 
 use crate::backend::{AudioBackend, StreamInfo};
 use crate::chain::{build_fir, build_iir, Correction, RealtimeChain};
+use crate::preamp;
 use crate::shared::{links, ControlLink, RtMsg, RtProcessor, RtShared};
 use crate::status::{EngineStatus, Watchdog, WatchdogConfig};
 use crate::EngineError;
@@ -120,13 +121,22 @@ impl CorrectionConfig {
 
 /// What [`build_correction`] had to do to make a config installable.
 /// Control-plane telemetry: nothing here is on the realtime path.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+///
+/// No `Eq`: `preamp_db` is an f64 (R1-1).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct BuildReport {
     /// Bands that are not designable at the live stream rate (at or above
     /// the new Nyquist, or otherwise out of range) and were dropped. The
     /// rest of the set still designs -- R1-3's rule, "the auto front-end
     /// must never be bricked by one bad band".
     pub bands_dropped: usize,
+    /// R1-1's auto-preamp for the correction that was actually installed, in
+    /// dB, always `<= 0`. Published as [`EngineState::auto_preamp_db`] -- the
+    /// number the Advanced drawer has to be able to explain (spec `:106`:
+    /// "The auto front-end must never apply a number it cannot explain") --
+    /// and `10^(preamp_db/20)` is what rides into the chain as
+    /// [`Correction::preamp_lin`].
+    pub preamp_db: f64,
     /// SOS rows the R1-3 Jury funnel replaced with the identity section.
     pub sections_substituted: usize,
 }
@@ -264,6 +274,17 @@ fn validate_correction(config: &CorrectionConfig) -> Option<String> {
 ///
 /// On `Err` the caller sends no correction at all: flat pass-through, the
 /// same fail-open philosophy as the `AutoDisabledNoInput` path.
+///
+/// R1-1: every arm also computes its auto-preamp here, from the SAME realized
+/// cascade that reaches the chain, and hands it to `build_iir`/`build_fir` so
+/// it swaps atomically with the coefficients it protects (spec `:101`). It is
+/// computed AFTER the Nyquist drop and from the surviving bands, because the
+/// headroom that matters is the headroom the installed filters need. `Peq`
+/// calls `ParametricEQ::preamp_db()` verbatim -- one implementation shared
+/// with the AutoEQ export, so spec `:117`'s export/engine agreement holds and
+/// the band-`fc` grid union stays intact; the two baked arms use
+/// [`crate::preamp`], which is the same idea without the bands. A
+/// multi-channel config takes the WORST channel's preamp.
 pub fn build_correction(
     config: &CorrectionConfig,
     channels: usize,
@@ -285,9 +306,19 @@ pub fn build_correction(
     match config {
         CorrectionConfig::Fir { design_rate, firs } => {
             refuse_on_rate_mismatch(*design_rate, stream_rate, "Fir")?;
+            let preamp_db = preamp::fir_preamp_db(firs);
             Ok((
-                build_fir(firs.clone(), channels, block_size),
-                BuildReport::default(),
+                build_fir(
+                    firs.clone(),
+                    channels,
+                    block_size,
+                    preamp::preamp_lin(preamp_db),
+                ),
+                BuildReport {
+                    bands_dropped: 0,
+                    preamp_db,
+                    sections_substituted: 0,
+                },
             ))
         }
         CorrectionConfig::Iir {
@@ -295,13 +326,19 @@ pub fn build_correction(
             sos_per_channel,
         } => {
             refuse_on_rate_mismatch(*design_rate, stream_rate, "Iir")?;
-            let (correction, substituted) =
-                build_iir(sos_per_channel.clone(), channels, block_size);
+            let preamp_db = preamp::sos_preamp_db(sos_per_channel, stream_rate);
+            let (correction, substituted) = build_iir(
+                sos_per_channel.clone(),
+                channels,
+                block_size,
+                preamp::preamp_lin(preamp_db),
+            );
             warn_on_substitutions(substituted);
             Ok((
                 correction,
                 BuildReport {
                     bands_dropped: 0,
+                    preamp_db,
                     sections_substituted: substituted,
                 },
             ))
@@ -309,22 +346,27 @@ pub fn build_correction(
         CorrectionConfig::Peq { bands, .. } => {
             let mut bands_dropped = 0;
             let mut kept = 0;
-            let sos_per_channel: Vec<Vec<[f64; 6]>> = bands
+            let kept_bands: Vec<Vec<EQBand>> = bands
                 .iter()
                 .map(|set| {
                     set.iter()
-                        .filter_map(|band| match validate_band_at(band, stream_rate) {
+                        .filter(|band| match validate_band_at(band, stream_rate) {
                             Ok(()) => {
                                 kept += 1;
-                                Some(band.to_sos(stream_rate))
+                                true
                             }
                             Err(_) => {
                                 bands_dropped += 1;
-                                None
+                                false
                             }
                         })
+                        .cloned()
                         .collect()
                 })
+                .collect();
+            let sos_per_channel: Vec<Vec<[f64; 6]>> = kept_bands
+                .iter()
+                .map(|set| set.iter().map(|band| band.to_sos(stream_rate)).collect())
                 .collect();
             if kept == 0 && bands_dropped > 0 {
                 return Err(EngineError::InvalidConfig(format!(
@@ -337,12 +379,35 @@ pub fn build_correction(
                      and were dropped; the rest of the correction still applies"
                 );
             }
-            let (correction, substituted) = build_iir(sos_per_channel, channels, block_size);
+            // R1-1, spec `:101`: `ParametricEQ::preamp_db()` VERBATIM, on the
+            // surviving bands at the live rate -- the same call the AutoEQ
+            // export makes, so the two numbers agree exactly (spec `:117`)
+            // and the band-`fc` grid union that makes high-Q peaks exact
+            // stays intact. The worst channel wins: a stereo config must not
+            // clip on the loud side because the quiet side needed less
+            // headroom.
+            let preamp_db = kept_bands
+                .iter()
+                .map(|set| {
+                    ParametricEQ {
+                        bands: set.clone(),
+                        sample_rate: stream_rate,
+                    }
+                    .preamp_db()
+                })
+                .fold(0.0f64, f64::min);
+            let (correction, substituted) = build_iir(
+                sos_per_channel,
+                channels,
+                block_size,
+                preamp::preamp_lin(preamp_db),
+            );
             warn_on_substitutions(substituted);
             Ok((
                 correction,
                 BuildReport {
                     bands_dropped,
+                    preamp_db,
                     sections_substituted: substituted,
                 },
             ))
@@ -393,7 +458,27 @@ pub enum EngineCommand {
 /// 135); stage 4 pushes it over Tauri as-is.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct EngineState {
+    /// R1-1's computed auto-preamp for the correction currently installed, in
+    /// dB and always `<= 0`; `None` when no correction is running. The
+    /// Advanced drawer explains it ("we pulled you down 9.4 dB to make room
+    /// for the 45 Hz boost" -- spec `:106`), and decision-engine `:340` gives
+    /// the user-facing wording verbatim.
+    ///
+    /// Session-scoped, like `correction_rate_mismatch` and for the same
+    /// reason: it names what the LIVE chain is applying, so with no chain
+    /// there is nothing being applied. Distinct from the user's manual trim
+    /// (`gain_db` / `EqState.preamp_db`), which it COMPOSES with -- they
+    /// multiply in linear and add in dB -- and which is never overwritten by
+    /// it.
+    pub auto_preamp_db: Option<f32>,
     pub bypass: bool,
+    /// Output samples the +-1.0 clamp engaged on (R1-8), counted per sample
+    /// per channel over both chain paths. Retained across a torn-down session
+    /// so a `Disable` does not blank the count the user is looking at.
+    ///
+    /// A nonzero value while `auto_preamp_db` is active is a BUG SIGNAL and
+    /// the spec says so (`:571`): it is R1-1's falsifier.
+    pub clipped_samples: u64,
     /// Short descriptor of the retained correction, e.g. `"iir:5-band"`.
     pub correction: Option<String>,
     /// `Some(stream_rate)` when the retained correction could NOT be built
@@ -421,8 +506,23 @@ pub struct EngineState {
     pub frame_mismatch_blocks: u64,
     pub gain_db: f32,
     pub input_peak: f32,
+    /// Maximum input |sample| since this session started (R1-8's session
+    /// statistic, spec `:552`). `input_peak` is the meter; this one never
+    /// decays.
+    pub input_peak_session: f32,
+    /// Non-finite samples zeroed at the capture boundary and by the chain's
+    /// output backstop (R1-2). Already counted in `RtShared`; R1-8 surfaces
+    /// it, so the drawer can show what the tick previously only logged.
+    /// Retained across a torn-down session, like `clipped_samples`.
+    pub invalid_samples: u64,
     /// `sample_time_delta / sample_rate * 1000` for the live stream.
     pub latency_ms: Option<f64>,
+    /// Maximum output |sample|, taken PRE-clamp, so "we peaked at 0.87, 1.2 dB
+    /// of margin" is answerable and a preamp that is not working reads as a
+    /// number over 1.0 rather than as a saturated 1.0 (see
+    /// [`crate::chain::ChainOutcome::peak_out`] for the spec-text
+    /// reconciliation this pins).
+    pub output_peak: f32,
     pub status: EngineStatus,
     pub stream: Option<StreamInfo>,
 }
@@ -494,14 +594,19 @@ impl EngineHandle {
         assert!(config.ring_capacity >= 1, "ring_capacity must be >= 1");
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let initial = Arc::new(EngineState {
+            auto_preamp_db: None,
             bypass: false,
+            clipped_samples: 0,
             correction: None,
             correction_rate_mismatch: None,
             enabled: config.enabled,
             frame_mismatch_blocks: 0,
             gain_db: 0.0,
             input_peak: 0.0,
+            input_peak_session: 0.0,
+            invalid_samples: 0,
             latency_ms: None,
+            output_peak: 0.0,
             status: EngineStatus::Stopped,
             stream: None,
         });
@@ -516,8 +621,10 @@ impl EngineHandle {
             .spawn(move || {
                 Controller {
                     auto_disabled: None,
+                    auto_preamp_db: None,
                     backend: StopGuard(backend),
                     bypass: false,
+                    clipped_samples: 0,
                     cmd_rx,
                     consecutive_start_failures: 0,
                     correction: None,
@@ -528,6 +635,7 @@ impl EngineHandle {
                     failed: None,
                     frame_mismatch_blocks: 0,
                     gain_db: 0.0,
+                    invalid_samples: 0,
                     last_tick: Instant::now(),
                     published: initial,
                     requested_buffer_frames: config.requested_buffer_frames,
@@ -621,8 +729,17 @@ struct Controller<B: AudioBackend> {
     /// publishing `AutoDisabledNoInput` (not the watchdog's `Stopped`)
     /// until an explicit Enable/Disable clears it.
     auto_disabled: Option<u64>,
+    /// Mirror of [`EngineState::auto_preamp_db`]: R1-1's computed preamp for
+    /// the correction currently installed. Set by `send_correction` from the
+    /// `BuildReport`, cleared on a refusal, a clear, and teardown.
+    auto_preamp_db: Option<f32>,
     backend: StopGuard<B>,
     bypass: bool,
+    /// Last `RtShared::clipped_samples` observed at snapshot time. Retained
+    /// across a torn-down session (SHELL's `frame_mismatch_blocks` pattern):
+    /// a `Disable` must not blank the clip count, because the count IS the
+    /// disclosure -- and R1-1's falsifier.
+    clipped_samples: u64,
     cmd_rx: Receiver<EngineCommand>,
     /// Consecutive `start` failures; at 2 the controller publishes `Failed`
     /// and stops retrying (no rebuild loop on a dead device).
@@ -645,6 +762,9 @@ struct Controller<B: AudioBackend> {
     /// next start reports 0.
     frame_mismatch_blocks: u64,
     gain_db: f32,
+    /// Last `RtShared::invalid_samples` observed at snapshot time; retained
+    /// across a torn-down session for the same reason `clipped_samples` is.
+    invalid_samples: u64,
     /// When `on_tick` last ran. A command flood keeps `recv_timeout`
     /// returning `Ok` and would otherwise starve the tick work entirely
     /// (watchdog, event poll, retired drain, swap retry); `run` checks this
@@ -937,8 +1057,11 @@ impl<B: AudioBackend> Controller<B> {
     /// the backend down, mark the watchdog stopped.
     fn stop_session(&mut self) {
         self.swap_pending = false;
-        // Session-scoped: the flag names the LIVE stream's rate, and there
-        // is no longer a live stream.
+        // Session-scoped: the flag names the LIVE stream's rate, and the
+        // preamp names what the LIVE chain is applying. There is no longer a
+        // live stream, so both statements are stale. The COUNTERS are not
+        // cleared here -- see `Controller::clipped_samples`.
+        self.auto_preamp_db = None;
         self.correction_rate_mismatch = None;
         if let Some(mut s) = self.session.take() {
             s.control.drain_retired();
@@ -967,32 +1090,39 @@ impl<B: AudioBackend> Controller<B> {
     fn send_correction(&mut self) {
         let Some(s) = &mut self.session else {
             // Not running: nothing has been attempted at any rate, so there
-            // is no refusal to report. The stored config is applied (and
-            // judged) at the next start.
+            // is no refusal to report and no preamp is being applied. The
+            // stored config is applied (and judged) at the next start.
+            self.auto_preamp_db = None;
             self.swap_pending = false;
             self.correction_rate_mismatch = None;
             return;
         };
         let stream_rate = s.stream.sample_rate;
-        let (msg, mismatch) = match self.correction.as_ref() {
-            None => (RtMsg::Correction(None), None),
+        let (msg, mismatch, auto_preamp_db) = match self.correction.as_ref() {
+            None => (RtMsg::Correction(None), None, None),
             Some(config) => match build_correction(config, s.channels, s.block_size, stream_rate) {
-                // `_report`'s drop/substitution counts are already logged by
-                // `build_correction`; publishing them in the Advanced drawer
-                // is queued behind R1-8's meter fields.
-                Ok((correction, _report)) => (RtMsg::Correction(Some(correction)), None),
+                // `report`'s drop/substitution counts are already logged by
+                // `build_correction`; its preamp is R1-1's `auto_preamp_db`
+                // and is published (the drawer must be able to explain the
+                // number the engine applied -- spec `:106`).
+                Ok((correction, report)) => (
+                    RtMsg::Correction(Some(correction)),
+                    None,
+                    Some(report.preamp_db as f32),
+                ),
                 Err(e) => {
                     log::warn!(
                         "correction refused at {stream_rate} Hz ({e}); \
                          running flat pass-through until it is redesigned"
                     );
-                    (RtMsg::Correction(None), Some(stream_rate))
+                    (RtMsg::Correction(None), Some(stream_rate), None)
                 }
             },
         };
         match s.control.send(msg) {
             Ok(()) => {
                 self.swap_pending = false;
+                self.auto_preamp_db = auto_preamp_db;
                 self.correction_rate_mismatch = mismatch;
             }
             // Ring-full: the built correction was dropped (control plane --
@@ -1028,30 +1158,47 @@ impl<B: AudioBackend> Controller<B> {
 
     /// Publish a snapshot iff it differs from the last published one.
     fn publish(&mut self) {
-        let (stream, latency_ms, input_peak, mismatch) = match &self.session {
-            Some(s) => (
-                Some(s.stream.clone()),
-                (s.stream.sample_rate > 0.0)
-                    .then(|| s.shared.sample_time_delta() / s.stream.sample_rate * 1000.0),
-                s.shared.peak_in(),
-                Some(s.shared.frame_mismatch_blocks.load(Ordering::Relaxed)),
-            ),
-            None => (None, None, 0.0, None),
-        };
-        // A live session owns the current count (fresh RtShared -> 0 on each
-        // start); a torn-down session retains the last observed count.
-        if let Some(count) = mismatch {
-            self.frame_mismatch_blocks = count;
+        let (stream, latency_ms, input_peak, input_peak_session, output_peak, counters) =
+            match &self.session {
+                Some(s) => (
+                    Some(s.stream.clone()),
+                    (s.stream.sample_rate > 0.0)
+                        .then(|| s.shared.sample_time_delta() / s.stream.sample_rate * 1000.0),
+                    s.shared.peak_in(),
+                    s.shared.peak_in_session(),
+                    s.shared.peak_out(),
+                    Some((
+                        s.shared.clipped_samples.load(Ordering::Relaxed),
+                        s.shared.frame_mismatch_blocks.load(Ordering::Relaxed),
+                        s.shared.invalid_samples.load(Ordering::Relaxed),
+                    )),
+                ),
+                // The PEAKS go to zero with the session (nothing is flowing);
+                // the COUNTERS are retained below.
+                None => (None, None, 0.0, 0.0, 0.0, None),
+            };
+        // A live session owns the current counts (fresh RtShared -> 0 on each
+        // start); a torn-down session retains the last observed ones, so a
+        // `Disable` does not blank the clip count the user is looking at.
+        if let Some((clipped, frame_mismatch, invalid)) = counters {
+            self.clipped_samples = clipped;
+            self.frame_mismatch_blocks = frame_mismatch;
+            self.invalid_samples = invalid;
         }
         let next = EngineState {
+            auto_preamp_db: self.auto_preamp_db,
             bypass: self.bypass,
+            clipped_samples: self.clipped_samples,
             correction: self.correction.as_ref().map(CorrectionConfig::descriptor),
             correction_rate_mismatch: self.correction_rate_mismatch,
             enabled: self.enabled,
             frame_mismatch_blocks: self.frame_mismatch_blocks,
             gain_db: self.gain_db,
             input_peak,
+            input_peak_session,
+            invalid_samples: self.invalid_samples,
             latency_ms,
+            output_peak,
             status: self.effective_status(),
             stream,
         };
@@ -1082,17 +1229,36 @@ impl<B: AudioBackend> Controller<B> {
 /// redesign trigger and the user's only disclosure that the EQ is paused, so
 /// a change in the rate it names must publish. It has no chatter to prevent
 /// -- in a healthy session it is pinned at `None`.
+///
+/// R1-8 (`:566`) says "the **counters compare exactly** -- a clip must
+/// publish", which reads as a contradiction of the `> 0` rule above. Both
+/// hold, scoped, and the asymmetry is deliberate: `clipped_samples` and
+/// `invalid_samples` compare EXACTLY because in a healthy session they are
+/// pinned at 0 (no chatter to prevent) and when they are not, the chatter IS
+/// the signal -- a clip count that stops moving is what the drawer is for.
+/// `frame_mismatch_blocks` keeps the `> 0` boolean: R1-8 never mentions it,
+/// and a degraded stretch increments it every block.
+///
+/// `auto_preamp_db` also compares exactly: it changes only on a deliberate
+/// rebuild, and a changed preamp must publish -- it is a number the app has
+/// promised to be able to explain. The two new peaks go through the existing
+/// 1e-3 quantization, exactly like `input_peak`.
 fn effectively_equal(a: &EngineState, b: &EngineState) -> bool {
     let q_latency = |l: Option<f64>| l.map(|v| (v * 10.0).round() as i64);
     let q_peak = |p: f32| (f64::from(p) * 1000.0).round() as i64;
-    a.bypass == b.bypass
+    a.auto_preamp_db == b.auto_preamp_db
+        && a.bypass == b.bypass
+        && a.clipped_samples == b.clipped_samples
         && a.correction == b.correction
         && a.correction_rate_mismatch == b.correction_rate_mismatch
         && a.enabled == b.enabled
         && (a.frame_mismatch_blocks > 0) == (b.frame_mismatch_blocks > 0)
         && a.gain_db == b.gain_db
         && q_peak(a.input_peak) == q_peak(b.input_peak)
+        && q_peak(a.input_peak_session) == q_peak(b.input_peak_session)
+        && a.invalid_samples == b.invalid_samples
         && q_latency(a.latency_ms) == q_latency(b.latency_ms)
+        && q_peak(a.output_peak) == q_peak(b.output_peak)
         && a.status == b.status
         && a.stream == b.stream
 }

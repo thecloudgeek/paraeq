@@ -28,7 +28,7 @@ use common::mock_backend::MockBackend;
 use paraeq_dsp::biquad;
 use paraeq_dsp::peq::{EQBand, FilterType};
 use paraeq_engine::backend::BackendEvent;
-use paraeq_engine::chain::Correction;
+use paraeq_engine::chain::{Correction, CorrectionKind};
 use paraeq_engine::controller::{
     build_correction, CorrectionConfig, EngineCommand, EngineConfig, EngineHandle, EngineState,
 };
@@ -63,6 +63,12 @@ fn peq(bands: Vec<EQBand>, design_rate: f64) -> CorrectionConfig {
 }
 
 /// A memoryless gain-`g` baked IIR correction (`y = g * x`).
+///
+/// Callers that assert on OUTPUT AMPLITUDES pass `g <= 1`: R1-1 computes an
+/// auto-preamp for the baked arm too (from the realized cascade's magnitude),
+/// so a boosting `g` would be pulled straight back to unity and the test
+/// could no longer tell a correction from pass-through. A pure cut gets a
+/// preamp of exactly 0 dB, which keeps the arithmetic about the swap.
 fn baked_iir(g: f64, design_rate: f64) -> CorrectionConfig {
     CorrectionConfig::Iir {
         design_rate,
@@ -72,9 +78,9 @@ fn baked_iir(g: f64, design_rate: f64) -> CorrectionConfig {
 
 /// The SOS rows a built correction actually installed on `channel`.
 fn installed_sos(correction: &Correction, channel: usize) -> Vec<[f64; 6]> {
-    match correction {
-        Correction::Iir(p) => p.sos(channel).expect("channel installed").to_vec(),
-        Correction::Fir(_) => panic!("expected an Iir correction"),
+    match &correction.kind {
+        CorrectionKind::Iir(p) => p.sos(channel).expect("channel installed").to_vec(),
+        CorrectionKind::Fir(_) => panic!("expected an Iir correction"),
     }
 }
 
@@ -124,6 +130,10 @@ fn impulse_block(amplitude: f32) -> Vec<Vec<f32>> {
 
 /// The impulse response a correction built at `rate` produces, computed
 /// OUTSIDE the engine: the reference the live chain is compared against.
+///
+/// R1-1's auto-preamp is part of the corrected path, so it is part of the
+/// reference: the chain applies `y * preamp_lin * gain`, and a reference that
+/// skipped the preamp would fail every boosting band set.
 fn reference_response(config: &CorrectionConfig, rate: f64, amplitude: f32) -> Vec<f32> {
     let (mut correction, _) =
         build_correction(config, CHANNELS, BLOCK, rate).expect("reference builds");
@@ -131,11 +141,15 @@ fn reference_response(config: &CorrectionConfig, rate: f64, amplitude: f32) -> V
     input[0] = f64::from(amplitude);
     let inputs: Vec<&[f64]> = (0..CHANNELS).map(|_| input.as_slice()).collect();
     let mut outputs = vec![vec![0.0f64; BLOCK]; CHANNELS];
-    match &mut correction {
-        Correction::Fir(c) => c.process(&inputs, &mut outputs),
-        Correction::Iir(p) => p.process(&inputs, &mut outputs),
+    let preamp_lin = correction.preamp_lin;
+    match &mut correction.kind {
+        CorrectionKind::Fir(c) => c.process(&inputs, &mut outputs),
+        CorrectionKind::Iir(p) => p.process(&inputs, &mut outputs),
     }
-    outputs[0].iter().map(|&v| v as f32).collect()
+    outputs[0]
+        .iter()
+        .map(|&v| (v as f32) * preamp_lin)
+        .collect()
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
@@ -429,21 +443,21 @@ fn baked_iir_fails_open_to_pass_through_on_rate_flip() {
     backend.set_reported_sample_rate(44_100.0);
     let handle = EngineHandle::spawn(backend.clone(), fast_config());
 
-    // -6.0206 dB is 0.5 linear; the correction doubles. At the design rate:
-    // 0.2 -> 0.4 -> 0.2.
-    handle.send(EngineCommand::SetCorrection(baked_iir(2.0, 48_000.0)));
+    // -6.0206 dB is 0.5 linear; the correction halves. At the design rate:
+    // 0.2 -> 0.1 -> 0.05.
+    handle.send(EngineCommand::SetCorrection(baked_iir(0.5, 48_000.0)));
     handle.send(EngineCommand::SetGainDb(-6.020_6));
     let input = impulse_block(0.2);
     assert!(wait_until(WAIT, || {
         backend
             .pump_samples(&input)
-            .is_some_and(|out| (out[0][0] - 0.2).abs() < 1e-5)
+            .is_some_and(|out| (out[0][0] - 0.05).abs() < 1e-5)
     }));
     assert_eq!(handle.state().correction_rate_mismatch, None);
 
     // Rate flip: the baked coefficients cannot be re-derived, so the chain
     // must run FLAT -- input x gain only (0.2 * 0.5 = 0.1), never the stale
-    // 0.2 the old coefficients would have produced.
+    // 0.05 the old coefficients would have produced.
     backend.queue_event(BackendEvent::DefaultOutputChanged);
     assert!(wait_until(WAIT, || handle.state().correction_rate_mismatch
         == Some(44_100.0)));
@@ -465,12 +479,12 @@ fn rate_unchanged_installs_with_no_flag() {
     backend.set_reported_sample_rate(48_000.0);
     let handle = EngineHandle::spawn(backend.clone(), fast_config());
 
-    handle.send(EngineCommand::SetCorrection(baked_iir(2.0, 48_000.0)));
+    handle.send(EngineCommand::SetCorrection(baked_iir(0.5, 48_000.0)));
     let input = impulse_block(0.2);
     assert!(wait_until(WAIT, || {
         backend
             .pump_samples(&input)
-            .is_some_and(|out| (out[0][0] - 0.4).abs() < 1e-5)
+            .is_some_and(|out| (out[0][0] - 0.1).abs() < 1e-5)
     }));
 
     backend.queue_event(BackendEvent::DefaultOutputChanged);
@@ -478,7 +492,7 @@ fn rate_unchanged_installs_with_no_flag() {
     assert!(wait_until(WAIT, || {
         backend
             .pump_samples(&input)
-            .is_some_and(|out| (out[0][0] - 0.4).abs() < 1e-5)
+            .is_some_and(|out| (out[0][0] - 0.1).abs() < 1e-5)
     }));
     assert_eq!(handle.state().correction_rate_mismatch, None);
 }

@@ -22,3 +22,30 @@ function formatRate(hz: number): string {
   const text = Number.isInteger(khz) ? khz.toString() : khz.toFixed(1);
   return `${text} kHz`;
 }
+
+/**
+ * The latched "clipped" chip for `EngineState.clipped_samples` (R1-8).
+ *
+ * The +-1.0 clamp used to engage completely invisibly; this is the minimum
+ * viable surfacing until the Advanced drawer exists (Stage 7), and it matches
+ * the strip's existing `frame_mismatch_blocks > 0` treatment. It latches
+ * because the engine's counter does: it is retained across a teardown.
+ *
+ * When `auto_preamp_db` is active the wording changes, because the spec says
+ * the meaning changes: engine-hardening `:571` -- "A nonzero
+ * `clipped_samples` while `auto_preamp_db` is active is a bug signal". With
+ * the preamp off, clipping is the user's own trim or source and reads as
+ * plain information.
+ *
+ * Returns `null` when there is nothing to disclose.
+ */
+export function clippedNotice(
+  clippedSamples: number,
+  autoPreampDb: number | null,
+): string | null {
+  if (!Number.isFinite(clippedSamples) || clippedSamples <= 0) return null;
+  const count = clippedSamples.toLocaleString();
+  return autoPreampDb == null
+    ? `clipped (${count} samples)`
+    : `clipped (${count} samples — unexpected with auto-preamp)`;
+}

@@ -69,6 +69,13 @@ fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
 }
 
 /// A memoryless gain-`g` IIR correction (`y = g * x`) for `channels`.
+///
+/// Every caller here passes `g <= 1`, and that is load-bearing: R1-1 computes
+/// an auto-preamp for the baked arm from the realized cascade's magnitude, so
+/// a boosting `g` would be attenuated straight back to unity and these tests
+/// could no longer tell a correction from pass-through. A pure cut gets a
+/// preamp of exactly 0 dB (DIVERGENCES.md #14 -- ParaEQ's preamp is clamped
+/// at <= 0), which keeps the arithmetic about the plumbing under test.
 fn iir_gain(g: f64, channels: usize) -> CorrectionConfig {
     CorrectionConfig::Iir {
         // The MockBackend reports 48 kHz, so the baked arm's R1-6 rate
@@ -123,13 +130,13 @@ fn engages_on_first_nonzero_input() {
 fn bypass_and_gain_commands_reach_the_rt_side() {
     let (backend, handle) = spawn_engine();
 
-    // Correction doubles: 0.2 -> 0.4.
-    handle.send(EngineCommand::SetCorrection(iir_gain(2.0, 2)));
-    assert!(wait_until(WAIT, || pump_matches(&backend, 512, 0.2, 0.4)));
+    // Correction halves: 0.2 -> 0.1.
+    handle.send(EngineCommand::SetCorrection(iir_gain(0.5, 2)));
+    assert!(wait_until(WAIT, || pump_matches(&backend, 512, 0.2, 0.1)));
 
-    // -6.0206 dB is 0.5 linear: corrected 0.4 * 0.5 = 0.2.
+    // -6.0206 dB is 0.5 linear: corrected 0.1 * 0.5 = 0.05.
     handle.send(EngineCommand::SetGainDb(-6.020_6));
-    assert!(wait_until(WAIT, || pump_matches(&backend, 512, 0.2, 0.2)));
+    assert!(wait_until(WAIT, || pump_matches(&backend, 512, 0.2, 0.05)));
 
     // Bypass skips correction only; gain still applies: 0.2 * 0.5 = 0.1.
     handle.send(EngineCommand::SetBypass(true));
@@ -137,7 +144,7 @@ fn bypass_and_gain_commands_reach_the_rt_side() {
 
     // And back: corrected output returns.
     handle.send(EngineCommand::SetBypass(false));
-    assert!(wait_until(WAIT, || pump_matches(&backend, 512, 0.2, 0.2)));
+    assert!(wait_until(WAIT, || pump_matches(&backend, 512, 0.2, 0.05)));
 }
 
 #[test]
@@ -148,7 +155,7 @@ fn set_correction_swaps_and_retires_off_thread() {
     // did not drain retired corrections, the retire ring would fill and
     // later swaps would defer forever (a swap is gated on retire space).
     for i in 0..6 {
-        let g = if i % 2 == 0 { 2.0 } else { 0.5 };
+        let g = if i % 2 == 0 { 0.5 } else { 0.25 };
         handle.send(EngineCommand::SetCorrection(iir_gain(g, 2)));
         let expect = 0.2 * g as f32;
         assert!(
@@ -167,10 +174,10 @@ fn set_correction_swaps_and_retires_off_thread() {
 fn backend_event_triggers_stop_start_rebuild() {
     let (backend, handle) = spawn_engine();
 
-    // Retained config: correction x2, gain 0.5 -> 0.2 in, 0.2 out.
-    handle.send(EngineCommand::SetCorrection(iir_gain(2.0, 2)));
+    // Retained config: correction x0.5, gain 0.5 -> 0.2 in, 0.05 out.
+    handle.send(EngineCommand::SetCorrection(iir_gain(0.5, 2)));
     handle.send(EngineCommand::SetGainDb(-6.020_6));
-    assert!(wait_until(WAIT, || pump_matches(&backend, 512, 0.2, 0.2)));
+    assert!(wait_until(WAIT, || pump_matches(&backend, 512, 0.2, 0.05)));
     assert_eq!(backend.start_count(), 1);
 
     backend.queue_event(BackendEvent::DefaultOutputChanged);
@@ -190,7 +197,7 @@ fn backend_event_triggers_stop_start_rebuild() {
     // Fresh RtShared + chain after rebuild: stored correction AND gain
     // re-applied (watchdog re-baselines to zeroed counters, so everything
     // must come back from controller-retained state).
-    assert!(wait_until(WAIT, || pump_matches(&backend, 512, 0.2, 0.2)));
+    assert!(wait_until(WAIT, || pump_matches(&backend, 512, 0.2, 0.05)));
     assert_eq!(backend.start_count(), 2, "one rebuild, no rebuild loop");
 }
 
@@ -302,9 +309,9 @@ fn buffer_frames_renegotiation() {
     // proves the chain was rebuilt for the effective size, not the request.
     handle.send(EngineCommand::SetCorrection(CorrectionConfig::Fir {
         design_rate: 48_000.0,
-        firs: vec![vec![2.0]; 2],
+        firs: vec![vec![0.5]; 2],
     }));
-    assert!(wait_until(WAIT, || pump_matches(&backend, 256, 0.2, 0.4)));
+    assert!(wait_until(WAIT, || pump_matches(&backend, 256, 0.2, 0.1)));
     assert_eq!(backend.start_count(), 2, "renegotiation must not loop");
 
     // SetBufferFrames while running: stored request updated + one clean
@@ -317,7 +324,7 @@ fn buffer_frames_renegotiation() {
             requested_buffer_frames: Some(256)
         })
     );
-    assert!(wait_until(WAIT, || pump_matches(&backend, 256, 0.2, 0.4)));
+    assert!(wait_until(WAIT, || pump_matches(&backend, 256, 0.2, 0.1)));
 }
 
 #[test]
@@ -329,11 +336,11 @@ fn channel_count_renegotiation() {
     // One stop+start cycle down to the mono chain.
     assert!(wait_until(WAIT, || backend.start_count() == 2));
 
-    handle.send(EngineCommand::SetCorrection(iir_gain(2.0, 1)));
+    handle.send(EngineCommand::SetCorrection(iir_gain(0.5, 1)));
     assert!(wait_until(WAIT, || {
         backend
             .pump(512, 0.2)
-            .is_some_and(|out| out.len() == 1 && (out[0][0] - 0.4).abs() < 1e-5)
+            .is_some_and(|out| out.len() == 1 && (out[0][0] - 0.1).abs() < 1e-5)
     }));
     assert_eq!(backend.start_count(), 2, "renegotiation must not loop");
     assert!(handle
@@ -384,12 +391,12 @@ fn shifting_geometry_renegotiation_converges_on_final_report() {
     // exactly block_size frames) corrects a mono 128-frame block.
     handle.send(EngineCommand::SetCorrection(CorrectionConfig::Fir {
         design_rate: 48_000.0,
-        firs: vec![vec![2.0]],
+        firs: vec![vec![0.5]],
     }));
     assert!(wait_until(WAIT, || {
         backend
             .pump(128, 0.2)
-            .is_some_and(|out| out.len() == 1 && (out[0][0] - 0.4).abs() < 1e-5)
+            .is_some_and(|out| out.len() == 1 && (out[0][0] - 0.1).abs() < 1e-5)
     }));
     assert_eq!(backend.start_count(), 3, "renegotiation must stop at cap");
     assert!(handle
@@ -441,8 +448,8 @@ fn malformed_correction_is_ignored_not_fatal() {
     }));
 
     // The controller thread survived and a subsequent valid command works.
-    handle.send(EngineCommand::SetCorrection(iir_gain(2.0, 2)));
-    assert!(wait_until(WAIT, || pump_matches(&backend, 512, 0.2, 0.4)));
+    handle.send(EngineCommand::SetCorrection(iir_gain(0.5, 2)));
+    assert!(wait_until(WAIT, || pump_matches(&backend, 512, 0.2, 0.1)));
     assert!(handle
         .state()
         .correction
@@ -475,8 +482,8 @@ fn slow_first_callback_does_not_rebuild() {
 fn disable_enable_roundtrip() {
     let (backend, handle) = spawn_engine();
 
-    handle.send(EngineCommand::SetCorrection(iir_gain(2.0, 2)));
-    assert!(wait_until(WAIT, || pump_matches(&backend, 512, 0.2, 0.4)));
+    handle.send(EngineCommand::SetCorrection(iir_gain(0.5, 2)));
+    assert!(wait_until(WAIT, || pump_matches(&backend, 512, 0.2, 0.1)));
 
     handle.send(EngineCommand::Disable);
     assert!(wait_until(WAIT, || {
@@ -487,7 +494,7 @@ fn disable_enable_roundtrip() {
     handle.send(EngineCommand::Enable);
     assert!(wait_until(WAIT, || backend.start_count() == 2));
     // Stored correction re-applied to the fresh chain after Enable.
-    assert!(wait_until(WAIT, || pump_matches(&backend, 512, 0.2, 0.4)));
+    assert!(wait_until(WAIT, || pump_matches(&backend, 512, 0.2, 0.1)));
 }
 
 #[test]
