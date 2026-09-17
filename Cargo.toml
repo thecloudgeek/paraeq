@@ -5,6 +5,7 @@ members = [
     "crates/paraeq-dsp",
     "crates/paraeq-engine",
     "crates/paraeq-measure",
+    "crates/paraeq-stimulus",
     "desktop/src-tauri",
 ]
 exclude = ["spikes/tap-spike"]
