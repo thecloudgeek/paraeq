@@ -777,8 +777,30 @@ pub use crate::biquad::is_stable;
 
 /// What [`clamp_band`] changed, and why. Every variant is rendered by the
 /// Advanced drawer as an explanation, so each carries the numbers.
+///
+/// **The derive is pre-freeze, not a convenience.** `CorrectionPlan` gains
+/// `clamps: Vec<Vec<Clamp>>` (base plan B6 item 4) and derives
+/// `Deserialize`/`Serialize` unconditionally, and `paraeq-decide` turns this
+/// crate's `serde` feature on unconditionally — so from that point on the
+/// variant set and the field names of this enum ARE a wire format, and every
+/// `fixtures/decide/<case>/expected.json` moves when either changes. Both the
+/// derive and [`Self::BelowMinGain`] land in one commit, before the fixture
+/// freeze, for that reason.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub enum Clamp {
+    /// Emitted by [`crate::autofit::auto_fit_room`], not by [`clamp_band`]:
+    /// the best feature left in the residual was smaller than `min_gain_db`,
+    /// so no band was placed on it at all.
+    ///
+    /// `decision-engine-design.md` § Decision table, `max_filters`: "Drop any
+    /// band with `|gain| < flatness/2`", and `min_gain_db` is that
+    /// `flatness/2`. Without this variant the drop is **silent**, which
+    /// contradicts [`clamp_band`]'s own premise that every change is
+    /// explainable — the drawer needs to be able to say "we found a 1.2 dB
+    /// bump and left it alone because you asked for 3 dB flat". `fc` and
+    /// `gain_db` are what was found, not what was emitted.
+    BelowMinGain { fc: f64, gain_db: f64 },
     /// The gain hit the Trinnov excursion envelope: confidence was full here,
     /// the physics ceiling was not.
     GainToExcursion { from: f64, to: f64 },

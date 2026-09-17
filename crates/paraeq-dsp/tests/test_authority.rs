@@ -62,7 +62,8 @@ fn gaussian_residual(grid: &LogGrid, centre_hz: f64, amp_db: f64, width_oct: f64
 fn fit(residual: &[f64], curve: &AuthorityCurve, max_bands: usize) -> RoomFitReport {
     let grid = LogGrid::standard();
     let per = PerChannel::new(vec![residual.to_vec()]).expect("one channel");
-    let out = auto_fit_room(&per, &grid, SR, curve, max_bands, 1.0, 0.0).expect("valid fit inputs");
+    let out =
+        auto_fit_room(&per, &grid, SR, curve, max_bands, 1.0, 0.0, None).expect("valid fit inputs");
     out.get(0).expect("one channel").clone()
 }
 
@@ -623,7 +624,7 @@ fn no_band_is_emitted_below_the_gates_own_resolution_limit() {
         .collect();
     let per = PerChannel::new(vec![residual]).expect("one channel");
     let curve = curve_at_sigma(0.5);
-    let out = auto_fit_room(&per, &grid, SR, &curve, 8, 1.0, 200.0).expect("valid");
+    let out = auto_fit_room(&per, &grid, SR, &curve, 8, 1.0, 200.0, None).expect("valid");
     let report = out.get(0).expect("one channel");
     assert!(
         report.bands.iter().all(|b| b.fc >= 200.0),
@@ -678,7 +679,7 @@ fn every_channel_is_fitted_independently() {
         .collect();
     let per = PerChannel::new(vec![left, right]).expect("two channels");
     let curve = curve_at_sigma(0.5);
-    let out = auto_fit_room(&per, &grid, SR, &curve, 1, 1.0, 0.0).expect("valid");
+    let out = auto_fit_room(&per, &grid, SR, &curve, 1, 1.0, 0.0, None).expect("valid");
     assert_eq!(out.channels(), 2);
     assert_relative_eq!(out.get(0).unwrap().bands[0].fc, left_f, epsilon = 1e-9);
     assert_relative_eq!(out.get(1).unwrap().bands[0].fc, right_f, epsilon = 1e-9);
@@ -689,17 +690,17 @@ fn auto_fit_room_refuses_malformed_input() {
     let grid = LogGrid::standard();
     let curve = curve_at_sigma(1.0);
     let short = PerChannel::new(vec![vec![0.0; 10]]).expect("one channel");
-    assert!(auto_fit_room(&short, &grid, SR, &curve, 4, 1.0, 0.0).is_err());
+    assert!(auto_fit_room(&short, &grid, SR, &curve, 4, 1.0, 0.0, None).is_err());
 
     let mut nan = vec![0.0; grid.len()];
     nan[5] = f64::NAN;
     let nan = PerChannel::new(vec![nan]).expect("one channel");
-    assert!(auto_fit_room(&nan, &grid, SR, &curve, 4, 1.0, 0.0).is_err());
+    assert!(auto_fit_room(&nan, &grid, SR, &curve, 4, 1.0, 0.0, None).is_err());
 
     let ok = PerChannel::new(vec![vec![0.0; grid.len()]]).expect("one channel");
-    assert!(auto_fit_room(&ok, &grid, 0.0, &curve, 4, 1.0, 0.0).is_err());
-    assert!(auto_fit_room(&ok, &grid, SR, &curve, 4, 1.0, f64::NAN).is_err());
-    assert!(auto_fit_room(&ok, &grid, SR, &curve, 4, f64::NAN, 0.0).is_err());
+    assert!(auto_fit_room(&ok, &grid, 0.0, &curve, 4, 1.0, 0.0, None).is_err());
+    assert!(auto_fit_room(&ok, &grid, SR, &curve, 4, 1.0, f64::NAN, None).is_err());
+    assert!(auto_fit_room(&ok, &grid, SR, &curve, 4, f64::NAN, 0.0, None).is_err());
 }
 
 #[test]
@@ -900,6 +901,53 @@ mod wire {
             serde_json::from_str(&serde_json::to_string(&curve).unwrap()).unwrap();
         negative["max_cut_db"][0] = serde_json::json!(-1.0);
         assert!(serde_json::from_value::<AuthorityCurve>(negative).is_err());
+    }
+
+    #[test]
+    fn the_below_min_gain_clamp_round_trips_through_serde() {
+        // `Clamp` gains its derive here because B6 lifts `clamps` onto
+        // `CorrectionPlan`, which derives serde unconditionally — so the
+        // variant and the derive are one pre-freeze change, not two. All five
+        // variants are exercised, because the derive is on the enum and a
+        // round-trip that covers only the new one would not notice the other
+        // four losing their fields.
+        let clamps = [
+            Clamp::BelowMinGain {
+                fc: 2000.0,
+                gain_db: -1.2,
+            },
+            Clamp::DipRefused { width_oct: 0.125 },
+            Clamp::GainToExcursion {
+                from: 12.0,
+                to: 5.0,
+            },
+            Clamp::GainToSigma {
+                from: 12.0,
+                to: 3.0,
+                sigma_db: 3.5,
+            },
+            Clamp::QToBoostCap {
+                from: 20.0,
+                to: 8.0,
+            },
+        ];
+        for clamp in clamps {
+            let json = serde_json::to_string(&clamp).expect("serializes");
+            let back: Clamp = serde_json::from_str(&json).expect("deserializes");
+            assert_eq!(back, clamp, "{json}");
+        }
+
+        // Externally tagged, like every other enum on this wire: the variant
+        // name and the field names ARE the contract, so renaming either moves
+        // every `fixtures/decide/<case>/expected.json` once B6 lands.
+        assert_eq!(
+            serde_json::to_string(&Clamp::BelowMinGain {
+                fc: 2000.0,
+                gain_db: -1.2,
+            })
+            .expect("serializes"),
+            r#"{"BelowMinGain":{"fc":2000.0,"gain_db":-1.2}}"#
+        );
     }
 }
 
