@@ -1,0 +1,34 @@
+{
+ "arrays": {
+  "egd_s": {
+   "file": "excess_group_delay.egd_s.f64",
+   "len": 4097,
+   "shape": [
+    4097
+   ]
+  },
+  "freqs": {
+   "file": "excess_group_delay.freqs.f64",
+   "len": 4097,
+   "shape": [
+    4097
+   ]
+  },
+  "ir": {
+   "file": "excess_group_delay.ir.f64",
+   "len": 2048,
+   "shape": [
+    2048
+   ]
+  }
+ },
+ "params": {
+  "delay_samples": 240,
+  "g": 2.0,
+  "half": false,
+  "n_fft": 8192,
+  "n_samples": 2048,
+  "sample_rate": 48000
+ },
+ "scalars": {}
+}

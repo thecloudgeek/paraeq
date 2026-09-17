@@ -1,0 +1,40 @@
+{
+ "arrays": {
+  "h": {
+   "file": "min_phase_spectrum.h.f64",
+   "len": 98,
+   "shape": [
+    98
+   ]
+  },
+  "min_phase_taps": {
+   "file": "min_phase_spectrum.min_phase_taps.f64",
+   "len": 98,
+   "shape": [
+    98
+   ]
+  },
+  "spectrum_im": {
+   "file": "min_phase_spectrum.spectrum_im.f64",
+   "len": 2049,
+   "shape": [
+    2049
+   ]
+  },
+  "spectrum_re": {
+   "file": "min_phase_spectrum.spectrum_re.f64",
+   "len": 2049,
+   "shape": [
+    2049
+   ]
+  }
+ },
+ "params": {
+  "half": false,
+  "method": "homomorphic",
+  "n_fft": 4096,
+  "n_taps": 98,
+  "n_taps_out": 98
+ },
+ "scalars": {}
+}

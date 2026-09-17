@@ -1,0 +1,33 @@
+{
+ "arrays": {
+  "sos": {
+   "file": "sosfilt_offline.sos.f64",
+   "len": 18,
+   "shape": [
+    3,
+    6
+   ]
+  },
+  "x": {
+   "file": "sosfilt_offline.x.f64",
+   "len": 4096,
+   "shape": [
+    4096
+   ]
+  },
+  "y": {
+   "file": "sosfilt_offline.y.f64",
+   "len": 4096,
+   "shape": [
+    4096
+   ]
+  }
+ },
+ "params": {
+  "n_samples": 4096,
+  "n_sections": 3,
+  "sample_rate": 48000,
+  "zi": "none"
+ },
+ "scalars": {}
+}

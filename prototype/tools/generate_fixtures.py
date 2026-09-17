@@ -38,6 +38,7 @@ from pathlib import Path
 import numpy as np
 import scipy
 from scipy.ndimage import gaussian_filter1d
+from scipy.signal import minimum_phase, sosfilt
 from scipy.signal.windows import blackmanharris, boxcar, hann, tukey
 
 from paraeq.correction.auto_fit import auto_fit_parametric_eq
@@ -311,6 +312,85 @@ def gen_variable_smooth():
               {"freqs": freqs, "mag_db": mag_db, "smoothed": out})
 
 
+def gen_complex_spectrum():
+    """fr::complex_spectrum vs np.fft.rfft / np.fft.rfftfreq (Tier 2).
+
+    compute_frequency_response returns MAGNITUDE only; fdw::apply_fdw and
+    logf::resample_complex_to_log_grid both need the complex linear-axis
+    spectrum, so this is the case that pins the phase half as well.
+
+    The one trap, and the reason n_samples < n_fft here: np.fft.rfft zero-pads
+    UP TO n_fft, it never truncates. A 1024-sample IR into a 4096-point rfft is
+    what actually exercises realfft's padding; an n_samples == n_fft case would
+    pin the easy path and miss it.
+
+    Complex arrays are split into spectrum_re / spectrum_im because save_case
+    writes '<f8' only.
+    """
+    rng = np.random.default_rng(52)
+    n_fft = 4096
+    n_samples = 1024
+    ir = rng.standard_normal(n_samples) * np.exp(-np.arange(n_samples) / 180.0)
+    spec = np.fft.rfft(ir, n=n_fft)
+    save_case("fr", "complex_spectrum",
+              {"n_fft": n_fft, "n_samples": n_samples, "sample_rate": SR},
+              {"freqs": np.fft.rfftfreq(n_fft, d=1.0 / SR),
+               "ir": ir, "spectrum_im": spec.imag, "spectrum_re": spec.real})
+
+
+def gen_excess_group_delay():
+    """fr::excess_group_delay_s vs a scipy min-phase + numpy phase reference (Tier 2).
+
+    EGD = -d(phi_meas - phi_min)/d(omega): the measured group delay minus the
+    group delay of the minimum-phase reconstruction of the SAME magnitude. Ships
+    in v1 as Evidence only (decide's Analysis.excess_group_delay_s); it gates
+    nothing.
+
+    THE DISCRETIZATION IS THE CONTRACT, because the derivative is where a
+    transcription would hide. All three steps are pinned here and the Rust must
+    use the identical stencil:
+
+      1. np.unwrap BEFORE differencing, on each phase separately.
+      2. np.gradient against the omega COORDINATE ARRAY, not a scalar spacing.
+         omega = 2*pi*rfftfreq is not exactly uniform in float (16 distinct
+         diffs at n_fft=8192), so np.gradient takes its NON-UNIFORM branch:
+         second-order interior weights from the two local spacings, first-order
+         one-sided at both ends (edge_order=1). The uniform central-difference
+         stencil is close but not bit-identical.
+      3. On the uniform LINEAR rfft axis. Resampling onto a log grid happens
+         AFTER, in the caller, never inside the derivative.
+
+    The IR is a two-path h = d(t0) + 2*d(t0 + tau) with |g| = 2 > 1, so its
+    zeros sit OUTSIDE the unit circle and the response is genuinely
+    non-minimum-phase. The minimum-phase counterpart reflects them inward and is
+    exactly 2*d(0) + 1*d(240) -- reversed taps -- so the excess is a pure
+    all-pass whose group delay has mean exactly tau. tau = 240 samples at 48 kHz
+    = 5 ms; measured here: mean 4.9992 ms, range 1.671..14.675 ms, ripple period
+    1/tau = 200 Hz. That mean is the cross-check that this fixture is not itself
+    wrong, and it is what the Rust-side Tier-3 invariant asserts independently.
+
+    NO RNG. Seed 54 is reserved for this case by the build plan's seed ledger and
+    is deliberately left undrawn: the whole value of a two-tap IR is that its
+    excess delay has a closed form, and a random IR would have none. Constructing
+    an unused default_rng(54) only to discard it would be a lie about provenance.
+    """
+    n_fft = 8192
+    delay_samples = 240
+    ir = np.zeros(2048)
+    ir[0] = 1.0
+    ir[delay_samples] = 2.0
+    freqs = np.fft.rfftfreq(n_fft, d=1.0 / SR)
+    mp = minimum_phase(ir, method="homomorphic", n_fft=n_fft, half=False)
+    phase_meas = np.unwrap(np.angle(np.fft.rfft(ir, n=n_fft)))
+    phase_min = np.unwrap(np.angle(np.fft.rfft(mp, n=n_fft)))
+    omega = 2.0 * np.pi * freqs
+    save_case("fr", "excess_group_delay",
+              {"delay_samples": delay_samples, "g": 2.0, "half": False,
+               "n_fft": n_fft, "n_samples": int(ir.size), "sample_rate": SR},
+              {"egd_s": -np.gradient(phase_meas - phase_min, omega),
+               "freqs": freqs, "ir": ir})
+
+
 def gen_logf():
     """resample_db_to_log_grid at Prefilter::None == np.interp (Tier 2).
 
@@ -335,6 +415,42 @@ def gen_logf():
                "prefilter": "none", "sample_rate": SR},
               {"freqs_linear": freqs_linear, "grid_freqs": grid_freqs, "mag_db": mag_db,
                "resampled": np.interp(grid_freqs, freqs_linear, mag_db)})
+
+
+def gen_min_phase_spectrum():
+    """fir::minimum_phase_spectrum vs scipy.signal.minimum_phase(half=False) (Tier 2).
+
+    WHY half=False, stated here because getting it wrong is silent and
+    catastrophic. half=True returns a filter of HALF the order whose magnitude
+    response is sqrt(|H|) -- and therefore whose phase is HALF the minimum phase
+    of |H|. That is the call fir.rs:131 ports (the `* 0.5` on the log magnitude),
+    and it is correct THERE only because design_fir_correction squares its target
+    magnitude first, so the two halvings cancel. Reached for directly by an EGD
+    that wants phi_min(|H|), it would halve every excess-group-delay number:
+    wrong everywhere, plausible-looking, and invisible unless a test states the
+    factor of two. `half` was added in scipy 1.14.0; the pin here is 1.18.0.
+
+    h is mixed-phase on purpose (a random FIR convolved with a minimum-phase
+    pair), so the reconstruction genuinely has to move zeros rather than return
+    its input.
+
+    The saved spectrum is np.fft.rfft(mp, n_fft) of scipy's OWN returned taps --
+    which for half=False are h_minimum[:len(h)], i.e. already truncated to the
+    input order. The Rust mirrors that truncation rather than returning the
+    untruncated exp(FFT(windowed cepstrum)): at n_fft=4096 the two differ by up
+    to 1.3e-3 relative, so a function that skipped the truncation could not be
+    graded against this delegate at all.
+    """
+    rng = np.random.default_rng(53)
+    n_fft = 4096
+    h = np.convolve(rng.standard_normal(96), [1.0, 0.6, 0.25])   # mixed-phase on purpose
+    mp = minimum_phase(h, method="homomorphic", n_fft=n_fft, half=False)
+    spec = np.fft.rfft(mp, n=n_fft)
+    save_case("fir", "min_phase_spectrum",
+              {"half": False, "method": "homomorphic", "n_fft": n_fft,
+               "n_taps": int(h.size), "n_taps_out": int(mp.size)},
+              {"h": h, "min_phase_taps": mp,
+               "spectrum_im": spec.imag, "spectrum_re": spec.real})
 
 
 def gen_rms_average():
@@ -367,6 +483,51 @@ def gen_rms_average():
                "sigma_db": np.std(meas, axis=0, ddof=0)})
 
 
+def gen_rms_average_weighted():
+    """Weighted power/RMS average and weighted sigma(f) vs numpy (Tier 2).
+
+    The de-weighting shape LowSnrSoft produces: one position fully de-weighted
+    (0.25) and one half-weighted (0.5). REUSES gen_rms_average's construction
+    verbatim -- same seed 50, same five pre-aligned curves -- and that reuse is
+    the point, not laziness: the Rust asserts that equal weights reproduce the
+    UNWEIGHTED fixture bit for bit, which is only a claim about the weighting if
+    both fixtures grade the same measurements. A fresh seed here would compare
+    two different data sets and pin nothing.
+
+    THE WEIGHTED-SIGMA CONVENTION HAS NO NUMPY DELEGATE. np.average takes
+    weights; np.std does not. So sigma is a STATED FORMULA, and saying so is the
+    honest form of the tier: RELIABILITY weights, ddof = 0, i.e.
+
+        mean_w = sum(w_i x_i) / sum(w_i)
+        sigma  = sqrt( sum(w_i (x_i - mean_w)^2) / sum(w_i) )
+
+    NOT frequency weights (which would use sum(w) - 1 in the denominator) and
+    not any of scipy's bias corrections. np.average carries both divisions here,
+    so the expression below is still numpy's arithmetic rather than a transcribed
+    loop -- but the CHOICE of denominator is ours and is pinned by this docstring.
+    """
+    rng = np.random.default_rng(50)
+    freqs = log_grid()
+    n_positions = 5
+    walk = np.cumsum(rng.standard_normal((n_positions, freqs.shape[0])), axis=1) * 0.15
+    meas = -0.9 * np.log2(freqs / freqs[0]) + np.clip(
+        walk - walk.mean(axis=1, keepdims=True), -12.0, 12.0)
+    band = (freqs >= 200.0) & (freqs <= 2000.0)
+    band_means = meas[:, band].mean(axis=1)
+    meas = meas - (band_means - band_means.mean())[:, None]
+    w = np.array([1.0, 0.25, 1.0, 0.5, 1.0])
+    power = 10.0 ** (meas / 10.0)
+    mean_w = np.average(meas, axis=0, weights=w)
+    save_case("fr", "rms_average_weighted",
+              {"axis_order": "position_bin", "band_hz": [200.0, 2000.0], "ddof": 0,
+               "n_positions": n_positions, "ppo": 96,
+               "weights_kind": "reliability_ddof0"},
+              {"freqs": freqs, "measurements": meas,
+               "rms_db": 10.0 * np.log10(np.average(power, axis=0, weights=w)),
+               "sigma_db": np.sqrt(np.average((meas - mean_w) ** 2, axis=0, weights=w)),
+               "weights": w})
+
+
 def gen_schroeder():
     """Schroeder backward integration vs a numpy reverse cumsum (Tier 2).
 
@@ -387,6 +548,46 @@ def gen_schroeder():
     energy = np.cumsum(ir[::-1] ** 2)[::-1]
     save_case("room", "schroeder_decay", {"n": n, "sample_rate": SR, "t60_s": t60_s},
               {"decay_db": 10.0 * np.log10(energy / energy[0]), "ir": ir})
+
+
+def gen_sosfilt_offline():
+    """peq::sosfilt vs scipy.signal.sosfilt, zero initial state (Tier 2).
+
+    THE SOS ARRAY IS HARDCODED AS PLAIN NUMBERS, and that is the whole design of
+    this case. The function under test takes an EXPLICITLY SUPPLIED sos array and
+    no `self`, exactly as scipy's does, so a fixture can actually reach it. Its
+    caller ParametricEQ::apply_offline derives its sections from
+    realized_sos(rate_hz) instead, so an arbitrary array could never be fed
+    through THAT door and a fixture hung there would have graded nothing.
+
+    Writing the rows as literals also keeps the provenance honest: importing
+    paraeq's biquad designers to build them would make this case a transcription
+    of our own coefficient math wearing a scipy label. What scipy is the
+    authority on here is the FILTERING -- cascaded direct-form-II-transposed,
+    zero initial state (zi=None) -- and nothing else. The rows happen to be a
+    peaking + low-shelf + high-shelf cascade at 48 kHz; all three are stable
+    (|a2| < 1 and |a1| < a2 + 1), which matters because an unstable row would
+    make the reference diverge rather than grade anything.
+
+    a0 is 1.0 in every row. scipy's sosfilt IGNORES column 3 and assumes it is
+    already normalized, so a row with a0 != 1 would silently mean something
+    different to scipy than to a reader; ours are pre-normalized the same way
+    biquad.rs emits them.
+    """
+    rng = np.random.default_rng(55)
+    sos = np.array([
+        [1.003828061497939, -1.9921367462290207, 0.9884793705421085,
+         1.0, -1.9921367462290207, 0.9923074320400475],
+        [0.9946744428395408, -1.9483203709749175, 0.9544749339210261,
+         1.0, -1.9480779310546488, 0.9493918166808356],
+        [1.2973147213531064, -1.4171921755757653, 0.5980851799190852,
+         1.0, -0.9334639352461903, 0.41167166094261687],
+    ])
+    x = rng.standard_normal(4096)
+    save_case("peq", "sosfilt_offline",
+              {"n_samples": int(x.size), "n_sections": int(sos.shape[0]),
+               "sample_rate": SR, "zi": "none"},
+              {"sos": sos, "x": x, "y": sosfilt(sos, x)})
 
 
 def gen_windows():
@@ -665,10 +866,15 @@ def main():
     gen_iir()
     # Tier 2 -- scipy/numpy-direct, no paraeq import. Their Rust consumers land
     # in stages 3-4; the fixtures come first, which is the point of the tier.
+    gen_complex_spectrum()
+    gen_excess_group_delay()
     gen_gaussian_smoothing()
     gen_logf()
+    gen_min_phase_spectrum()
     gen_rms_average()
+    gen_rms_average_weighted()
     gen_schroeder()
+    gen_sosfilt_offline()
     gen_variable_smooth()
     gen_windows()
     manifest = {
