@@ -11,9 +11,24 @@
 //! therefore not the engine's output path and must never be wired to it: do not
 //! pre-convolve the stimulus with the active correction, which would defeat the
 //! exclusion and corrupt the measurement it protects.
+//!
+//! **[`RenderSink`] is the documented exception to the paragraph above, and it
+//! is an exception rather than a violation.** measurement-safety § The
+//! Load-Bearing Invariant, consequence 4: "Closed-loop verification is the one
+//! exception, and it inverts the reasoning. Measuring the *corrected* output
+//! requires the stimulus to go *through* the engine, which self-exclusion
+//! prevents. The resolution is … **play the verification stimulus from a helper
+//! child process**". That stimulus is rendered by a different process on the
+//! physical output device, is therefore tapped, and is therefore clamped at
+//! both `RealtimeChain` sites — so it is the one stimulus in the product the
+//! engine's safety clamps DO see. Nothing here is pre-convolved: the child
+//! renders the same bytes the baseline played, and the correction arrives from
+//! the engine, live.
 
 use crate::level::SweepLevel;
 use crate::MeasureError;
+use std::path::Path;
+use std::time::Duration;
 
 /// Effective geometry of one stream. Reported per-stream rather than assumed
 /// shared: a UMIK-1 runs at its own fixed rate on its own crystal against an
@@ -120,4 +135,186 @@ pub trait VolumeControl: Send {
     fn volume(&self) -> Result<f64, MeasureError>;
 
     fn set_volume(&mut self, scalar: f64) -> Result<(), MeasureError>;
+}
+
+/// Where PRE-LEVELLED raw blocks are rendered, when the MS-2 type interlock
+/// has already been discharged upstream and BYTES, not types, are the contract.
+///
+/// # Why this is not `StimulusSink`, and why that is not a loophole
+///
+/// [`StimulusSink::emit`] takes a [`SweepLevel`] and no other level type, and
+/// `tests/ui/` proves a bare `f64` cannot reach it. That interlock **cannot
+/// cross a process boundary**: a child receives a file, not a type. Rather than
+/// weaken `SweepLevel` with a second constructor — which
+/// `tests/ui/sweep_level_has_no_second_constructor.rs` exists to forbid — this
+/// trait states the honest thing: it has NO level parameter at all, because on
+/// this side of the boundary there is nothing that could disagree with the WAV.
+///
+/// The replacement interlock, all four parts required:
+///
+/// 1. **The WAV *is* the level.** The helper binary has no `--level` flag and
+///    never will; there is nothing to pass and nothing to mis-pass.
+/// 2. **The child re-checks before opening a device**, against
+///    [`ABSOLUTE_MAX_DBFS_RMS`](crate::level::ABSOLUTE_MAX_DBFS_RMS), as a
+///    max-over-windows bound rather than a whole-file RMS (which padding
+///    defeats), plus `peak > 1.0`, plus its own MS-4 guard.
+/// 3. **The parent proves the bytes** the child played are the bytes it
+///    assembled.
+/// 4. **A `RenderSink` can never stand in for a `StimulusSink`.**
+///    [`SessionSeam`](crate::session::SessionSeam) has no `RenderSink` slot,
+///    and `tests/ui/render_sink_cannot_be_passed_where_a_stimulus_sink_is_required.rs`
+///    pins it.
+///
+/// Contract:
+///
+/// - `write` is PACED by the hardware, exactly as [`StimulusSink::emit`] is and
+///   for exactly the same MS-14 reason: it must not return until the device is
+///   within about one block of caught up, so the caller's poll-per-block abort
+///   cadence is real rather than fictional.
+/// - `write` applies **NO gain of its own**. The block arrives already at
+///   level; multiplying here would double-apply it.
+/// - `ramp_out` ARMS the abort: the NEXT block written is the 5 ms raised
+///   cosine, it is the last audio the sink accepts, and everything after it is
+///   silence. It is never a hard stop — "A hard stop is itself a full-scale
+///   click" — and never a re-render of the stimulus. The envelope itself is
+///   [`abort_envelope`](crate::ramp::abort_envelope), so the in-process abort
+///   and the cross-process abort are one shape with one test.
+/// - `stop` is idempotent and must not click: it drops still-queued audio
+///   rather than flushing it at level. By the time a caller reaches it the
+///   ramp has already played, so there is nothing left at level to drop.
+/// - Neither `ramp_out` nor `stop` returns a `Result`. Both run on the teardown
+///   ladder, on every exit path including panic, and a rung that could fail
+///   into a `?` is a rung that can abort the ladder before the render device is
+///   destroyed. Failures are the implementation's to log and collect.
+pub trait RenderSink: Send {
+    fn format(&self) -> StreamFormat;
+
+    fn ramp_out(&mut self);
+
+    fn stop(&mut self);
+
+    fn write(&mut self, block: &[f32]) -> Result<(), MeasureError>;
+}
+
+/// Spawns and owns the verification helper child process.
+///
+/// Declared here and implemented by the shell for the same reason
+/// [`StimulusSink`] is: this crate owns the POLICY (which rungs, in what order,
+/// with what deadlines) and must stay testable with no process at all. The
+/// implementation owns the mechanism (path resolution, spawn, signals, reap).
+///
+/// **The trait cannot be handed a level or a stimulus.** The WAV is the level,
+/// so `spawn` takes a path and nothing that could disagree with it — the same
+/// structural interlock [`RenderSink`] carries, on the parent's side of the
+/// boundary.
+pub trait StimulusHelper: Send {
+    /// Spawn the child on `wav_path` with `device_uid` and `routing`, and
+    /// return it with stdin/stdout already wired.
+    ///
+    /// The child opens its device and emits `ready` BEFORE any audio, so a
+    /// spawn that returns `Ok` has not yet played a sample.
+    fn spawn(
+        &mut self,
+        wav_path: &Path,
+        device_uid: &str,
+        routing: HelperRouting,
+    ) -> Result<Box<dyn HelperProcess>, MeasureError>;
+}
+
+/// One live helper.
+///
+/// **EVERY method is safe to call on an already-dead child.** The teardown
+/// ladder runs all five rungs on every exit path including panic, and a rung
+/// that panicked on a dead child would abort the ladder before the render
+/// device is destroyed — which is the exact failure the ladder exists to
+/// prevent.
+pub trait HelperProcess: Send {
+    /// The child's OS process id.
+    ///
+    /// Used ONLY to build the render aggregate's expected UID for the
+    /// device-gone assertion at the end of teardown. Never used to signal —
+    /// that is [`request_abort`](Self::request_abort),
+    /// [`request_terminate`](Self::request_terminate) and [`kill`](Self::kill),
+    /// so the signalling mechanism has one home.
+    fn pid(&self) -> u32;
+
+    /// Teardown rung 1: write `abort\n` to stdin.
+    ///
+    /// The POLITE rung — the child runs the shared 5 ms raised cosine rather
+    /// than stopping. "A hard stop is itself a full-scale click."
+    fn request_abort(&mut self) -> Result<(), MeasureError>;
+
+    /// Teardown rung 1b: SIGTERM.
+    ///
+    /// A SECOND ramp request, not a stop — the child's signal handler arms the
+    /// SAME abort flag `abort\n` does, so a child that missed the stdin write
+    /// still fades. MUST NOT be SIGKILL.
+    fn request_terminate(&mut self) -> Result<(), MeasureError>;
+
+    /// Teardown rung 1c: SIGKILL.
+    ///
+    /// LAST, and only after both deadlines. It bypasses `Drop`, so the child's
+    /// render-aggregate RAII does not run and the render device survives —
+    /// which is why the next rung asserts the device is gone and this one is
+    /// reported rather than being silent.
+    fn kill(&mut self) -> Result<(), MeasureError>;
+
+    /// Teardown rung 1d: wait for the child to exit and reap it.
+    ///
+    /// Idempotent: a second reap returns the cached status rather than blocking
+    /// forever on an already-reaped pid.
+    fn reap(&mut self) -> Result<HelperExit, MeasureError>;
+
+    /// Write one protocol line to stdin (`play\n`).
+    ///
+    /// Separate from [`request_abort`](Self::request_abort) so the abort path
+    /// cannot be reached by a typo in a string.
+    fn send_play(&mut self) -> Result<(), MeasureError>;
+
+    /// Read one line from stdout, or `None` on EOF, with a deadline.
+    ///
+    /// The parent never blocks forever on a wedged child: every read that can
+    /// hang carries the deadline of the gate that made it.
+    fn read_line(&mut self, deadline: Duration) -> Result<Option<String>, MeasureError>;
+}
+
+/// The child's routing argument.
+///
+/// A THIRD spelling of the same idea would be wrong, so this is a plain mirror
+/// of the capture-side routing and of `paraeq_coreaudio::StimulusRouting`,
+/// declared here because this crate may name neither crate's type.
+///
+/// Routing is **provenance, not level**: which channel carries the mono
+/// stimulus, never how loud it is, so the MS-2 interlock is untouched. It
+/// matters because "left and right are separate measurements, so playing to
+/// both at once measures their sum and nothing useful".
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HelperRouting {
+    /// Every output channel.
+    Both,
+    /// One channel index only; every other channel stays silent.
+    Only(u32),
+}
+
+impl HelperRouting {
+    /// The `--channel` argument value this routing spells.
+    ///
+    /// ONE mapping, here, so the parent's enum and the child's CLI cannot
+    /// disagree about what `Only(n)` means. The implementation that spawns the
+    /// child calls this instead of formatting its own string.
+    pub fn as_channel_arg(self) -> String {
+        match self {
+            HelperRouting::Both => "both".to_owned(),
+            HelperRouting::Only(ch) => ch.to_string(),
+        }
+    }
+}
+
+/// How the child ended. `signalled` distinguishes "we had to SIGKILL it" from
+/// "it exited on its own", which is the difference between a clean abort and a
+/// possibly-leaked render device.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HelperExit {
+    pub code: Option<i32>,
+    pub signalled: bool,
 }

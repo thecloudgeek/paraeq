@@ -1,0 +1,45 @@
+[package]
+name = "paraeq-stimulus"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+# The verification helper child process. measurement-suite's architecture
+# section is explicit about the shape: "one [[bin]]; may depend on
+# paraeq-coreaudio, must not depend on paraeq-measure, paraeq-decide or Tauri",
+# re-pinned as an owner decision. That sentence binds a MANIFEST, and this
+# manifest honours it to the letter: neither forbidden crate appears below, in
+# [dependencies] or in [dev-dependencies] — there is no [dev-dependencies]
+# section at all, because the tests need only this crate's own library target
+# and paraeq-coreaudio, which a normal dependency already gives them.
+#
+# Everything this crate needs from paraeq-measure — the RenderSink trait, the
+# StreamFormat and MeasureError types, the ABSOLUTE_MAX_DBFS_RMS ceiling and the
+# abort-envelope pair — arrives through paraeq-coreaudio's own re-export
+# surface, so from here they are paraeq-coreaudio items. A missing re-export is
+# a build error rather than a silent re-addition of the dependency.
+#
+# `libc` is the SIGTERM handler's mechanism: std has no way for a process to
+# install a signal handler, and without one SIGTERM's default disposition
+# terminates without unwinding, so the render aggregate's Drop never runs and a
+# private aggregate is left wrapping the user's output device. It is already a
+# workspace dependency and already paraeq-coreaudio's, so nothing new enters the
+# build graph, and it is none of the three names the rule forbids.
+
+# ONE binary target. Explicit rather than auto-discovered so the count is
+# greppable: CI asserts exactly one `[[bin]]` section here. The crate also has
+# a library target (src/lib.rs) — a library is not a second binary, the crate
+# still produces exactly one executable, and without it nothing under tests/
+# would compile, because an integration test is its own crate and links the
+# package's LIBRARY.
+[[bin]]
+name = "paraeq-stimulus"
+path = "src/main.rs"
+
+[dependencies]
+hound = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
+paraeq-coreaudio = { path = "../paraeq-coreaudio" }
+serde = { workspace = true }
+serde_json = { workspace = true }

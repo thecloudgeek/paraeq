@@ -2690,6 +2690,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "paraeq-stimulus"
+version = "0.1.0"
+dependencies = [
+ "hound",
+ "libc",
+ "log",
+ "paraeq-coreaudio",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

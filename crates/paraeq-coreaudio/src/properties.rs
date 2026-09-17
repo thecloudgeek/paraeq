@@ -12,9 +12,9 @@ use objc2_core_audio::{
     kAudioHardwarePropertyDefaultInputDevice, kAudioHardwarePropertyDefaultOutputDevice,
     kAudioHardwarePropertyTranslatePIDToProcessObject, kAudioHardwarePropertyTranslateUIDToDevice,
     kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal,
-    kAudioObjectPropertyScopeInput, kAudioObjectSystemObject, kAudioTapPropertyFormat,
-    AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectID,
-    AudioObjectPropertyAddress, AudioObjectSetPropertyData,
+    kAudioObjectPropertyScopeInput, kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject,
+    kAudioTapPropertyFormat, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize,
+    AudioObjectID, AudioObjectPropertyAddress, AudioObjectSetPropertyData,
 };
 use objc2_core_audio_types::{AudioBuffer, AudioBufferList, AudioStreamBasicDescription};
 use objc2_core_foundation::{CFRetained, CFString};
@@ -166,9 +166,40 @@ pub fn translate_uid_to_device(uid: &str) -> Result<AudioObjectID, CaError> {
 /// (kAudioDevicePropertyStreamConfiguration, input scope). 0 means the device
 /// captures nothing — it is not usable as a mic.
 pub fn input_stream_channel_count(dev: AudioObjectID) -> Result<u32, CaError> {
+    stream_channel_count(
+        dev,
+        kAudioObjectPropertyScopeInput,
+        "get input stream configuration",
+    )
+}
+
+/// Total output channels across the device's output streams
+/// (kAudioDevicePropertyStreamConfiguration, output scope). 0 means the device
+/// renders nothing — refuse rather than open an IOProc that writes into
+/// nowhere.
+///
+/// The twin of [`input_stream_channel_count`], and deliberately not a
+/// convenience: the verification helper echoes this count in its `ready` line
+/// and refuses a `--channel N` at or above it BEFORE it plays a sample. Reading
+/// the channel count off the first callback instead would arrive after `ready`
+/// has been emitted and after the parent has committed, i.e. after the decision
+/// it is supposed to inform.
+pub fn output_channel_count(dev: AudioObjectID) -> Result<u32, CaError> {
+    stream_channel_count(
+        dev,
+        kAudioObjectPropertyScopeOutput,
+        "get output stream configuration",
+    )
+}
+
+/// The shared walk of `kAudioDevicePropertyStreamConfiguration`'s
+/// `AudioBufferList`. The SELECTOR is the part that does not change between the
+/// two scopes, which is why one body serves both and why the output twin
+/// carries no new HAL risk.
+fn stream_channel_count(dev: AudioObjectID, scope: u32, ctx: &str) -> Result<u32, CaError> {
     let address = AudioObjectPropertyAddress {
         mSelector: kAudioDevicePropertyStreamConfiguration,
-        mScope: kAudioObjectPropertyScopeInput,
+        mScope: scope,
         mElement: kAudioObjectPropertyElementMain,
     };
     let mut size: u32 = 0;
@@ -182,7 +213,7 @@ pub fn input_stream_channel_count(dev: AudioObjectID) -> Result<u32, CaError> {
             NonNull::from(&mut size),
         )
     };
-    check(status, "get input stream configuration size")?;
+    check(status, &format!("{ctx} size"))?;
     if (size as usize) < size_of::<AudioBufferList>() {
         return Ok(0);
     }
@@ -202,7 +233,7 @@ pub fn input_stream_channel_count(dev: AudioObjectID) -> Result<u32, CaError> {
             NonNull::new(backing.as_mut_ptr().cast::<c_void>()).expect("vec ptr"),
         )
     };
-    check(status, "get input stream configuration")?;
+    check(status, ctx)?;
     let list = backing.as_ptr().cast::<AudioBufferList>();
     // SAFETY: the HAL wrote a valid AudioBufferList into `backing`.
     let declared = unsafe { (*list).mNumberBuffers } as usize;
