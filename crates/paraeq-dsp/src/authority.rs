@@ -7,6 +7,13 @@
 //! (`tests/test_authority.rs`) is the closed form of every composition step,
 //! the two worked `max_q_for_boost` values the spec states, and the
 //! monotonicity/endpoint invariants of the excursion interpolation.
+//! The same tier and the same missing oracle cover the path additions:
+//! [`COUPLER_EXCURSION_DB`]'s endpoints (the room vector's shape up to
+//! [`COUPLER_CUTOFF_HZ`], exactly zero above it), the [`AuthorityPolicy::q_ceiling`]
+//! composition in [`max_q_for_boost_capped`] ([`COUPLER_Q_CEILING`] flat at 5.0;
+//! [`ROOM_Q_CEILING`] log-linear from 10.0 at 200 Hz to 3.0 at 10 kHz), and
+//! [`authority_band_mask`]. Each is a policy constant or one composition step,
+//! closed form, and adds no fixture case.
 //! Spec: docs/specs/2026-07-15-room-dsp-design.md, "`authority.rs` — new".
 //!
 //! # Why authority is confidence-derived, not threshold-derived
@@ -44,6 +51,46 @@ use crate::DspError;
 /// Log-f interpolated between breakpoints by [`excursion_db`].
 pub const DEFAULT_EXCURSION_DB: [(f64, f64); 4] =
     [(20.0, 10.0), (150.0, 10.0), (500.0, 2.0), (20000.0, 2.0)];
+
+/// Where the coupler path's excursion envelope stops. Above this frequency the
+/// coupler is allowed no correction of either sign.
+pub const COUPLER_CUTOFF_HZ: f64 = 10_000.0;
+
+/// The coupler path's excursion envelope: [`DEFAULT_EXCURSION_DB`]'s shape up
+/// to [`COUPLER_CUTOFF_HZ`], and **zero above it**.
+///
+/// `decision-engine-design.md` § Authority 1, verbatim: "On the coupler path,
+/// `A_base(f) = 0` above 10 kHz."
+///
+/// **Why the fifth breakpoint looks like that.** The spec states a step, and a
+/// step is what this is. [`validate_policy`] requires breakpoints strictly
+/// increasing in frequency — two points at the same frequency would be a
+/// second, unvalidated way to write a curve — so the step is spelled as a
+/// [`COUPLER_CUTOFF_STEP`]-wide ramp instead. The readable alternative, a taper
+/// from 2 dB at 10 kHz to 0 dB at 20 kHz, is wrong in the direction that
+/// matters: it licenses correction across the octave the spec licenses none in.
+pub const COUPLER_EXCURSION_DB: [(f64, f64); 5] = [
+    (20.0, 10.0),
+    (150.0, 10.0),
+    (500.0, 2.0),
+    (COUPLER_CUTOFF_HZ, 2.0),
+    (COUPLER_CUTOFF_HZ * (1.0 + COUPLER_CUTOFF_STEP), 0.0),
+];
+
+/// The width of [`COUPLER_EXCURSION_DB`]'s step, as a fraction of
+/// [`COUPLER_CUTOFF_HZ`]. One part per billion, which is the only number in
+/// this file chosen against two numerical bounds rather than a spec sentence:
+///
+/// - **Narrow enough to be a step.** The standard analysis grid is 96 points
+///   per octave, so its bins are ~72 Hz apart at 10 kHz. A 1e-5 Hz ramp cannot
+///   contain one, and no curve this module builds can sample partway down it.
+/// - **Wide enough to survive the logarithm.** [`excursion_db`] interpolates in
+///   `ln f` and divides by `ln(f_hi) − ln(f_lo)`. At 10 kHz that difference
+///   rounds to exactly zero below ~9e-16 relative, and the division then
+///   returns NaN — a NaN ceiling compares false against every gain, i.e. reads
+///   as "no limit" rather than "no authority". One part per billion clears
+///   that floor by six orders of magnitude.
+const COUPLER_CUTOFF_STEP: f64 = 1e-9;
 
 /// σ (dB) at or below which authority is FULL.
 ///
@@ -102,6 +149,120 @@ pub const BOOST_Q_CONSTANT: f64 = 0.227;
 /// restriction on boosts, never a licence to exceed this.
 pub const Q_CLAMP: std::ops::RangeInclusive<f64> = 0.5..=20.0;
 
+/// The path ceiling on boost Q. REW's gain-dependent cap
+/// (`Q_max = 0.227·f₀/A`) is applied unconditionally on top of this and is
+/// not a policy choice — `decide()` takes the min of the two.
+///
+/// Deliberately NOT `PartialOrd`. The spec gives `q_cap` the domain
+/// `Range 1.0..=20.0` "on the ceiling" — a range over a scalar, not over this
+/// enum — so a `Domain<QCapPolicy>::Range` cannot answer `contains` for the
+/// room's own `LogLinear` value. An ordering here would answer it `false`
+/// rather than leaving the ambiguity visible. OPEN for the owner: either
+/// `q_cap`'s domain is `Choice` over the two path policies, or `QCapPolicy`
+/// splits into a decided ceiling scalar plus a profile-owned shape.
+///
+/// **Moved here from `paraeq_decide::decisions` (Stage 6), and `paraeq-decide`
+/// re-exports it** — the move Stage 5 already made for [`AuthorityCurve`], for
+/// the same reason: `decision-engine-design.md` § Authority says `decide()`
+/// "must not re-specify different numbers", and a policy owned by the crate
+/// that composes it cannot drift from the crate that consumes it. The variants,
+/// their fields and their externally-tagged wire form are unchanged, so
+/// `{"Ceiling":5.0}` / `{"LogLinear":{…}}` still read and write identically and
+/// no fixture or persisted profile moves with the type. The "min of the two" the
+/// first paragraph names is [`max_q_for_boost_capped`]. The owner's `Choice`
+/// option above is the one taken by
+/// `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md` § D-C, applied on
+/// the `paraeq-decide` side where the domain lives.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub enum QCapPolicy {
+    /// A flat ceiling (coupler: 5.0). The drawer's `Range 1.0..=20.0` writes
+    /// this variant.
+    Ceiling(f64),
+    /// Log-linear in frequency between two `(hz, q)` breakpoints. The room
+    /// path: 10.0 @ 200 Hz → 3.0 @ 10 kHz.
+    LogLinear { hi: (f64, f64), lo: (f64, f64) },
+}
+
+impl QCapPolicy {
+    /// The path ceiling on boost Q at `f0`, interpolated in `log f` between the
+    /// breakpoints and clamped to the end values outside them — the same
+    /// interpolation law [`excursion_db`] and [`AuthorityCurve::at`] use.
+    ///
+    /// Linear in `log f`, not in `f`: a linear-`f` ramp hits both breakpoints
+    /// and is wrong everywhere between them (at the geometric midpoint of the
+    /// room ceiling it answers 9.13 where the spec's ramp answers 6.5, which is
+    /// 2.6 Q of extra ringing licensed by an implementation detail).
+    pub fn ceiling_at(&self, f0: f64) -> f64 {
+        if !self.is_well_formed() {
+            // [`validate_policy`] refuses a malformed ceiling, so this is a
+            // direct-caller guard. Degrading to the global clamp says out loud
+            // what a NaN would do silently: `f64::min` discards a NaN operand,
+            // so the path would stop restricting anything either way.
+            return *Q_CLAMP.end();
+        }
+        match *self {
+            Self::Ceiling(q) => q,
+            Self::LogLinear {
+                hi: (f_hi, q_hi),
+                lo: (f_lo, q_lo),
+            } => {
+                if !f0.is_finite() {
+                    // A frequency that cannot be placed gets the TIGHTEST
+                    // ceiling this policy names. The permissive NaN guard in
+                    // [`AuthorityCurve::locate`] is deliberately the other way
+                    // round; the fail-safe direction for a Q ceiling is down,
+                    // because it is a ringing guard and the loose end of the
+                    // room ramp is over three times the tight end.
+                    return q_lo.min(q_hi);
+                }
+                if f0 <= f_lo {
+                    return q_lo;
+                }
+                if f0 >= f_hi {
+                    return q_hi;
+                }
+                let t = (f0.ln() - f_lo.ln()) / (f_hi.ln() - f_lo.ln());
+                q_lo + t * (q_hi - q_lo)
+            }
+        }
+    }
+
+    /// Positive requirements throughout, so a NaN refuses rather than passing:
+    /// a non-finite ceiling compares false against every Q, which reads as "no
+    /// limit" rather than "no authority".
+    fn is_well_formed(&self) -> bool {
+        match *self {
+            Self::Ceiling(q) => q.is_finite() && q > 0.0,
+            Self::LogLinear {
+                hi: (f_hi, q_hi),
+                lo: (f_lo, q_lo),
+            } => {
+                f_lo.is_finite()
+                    && f_lo > 0.0
+                    && f_hi.is_finite()
+                    && f_hi > f_lo
+                    && q_lo.is_finite()
+                    && q_lo > 0.0
+                    && q_hi.is_finite()
+                    && q_hi > 0.0
+            }
+        }
+    }
+}
+
+/// The coupler path's Q ceiling: a flat 5.0.
+/// `decision-engine-design.md` § Decision table, `q_cap`: "the path ceiling:
+/// 5.0 coupler; room `10.0 @ 200 Hz → 3.0 @ 10 kHz` log-linear. Take the min."
+pub const COUPLER_Q_CEILING: QCapPolicy = QCapPolicy::Ceiling(5.0);
+
+/// The room path's Q ceiling: 10.0 at 200 Hz falling log-linearly to 3.0 at
+/// 10 kHz. See [`COUPLER_Q_CEILING`] for the spec sentence both come from.
+pub const ROOM_Q_CEILING: QCapPolicy = QCapPolicy::LogLinear {
+    hi: (10_000.0, 3.0),
+    lo: (200.0, 10.0),
+};
+
 /// The policy inputs to [`build_authority`]. Every field is a named constant
 /// with a documented provenance, so an owner ruling changes data, not code.
 #[derive(Clone, Debug, PartialEq)]
@@ -120,9 +281,17 @@ pub struct AuthorityPolicy {
     /// Never fill a dip narrower than this. Default
     /// [`DEFAULT_MIN_DIP_WIDTH_OCT`].
     pub min_dip_width_oct: f64,
+    /// The path ceiling on boost Q, composed with the gain-dependent cap by
+    /// [`max_q_for_boost_capped`]. Default [`ROOM_Q_CEILING`].
+    ///
+    /// Last, because the fields above are in the spec's composition order and
+    /// the Q ceiling is the last step of it.
+    pub q_ceiling: QCapPolicy,
 }
 
 impl Default for AuthorityPolicy {
+    /// The room path. [`AuthorityPolicy::room`] says so by name; this impl
+    /// exists because the struct-update syntax in every caller needs it.
     fn default() -> Self {
         Self {
             excursion: DEFAULT_EXCURSION_DB.to_vec(),
@@ -130,7 +299,31 @@ impl Default for AuthorityPolicy {
             sigma_none_db: SIGMA_NONE_DB,
             boost_ratio: DEFAULT_BOOST_RATIO,
             min_dip_width_oct: DEFAULT_MIN_DIP_WIDTH_OCT,
+            q_ceiling: ROOM_Q_CEILING,
         }
+    }
+}
+
+impl AuthorityPolicy {
+    /// The coupler path: [`COUPLER_EXCURSION_DB`] (zero above
+    /// [`COUPLER_CUTOFF_HZ`]) and [`COUPLER_Q_CEILING`].
+    ///
+    /// Named constructors rather than a `for_path(CouplingPath)`: `CouplingPath`
+    /// lives in `paraeq-decide`, and this crate may not depend on it. The two
+    /// paths differ in exactly these two fields, so `decide()` picks a
+    /// constructor instead of re-specifying numbers the spec says it must not.
+    pub fn coupler() -> Self {
+        Self {
+            excursion: COUPLER_EXCURSION_DB.to_vec(),
+            q_ceiling: COUPLER_Q_CEILING,
+            ..Self::default()
+        }
+    }
+
+    /// The room path: [`DEFAULT_EXCURSION_DB`] and [`ROOM_Q_CEILING`]. Equal to
+    /// [`AuthorityPolicy::default`]; see [`AuthorityPolicy::coupler`].
+    pub fn room() -> Self {
+        Self::default()
     }
 }
 
@@ -445,6 +638,47 @@ pub fn build_authority(
     })
 }
 
+/// Which bins of `grid` are inside **the authority band**, the one definition
+/// of that phrase.
+///
+/// `decision-engine-design.md` § Refusal table, verbatim: the band is
+/// `correction_range ∩ { f : authority.at(f).max_boost_db > 0 || max_cut_db > 0 }`,
+/// taken on the analysis grid. Both edges of `correction_range` are inclusive,
+/// matching the `Range` domains the spec's decision table gives it.
+///
+/// **This function exists so the phrase has one meaning.** Two consumers need
+/// it — `autofit`'s residual-RMS stopping criterion and `decide()`'s
+/// verification gate — and two spec sections use the phrase without defining
+/// it (`decision-engine-design.md` § Decision table, `max_filters`, and the
+/// refusal row above). A second open-coded filter would be a second answer to
+/// "did the correction land", which is the one question the product refuses on.
+/// `tests/test_authority.rs` enforces the single copy by scanning the
+/// workspace's library sources for the predicate.
+///
+/// Returns all-`false` for a `correction_range` that is non-finite or inverted,
+/// and `false` for any non-finite grid frequency: a band that cannot be placed
+/// grades nothing, rather than grading everything. There is no `Result` because
+/// the callers' alternative to an empty band is a refusal they already emit.
+pub fn authority_band_mask(
+    grid: &[f64],
+    curve: &AuthorityCurve,
+    correction_range: (f64, f64),
+) -> Vec<bool> {
+    let (low_hz, high_hz) = correction_range;
+    if !(low_hz.is_finite() && high_hz.is_finite() && low_hz <= high_hz) {
+        return vec![false; grid.len()];
+    }
+    grid.iter()
+        .map(|&f| {
+            if !f.is_finite() || f < low_hz || f > high_hz {
+                return false;
+            }
+            let at = curve.at(f);
+            at.max_boost_db > 0.0 || at.max_cut_db > 0.0
+        })
+        .collect()
+}
+
 /// Log-f linear interpolation of the excursion breakpoints, clamped to the end
 /// values outside their range.
 ///
@@ -491,6 +725,30 @@ pub fn excursion_db(breakpoints: &[(f64, f64)], freq_hz: f64) -> f64 {
 pub fn max_q_for_boost(f0: f64, gain_db: f64) -> f64 {
     let a = 10f64.powf(gain_db / 40.0);
     BOOST_Q_CONSTANT * f0 / a
+}
+
+/// The whole Q ceiling on a boost: the gain-dependent [`max_q_for_boost`] cap,
+/// the path ceiling, and the global [`Q_CLAMP`] — the min of the three.
+///
+/// `decision-engine-design.md` § Decision table, `q_cap`: "Boosts only:
+/// `Q_max = 0.227·f₀/A`, `A = 10^(G/40)`. **And** the path ceiling: 5.0 coupler;
+/// room `10.0 @ 200 Hz → 3.0 @ 10 kHz` log-linear. Take the min." Until this
+/// function existed the path ceiling was applied nowhere, and the only
+/// alternative was `decide()` re-specifying numbers the same spec forbids it to
+/// re-specify.
+///
+/// **Additive, and [`clamp_band`] is deliberately not rewritten to call it.**
+/// `clamp_band` is the Stage-5 per-band clamp: it is handed a curve, not a
+/// policy, so it has no path to apply and composes the other two terms exactly
+/// as this function does. Routing it through here would change the Q of every
+/// band the shipped path already clamps — a behaviour change dressed as a
+/// refactor. `tests/test_authority.rs` pins the two compositions equal wherever
+/// the path ceiling is not the binding term, so they cannot drift apart while
+/// waiting for the caller that passes the policy down.
+pub fn max_q_for_boost_capped(f0: f64, gain_db: f64, q_ceiling: &QCapPolicy) -> f64 {
+    max_q_for_boost(f0, gain_db)
+        .min(q_ceiling.ceiling_at(f0))
+        .clamp(*Q_CLAMP.start(), *Q_CLAMP.end())
 }
 
 /// The half-amplitude width in octaves of a resonance of quality `q`.
@@ -654,6 +912,13 @@ fn validate_policy(policy: &AuthorityPolicy) -> Result<(), DspError> {
         return Err(DspError::InvalidInput(format!(
             "AuthorityPolicy: min_dip_width_oct must be finite and >= 0, got {}",
             policy.min_dip_width_oct
+        )));
+    }
+    if !policy.q_ceiling.is_well_formed() {
+        return Err(DspError::InvalidInput(format!(
+            "AuthorityPolicy: q_ceiling needs finite positive Q and, for \
+             LogLinear, strictly increasing finite positive breakpoints, got {:?}",
+            policy.q_ceiling
         )));
     }
     Ok(())
