@@ -1,0 +1,12 @@
+error[E0277]: the trait bound `Renderer: StimulusSink` is not satisfied
+  --> tests/ui/render_sink_cannot_be_passed_where_a_stimulus_sink_is_required.rs:41:30
+   |
+41 |     let _ = stimulus.emit_to(&mut renderer);
+   |                              ^^^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `StimulusSink` is not implemented for `Renderer`
+  --> tests/ui/render_sink_cannot_be_passed_where_a_stimulus_sink_is_required.rs:16:1
+   |
+16 | struct Renderer;
+   | ^^^^^^^^^^^^^^^
+   = note: required for the cast from `&mut Renderer` to `&mut dyn StimulusSink`

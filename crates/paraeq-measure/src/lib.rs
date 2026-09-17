@@ -59,8 +59,10 @@
 pub mod cal;
 pub mod capture;
 pub mod diagnostic;
+pub mod engine_seam;
 pub mod ladder;
 pub mod level;
+pub mod ramp;
 pub mod seam;
 pub mod session;
 pub mod stimulus;
@@ -71,6 +73,10 @@ pub use cal::{
 };
 pub use capture::{record, CaptureEnd, CaptureMeter, CaptureRun, CLIP_BLOCK_FRACTION};
 pub use diagnostic::{CalSensitivity, MeasurementDiagnostic, MicSensitivity, Refusal, Severity};
+pub use engine_seam::{
+    EngineControl, EngineFacts, EngineStatusKind, GainPin, GainRestore, MeasurementLeaseToken,
+    TapActivity,
+};
 pub use ladder::{
     analyze_magnitude_db, snr_band_hz, LadderError, LevelLadder, NoiseFloor, Remedy, Rung,
     SnrOutcome, MAX_REMEDIES, MAX_RUNG_STEP_DB, NOISE_FLOOR_MAX_DBFS,
@@ -81,7 +87,11 @@ pub use level::{caps_for, LevelError, SweepLevel, TransducerCaps, ABSOLUTE_MAX_D
 /// crate uses it as the key into the caps table and as `SweepLevel::new`'s
 /// second argument.
 pub use paraeq_dsp::targets::TransducerClass;
-pub use seam::{CaptureSource, StimulusSink, StreamFormat, TapStatus, VolumeControl};
+pub use ramp::{abort_envelope, abort_ramp_len};
+pub use seam::{
+    CaptureSource, HelperExit, HelperProcess, HelperRouting, RenderSink, StimulusHelper,
+    StimulusSink, StreamFormat, TapStatus, VolumeControl,
+};
 pub use session::{
     AbortHandle, AbortReason, MeasurementSession, SessionError, SessionEvent, SessionLog,
     SessionPhase, SessionSeam, SolveOutcome, SweepOutcome, ABORT_RAMP_MS, ACK_SPL_TOLERANCE_DB,
