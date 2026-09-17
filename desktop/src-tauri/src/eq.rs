@@ -22,7 +22,7 @@
 //! unit-tested.
 
 use paraeq_dsp::peq::{parse_autoeq, EQBand, ParametricEQ};
-use paraeq_engine::controller::{validate_band_at, CorrectionConfig, EngineState};
+use paraeq_engine::controller::{validate_band_at, CorrectionConfig, EngineCommand, EngineState};
 
 // The per-band limits (`GAIN_LIMIT_DB`, `Q_MAX`, `Q_MIN`) moved to
 // `paraeq_engine::controller` -- one source of truth for every consumer, the
@@ -131,6 +131,45 @@ pub fn resend_decision(
     } else {
         None
     }
+}
+
+/// The forwarder's whole correction reconcile, pure so it can be tested
+/// without a Tauri app handle: given the last-seen rate, the engine snapshot
+/// and the desktop's band set, return the command to send and the rate to
+/// record as `last_rate`.
+///
+/// **It does not gate the band set, and it can never clear one.** The
+/// forwarder used to re-validate every band at the live rate here and send a
+/// whole-set [`EngineCommand::ClearCorrection`] if ANY single band failed.
+/// That is the behaviour D-10 ruled against
+/// (`docs/decisions/2026-09-16-post-merge-and-stage6-calls.md`, and
+/// `crates/paraeq-dsp/DIVERGENCES.md` #18): `build_correction` drops only the
+/// bands that are illegal at the live rate, counts them, and refuses the
+/// whole configuration only when nothing survives. Handing the set over
+/// unconditionally is what lets the engine apply that rule.
+///
+/// It also repairs a worse consequence of the clear. `ClearCorrection` sets
+/// the engine's retained `correction` to `None`, and the publish that
+/// follows therefore reports `correction_rate_mismatch: None` — so BOTH of
+/// [`resend_decision`]'s triggers went permanently false (the flag was
+/// cleared, and `last_rate` was already `Some(..)`). An AirPods 48 → 44.1 →
+/// 48 kHz round trip lost the user's EQ for the rest of the process, with
+/// the UI still drawing the bands the engine no longer held. Nothing
+/// re-sends on a stream or device change; only a band edit or a profile
+/// switch does. Leaving the intent in the engine makes the round trip
+/// self-healing, which is pinned in `paraeq-engine` by
+/// `test_rate_independence.rs::a_refused_peq_installs_itself_at_the_next_legal_rate`.
+///
+/// [`validate_bands`] keeps its job — the indexed, user-facing message on an
+/// EDIT — at the two command call sites. It was never the safety wall here.
+pub fn resend_command(
+    last_rate: Option<f64>,
+    snapshot: &EngineState,
+    bands: &[EQBand],
+) -> Option<(EngineCommand, f64)> {
+    let rate = resend_decision(last_rate, snapshot, !bands.is_empty())?;
+    let config = design_correction(bands, rate)?;
+    Some((EngineCommand::SetCorrection(config), rate))
 }
 
 /// The outcome of a successful AutoEQ file import, returned to the UI so it can
@@ -528,6 +567,66 @@ mod tests {
     fn resend_no_stream_is_none() {
         let snap = snapshot_with_stream(None);
         assert_eq!(resend_decision(Some(48_000.0), &snap, true), None);
+    }
+
+    // ---- resend_command ----
+
+    /// D-10's round trip, and the regression that motivated this function.
+    /// A band above the LIVE Nyquist is handed to the engine unchanged: the
+    /// engine drops that band and keeps the rest (or, when nothing survives,
+    /// refuses and RETAINS the intent so a later legal rate installs it).
+    /// The forwarder used to send a whole-set `ClearCorrection` here, which
+    /// destroyed the retained intent and, since the clear also cleared
+    /// `correction_rate_mismatch`, left both re-send conditions false for
+    /// the rest of the process -- the correction never came back.
+    #[test]
+    fn resend_command_hands_over_a_band_illegal_at_the_live_rate() {
+        // Legal at 48 kHz, above Nyquist at 44.1 kHz.
+        let bands = [peaking(1_000.0, 6.0, 1.0), peaking(23_000.0, -3.0, 1.0)];
+        let snap = snapshot_with_stream(Some(stream_at(44_100.0)));
+        assert!(
+            validate_bands(&bands, 44_100.0).is_err(),
+            "the premise: this set does NOT pass the user-facing check at 44.1 kHz"
+        );
+
+        let (cmd, rate) =
+            resend_command(None, &snap, &bands).expect("the first stream must re-send");
+        assert_eq!(rate, 44_100.0);
+        match cmd {
+            EngineCommand::SetCorrection(CorrectionConfig::Peq {
+                bands: sets,
+                design_rate,
+            }) => {
+                assert_eq!(sets, vec![bands.to_vec()], "every band goes over untouched");
+                assert_eq!(design_rate, 44_100.0);
+            }
+            _ => panic!("the forwarder must never clear the whole set (D-10)"),
+        }
+    }
+
+    /// The other half of the round trip: with the intent still in the
+    /// engine, a snapshot that raises the refusal flag re-sends it rather
+    /// than clearing, whatever the bands look like at that rate.
+    #[test]
+    fn resend_command_on_a_refusal_re_sends_rather_than_clearing() {
+        let bands = [peaking(23_000.0, -3.0, 1.0)];
+        let mut snap = snapshot_with_stream(Some(stream_at(44_100.0)));
+        snap.correction_rate_mismatch = Some(44_100.0);
+        let (cmd, _) = resend_command(Some(44_100.0), &snap, &bands).expect("a refusal re-sends");
+        assert!(matches!(cmd, EngineCommand::SetCorrection(_)));
+    }
+
+    /// It stays a pure pass-through of [`resend_decision`]'s verdict: no
+    /// trigger, no command.
+    #[test]
+    fn resend_command_is_none_when_nothing_triggers() {
+        let bands = [peaking(1_000.0, 3.0, 1.0)];
+        let snap = snapshot_with_stream(Some(stream_at(48_000.0)));
+        assert!(resend_command(Some(48_000.0), &snap, &bands).is_none());
+        assert!(
+            resend_command(None, &snap, &[]).is_none(),
+            "no bands, nothing to send"
+        );
     }
 
     // ---- response ----

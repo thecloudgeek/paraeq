@@ -629,6 +629,74 @@ fn a_refused_correction_replaces_a_live_one_with_flat_pass_through() {
     );
 }
 
+/// The self-heal that makes the desktop's whole-set `ClearCorrection`
+/// unnecessary -- and that its removal now depends on (D-10,
+/// `crates/paraeq-dsp/DIVERGENCES.md` #18). A `Peq` the engine had to refuse
+/// is RETAINED, not discarded, so the next stream geometry that CAN carry it
+/// installs it with no help from the desktop at all.
+///
+/// Nothing pinned the round trip. `a_refused_correction_replaces_a_live_one_...`
+/// pins the refusal, `mismatch_flag_clears_when_a_re_derivable_config_arrives`
+/// pins recovery from a NEW config; neither shows the SAME config coming back
+/// by itself. The desktop's forwarder used to clear on exactly this path,
+/// which destroyed the retained intent, cleared the flag, and left the user's
+/// EQ gone for the rest of the process.
+#[test]
+fn a_refused_peq_installs_itself_at_the_next_legal_rate() {
+    const AMPLITUDE: f32 = 0.1;
+    let backend = MockBackend::new();
+    // First start reports 44.1 kHz; every later start reports 48 kHz.
+    backend.queue_sample_rate(44_100.0);
+    backend.set_reported_sample_rate(48_000.0);
+    let handle = EngineHandle::spawn(backend.clone(), fast_config());
+
+    // 23 kHz is above Nyquist at 44.1 kHz and legal at 48 kHz, and it is the
+    // ONLY band -- so nothing survives and the whole config is refused.
+    let config = peq(vec![peaking(23_000.0, 9.0, 1.0)], 48_000.0);
+    handle.send(EngineCommand::SetCorrection(config.clone()));
+    assert!(
+        wait_until(WAIT, || handle.state().correction_rate_mismatch
+            == Some(44_100.0)),
+        "the refusal was never published at 44.1 kHz"
+    );
+    assert_eq!(
+        handle.state().correction.as_deref(),
+        Some("peq:1-band"),
+        "a refusal must RETAIN the design intent -- there is nothing to recover from otherwise"
+    );
+
+    // The stream moves to a rate the band is legal at. No new SetCorrection.
+    backend.queue_event(BackendEvent::DefaultOutputChanged);
+    assert!(
+        wait_until(WAIT, || handle
+            .state()
+            .stream
+            .as_ref()
+            .is_some_and(|s| s.sample_rate == 48_000.0)),
+        "the session never reached 48 kHz"
+    );
+    assert!(
+        wait_until(WAIT, || handle.state().correction_rate_mismatch.is_none()),
+        "the refusal flag never cleared at a rate the correction is designable at"
+    );
+
+    let input = impulse_block(AMPLITUDE);
+    let expected = reference_response(&config, 48_000.0, AMPLITUDE);
+    let flat = input[0].clone();
+    assert!(
+        max_abs_diff(&expected, &flat) > 1e-3,
+        "the band must be audible, or 'restored' would look like pass-through"
+    );
+    assert!(
+        wait_until(WAIT, || {
+            backend
+                .pump_samples(&input)
+                .is_some_and(|out| max_abs_diff(&out[0], &expected) < 1e-6)
+        }),
+        "the retained correction never became audible at 48 kHz"
+    );
+}
+
 /// `correction_rate_mismatch` and `auto_preamp_db` are SESSION-SCOPED, and
 /// their own docs say so: the flag names the LIVE stream's rate and the
 /// preamp names what the LIVE chain is applying, so with no session both

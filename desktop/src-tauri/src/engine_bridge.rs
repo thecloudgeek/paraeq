@@ -8,12 +8,17 @@
 //!   1. NEVER hold the [`AppShared::data`] lock across an `EngineHandle::send`
 //!      or a Tauri `emit` -- lock, copy what is needed, drop the guard, THEN
 //!      send/emit.
-//!   2. NEVER send bands that were not [`eq::validate_bands`]-validated, so the
-//!      user gets a named reason instead of a silently dropped band. Since
-//!      R1-6 this is feedback, not the safety wall: `paraeq-engine` re-derives
-//!      every band at the LIVE stream rate at install time and drops (or, if
-//!      nothing survives, refuses) anything at or above the new Nyquist, so no
-//!      NaN/Inf coefficient can reach the realtime chain by any route.
+//!   2. NEVER send bands from a USER EDIT that were not
+//!      [`eq::validate_bands`]-validated, so the user gets a named reason
+//!      instead of a silently dropped band. Since R1-6 this is feedback, not
+//!      the safety wall: `paraeq-engine` re-derives every band at the LIVE
+//!      stream rate at install time and drops (or, if nothing survives,
+//!      refuses) anything at or above the new Nyquist, so no NaN/Inf
+//!      coefficient can reach the realtime chain by any route. The
+//!      forwarder's own re-send deliberately does NOT gate on it (D-10) --
+//!      there is no user at the keyboard to read a message, and refusing the
+//!      whole set there removed the entire EQ over one band above the new
+//!      Nyquist.
 
 use crate::eq;
 use crate::settings::{self, Settings};
@@ -156,25 +161,15 @@ pub fn start_forwarder(app: tauri::AppHandle, rx: Receiver<Arc<EngineState>>) {
 
                         // 1. Redesign re-send: the engine refused the config
                         //    it holds, or this is the first stream we have
-                        //    seen. Same shape as before, re-pointed at the
-                        //    engine's own verdict.
+                        //    seen. The set goes over WHOLE -- the engine
+                        //    drops only the bands that are illegal at the
+                        //    live rate (D-10); clearing here used to lose
+                        //    the user's entire EQ, unrecoverably. See
+                        //    `eq::resend_command`.
                         let bands = { shared.data.lock().unwrap().bands.clone() };
-                        let have_bands = !bands.is_empty();
-                        if let Some(rate) = eq::resend_decision(last_rate, &snapshot, have_bands) {
-                            match eq::validate_bands(&bands, rate) {
-                                Ok(()) => {
-                                    if let Some(cfg) = eq::design_correction(&bands, rate) {
-                                        send_cmd(&shared, EngineCommand::SetCorrection(cfg));
-                                    }
-                                }
-                                Err(e) => {
-                                    log::warn!(
-                                        "bands invalid at {rate} Hz: {e}; clearing correction \
-                                         (flat passthrough)"
-                                    );
-                                    send_cmd(&shared, EngineCommand::ClearCorrection);
-                                }
-                            }
+                        if let Some((cmd, rate)) = eq::resend_command(last_rate, &snapshot, &bands)
+                        {
+                            send_cmd(&shared, cmd);
                             last_rate = Some(rate);
                         }
 

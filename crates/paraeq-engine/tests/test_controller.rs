@@ -10,6 +10,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::time::{Duration, Instant};
 
 use common::mock_backend::{Call, MockBackend};
+use paraeq_dsp::peq::{EQBand, FilterType};
 use paraeq_engine::backend::BackendEvent;
 use paraeq_engine::controller::{
     CorrectionConfig, EngineCommand, EngineConfig, EngineHandle, EngineState,
@@ -86,6 +87,24 @@ fn iir_gain(g: f64, channels: usize) -> CorrectionConfig {
         // `test_rate_independence.rs`.
         design_rate: 48_000.0,
         sos_per_channel: vec![vec![[g, 0.0, 0.0, 1.0, 0.0, 0.0]]; channels],
+    }
+}
+
+fn peaking(fc: f64, gain_db: f64, q: f64) -> EQBand {
+    EQBand {
+        filter_type: FilterType::Peaking,
+        fc,
+        gain_db,
+        q,
+    }
+}
+
+/// A `Peq` config at the MockBackend's 48 kHz, one band set broadcast across
+/// channels -- the shape the desktop sends.
+fn peq(bands: Vec<EQBand>) -> CorrectionConfig {
+    CorrectionConfig::Peq {
+        bands: vec![bands],
+        design_rate: 48_000.0,
     }
 }
 
@@ -458,6 +477,81 @@ fn malformed_correction_is_ignored_not_fatal() {
         .correction
         .as_ref()
         .is_some_and(|c| c.starts_with("iir")));
+}
+
+/// The other half of `validate_correction`: bad band VALUES, which the
+/// owner-decided relocation (D-13,
+/// `docs/decisions/2026-07-22-owner-value-calls.md`) moved out of
+/// `desktop/src-tauri/src/eq.rs` into the engine, so the daemon seam
+/// inherits the guard. The rate-independent checks (finite `fc`/`q`/
+/// `gain_db`, `fc > 0`, `q` in range, `|gain_db| <= GAIN_LIMIT_DB`) run at
+/// COMMAND time and warn-and-ignore the whole config; the Nyquist half is
+/// rate-dependent and belongs at build time, where it drops band by band.
+///
+/// The distinction is the point, and nothing exercised it: the existing
+/// malformed-correction test sends only STRUCTURAL defects (which
+/// `build_correction` rejects independently), and every `SetCorrection` with
+/// `Peq` bands elsewhere in the suite carries valid ones. Deleting the value
+/// pre-screen left the whole workspace green while changing the contract --
+/// the junk config would be ACCEPTED, `build_correction` would drop its only
+/// band, nothing would survive, and the engine would replace a healthy live
+/// correction with flat pass-through AND publish a rate-mismatch refusal
+/// that blames the sample rate for a NaN.
+#[test]
+fn a_band_value_defect_is_ignored_and_leaves_the_live_correction_alone() {
+    let (backend, handle) = spawn_engine();
+
+    // A good two-band Peq goes live, with a boost so it owns a preamp.
+    handle.send(EngineCommand::SetCorrection(peq(vec![
+        peaking(1_000.0, 9.0, 1.0),
+        peaking(4_000.0, -3.0, 1.0),
+    ])));
+    assert!(
+        wait_until(WAIT, || handle.state().correction.as_deref()
+            == Some("peq:2-band")),
+        "the good correction never installed"
+    );
+    let live = handle.state();
+    let preamp = live
+        .auto_preamp_db
+        .expect("a +9 dB band must carry an auto-preamp");
+
+    for bad in [
+        peaking(1_000.0, 3.0, f64::NAN),
+        peaking(1_000.0, 3.0, 0.0),
+        peaking(1_000.0, f64::INFINITY, 1.0),
+        peaking(1_000.0, 1_000.0, 1.0),
+    ] {
+        handle.send(EngineCommand::SetCorrection(peq(vec![bad])));
+    }
+    // A command that IS accepted, to order the assertions behind the ignored
+    // ones: the controller handles commands in the order they were sent.
+    handle.send(EngineCommand::SetBypass(true));
+    assert!(
+        wait_until(WAIT, || handle.state().bypass),
+        "the ordering command never landed"
+    );
+
+    let after = handle.state();
+    assert_eq!(
+        after.correction.as_deref(),
+        Some("peq:2-band"),
+        "an ignored SetCorrection must not replace the retained config"
+    );
+    assert_eq!(
+        after.auto_preamp_db,
+        Some(preamp),
+        "the live chain (and its headroom) must be untouched"
+    );
+    assert_eq!(
+        after.correction_rate_mismatch, None,
+        "a value defect is not a rate refusal and must not be reported as one"
+    );
+
+    // The thread survived all four and still accepts work.
+    handle.send(EngineCommand::SetBypass(false));
+    handle.send(EngineCommand::SetCorrection(iir_gain(0.5, 2)));
+    assert!(wait_until(WAIT, || pump_matches(&backend, 512, 0.2, 0.1)));
 }
 
 #[test]

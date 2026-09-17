@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::mock_backend::MockBackend;
-use paraeq_dsp::peq::{EQBand, FilterType};
+use paraeq_dsp::peq::{EQBand, FilterType, ParametricEQ};
 use paraeq_engine::chain::{build_fir, build_iir, Correction, RealtimeChain};
 use paraeq_engine::controller::{
     build_correction, decay_per_block, CorrectionConfig, EngineCommand, EngineConfig, EngineHandle,
@@ -483,6 +483,95 @@ fn baked_iir_preamp_agrees_with_the_peq_preamp() {
     );
 }
 
+/// **The worst channel wins**, on the arm the product will reach first.
+/// `CorrectionConfig::Peq.bands` is a `Vec<Vec<EQBand>>` precisely so a room
+/// / per-ear correction can fit each channel independently
+/// (`paraeq-dsp`'s `auto_fit_room` already produces different sets per
+/// channel), while `Correction::preamp_lin` is ONE scalar covering every
+/// channel -- so the only value that keeps R1-1's promise on an asymmetric
+/// config is the LOUDEST channel's.
+///
+/// Nothing pinned it before this test: every other multi-channel config in
+/// the suite is `vec![<one set>; CHANNELS]`, so `build_correction`'s
+/// cross-channel fold sees one distinct value and `min`/`max` are
+/// indistinguishable. Flipping the fold to "best channel wins" left the
+/// whole workspace green while installing a +12 dB boost with ZERO headroom
+/// -- R1-1's falsifier condition (spec `R1-8 § UI contract`).
+#[test]
+fn the_worst_channel_wins_the_peq_preamp() {
+    let loud = peaking(1_000.0, 12.0, 1.0);
+    let quiet = peaking(1_000.0, -3.0, 1.0);
+    let alone = |band: EQBand| {
+        ParametricEQ {
+            bands: vec![band],
+            sample_rate: RATE,
+        }
+        .preamp_db()
+    };
+    let loud_alone = alone(loud.clone());
+    assert!(
+        loud_alone < -11.0,
+        "the loud channel must want real headroom ({loud_alone} dB)"
+    );
+    assert_eq!(
+        alone(quiet.clone()),
+        0.0,
+        "the quiet channel must want none, or min and max are the same fold"
+    );
+
+    let config = CorrectionConfig::Peq {
+        bands: vec![vec![loud], vec![quiet]],
+        design_rate: RATE,
+    };
+    let (correction, report) = build_correction(&config, CHANNELS, BLOCK, RATE).expect("builds");
+    assert!(
+        (report.preamp_db - loud_alone).abs() < 1e-9,
+        "the stereo preamp is {} dB; the loud channel alone needs {loud_alone} dB",
+        report.preamp_db
+    );
+    assert!(
+        (f64::from(correction.preamp_lin) - 10f64.powf(loud_alone / 20.0)).abs() < 1e-6,
+        "the carrier must ride the same number the report publishes, got {}",
+        correction.preamp_lin
+    );
+}
+
+/// The same rule for the baked arm, which folds in
+/// `preamp::sos_preamp_db` rather than in `build_correction`, and which was
+/// equally unexercised: every baked config in the suite is
+/// `vec![<one set>; CHANNELS]` too.
+#[test]
+fn the_worst_channel_wins_the_baked_preamp() {
+    let loud = peaking(1_000.0, 12.0, 1.0).to_sos(RATE);
+    let quiet = peaking(1_000.0, -3.0, 1.0).to_sos(RATE);
+    let mixed = CorrectionConfig::Iir {
+        design_rate: RATE,
+        sos_per_channel: vec![vec![loud], vec![quiet]],
+    };
+    let loud_only = CorrectionConfig::Iir {
+        design_rate: RATE,
+        sos_per_channel: vec![vec![loud]],
+    };
+    let quiet_only = CorrectionConfig::Iir {
+        design_rate: RATE,
+        sos_per_channel: vec![vec![quiet]],
+    };
+
+    let (_, mixed_report) = build_correction(&mixed, CHANNELS, BLOCK, RATE).expect("builds");
+    let (_, loud_report) = build_correction(&loud_only, 1, BLOCK, RATE).expect("builds");
+    let (_, quiet_report) = build_correction(&quiet_only, 1, BLOCK, RATE).expect("builds");
+    assert_eq!(
+        quiet_report.preamp_db, 0.0,
+        "the quiet channel must want no headroom, or the two folds agree by accident"
+    );
+    assert!(
+        (mixed_report.preamp_db - loud_report.preamp_db).abs() < 1e-9,
+        "the stereo preamp is {} dB; the loud channel alone needs {} dB",
+        mixed_report.preamp_db,
+        loud_report.preamp_db
+    );
+}
+
 /// The baked arm's preamp must mirror `build_iir`'s R1-3 identity
 /// substitution, and nothing reached it before this test: every other baked
 /// case in the suite carries only stable rows.
@@ -850,6 +939,62 @@ fn input_peak_decays_at_the_broadcast_release_rate() {
         r.shared.peak_in_session(),
         1.0,
         "the session statistic never decays (spec `:552`)"
+    );
+}
+
+/// The split's whole point, and the one stimulus that separates the two
+/// fields: a QUIETER but still NONZERO block. `input_peak_session` answers
+/// "how loud did it ever get" and `input_peak` answers "how loud is it now",
+/// so the meter must fall to the quiet block while the statistic holds.
+///
+/// Every other assertion on the session field follows full-scale blocks and
+/// then SILENCE, and silence takes `process_block`'s `peak == 0.0` branch --
+/// which the session store does not run in. So dropping the monotonic
+/// compare altogether (storing every nonzero block's peak, i.e. "the last
+/// nonzero block" rather than "the session maximum") left the whole
+/// workspace green.
+#[test]
+fn the_session_peak_holds_while_the_meter_follows_a_quieter_block() {
+    const QUIET: f32 = 0.3;
+    let decay = decay_per_block(BLOCK, RATE);
+    let mut r = rig(None, 0.0, false);
+    r.shared.set_decay_per_block(decay);
+
+    for _ in 0..10 {
+        pump_with(&mut r, &flat_block(1.0));
+    }
+    assert_eq!(r.shared.peak_in(), 1.0);
+    assert_eq!(r.shared.peak_in_session(), 1.0);
+
+    // One quiet block already separates them: the meter is released towards
+    // it, the statistic is not.
+    pump_with(&mut r, &flat_block(QUIET));
+    assert_eq!(
+        r.shared.peak_in(),
+        decay,
+        "the meter must release from full scale, not jump to the quiet block"
+    );
+    assert_eq!(
+        r.shared.peak_in_session(),
+        1.0,
+        "a quieter nonzero block must not lower the session maximum"
+    );
+
+    // ...and it still holds once the meter has released all the way down to
+    // the quiet block's own level.
+    let blocks = (f64::from(QUIET).ln() / f64::from(decay).ln()).ceil() as usize + 2;
+    for n in 1..=blocks {
+        pump_with(&mut r, &flat_block(QUIET));
+        assert_eq!(
+            r.shared.peak_in_session(),
+            1.0,
+            "quiet block {n} lowered the session maximum"
+        );
+    }
+    assert_eq!(
+        r.shared.peak_in(),
+        QUIET,
+        "the meter must settle on the quiet block's own peak"
     );
 }
 

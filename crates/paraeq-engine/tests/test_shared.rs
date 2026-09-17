@@ -166,11 +166,23 @@ fn zero_and_nonzero_blocks_counted() {
     assert_eq!(shared.zero_blocks.load(Ordering::Relaxed), 1);
     assert_eq!(shared.nonzero_blocks.load(Ordering::Relaxed), 1);
     assert_eq!(shared.peak_in(), 0.75);
+    assert_eq!(shared.peak_in_session(), 0.75);
 
-    // A quieter block bumps the counter but not the peak.
+    // A quieter block bumps the counter but not the peak. `peak_in` is the
+    // decaying METER and reads as a max here only because
+    // `RtShared::default()` leaves `decay_per_block` at 1.0; the MONOTONIC
+    // field R1-8 split out is `peak_in_session`, and this is the only
+    // descending stimulus in the suite -- the meter tests all go
+    // full-scale-then-SILENCE, and silence takes the `peak == 0.0` branch
+    // the session store never runs in.
     pump(&mut proc_, 2, BLOCK, 0.5);
     assert_eq!(shared.nonzero_blocks.load(Ordering::Relaxed), 2);
     assert_eq!(shared.peak_in(), 0.75, "peak tracks the maximum");
+    assert_eq!(
+        shared.peak_in_session(),
+        0.75,
+        "the session maximum must not follow a quieter nonzero block"
+    );
 
     assert_eq!(shared.callbacks.load(Ordering::Relaxed), 3);
     assert_eq!(shared.sample_time_delta(), 512.0);
