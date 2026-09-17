@@ -7,14 +7,16 @@
 
 use approx::assert_relative_eq;
 use paraeq_dsp::authority::{
-    authority_band_mask, build_authority, clamp_band, excursion_db, is_stable, max_q_for_boost,
-    max_q_for_boost_capped, stabilize_band, width_oct_for_q, AuthorityCurve, AuthorityPolicy,
-    Clamp, QCapPolicy, COUPLER_CUTOFF_HZ, COUPLER_EXCURSION_DB, COUPLER_Q_CEILING,
-    DEFAULT_BOOST_RATIO, DEFAULT_EXCURSION_DB, DEFAULT_MIN_DIP_WIDTH_OCT, Q_CLAMP, ROOM_Q_CEILING,
+    authority_band_mask, build_authority, build_authority_gated, clamp_band, egd_flat_mask,
+    excursion_db, is_stable, max_q_for_boost, max_q_for_boost_capped, stabilize_band,
+    width_oct_for_q, AuthorityCurve, AuthorityPolicy, Clamp, EgdGate, QCapPolicy,
+    COUPLER_CUTOFF_HZ, COUPLER_EXCURSION_DB, COUPLER_Q_CEILING, DEFAULT_BOOST_RATIO,
+    DEFAULT_EXCURSION_DB, DEFAULT_MIN_DIP_WIDTH_OCT, EGD_FLATNESS_PERIODS, Q_CLAMP, ROOM_Q_CEILING,
     SIGMA_FULL_DB, SIGMA_NONE_DB,
 };
 use paraeq_dsp::autofit::{auto_fit_parametric_eq, auto_fit_room, RoomFitReport};
-use paraeq_dsp::logf::LogGrid;
+use paraeq_dsp::fr;
+use paraeq_dsp::logf::{resample_db_to_log_grid, LogGrid, Prefilter};
 use paraeq_dsp::peq::{EQBand, FilterType};
 use paraeq_dsp::PerChannel;
 use proptest::prelude::*;
@@ -1340,4 +1342,383 @@ mod q_cap_wire {
         assert!(matches!(coupler, QCapPolicy::Ceiling(_)));
         assert!(matches!(room, QCapPolicy::LogLinear { .. }));
     }
+}
+
+// ────────────────── the EGD authority gate (v1.1, ships Off) ─────────────────
+//
+// Every test below that exercises the ON behaviour constructs `EgdGate::On`
+// EXPLICITLY. None of them asserts anything about v1: the v1 assertion is that
+// the gate is off and that the gated builder is the shipped builder, bit for
+// bit.
+//
+// The synthetic oracle is the two-path IR `h = δ(0) + g·δ(τ)`, τ = 5 ms at
+// 48 kHz, whose excess group delay is a first-order all-pass with `a = 1/g` and
+// is therefore known in closed form. Every number pinned below was measured
+// against this crate's own `fr::excess_group_delay_s`, not asserted from the
+// algebra:
+//
+// | quantity                          | closed form   | measured         |
+// |-----------------------------------|---------------|------------------|
+// | mean EGD (linear rfft axis)       | τ = 5.000 ms  | 5.000813 ms      |
+// | ripple period 1/τ                 | 200.000 Hz    | 200.284 Hz       |
+// | min EGD, τ(1−|a|)/(1+|a|)         | 1.666667 ms   | 1.672283 ms      |
+// | max EGD, τ(1+|a|)/(1−|a|)         | 15.000000 ms  | 14.628913 ms     |
+// | 1/3-oct width f_c·(2^⅙ − 2^−⅙)    | 0.231563·f_c  | 231.881 Hz @ f_c |
+//
+// The two maxima disagree by 2.5% because the all-pass peak is ~45 Hz wide at
+// half height and neither the 5.86 Hz rfft axis nor the 96-ppo analysis grid
+// lands on its apex — the same reason `test_fr_room.rs` reports 14.67 ms for
+// the same IR. The gate's margin here is three orders of magnitude, so nothing
+// below is sensitive to it.
+
+/// A deterministic σ vector spanning both ends of the confidence ramp, so the
+/// bit-equality tests below compare full-authority bins, zero-authority bins
+/// and every interpolated value in between rather than one flat number.
+///
+/// An LCG rather than `proptest`: the claim under test is *bit* equality of two
+/// code paths on one input, so the input has to be reproducible from the file
+/// alone when a failure is reported.
+fn pseudo_random_sigma(n: usize) -> Vec<f64> {
+    let mut state: u64 = 0x2026_0917;
+    (0..n)
+        .map(|_| {
+            // Knuth's LCG constants; the top 53 bits are the mantissa.
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 11) as f64 / (1u64 << 53) as f64) * 7.0
+        })
+        .collect()
+}
+
+/// Every `f64` in the curve, compared by `to_bits()` rather than `==`, so a
+/// `-0.0` standing in for `0.0` — or a NaN for a NaN — cannot pass silently.
+fn assert_bit_identical(left: &AuthorityCurve, right: &AuthorityCurve, what: &str) {
+    let vectors: [(&str, &[f64], &[f64]); 6] = [
+        ("excursion_db", left.excursion_db(), right.excursion_db()),
+        ("freqs", left.freqs(), right.freqs()),
+        ("max_boost_db", left.max_boost_db(), right.max_boost_db()),
+        ("max_cut_db", left.max_cut_db(), right.max_cut_db()),
+        ("max_q", left.max_q(), right.max_q()),
+        ("sigma_db", left.sigma_db(), right.sigma_db()),
+    ];
+    for (name, l, r) in vectors {
+        assert_eq!(l.len(), r.len(), "{what}: {name} length");
+        for (i, (a, b)) in l.iter().zip(r).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "{what}: {name}[{i}] {a} vs {b}");
+        }
+    }
+    assert_eq!(
+        left.min_dip_width_oct().to_bits(),
+        right.min_dip_width_oct().to_bits(),
+        "{what}: min_dip_width_oct"
+    );
+}
+
+/// The excess group delay of the two-path IR `h = δ(0) + g·δ(τ)`, τ = 5 ms at
+/// 48 kHz, resampled onto `grid` the way the gate's caller must do it.
+///
+/// `fr::excess_group_delay_s` returns the trace on the LINEAR rfft axis;
+/// `egd_flat_mask` consumes it on the analysis grid. The bridge is `logf`'s
+/// resampler — the crate's one resampler — and writing the bridge here, in the
+/// test, is the proof that `authority.rs` did not need a second one.
+fn two_path_egd_on_the_grid(g: f64, grid: &LogGrid) -> Vec<f64> {
+    const N_FFT: usize = 8192;
+    const SR_HZ: u32 = 48_000;
+    // 240 samples at 48 kHz is exactly 5 ms.
+    let mut ir = vec![0.0; 2048];
+    ir[0] = 1.0;
+    ir[240] = g;
+    let egd = fr::excess_group_delay_s(&ir, SR_HZ, N_FFT).expect("valid EGD inputs");
+    let freqs_linear: Vec<f64> = (0..egd.len())
+        .map(|k| k as f64 * f64::from(SR_HZ) / N_FFT as f64)
+        .collect();
+    resample_db_to_log_grid(&freqs_linear, &egd, grid, Prefilter::None)
+        .expect("the linear axis and the trace are the same length")
+}
+
+#[test]
+fn the_default_policy_ships_the_egd_gate_off() {
+    // THE v1 CONTRACT. `measurement-suite-design.md` § Out of Scope, verbatim:
+    // "Excess-group-delay authority masking — v1.1, not v1."
+    assert_eq!(AuthorityPolicy::default().egd_gate, EgdGate::Off);
+    assert_eq!(EgdGate::default(), EgdGate::Off);
+    // Both path constructors agree, because both build on `default()` and a
+    // future path that stopped doing so would land here.
+    assert_eq!(AuthorityPolicy::room().egd_gate, EgdGate::Off);
+    assert_eq!(AuthorityPolicy::coupler().egd_gate, EgdGate::Off);
+    // The starting value is `decision-engine-design.md` § Authority 2's
+    // `1/(4·f_c)`, expressed as a fraction of the centre period.
+    assert_eq!(EGD_FLATNESS_PERIODS, 0.25);
+}
+
+#[test]
+fn egd_flat_mask_is_a_quarter_period_peak_to_peak_test_over_a_third_octave() {
+    let grid = LogGrid::standard();
+    let i_khz = nearest_bin(&grid, 1000.0);
+    let f_c = grid.freqs()[i_khz];
+    const TAU_S: f64 = 240.0 / 48_000.0;
+
+    // A 1/3-octave band centred at f_c spans f_c·2^(-1/6) .. f_c·2^(+1/6), so
+    // it is f_c·(2^(1/6) - 2^(-1/6)) = 0.231563·f_c wide. Measured, not
+    // asserted from the algebra.
+    let width_factor = 2f64.powf(1.0 / 6.0) - 2f64.powf(-1.0 / 6.0);
+    assert_relative_eq!(width_factor, 0.231563, epsilon = 1e-6);
+    let band_width_hz = f_c * width_factor;
+    assert_relative_eq!(band_width_hz, 231.881, epsilon = 1e-3);
+    // THE LOAD-BEARING COMPARISON: the band is wider than one ripple of the
+    // all-pass (1/τ = 200 Hz), so it contains a full excursion and sees the
+    // whole peak-to-peak rather than a fragment of it.
+    assert!(
+        band_width_hz > 1.0 / TAU_S,
+        "a {band_width_hz:.3} Hz band must contain a {:.3} Hz ripple",
+        1.0 / TAU_S
+    );
+
+    let rippled = two_path_egd_on_the_grid(2.0, &grid);
+    let minimum_phase = two_path_egd_on_the_grid(0.5, &grid);
+
+    // The all-pass spans τ(1-|a|)/(1+|a|) .. τ(1+|a|)/(1-|a|) with a = 1/g =
+    // 0.5, i.e. 1.6667 .. 15.0000 ms. On the analysis grid the floor is hit
+    // (1.6723 ms) and the peak is approached but not sampled (14.6289 ms).
+    let whole_lo = rippled.iter().fold(f64::INFINITY, |m, v| m.min(*v));
+    let whole_hi = rippled.iter().fold(f64::NEG_INFINITY, |m, v| m.max(*v));
+    assert_relative_eq!(whole_lo, 1.672283e-3, epsilon = 1e-8);
+    assert_relative_eq!(whole_hi, 14.628913e-3, epsilon = 1e-8);
+    assert!(whole_lo >= TAU_S * (1.0 - 0.5) / (1.0 + 0.5));
+    assert!(whole_hi <= TAU_S * (1.0 + 0.5) / (1.0 - 0.5));
+
+    // Inside the 1 kHz band: 12.827 ms peak-to-peak against a 0.2497 ms
+    // threshold — a factor of 51, so nothing here rides on the 2.5% the
+    // discrete peak misses.
+    let lo_hz = f_c * 2f64.powf(-1.0 / 6.0);
+    let hi_hz = f_c * 2f64.powf(1.0 / 6.0);
+    let in_band: Vec<f64> = grid
+        .freqs()
+        .iter()
+        .zip(&rippled)
+        .filter(|(&f, _)| f >= lo_hz && f <= hi_hz)
+        .map(|(_, &e)| e)
+        .collect();
+    assert_eq!(in_band.len(), 32, "a 1/3-octave band at 96 ppo");
+    let band_lo = in_band.iter().fold(f64::INFINITY, |m, v| m.min(*v));
+    let band_hi = in_band.iter().fold(f64::NEG_INFINITY, |m, v| m.max(*v));
+    assert_relative_eq!(band_hi - band_lo, 12.826985e-3, epsilon = 1e-8);
+    assert_relative_eq!(EGD_FLATNESS_PERIODS / f_c, 0.249658e-3, epsilon = 1e-9);
+
+    let rippled_mask = egd_flat_mask(&grid, &rippled, EGD_FLATNESS_PERIODS);
+    assert!(!rippled_mask[i_khz], "12.8 ms >> 0.25 ms: not flat");
+
+    // The minimum-phase twin (g = 0.5 puts both zeros inside the unit circle)
+    // has EGD ≡ 0 to 4e-10 s, so it passes at EVERY centre frequency — the
+    // control that stops the test above passing because the mask is stuck off.
+    let flat_mask = egd_flat_mask(&grid, &minimum_phase, EGD_FLATNESS_PERIODS);
+    assert!(
+        flat_mask.iter().all(|&m| m),
+        "a minimum-phase IR is flat everywhere"
+    );
+
+    // The threshold SELF-SCALES, which is the property `1/(4·f_c)` was chosen
+    // for: the same trace passes low and fails high, because at 70 Hz a
+    // 1/3-octave band is 16 Hz wide against a 3.6 ms ceiling while at 1 kHz it
+    // is 232 Hz wide against 0.25 ms. So the mask is neither all-true nor
+    // all-false, and a gate wired to a constant would fail here.
+    assert!(rippled_mask[..170].iter().all(|&m| m));
+    assert!(rippled_mask[400..].iter().all(|&m| !m));
+
+    // Degenerate inputs grade NOTHING as flat rather than everything: a mask
+    // that could not be computed must not license a boost.
+    let ok_len = grid.len();
+    assert!(
+        egd_flat_mask(&grid, &rippled[..ok_len - 1], EGD_FLATNESS_PERIODS)
+            .iter()
+            .all(|&m| !m)
+    );
+    assert!(egd_flat_mask(&grid, &minimum_phase, f64::NAN)
+        .iter()
+        .all(|&m| !m));
+    assert!(egd_flat_mask(&grid, &minimum_phase, 0.0)
+        .iter()
+        .all(|&m| !m));
+    let mut with_nan = minimum_phase.clone();
+    with_nan[i_khz] = f64::NAN;
+    let nan_mask = egd_flat_mask(&grid, &with_nan, EGD_FLATNESS_PERIODS);
+    assert!(!nan_mask[i_khz], "a non-finite sample is not flatness");
+    assert!(
+        nan_mask.iter().any(|&m| m),
+        "and it only poisons the bands that contain it"
+    );
+}
+
+#[test]
+fn build_authority_gated_with_the_default_policy_is_build_authority() {
+    let grid = LogGrid::standard();
+    let sigma = pseudo_random_sigma(grid.len());
+    let shipped = build_authority(&grid, &sigma, &policy()).expect("valid inputs");
+
+    // Leg 1 — no evidence at all. This is the delegation `build_authority`
+    // itself performs, so it is the identity the v1 path depends on.
+    let no_mask = build_authority_gated(&grid, &sigma, None, &policy()).expect("valid inputs");
+    assert_bit_identical(&shipped, &no_mask, "egd_flat = None");
+
+    // Leg 2 — evidence that would zero EVERY boost if the argument were in
+    // control. It is not: the FLAG is, and the flag is Off. This is the leg
+    // that proves the mask alone cannot arm the gate.
+    let all_false = vec![false; grid.len()];
+    let vetoing =
+        build_authority_gated(&grid, &sigma, Some(&all_false), &policy()).expect("valid inputs");
+    assert_bit_identical(&shipped, &vetoing, "all-false mask, gate Off");
+
+    // Leg 3 — an all-true mask with the gate ON. The gate is armed and the
+    // evidence vetoes nothing, so the curve is still the shipped one: the gate
+    // only ever SUBTRACTS authority the mask names.
+    let all_true = vec![true; grid.len()];
+    let armed = AuthorityPolicy {
+        egd_gate: EgdGate::On {
+            periods: EGD_FLATNESS_PERIODS,
+        },
+        ..policy()
+    };
+    let permissive =
+        build_authority_gated(&grid, &sigma, Some(&all_true), &armed).expect("valid inputs");
+    assert_bit_identical(&shipped, &permissive, "all-true mask, gate On");
+
+    // And the same on the coupler path, whose excursion envelope and Q ceiling
+    // both differ — so this is not re-testing the room policy twice.
+    let coupler = build_authority(&grid, &sigma, &AuthorityPolicy::coupler()).expect("valid");
+    let coupler_gated =
+        build_authority_gated(&grid, &sigma, None, &AuthorityPolicy::coupler()).expect("valid");
+    assert_bit_identical(&coupler, &coupler_gated, "coupler, egd_flat = None");
+}
+
+#[test]
+fn egd_gate_is_off_by_default_and_a_mask_alone_cannot_enable_it() {
+    let grid = LogGrid::standard();
+    // Full confidence everywhere, so every bin has a real boost ceiling to lose
+    // and "unchanged" is a claim with teeth.
+    let sigma = vec![SIGMA_FULL_DB; grid.len()];
+    let all_false = vec![false; grid.len()];
+
+    // Off (the default) + a total-veto mask: every boost survives.
+    let off = build_authority_gated(&grid, &sigma, Some(&all_false), &policy()).expect("valid");
+    assert!(
+        off.max_boost_db().iter().all(|&b| b > 0.0),
+        "the mask must not bite while the gate is Off"
+    );
+
+    // The SAME mask with the flag flipped, and nothing else changed: every
+    // boost goes to zero. One field is the difference between the two.
+    let armed = AuthorityPolicy {
+        egd_gate: EgdGate::On {
+            periods: EGD_FLATNESS_PERIODS,
+        },
+        ..policy()
+    };
+    let on = build_authority_gated(&grid, &sigma, Some(&all_false), &armed).expect("valid");
+    assert!(
+        on.max_boost_db().iter().all(|&b| b == 0.0),
+        "an armed gate with an all-false mask must zero every boost"
+    );
+
+    // Boost only. The cut ceiling is bit-identical in both states —
+    // `decision-engine-design.md` § Authority 2 gates boosts and nothing else.
+    for (i, (a, b)) in off.max_cut_db().iter().zip(on.max_cut_db()).enumerate() {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "max_cut_db[{i}] moved: {a} vs {b}"
+        );
+    }
+
+    // Missing evidence never vetoes: arming the flag with no mask is the
+    // shipped curve, not a silent global mute of every boost. A fail-closed
+    // arm here would zero boost on every bundle whose IR could not be
+    // derotated.
+    let armed_no_evidence = build_authority_gated(&grid, &sigma, None, &armed).expect("valid");
+    let shipped = build_authority(&grid, &sigma, &policy()).expect("valid");
+    assert_bit_identical(&shipped, &armed_no_evidence, "gate On, egd_flat = None");
+
+    // A mask of the wrong shape is refused in BOTH states, so a caller bug
+    // cannot lie dormant until the owner arms the flag in v1.1.
+    let ragged = vec![true; grid.len() - 1];
+    assert!(build_authority_gated(&grid, &sigma, Some(&ragged), &policy()).is_err());
+    assert!(build_authority_gated(&grid, &sigma, Some(&ragged), &armed).is_err());
+
+    // And a NaN threshold is refused rather than vetoing everything silently.
+    let nan_armed = AuthorityPolicy {
+        egd_gate: EgdGate::On { periods: f64::NAN },
+        ..policy()
+    };
+    assert!(build_authority(&grid, &sigma, &nan_armed).is_err());
+    assert!(build_authority_gated(&grid, &sigma, None, &nan_armed).is_err());
+}
+
+#[test]
+fn an_egd_rippled_region_gets_zero_boost_ceiling_when_the_v1_1_gate_is_on() {
+    let grid = LogGrid::standard();
+    let i_khz = nearest_bin(&grid, 1000.0);
+    // Full confidence everywhere: σ is deliberately NOT the thing zeroing the
+    // boost here, so anything that reaches zero reached it through the gate.
+    let sigma = vec![SIGMA_FULL_DB; grid.len()];
+    let rippled = two_path_egd_on_the_grid(2.0, &grid);
+    let mask = egd_flat_mask(&grid, &rippled, EGD_FLATNESS_PERIODS);
+
+    // EXPLICIT — this test asserts the v1.1 behaviour and says so in the
+    // literal.
+    let armed = AuthorityPolicy {
+        egd_gate: EgdGate::On {
+            periods: EGD_FLATNESS_PERIODS,
+        },
+        ..AuthorityPolicy::room()
+    };
+    let gated = build_authority_gated(&grid, &sigma, Some(&mask), &armed).expect("valid");
+    let ungated = build_authority(&grid, &sigma, &AuthorityPolicy::room()).expect("valid");
+
+    // The 1/3-octave band at 1 kHz holds a full 200 Hz ripple of a 12.8 ms
+    // peak-to-peak all-pass against a 0.25 ms ceiling, so it fails — and
+    // `boost_ceiling = 0` is what failing means.
+    let lo_hz = grid.freqs()[i_khz] * 2f64.powf(-1.0 / 6.0);
+    let hi_hz = grid.freqs()[i_khz] * 2f64.powf(1.0 / 6.0);
+    for (i, &f) in grid.freqs().iter().enumerate() {
+        if f >= lo_hz && f <= hi_hz {
+            assert_eq!(gated.max_boost_db()[i], 0.0, "bin {i} at {f:.2} Hz");
+            assert!(
+                ungated.max_boost_db()[i] > 0.0,
+                "and the ungated curve must have had something to lose at {f:.2} Hz"
+            );
+        }
+    }
+
+    // `max_cut_db` is untouched everywhere — bit for bit, not approximately.
+    for (i, (a, b)) in gated
+        .max_cut_db()
+        .iter()
+        .zip(ungated.max_cut_db())
+        .enumerate()
+    {
+        assert_eq!(a.to_bits(), b.to_bits(), "max_cut_db[{i}]: {a} vs {b}");
+    }
+
+    // Below ~70 Hz the same trace passes, because the threshold self-scales:
+    // those bins keep the ungated boost bit for bit. A gate that zeroed the
+    // whole curve would pass every assertion above and fail here.
+    assert!(mask[0], "the 20 Hz band is flat at this threshold");
+    for (i, &flat) in mask.iter().enumerate() {
+        if flat {
+            assert_eq!(
+                gated.max_boost_db()[i].to_bits(),
+                ungated.max_boost_db()[i].to_bits(),
+                "a flat bin {i} at {:.2} Hz must be untouched",
+                grid.freqs()[i]
+            );
+        }
+    }
+
+    // The minimum-phase twin passes everywhere, so an armed gate fed its mask
+    // reproduces the shipped curve exactly: the gate bites on evidence, not on
+    // being switched on.
+    let minimum_phase = two_path_egd_on_the_grid(0.5, &grid);
+    let flat_mask = egd_flat_mask(&grid, &minimum_phase, EGD_FLATNESS_PERIODS);
+    let unharmed = build_authority_gated(&grid, &sigma, Some(&flat_mask), &armed).expect("valid");
+    assert_bit_identical(&ungated, &unharmed, "minimum-phase evidence, gate On");
 }
