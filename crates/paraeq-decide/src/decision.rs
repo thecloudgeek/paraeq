@@ -3,6 +3,7 @@
 //! invalidation tier an override triggers. Every parameter a competitor asks
 //! or hardcodes is one of these.
 
+use paraeq_dsp::authority::QCapPolicy;
 use paraeq_dsp::targets::TransducerClass;
 use serde::{Deserialize, Serialize};
 
@@ -81,8 +82,29 @@ impl InRange for (f64, f64) {
     }
 }
 
+/// `shelves` is a `Choice` over `{false, true}` — a two-item select, not a
+/// range.
+impl InRange for bool {}
+
 /// `class` is a `Choice` — the four transducer types are unordered.
 impl InRange for TransducerClass {}
+
+/// `q_cap` is a `Choice` over the two path policies, so the default `false`
+/// never runs.
+///
+/// `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md` § D-C, verbatim:
+/// "`Domain::Choice(vec![Ceiling(5.0), LogLinear { hi: (10000.0, 3.0), lo:
+/// (200.0, 10.0) }])` … the drawer's control becomes a two-item select over the
+/// two path policies, which is what the value actually is."
+///
+/// The impl exists rather than being omitted because [`Domain::contains`] is
+/// bounded on this trait: without it `Domain<QCapPolicy>` has no `contains` at
+/// all and the standing "every `Decision::value` is inside its `Domain`"
+/// invariant is not merely unfalsifiable but unwritable. The `Range` form it
+/// used to take answered `contains == false` for the room path's own value,
+/// which is the defect D-C closes. `QCapPolicy` is deliberately not
+/// `PartialOrd` (`paraeq_dsp::authority`), so there is nothing to order here.
+impl InRange for QCapPolicy {}
 
 impl<T: InRange + PartialEq> Domain<T> {
     /// The spec's standing invariant: every `Decision::value` is inside its
@@ -163,6 +185,9 @@ pub enum RationaleKey {
     Authority,
     Averaging,
     Class,
+    /// The 2026-07-21 record's §Q6 drawer toggle: "clock-adjust toggle with the
+    /// estimated ppm shown, **defaulted on**".
+    ClockAdjust,
     CorrectionKind,
     CorrectionRange,
     FdwPostCycles,
@@ -220,13 +245,38 @@ pub enum EvidenceLabel {
     MidbandLevel,
     /// `t_peak`: how much time exists before the impulse arrives.
     PeakArrival,
+    /// Mean of the verification residual over the gated band, dB. Near zero is
+    /// what says the level compensation `K` was right.
+    ResidualMean,
+    /// Spread of the verification residual about its mean, dB.
+    ResidualScatter,
+    /// RMS of `measured_corrected − (measured_baseline + designed_correction)`
+    /// over the authority band, dB. **The gated quantity.**
+    ///
+    /// Attached once **per capture channel**, so this label may repeat inside
+    /// one `Vec<Evidence>`: the gate is the worst channel, and the drawer has to
+    /// be able to say which ear failed.
+    ResidualVsPrediction,
+    /// RMS of the corrected response against the decided target, dB. Reported,
+    /// plotted, and **never gated** — on a coupler with a 1.0 dB flatness target
+    /// it would refuse a correct correction whenever the rig's own error exceeds
+    /// the gate, which EARS routinely does.
+    ResidualVsTarget,
     /// The frequency below which the right window cannot resolve 1/N-octave
     /// detail.
     ResolutionLimit,
     SchroederRange,
+    /// How many biquad rows the engine substituted IDENTITY for because they
+    /// failed the Jury stability test at the live rate. Evidence, not a gate:
+    /// the realized-cascade prediction already models the substitution.
+    SectionsSubstituted,
     /// σ(f): the per-bin standard deviation in dB across positions.
     Sigma,
     Snr,
+    /// RMS of the two-clock marker fit's residuals, capture samples.
+    TwoClockResidual,
+    /// The estimated mic-vs-output clock skew, parts per million.
+    TwoClockSkewPpm,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -237,4 +287,13 @@ pub enum Unit {
     DbPerOctave,
     Hz,
     Milliseconds,
+    /// Clock skew. [`Unit::Count`] is an integer count and would misreport a
+    /// fractional ppm; this is also the unit `Diagnostic::value` carries for
+    /// D-Q's `TwoClock` warning.
+    PartsPerMillion,
+    /// Capture samples, and **fractional**: a matched-filter residual is not an
+    /// integer, which is why this is not [`Unit::Count`], and it is a count of
+    /// samples rather than a duration, which is why it is not
+    /// [`Unit::Milliseconds`].
+    Samples,
 }

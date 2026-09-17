@@ -12,3 +12,11 @@ version.workspace = true
 paraeq-dsp = { path = "../paraeq-dsp", features = ["serde"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+# proptest is for the GENERATOR half only: synthesizing wire values (channel
+# widths, routing indices) so the serde shapes are exercised beyond the handful
+# of literals the contract tests spell. Dev-deps do not appear in
+# `cargo tree -e normal`, so the crate-boundary assertion is unaffected
+# (precedent: `crates/paraeq-measure/Cargo.toml`'s paraeq-decide dev-dep).
+[dev-dependencies]
+proptest = { workspace = true }

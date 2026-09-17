@@ -30,18 +30,19 @@ pub mod outcome;
 pub mod profile;
 
 pub use bundle::{
-    CalFile, CalVariant, CapturePlan, ImpulseResponse, MeasurementBundle, NoiseFloor, Position,
-    SweepPlan, Verification,
+    CalFile, CalVariant, CapturePlan, CaptureRouting, CaptureStats, ImpulseResponse,
+    MeasurementBundle, NoiseFloor, Position, SweepPlan, TwoClockFit, Verification,
 };
 pub use decision::{
     Decision, Domain, Evidence, EvidenceLabel, Invalidation, Rationale, RationaleKey, Source, Unit,
 };
 pub use decisions::{
-    AuthorityCurve, CorrectionKind, DecisionView, Decisions, Overrides, QCapPolicy, TargetChoice,
-    WindowType,
+    AuthorityCurve, AuthorityPreset, CorrectionForm, DecisionView, Decisions, Overrides,
+    QCapPolicy, TargetChoice, WindowType,
 };
 pub use outcome::{
     Analysis, CorrectionPlan, DecisionSet, Diagnostic, DiagnosticCode, Severity, Verdict,
+    VerificationReport,
 };
 /// Re-exported: the enum lives in `paraeq-dsp` because that is the only crate
 /// every consumer may depend on, but its semantics are owned here — it is
