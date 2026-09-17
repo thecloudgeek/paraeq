@@ -13,6 +13,11 @@ Two tiers are written from here (docs/specs/2026-07-15-measurement-suite-design.
     cannot be graded against a transcription of itself. Marked `Tier 2` in each
     gen_*() docstring.
 
+fixtures/decide/ is a fifth kind and is NOT one of them: owner-reviewed
+decision bundles, frozen once accepted, which this script neither writes nor
+removes. No prototype decision engine is ever written, so there is nothing here
+that could regenerate them -- see PRESERVED below for how they are protected.
+
 Run:  source .venv/bin/activate && python prototype/tools/generate_fixtures.py
 Deterministic: seeded RNG, no timestamps. Rerunning must be byte-identical.
 
@@ -70,10 +75,34 @@ OUT = ROOT / "fixtures"
 # the declaration, this dict is the enforcement, and fixtures/manifest.json is
 # only the record of what actually ran.
 PINNED_VERSIONS = {"numpy": "2.5.0", "scipy": "1.18.0"}
+# Children of fixtures/ this script must never write and never remove. Only
+# fixtures/decide/ qualifies: those bundles are owner-reviewed characterization
+# records, frozen once accepted, and no code here can reproduce them.
+PRESERVED = frozenset({"decide"})
 SR = 48000
 
 
+def wipe_generated_fixtures():
+    """Clear what this script owns, child by child, leaving PRESERVED alone.
+
+    Not shutil.rmtree(OUT): that recursively deleted fixtures/decide/ too, so
+    the regeneration command CLAUDE.md sanctions destroyed every owner-frozen
+    decision bundle in passing. The wipe is still total for everything else --
+    a renamed or deleted gen_*() case must not leave an orphan behind.
+    """
+    OUT.mkdir(parents=True, exist_ok=True)
+    for child in sorted(OUT.iterdir()):
+        if child.name in PRESERVED:
+            continue
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+
+
 def save_case(stage: str, name: str, params: dict, arrays: dict, scalars: dict | None = None):
+    # Before the mkdir, so a mis-named stage cannot even create the directory.
+    assert stage not in PRESERVED, f"{stage}/ is owner-frozen; no gen_*() may write it"
     d = OUT / stage
     d.mkdir(parents=True, exist_ok=True)
     case = {"params": params, "scalars": scalars or {}, "arrays": {}}
@@ -621,9 +650,7 @@ def main():
              "into fixtures/manifest.json")
     args = parser.parse_args()
     drift = check_pinned_versions(args.allow_version_drift)
-    if OUT.exists():
-        shutil.rmtree(OUT)
-    OUT.mkdir()
+    wipe_generated_fixtures()
     gen_sweep()
     gen_deconvolution()
     gen_frequency_response()
@@ -653,7 +680,9 @@ def main():
     if drift:
         manifest["drift"] = True
     (OUT / "manifest.json").write_text(json.dumps(manifest, indent=1, sort_keys=True) + "\n")
-    n = sum(1 for _ in OUT.rglob("*"))
+    # Count only what this run produced: the PRESERVED children were already
+    # there and were deliberately left untouched.
+    n = sum(1 for p in OUT.rglob("*") if p.relative_to(OUT).parts[0] not in PRESERVED)
     print(f"wrote {n} files under {OUT}")
 
 
