@@ -7,9 +7,11 @@
 
 use approx::assert_relative_eq;
 use paraeq_dsp::authority::{
-    build_authority, clamp_band, excursion_db, is_stable, max_q_for_boost, stabilize_band,
-    width_oct_for_q, AuthorityCurve, AuthorityPolicy, Clamp, DEFAULT_BOOST_RATIO,
-    DEFAULT_EXCURSION_DB, DEFAULT_MIN_DIP_WIDTH_OCT, SIGMA_FULL_DB, SIGMA_NONE_DB,
+    authority_band_mask, build_authority, clamp_band, excursion_db, is_stable, max_q_for_boost,
+    max_q_for_boost_capped, stabilize_band, width_oct_for_q, AuthorityCurve, AuthorityPolicy,
+    Clamp, QCapPolicy, COUPLER_CUTOFF_HZ, COUPLER_EXCURSION_DB, COUPLER_Q_CEILING,
+    DEFAULT_BOOST_RATIO, DEFAULT_EXCURSION_DB, DEFAULT_MIN_DIP_WIDTH_OCT, Q_CLAMP, ROOM_Q_CEILING,
+    SIGMA_FULL_DB, SIGMA_NONE_DB,
 };
 use paraeq_dsp::autofit::{auto_fit_parametric_eq, auto_fit_room, RoomFitReport};
 use paraeq_dsp::logf::LogGrid;
@@ -60,7 +62,8 @@ fn gaussian_residual(grid: &LogGrid, centre_hz: f64, amp_db: f64, width_oct: f64
 fn fit(residual: &[f64], curve: &AuthorityCurve, max_bands: usize) -> RoomFitReport {
     let grid = LogGrid::standard();
     let per = PerChannel::new(vec![residual.to_vec()]).expect("one channel");
-    let out = auto_fit_room(&per, &grid, SR, curve, max_bands, 1.0, 0.0).expect("valid fit inputs");
+    let out =
+        auto_fit_room(&per, &grid, SR, curve, max_bands, 1.0, 0.0, None).expect("valid fit inputs");
     out.get(0).expect("one channel").clone()
 }
 
@@ -621,7 +624,7 @@ fn no_band_is_emitted_below_the_gates_own_resolution_limit() {
         .collect();
     let per = PerChannel::new(vec![residual]).expect("one channel");
     let curve = curve_at_sigma(0.5);
-    let out = auto_fit_room(&per, &grid, SR, &curve, 8, 1.0, 200.0).expect("valid");
+    let out = auto_fit_room(&per, &grid, SR, &curve, 8, 1.0, 200.0, None).expect("valid");
     let report = out.get(0).expect("one channel");
     assert!(
         report.bands.iter().all(|b| b.fc >= 200.0),
@@ -676,7 +679,7 @@ fn every_channel_is_fitted_independently() {
         .collect();
     let per = PerChannel::new(vec![left, right]).expect("two channels");
     let curve = curve_at_sigma(0.5);
-    let out = auto_fit_room(&per, &grid, SR, &curve, 1, 1.0, 0.0).expect("valid");
+    let out = auto_fit_room(&per, &grid, SR, &curve, 1, 1.0, 0.0, None).expect("valid");
     assert_eq!(out.channels(), 2);
     assert_relative_eq!(out.get(0).unwrap().bands[0].fc, left_f, epsilon = 1e-9);
     assert_relative_eq!(out.get(1).unwrap().bands[0].fc, right_f, epsilon = 1e-9);
@@ -687,17 +690,17 @@ fn auto_fit_room_refuses_malformed_input() {
     let grid = LogGrid::standard();
     let curve = curve_at_sigma(1.0);
     let short = PerChannel::new(vec![vec![0.0; 10]]).expect("one channel");
-    assert!(auto_fit_room(&short, &grid, SR, &curve, 4, 1.0, 0.0).is_err());
+    assert!(auto_fit_room(&short, &grid, SR, &curve, 4, 1.0, 0.0, None).is_err());
 
     let mut nan = vec![0.0; grid.len()];
     nan[5] = f64::NAN;
     let nan = PerChannel::new(vec![nan]).expect("one channel");
-    assert!(auto_fit_room(&nan, &grid, SR, &curve, 4, 1.0, 0.0).is_err());
+    assert!(auto_fit_room(&nan, &grid, SR, &curve, 4, 1.0, 0.0, None).is_err());
 
     let ok = PerChannel::new(vec![vec![0.0; grid.len()]]).expect("one channel");
-    assert!(auto_fit_room(&ok, &grid, 0.0, &curve, 4, 1.0, 0.0).is_err());
-    assert!(auto_fit_room(&ok, &grid, SR, &curve, 4, 1.0, f64::NAN).is_err());
-    assert!(auto_fit_room(&ok, &grid, SR, &curve, 4, f64::NAN, 0.0).is_err());
+    assert!(auto_fit_room(&ok, &grid, 0.0, &curve, 4, 1.0, 0.0, None).is_err());
+    assert!(auto_fit_room(&ok, &grid, SR, &curve, 4, 1.0, f64::NAN, None).is_err());
+    assert!(auto_fit_room(&ok, &grid, SR, &curve, 4, f64::NAN, 0.0, None).is_err());
 }
 
 #[test]
@@ -898,5 +901,443 @@ mod wire {
             serde_json::from_str(&serde_json::to_string(&curve).unwrap()).unwrap();
         negative["max_cut_db"][0] = serde_json::json!(-1.0);
         assert!(serde_json::from_value::<AuthorityCurve>(negative).is_err());
+    }
+
+    #[test]
+    fn the_below_min_gain_clamp_round_trips_through_serde() {
+        // `Clamp` gains its derive here because B6 lifts `clamps` onto
+        // `CorrectionPlan`, which derives serde unconditionally — so the
+        // variant and the derive are one pre-freeze change, not two. All five
+        // variants are exercised, because the derive is on the enum and a
+        // round-trip that covers only the new one would not notice the other
+        // four losing their fields.
+        let clamps = [
+            Clamp::BelowMinGain {
+                fc: 2000.0,
+                gain_db: -1.2,
+            },
+            Clamp::DipRefused { width_oct: 0.125 },
+            Clamp::GainToExcursion {
+                from: 12.0,
+                to: 5.0,
+            },
+            Clamp::GainToSigma {
+                from: 12.0,
+                to: 3.0,
+                sigma_db: 3.5,
+            },
+            Clamp::QToBoostCap {
+                from: 20.0,
+                to: 8.0,
+            },
+        ];
+        for clamp in clamps {
+            let json = serde_json::to_string(&clamp).expect("serializes");
+            let back: Clamp = serde_json::from_str(&json).expect("deserializes");
+            assert_eq!(back, clamp, "{json}");
+        }
+
+        // Externally tagged, like every other enum on this wire: the variant
+        // name and the field names ARE the contract, so renaming either moves
+        // every `fixtures/decide/<case>/expected.json` once B6 lands.
+        assert_eq!(
+            serde_json::to_string(&Clamp::BelowMinGain {
+                fc: 2000.0,
+                gain_db: -1.2,
+            })
+            .expect("serializes"),
+            r#"{"BelowMinGain":{"fc":2000.0,"gain_db":-1.2}}"#
+        );
+    }
+}
+
+// ─────────────────────── the coupler excursion envelope ──────────────────────
+
+#[test]
+fn the_coupler_envelope_is_zero_above_ten_kilohertz() {
+    // decision-engine-design.md § Authority 1, verbatim: "On the coupler
+    // path, `A_base(f) = 0` above 10 kHz." Above means above: at the cutoff
+    // itself the envelope is still the room vector's +-2 dB.
+    assert_eq!(excursion_db(&COUPLER_EXCURSION_DB, COUPLER_CUTOFF_HZ), 2.0);
+    for f in [10_001.0, 12_000.0, 16_000.0, 20_000.0, 40_000.0] {
+        assert_eq!(
+            excursion_db(&COUPLER_EXCURSION_DB, f),
+            0.0,
+            "the coupler envelope must be exactly zero at {f} Hz, not tapering \
+             toward it — a taper licenses correction the spec licenses none of"
+        );
+    }
+
+    // ... and stays at the room vector's shape below it, bin for bin.
+    let grid = LogGrid::standard();
+    for &f in grid.freqs() {
+        if f <= COUPLER_CUTOFF_HZ {
+            assert_relative_eq!(
+                excursion_db(&COUPLER_EXCURSION_DB, f),
+                excursion_db(&DEFAULT_EXCURSION_DB, f),
+                epsilon = 1e-12
+            );
+        }
+    }
+
+    // The two path constructors carry their own vectors, so `decide()` picks a
+    // path rather than re-specifying numbers.
+    assert_eq!(
+        AuthorityPolicy::coupler().excursion,
+        COUPLER_EXCURSION_DB.to_vec()
+    );
+    assert_eq!(
+        AuthorityPolicy::room().excursion,
+        DEFAULT_EXCURSION_DB.to_vec()
+    );
+    assert_eq!(AuthorityPolicy::room(), AuthorityPolicy::default());
+
+    // And the coupler vector is a policy `build_authority` accepts: strictly
+    // increasing, finite, non-negative.
+    let sigma = vec![SIGMA_FULL_DB; grid.len()];
+    let curve = build_authority(&grid, &sigma, &AuthorityPolicy::coupler())
+        .expect("the coupler policy must be well-formed");
+    for (i, &f) in grid.freqs().iter().enumerate() {
+        if f > COUPLER_CUTOFF_HZ {
+            assert_eq!(
+                (curve.max_cut_db()[i], curve.max_boost_db()[i]),
+                (0.0, 0.0),
+                "no authority of either sign above {COUPLER_CUTOFF_HZ} Hz on \
+                 the coupler path, at {f} Hz"
+            );
+        }
+    }
+}
+
+// ───────────────────────────── the path Q ceiling ────────────────────────────
+
+#[test]
+fn the_room_q_ceiling_is_log_linear_between_its_breakpoints() {
+    // decision-engine-design.md § Decision table, `q_cap`: room
+    // `10.0 @ 200 Hz -> 3.0 @ 10 kHz` log-linear.
+    let room = ROOM_Q_CEILING;
+    assert_eq!(
+        room,
+        QCapPolicy::LogLinear {
+            hi: (10_000.0, 3.0),
+            lo: (200.0, 10.0),
+        }
+    );
+    assert_relative_eq!(room.ceiling_at(200.0), 10.0, epsilon = 1e-12);
+    assert_relative_eq!(room.ceiling_at(10_000.0), 3.0, epsilon = 1e-12);
+    // Clamped to the end values outside the breakpoints, like every other
+    // interpolation in this module.
+    assert_relative_eq!(room.ceiling_at(20.0), 10.0, epsilon = 1e-12);
+    assert_relative_eq!(room.ceiling_at(20_000.0), 3.0, epsilon = 1e-12);
+
+    // The midpoint in LOG f is the geometric mean, sqrt(200 * 10000) =
+    // 1414.21 Hz, where a log-linear ramp is exactly halfway: 6.5.
+    let mid_log_f = (200.0f64 * 10_000.0).sqrt();
+    assert_relative_eq!(room.ceiling_at(mid_log_f), 6.5, epsilon = 1e-9);
+
+    // The falsifier this test exists for: a linear-f implementation passes
+    // both endpoints and is wrong everywhere between. At the log midpoint it
+    // answers 9.13, which is 2.6 Q looser than the spec's ramp.
+    let linear_f = 10.0 + (mid_log_f - 200.0) / (10_000.0 - 200.0) * (3.0 - 10.0);
+    assert!(
+        (linear_f - room.ceiling_at(mid_log_f)).abs() > 2.0,
+        "a linear-f ramp would answer {linear_f:.3} here; if this assertion \
+         stops discriminating, the test has stopped testing anything"
+    );
+
+    // A flat ceiling is flat everywhere, including outside any grid.
+    let coupler = COUPLER_Q_CEILING;
+    assert_eq!(coupler, QCapPolicy::Ceiling(5.0));
+    for f in [1.0, 200.0, 10_000.0, 1e9] {
+        assert_eq!(coupler.ceiling_at(f), 5.0);
+    }
+
+    // Fail-safe on a frequency that cannot be placed: the TIGHTEST breakpoint,
+    // never an unbounded ceiling. A NaN ceiling compares false against every Q,
+    // which reads as "no limit" rather than "no authority".
+    assert_eq!(room.ceiling_at(f64::NAN), 3.0);
+    assert_eq!(coupler.ceiling_at(f64::NAN), 5.0);
+}
+
+#[test]
+fn every_boost_bands_q_is_at_most_the_gain_dependent_cap_and_the_path_ceiling() {
+    // The gain-dependent cap alone, at the spec's two worked values.
+    assert_relative_eq!(max_q_for_boost(100.0, 6.0), 16.07, epsilon = 5e-3);
+    assert_relative_eq!(max_q_for_boost(100.0, 0.0), 22.7, epsilon = 1e-9);
+
+    // Coupler: `Ceiling(5.0)` is far below both, so it is what binds.
+    let coupler = AuthorityPolicy::coupler().q_ceiling;
+    assert_relative_eq!(
+        max_q_for_boost_capped(100.0, 6.0, &coupler),
+        5.0,
+        epsilon = 1e-12
+    );
+    assert_relative_eq!(
+        max_q_for_boost_capped(100.0, 0.0, &coupler),
+        5.0,
+        epsilon = 1e-12
+    );
+    // ... but the gain cap still wins where it is tighter than the path: at
+    // 20 Hz a +6 dB boost is capped at 0.227*20/1.41254 = 3.21.
+    assert_relative_eq!(
+        max_q_for_boost_capped(20.0, 6.0, &coupler),
+        max_q_for_boost(20.0, 6.0),
+        epsilon = 1e-12
+    );
+
+    // Room: `LogLinear` clamps to 10.0 at and below 200 Hz, so at 100 Hz it
+    // binds against both worked values; at 10 kHz the ceiling is 3.0 while the
+    // gain cap is three orders of magnitude looser.
+    let room = AuthorityPolicy::room().q_ceiling;
+    assert_relative_eq!(
+        max_q_for_boost_capped(100.0, 6.0, &room),
+        10.0,
+        epsilon = 1e-12
+    );
+    assert_relative_eq!(
+        max_q_for_boost_capped(100.0, 0.0, &room),
+        10.0,
+        epsilon = 1e-12
+    );
+    assert_relative_eq!(
+        max_q_for_boost_capped(10_000.0, 6.0, &room),
+        3.0,
+        epsilon = 1e-12
+    );
+
+    // The composition is the min of three terms, never above any of them, and
+    // never outside the global clamp — swept over the whole design space.
+    for policy in [&coupler, &room] {
+        for f0 in [20.0, 60.0, 200.0, 1000.0, 8000.0, 20000.0] {
+            for gain in [0.0, 0.5, 2.0, 6.0, 10.0] {
+                let q = max_q_for_boost_capped(f0, gain, policy);
+                assert!(q <= max_q_for_boost(f0, gain) + 1e-12);
+                assert!(q <= policy.ceiling_at(f0) + 1e-12);
+                assert!(
+                    Q_CLAMP.contains(&q),
+                    "q={q} outside the global clamp at f0={f0} gain={gain}"
+                );
+                let band = EQBand {
+                    filter_type: FilterType::Peaking,
+                    fc: f0,
+                    gain_db: gain,
+                    q,
+                };
+                assert!(
+                    is_stable(&band.to_sos(SR)),
+                    "capped band {band:?} failed the Jury test"
+                );
+            }
+        }
+    }
+
+    // One composition, not two: with a path ceiling that cannot bind, the new
+    // function must reproduce `clamp_band`'s realized Q exactly. If these ever
+    // drift, the Q ceiling has become a second answer.
+    let curve = curve_at_sigma(SIGMA_FULL_DB);
+    let unbinding = QCapPolicy::Ceiling(*Q_CLAMP.end());
+    for fc in [30.0, 60.0, 120.0, 400.0] {
+        let band = EQBand {
+            filter_type: FilterType::Peaking,
+            fc,
+            gain_db: 12.0,
+            q: *Q_CLAMP.end(),
+        };
+        let (out, _) = clamp_band(&band, &curve);
+        assert_relative_eq!(
+            out.q,
+            max_q_for_boost_capped(fc, out.gain_db, &unbinding),
+            epsilon = 1e-12
+        );
+    }
+}
+
+// ─────────────────────────── the authority band ──────────────────────────────
+
+#[test]
+fn the_authority_band_mask_is_the_same_function_the_gate_and_the_stop_both_use() {
+    // decision-engine-design.md § Refusal table, verbatim: the band is
+    // `correction_range ∩ { f : authority.at(f).max_boost_db > 0 || max_cut_db > 0 }`.
+    let grid = LogGrid::standard();
+    // sigma below sigma_none in the modal region, at/above it further up, so
+    // authority genuinely collapses partway along the grid rather than the
+    // range alone doing all the masking.
+    let sigma: Vec<f64> = grid
+        .freqs()
+        .iter()
+        .map(|&f| if f < 300.0 { 0.5 } else { SIGMA_NONE_DB })
+        .collect();
+    let curve = build_authority(&grid, &sigma, &policy()).expect("valid");
+    let range = (40.0, 1000.0);
+    let mask = authority_band_mask(grid.freqs(), &curve, range);
+
+    assert_eq!(mask.len(), grid.len());
+    // The second, open-coded filter the plan exists to prevent — written HERE,
+    // in the test, so that the crate's `src/` holds exactly one copy.
+    for (i, &f) in grid.freqs().iter().enumerate() {
+        let at = curve.at(f);
+        let expected =
+            f >= range.0 && f <= range.1 && (at.max_boost_db > 0.0 || at.max_cut_db > 0.0);
+        assert_eq!(mask[i], expected, "bin {i} at {f:.2} Hz");
+    }
+    assert!(mask.iter().any(|&m| m), "the band must not be empty here");
+    assert!(
+        mask.iter().any(|&m| !m),
+        "and it must not be the whole grid, or this asserts nothing"
+    );
+
+    // Both edges are inclusive. `narrow` ends inside the confident region, so
+    // the upper edge tests the RANGE rather than the authority collapse.
+    let narrow = (40.0, 250.0);
+    assert!(!authority_band_mask(&[39.9], &curve, narrow)[0]);
+    assert!(authority_band_mask(&[40.0], &curve, narrow)[0]);
+    assert!(authority_band_mask(&[250.0], &curve, narrow)[0]);
+    assert!(!authority_band_mask(&[250.1], &curve, narrow)[0]);
+    // Zero authority inside the range is still out of band.
+    assert!(!authority_band_mask(&[900.0], &curve, range)[0]);
+
+    // Degenerate inputs are empty, not panics and not everything: a band that
+    // cannot be placed must grade nothing rather than grade everything.
+    assert_eq!(
+        authority_band_mask(&[100.0], &curve, (1000.0, 40.0)),
+        [false]
+    );
+    assert_eq!(
+        authority_band_mask(&[100.0], &curve, (f64::NAN, 1000.0)),
+        [false]
+    );
+    assert_eq!(authority_band_mask(&[f64::NAN], &curve, range), [false]);
+
+    // The guard that makes the name true: the predicate is spelled in exactly
+    // one place in the workspace's library code. B4's residual-RMS stop and
+    // B8's verification gate must CALL `authority_band_mask`; re-deriving the
+    // definition in either of them fails here.
+    //
+    // The needles are the DISJUNCTION, in either order — the trailing `||` is
+    // what makes them the band predicate and not `autofit`'s legitimate
+    // `if at.max_cut_db > 0.0` divide-by-zero guard.
+    let needles = ["max_boost_db>0.0||", "max_cut_db>0.0||"];
+    let mut hits: Vec<(String, usize)> = Vec::new();
+    for path in workspace_library_sources() {
+        let squashed = code_without_comments(&path);
+        let n: usize = needles
+            .iter()
+            .map(|needle| squashed.matches(needle).count())
+            .sum();
+        if n > 0 {
+            hits.push((path, n));
+        }
+    }
+    assert_eq!(
+        hits.len(),
+        1,
+        "the authority-band predicate must live in exactly one file, found {hits:?}"
+    );
+    assert!(
+        hits[0].0.ends_with("paraeq-dsp/src/authority.rs"),
+        "and that file must be authority.rs, found {hits:?}"
+    );
+    assert_eq!(
+        hits[0].1, 1,
+        "and be spelled exactly once there, found {hits:?}"
+    );
+}
+
+/// Every `.rs` file under a workspace member's `src/`, absolute, sorted —
+/// the five crates and the desktop, which is where a second copy of a DSP
+/// predicate would most plausibly appear.
+///
+/// Library code only: a test is allowed — and in the case above, required — to
+/// re-derive a definition independently in order to check it.
+fn workspace_library_sources() -> Vec<String> {
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates/paraeq-dsp has a parent")
+        .to_path_buf();
+    let workspace = crates.parent().expect("crates/ has a parent").to_path_buf();
+    let mut stack: Vec<std::path::PathBuf> = std::fs::read_dir(&crates)
+        .expect("the crates directory is readable")
+        .filter_map(|e| e.ok().map(|e| e.path().join("src")))
+        .filter(|p| p.is_dir())
+        .collect();
+    stack.push(workspace.join("desktop/src-tauri/src"));
+    let mut out = Vec::new();
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("a src directory is readable") {
+            let path = entry.expect("a readable directory entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    assert!(
+        out.len() > 10,
+        "the source scan found only {} files — it is not looking where it \
+         thinks it is",
+        out.len()
+    );
+    out.sort();
+    out
+}
+
+/// A file's code with line comments and all whitespace removed, so the scan
+/// above matches a rustfmt line break and does not match prose that quotes the
+/// predicate.
+fn code_without_comments(path: &str) -> String {
+    let text = std::fs::read_to_string(path).expect("a source file is readable");
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let code = match line.find("//") {
+            Some(i) => &line[..i],
+            None => line,
+        };
+        out.extend(code.chars().filter(|c| !c.is_whitespace()));
+    }
+    out
+}
+
+// ───────────────────────── QCapPolicy's move to dsp ──────────────────────────
+
+/// `QCapPolicy`'s wire contract, under the same gate as the rest of this file's
+/// serde tests. `cargo test --workspace` runs it — `paraeq-decide`,
+/// `paraeq-engine` and the desktop all turn `paraeq-dsp`'s `serde` feature on
+/// unconditionally, so feature unification has it on for every command CI and
+/// CLAUDE.md name. The gate is what keeps `cargo test -p paraeq-dsp` compiling.
+#[cfg(feature = "serde")]
+mod q_cap_wire {
+    use super::*;
+
+    #[test]
+    fn q_cap_policy_round_trips_through_serde_after_the_move() {
+        // The move is byte-for-byte invisible on the wire: externally-tagged
+        // serde depends only on the variant names, so no fixture and no
+        // persisted profile moves with the type.
+        let coupler = COUPLER_Q_CEILING;
+        assert_eq!(
+            serde_json::to_string(&coupler).expect("serializes"),
+            r#"{"Ceiling":5.0}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<QCapPolicy>(r#"{"Ceiling":5.0}"#).expect("deserializes"),
+            coupler
+        );
+
+        let room = ROOM_Q_CEILING;
+        let json = serde_json::to_string(&room).expect("serializes");
+        assert_eq!(
+            json,
+            r#"{"LogLinear":{"hi":[10000.0,3.0],"lo":[200.0,10.0]}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<QCapPolicy>(&json).expect("deserializes"),
+            room
+        );
+
+        // The two shipped path ceilings are the two variants, so the wire form
+        // above is the whole wire form.
+        assert!(matches!(coupler, QCapPolicy::Ceiling(_)));
+        assert!(matches!(room, QCapPolicy::LogLinear { .. }));
     }
 }

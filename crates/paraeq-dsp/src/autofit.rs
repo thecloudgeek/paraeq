@@ -9,8 +9,16 @@
 //!   correct parity with the oracle and wrong for a room, which is why the
 //!   room does not use it.
 //! - [`auto_fit_room`] — the room path. Tier 3 (analytic), additive, per
-//!   channel, authority-limited. Pointed at a room curve the legacy function
-//!   does exactly what Toole warns automated algorithms do: **it fills nulls.**
+//!   channel, authority-limited, plus the residual-RMS stop and shelf
+//!   emission, both Tier 3: the stop is asserted as a band count against a
+//!   curve with a known residual, the shelf against the closed-form half-gain
+//!   width. [`crate::biquad::low_shelf`] / [`crate::biquad::high_shelf`] are
+//!   themselves Tier-1 fixture-pinned (`fixtures/biquad/matrix`), so the shelf
+//!   work adds no new oracle need and **no new fixture case**. There is no
+//!   delegate for any of it: the policy being tested is ParaEQ's own, and a
+//!   Python port written to check it would launder a design guess into a
+//!   golden fixture. Pointed at a room curve the legacy function does exactly
+//!   what Toole warns automated algorithms do: **it fills nulls.**
 //!
 //! # The autofit-shape reconciliation (cross-spec question 2, 2026-07-25)
 //!
@@ -35,6 +43,66 @@ use crate::authority::{self, AuthorityCurve, Clamp};
 use crate::logf::LogGrid;
 use crate::peq::{EQBand, FilterType, ParametricEQ};
 use crate::{DspError, PerChannel};
+
+/// A one-signed excursion at an end of `correction_range` must span at least
+/// this many octaves before a shelf is emitted for it.
+///
+/// `decision-engine-design.md` § Decision table, `shelves`: "Emit a shelf where
+/// a ≥0.5-octave one-signed excursion exists at either end of
+/// `correction_range`". The span is measured to the excursion's own **half-gain
+/// point**, which is not a convenience: an RBJ shelf sits at exactly half its
+/// gain at `fc`, so the half-gain frequency IS the corner the shelf should be
+/// placed at, and the same measurement answers both "is it broad enough" and
+/// "where does it turn over".
+pub const SHELF_MIN_WIDTH_OCT: f64 = 0.5;
+
+/// Shelf Q is clamped into this range — `decision-engine-design.md` § Decision
+/// table, `shelves`: "shelf Q clamped `[0.4, 0.7]`".
+///
+/// The ceiling is below RBJ's Butterworth 0.7071, and that is the whole point:
+/// a shelf with Q above 0.7071 overshoots just outside its corner, re-creating
+/// the bump it was emitted to remove. [`SHELF_Q_REQUEST`] therefore asks for
+/// Butterworth and this clamp is what actually bites.
+pub const SHELF_Q: std::ops::RangeInclusive<f64> = 0.4..=0.7;
+
+/// The Q the room path asks for before [`SHELF_Q`]'s clamp: RBJ's
+/// maximally-flat 0.7071 — the highest Q that does not overshoot, i.e. the
+/// fastest transition the shape allows without inventing a new bump.
+const SHELF_Q_REQUEST: f64 = std::f64::consts::FRAC_1_SQRT_2;
+
+/// The slice of `decide()`'s decision table [`auto_fit_room`] needs beyond the
+/// authority curve: **where** to correct, **how flat** is flat enough, and
+/// whether the ends may be corrected with a shelf.
+///
+/// Distinct from [`crate::authority::AuthorityPolicy`], which is the physics
+/// *ceiling* (excursion envelope, confidence, boost ratio, Q cap). This is the
+/// *goal*, and the two are deliberately different types so a tuning change to
+/// one cannot be mistaken for a safety change to the other.
+///
+/// [`auto_fit_room`] takes it as an `Option` because both behaviours it gates
+/// need a `correction_range` that no caller had to supply before it existed:
+/// `None` is the Stage-5 behaviour — fit until the band budget or the
+/// candidates run out — and is what a caller with no decision table (a test, a
+/// direct probe) should pass. `decide()` always passes `Some`.
+///
+/// Spec: `decision-engine-design.md` § Decision table, rows `correction_range`,
+/// `flatness_target_db` ("3.0 room / 1.0 coupler"), `max_filters` ("Greedy
+/// worst-first; stop when residual RMS over the authority band
+/// `< flatness_target_db` or the cap is hit") and `shelves`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RoomFitPolicy {
+    /// `(low_hz, high_hz)`, **both edges inclusive** — the band the fit works
+    /// in and, intersected with where the curve has any authority at all, the
+    /// band the stop is graded over.
+    pub correction_range: (f64, f64),
+    /// The residual RMS, in dB over the authority band, at or below which the
+    /// fit is finished. Must be finite and positive.
+    pub flatness_target_db: f64,
+    /// Whether a broad one-signed excursion at either end of
+    /// `correction_range` may be corrected with a shelf rather than left to
+    /// the peaking loop. `Choice: true, false`, default true.
+    pub shelves: bool,
+}
 
 pub fn auto_fit_parametric_eq(
     correction_db: &[f64],
@@ -179,12 +247,40 @@ pub struct RoomFitReport {
 /// though its own item 4 requires it; pass `GateReport::min_valid_freq_hz`, or
 /// `0.0` on an ungated path.
 ///
+/// # `max_bands`, `min_gain_db` and `fit_policy`
+///
+/// `max_bands` is `decisions.max_filters` — a **cap**, not a target. With a
+/// `fit_policy` the fit stops as soon as the residual RMS over the authority
+/// band falls below `flatness_target_db`, so the cap binds only on a curve the
+/// budget cannot flatten (`decision-engine-design.md` § Decision table,
+/// `max_filters`). Shelves are charged against the same budget: `max_bands` is
+/// a limit on **filters**, not on peaking filters.
+///
+/// `min_gain_db` is the same row's drop rule — "Drop any band with
+/// `|gain| < flatness/2`". The *binding* `min_gain_db = flatness_target_db / 2`
+/// is `decide()`'s to make and is tested there; this function owns the
+/// mechanism, and a feature refused by it is reported as
+/// [`Clamp::BelowMinGain`] rather than dropped silently.
+///
 /// # Errors
 ///
 /// `InvalidInput` when a channel's length does not match the grid, when any
 /// correction value is non-finite (a NaN residual wins every comparison it
-/// should lose once negated), when `min_valid_freq_hz` is not finite, or when
-/// `sample_rate` is not positive and finite.
+/// should lose once negated), when `min_valid_freq_hz` is not finite, when
+/// `sample_rate` is not positive and finite, or when a `fit_policy` is present
+/// and malformed (a non-finite or inverted `correction_range`, a
+/// `correction_range` that starts at or below 0 Hz, or a
+/// `flatness_target_db` that is not finite and positive). The policy is
+/// validated rather than tolerated because
+/// [`crate::authority::authority_band_mask`] answers an empty band for a range
+/// it cannot place — and an empty band can never say "flat enough", so a
+/// tolerated one would silently disable the stop instead of refusing.
+// The argument list is the spec's own signature (room-dsp § `autofit.rs`
+// changes) plus the two parameters its own items require but its signature
+// omits — `min_valid_freq_hz` and the decision-table slice. Bundling them into
+// one struct would hide which of them are safety inputs and which are goals,
+// which is the distinction `RoomFitPolicy`'s doc exists to keep visible.
+#[allow(clippy::too_many_arguments)]
 pub fn auto_fit_room(
     correction: &PerChannel<Vec<f64>>,
     grid: &LogGrid,
@@ -193,6 +289,7 @@ pub fn auto_fit_room(
     max_bands: usize,
     min_gain_db: f64,
     min_valid_freq_hz: f64,
+    fit_policy: Option<&RoomFitPolicy>,
 ) -> Result<PerChannel<RoomFitReport>, DspError> {
     if !(sample_rate.is_finite() && sample_rate > 0.0) {
         return Err(DspError::InvalidInput(format!(
@@ -209,28 +306,52 @@ pub fn auto_fit_room(
             "auto_fit_room: min_gain_db must be finite and >= 0, got {min_gain_db}"
         )));
     }
-    correction.try_map(|channel| {
-        fit_one_channel(
-            channel,
-            grid,
-            sample_rate,
-            authority,
-            max_bands,
-            min_gain_db,
-            min_valid_freq_hz,
-        )
-    })
+    if let Some(policy) = fit_policy {
+        let (low_hz, high_hz) = policy.correction_range;
+        if !(low_hz.is_finite() && high_hz.is_finite() && low_hz > 0.0 && low_hz <= high_hz) {
+            return Err(DspError::InvalidInput(format!(
+                "auto_fit_room: correction_range must be finite with 0 < low <= high, \
+                 got ({low_hz}, {high_hz})"
+            )));
+        }
+        if !(policy.flatness_target_db.is_finite() && policy.flatness_target_db > 0.0) {
+            return Err(DspError::InvalidInput(format!(
+                "auto_fit_room: flatness_target_db must be finite and > 0, got {}",
+                policy.flatness_target_db
+            )));
+        }
+    }
+    let ctx = FitContext {
+        authority,
+        grid,
+        min_gain_db,
+        sample_rate,
+    };
+    correction
+        .try_map(|channel| fit_one_channel(channel, &ctx, max_bands, min_valid_freq_hz, fit_policy))
+}
+
+/// What every step of one fit shares and none of them changes: the ceiling,
+/// the grid, the drop floor and the design rate.
+///
+/// It exists so the band path — clamp, stabilize, shrink, commit — can be one
+/// function called from both the shelf pre-pass and the greedy loop without a
+/// nine-argument signature. Nothing here is per-band or per-channel.
+struct FitContext<'a> {
+    authority: &'a AuthorityCurve,
+    grid: &'a LogGrid,
+    min_gain_db: f64,
+    sample_rate: f64,
 }
 
 fn fit_one_channel(
     correction_db: &[f64],
-    grid: &LogGrid,
-    sample_rate: f64,
-    authority: &AuthorityCurve,
+    ctx: &FitContext,
     max_bands: usize,
-    min_gain_db: f64,
     min_valid_freq_hz: f64,
+    fit_policy: Option<&RoomFitPolicy>,
 ) -> Result<RoomFitReport, DspError> {
+    let (authority, grid, min_gain_db) = (ctx.authority, ctx.grid, ctx.min_gain_db);
     let freqs = grid.freqs();
     if correction_db.len() != freqs.len() {
         return Err(DspError::InvalidInput(format!(
@@ -278,7 +399,46 @@ fn fit_one_channel(
     // shoulders it over-cut. The envelope is a driver-excursion limit, so
     // exceeding it 2.3× is exactly the failure it exists to prevent.
     let mut applied = vec![0.0f64; freqs.len()];
-    for _ in 0..max_bands {
+
+    // THE authority band, called rather than re-derived: `authority_band_mask`
+    // is the single definition of the phrase, shared with `decide()`'s
+    // verification gate, and `tests/test_authority.rs` fails if a second copy
+    // of the predicate appears anywhere in the workspace's library sources.
+    let band_mask =
+        fit_policy.map(|p| authority::authority_band_mask(freqs, authority, p.correction_range));
+    let flat_enough = |residual: &[f64]| match (fit_policy, band_mask.as_ref()) {
+        (Some(policy), Some(mask)) => {
+            residual_rms_db(residual, mask).is_some_and(|rms| rms < policy.flatness_target_db)
+        }
+        // No policy is no target, so nothing is ever "flat enough" and the fit
+        // runs to its band budget — the pre-B4 behaviour, unchanged.
+        _ => false,
+    };
+
+    // Shelves first, and before the greedy loop rather than inside it: a broad
+    // end tilt is one filter's work, and the loop would otherwise spend six
+    // peaking bands walking up it before the shelf could be considered. The
+    // spec's own sentence for the row is "a shelf fixes it with one filter
+    // instead of six".
+    if let Some(policy) = fit_policy {
+        if policy.shelves && !flat_enough(&residual) {
+            emit_shelves(
+                policy.correction_range,
+                ctx,
+                &admissible,
+                &mut applied,
+                &mut residual,
+                &mut report,
+            );
+        }
+    }
+
+    // Shelves are filters, so they are charged against `max_filters` too.
+    let budget = max_bands.saturating_sub(report.bands.len());
+    for _ in 0..budget {
+        if flat_enough(&residual) {
+            break;
+        }
         let Some((idx, gain, q)) = pick_candidate(
             &residual,
             &applied,
@@ -296,50 +456,219 @@ fn fit_one_channel(
             gain_db: gain,
             q,
         };
-        let (clamped, clamps) = authority::clamp_band(&requested, authority);
-        report.clamps.extend(clamps);
-        let Some((stable, _sos)) = authority::stabilize_band(&clamped, sample_rate) else {
-            // The Jury funnel gave up. Strike the bin so the loop advances,
-            // count it, and keep fitting the rest of the curve — dropping one
-            // band is a defect to report, not a reason to abandon the fit.
-            report.dropped += 1;
-            admissible[idx] = false;
-            continue;
-        };
-        // THE cascade gate. Everything above bounds one band; this bounds the
-        // sum, which is the only thing the driver and the headroom budget
-        // actually see.
-        let Some((realized, response)) = shrink_into_cascade(
-            &stable,
-            &applied,
-            authority,
-            freqs,
-            sample_rate,
-            min_gain_db,
-        ) else {
-            // No usable gain survives here — the ceiling is already spent at
-            // this feature. Strike the bin rather than emitting a filter that
-            // does nothing, and do not charge the band budget for it.
-            admissible[idx] = false;
-            continue;
-        };
-        if realized.gain_db != stable.gain_db {
-            report.clamps.push(
-                authority
-                    .at(freqs[idx])
-                    .gain_clamp(stable.gain_db, realized.gain_db),
-            );
+        match commit_band(&requested, ctx, &mut applied, &mut residual, &mut report) {
+            Commit::Emitted => {}
+            Commit::Unstable => {
+                // The Jury funnel gave up. Strike the bin so the loop
+                // advances, count it, and keep fitting the rest of the curve —
+                // dropping one band is a defect to report, not a reason to
+                // abandon the fit.
+                report.dropped += 1;
+                admissible[idx] = false;
+            }
+            Commit::NoHeadroom => {
+                // No usable gain survives here — the ceiling is already spent
+                // at this feature. Strike the bin rather than emitting a
+                // filter that does nothing. The budget iteration IS spent, so
+                // a curve whose ceiling is exhausted ends the fit early rather
+                // than walking the whole grid one struck bin at a time; that
+                // is what `a_spent_ceiling_does_not_burn_the_band_budget`
+                // pins.
+                admissible[idx] = false;
+            }
         }
-        // Subtract what will actually run, not what was asked for: the greedy
-        // loop's bookkeeping must track the realized cascade or every
-        // subsequent pick is fitting a residual that does not exist.
-        for ((r, a), resp) in residual.iter_mut().zip(applied.iter_mut()).zip(&response) {
-            *r -= resp;
-            *a += resp;
-        }
-        report.bands.push(realized);
     }
     Ok(report)
+}
+
+/// The residual RMS over the authority band, in dB — `None` when the band is
+/// empty, because a band with no bins grades nothing and must not be read as
+/// "flat".
+///
+/// A plain mean of squares over grid bins **is** the octave-weighted mean the
+/// spec asks for, and only because the analysis grid is uniform in `log f`
+/// ([`LogGrid`]): every bin covers the same fraction of an octave, so no
+/// explicit weight is needed. On a linear grid the same code would be
+/// treble-weighted, and wrong.
+fn residual_rms_db(residual: &[f64], band: &[bool]) -> Option<f64> {
+    let mut sum_sq = 0.0;
+    let mut n = 0usize;
+    for (r, in_band) in residual.iter().zip(band) {
+        if *in_band {
+            sum_sq += r * r;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return None;
+    }
+    Some((sum_sq / n as f64).sqrt())
+}
+
+/// What happened to a band on its way from "requested" to "installed".
+enum Commit {
+    /// Clamped, stable, and inside the cascade ceiling: it is in the report.
+    Emitted,
+    /// The Jury retry funnel could not stabilize it.
+    Unstable,
+    /// Nothing at or above `min_gain_db` fits under what the cascade has
+    /// already spent here.
+    NoHeadroom,
+}
+
+/// Clamp one requested band to the curve, stabilize it, shrink it into the
+/// cascade, and — if anything survives — commit it to `report`, `residual` and
+/// `applied`.
+///
+/// Extracted so the shelf pre-pass and the greedy loop cannot drift: every
+/// band `auto_fit_room` emits goes through the same four gates in the same
+/// order, whatever picked it.
+fn commit_band(
+    requested: &EQBand,
+    ctx: &FitContext,
+    applied: &mut [f64],
+    residual: &mut [f64],
+    report: &mut RoomFitReport,
+) -> Commit {
+    let (clamped, clamps) = authority::clamp_band(requested, ctx.authority);
+    report.clamps.extend(clamps);
+    let Some((stable, _sos)) = authority::stabilize_band(&clamped, ctx.sample_rate) else {
+        return Commit::Unstable;
+    };
+    // THE cascade gate. Everything above bounds one band; this bounds the sum,
+    // which is the only thing the driver and the headroom budget actually see.
+    let Some((realized, response)) = shrink_into_cascade(
+        &stable,
+        applied,
+        ctx.authority,
+        ctx.grid.freqs(),
+        ctx.sample_rate,
+        ctx.min_gain_db,
+    ) else {
+        return Commit::NoHeadroom;
+    };
+    if realized.gain_db != stable.gain_db {
+        report.clamps.push(
+            ctx.authority
+                .at(requested.fc)
+                .gain_clamp(stable.gain_db, realized.gain_db),
+        );
+    }
+    // Subtract what will actually run, not what was asked for: the greedy
+    // loop's bookkeeping must track the realized cascade or every subsequent
+    // pick is fitting a residual that does not exist.
+    for ((r, a), resp) in residual.iter_mut().zip(applied.iter_mut()).zip(&response) {
+        *r -= resp;
+        *a += resp;
+    }
+    report.bands.push(realized);
+    Commit::Emitted
+}
+
+/// Emit at most one shelf at each end of `correction_range`.
+///
+/// `decision-engine-design.md` § Decision table, `shelves`: "Emit a shelf where
+/// a ≥0.5-octave one-signed excursion exists at either end of
+/// `correction_range`; shelf Q clamped `[0.4, 0.7]`."
+fn emit_shelves(
+    correction_range: (f64, f64),
+    ctx: &FitContext,
+    admissible: &[bool],
+    applied: &mut [f64],
+    residual: &mut [f64],
+    report: &mut RoomFitReport,
+) {
+    for filter_type in [FilterType::LowShelf, FilterType::HighShelf] {
+        let Some(shelf) = shelf_at_end(filter_type, correction_range, ctx, residual, admissible)
+        else {
+            continue;
+        };
+        match commit_band(&shelf, ctx, applied, residual, report) {
+            Commit::Emitted => {}
+            // Same meaning as in the greedy loop: a design the Jury funnel
+            // could not stabilize is a defect to report.
+            Commit::Unstable => report.dropped += 1,
+            // Nothing to strike and nothing to report: the tilt is still in
+            // the residual, so the peaking loop gets its turn at it under the
+            // same ceiling. No budget is spent, because no filter was placed.
+            Commit::NoHeadroom => {}
+        }
+    }
+}
+
+/// The shelf one end of `correction_range` asks for, if any.
+///
+/// The excursion's **asymptote** is the residual at the end bin itself — that
+/// is what a shelf's gain parameter means — and its **corner** is the first bin
+/// walking inward where the residual either changes sign or falls to half that
+/// asymptote, because an RBJ shelf sits at exactly half its gain at `fc`. The
+/// span between the two is the "one-signed excursion" the spec measures against
+/// [`SHELF_MIN_WIDTH_OCT`].
+///
+/// A run that is broad enough but whose asymptote is below `min_gain_db` yields
+/// no shelf and **no report**: the feature is still in the residual, so the
+/// greedy loop sees it and, if it is the largest thing left, reports it as
+/// [`Clamp::BelowMinGain`] there. One emission site, one meaning — reporting
+/// here as well would announce every silent grid tail as a decision.
+fn shelf_at_end(
+    filter_type: FilterType,
+    correction_range: (f64, f64),
+    ctx: &FitContext,
+    residual: &[f64],
+    admissible: &[bool],
+) -> Option<EQBand> {
+    let freqs = ctx.grid.freqs();
+    let (low_hz, high_hz) = correction_range;
+    let in_band = |i: usize| admissible[i] && freqs[i] >= low_hz && freqs[i] <= high_hz;
+    let from_low = matches!(filter_type, FilterType::LowShelf);
+    let end = if from_low {
+        (0..freqs.len()).find(|&i| in_band(i))?
+    } else {
+        (0..freqs.len()).rev().find(|&i| in_band(i))?
+    };
+    let asymptote = residual[end];
+    if asymptote == 0.0 {
+        // No excursion at all, and `0.0.signum()` is +1.0 — so this has to be
+        // tested rather than left to the sign walk below.
+        return None;
+    }
+    let half = 0.5 * asymptote.abs();
+    let mut corner = end;
+    loop {
+        let next = if from_low {
+            if corner + 1 >= freqs.len() {
+                break;
+            }
+            corner + 1
+        } else {
+            if corner == 0 {
+                break;
+            }
+            corner - 1
+        };
+        if !in_band(next) {
+            break;
+        }
+        let r = residual[next];
+        if r * asymptote <= 0.0 || r.abs() < half {
+            break;
+        }
+        corner = next;
+    }
+    let width_oct = if from_low {
+        (freqs[corner] / freqs[end]).log2()
+    } else {
+        (freqs[end] / freqs[corner]).log2()
+    };
+    if width_oct < SHELF_MIN_WIDTH_OCT || asymptote.abs() < ctx.min_gain_db {
+        return None;
+    }
+    Some(EQBand {
+        filter_type,
+        fc: freqs[corner],
+        gain_db: asymptote,
+        q: SHELF_Q_REQUEST.clamp(*SHELF_Q.start(), *SHELF_Q.end()),
+    })
 }
 
 /// What is left of the ceiling at a bin, given `applied` dB of realized
@@ -484,6 +813,20 @@ fn pick_candidate(
         // ratio of validated ceilings.
         let (idx, score) = best?;
         if score < min_gain_db {
+            // The drop rule, made visible. `decision-engine-design.md`
+            // § Decision table, `max_filters`: "Drop any band with
+            // `|gain| < flatness/2`" — and `min_gain_db` IS that flatness/2.
+            // The best thing left is too small to be worth a filter, so the
+            // fit is finished; reporting it is what lets the drawer say "we
+            // found a 1.2 dB bump and left it alone because you asked for
+            // 3 dB flat" instead of dropping it in silence, which is the one
+            // option `clamp_band`'s premise — report every change — forbids.
+            // The reported gain is what was FOUND (the raw residual), not the
+            // asymmetric score that ranked it.
+            report.clamps.push(Clamp::BelowMinGain {
+                fc: freqs[idx],
+                gain_db: residual[idx],
+            });
             return None;
         }
         let gain = residual[idx];

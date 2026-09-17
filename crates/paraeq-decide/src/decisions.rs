@@ -165,26 +165,23 @@ pub enum CorrectionKind {
     Peq,
 }
 
-/// The path ceiling on boost Q. REW's gain-dependent cap
-/// (`Q_max = 0.227·f₀/A`) is applied unconditionally on top of this and is
-/// not a policy choice — `decide()` takes the min of the two.
+/// The path ceiling on boost Q that `decide()` consumes.
 ///
-/// Deliberately NOT `PartialOrd`. The spec gives `q_cap` the domain
-/// `Range 1.0..=20.0` "on the ceiling" — a range over a scalar, not over this
-/// enum — so a `Domain<QCapPolicy>::Range` cannot answer `contains` for the
-/// room's own `LogLinear` value. An ordering here would answer it `false`
-/// rather than leaving the ambiguity visible. OPEN for the owner: either
-/// `q_cap`'s domain is `Choice` over the two path policies, or `QCapPolicy`
-/// splits into a decided ceiling scalar plus a profile-owned shape.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
-pub enum QCapPolicy {
-    /// A flat ceiling (coupler: 5.0). The drawer's `Range 1.0..=20.0` writes
-    /// this variant.
-    Ceiling(f64),
-    /// Log-linear in frequency between two `(hz, q)` breakpoints. The room
-    /// path: 10.0 @ 200 Hz → 3.0 @ 10 kHz.
-    LogLinear { hi: (f64, f64), lo: (f64, f64) },
-}
+/// **Now a re-export** (Stage 6), for the reason [`AuthorityCurve`] moved in
+/// Stage 5 and to the same module: `paraeq_dsp::authority` owns the excursion
+/// envelope and both path ceilings, and composes the ceiling with REW's
+/// gain-dependent cap in `max_q_for_boost_capped` — the "min of the two" this
+/// type's own doc comment names. Keeping the definition here left the ceiling
+/// applied nowhere and `decide()` free to re-specify numbers the
+/// decision-engine spec says it must not. The variants, their fields and the
+/// externally-tagged wire form are unchanged, so nothing under
+/// `fixtures/decide/` and no persisted profile moves with the type.
+///
+/// The `PartialOrd` ruling and its OPEN-for-owner note travelled with the
+/// definition; read them there. `paraeq-dsp` cannot carry the answer, because
+/// `Domain` and `InRange` are this crate's types — `q_cap`'s domain is decided
+/// on this side, exactly as `TransducerClass`'s is.
+pub use paraeq_dsp::authority::QCapPolicy;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, PartialOrd, Serialize)]
 pub enum TargetChoice {
