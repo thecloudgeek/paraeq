@@ -12,14 +12,28 @@ use paraeq_stimulus::protocol::ExitCode;
 
 const RATE: u32 = 48_000;
 
-/// A sine at a known RMS. Amplitude `a` gives `a / sqrt(2)` RMS, so the dBFS
-/// is exact rather than approximate.
-fn sine_at_dbfs_rms(dbfs: f64, seconds: f64) -> Vec<f32> {
-    let amplitude = 10f64.powf(dbfs / 20.0) * 2f64.sqrt();
+/// A square wave at a known RMS.
+///
+/// A SQUARE, not a sine, and that choice is the whole reason these tests test
+/// what they say they do. A square's crest factor is 1, so its peak IS its RMS
+/// and a buffer at -2.9 dBFS RMS peaks at 0.715 — comfortably inside full
+/// scale. A sine at the same RMS peaks at 1.012, which trips the backstop's
+/// PEAK bound, so a "refused at the ceiling" test built on sines would pass
+/// without ever exercising the windowed RMS it claims to pin. The two bounds
+/// are independent and are tested independently.
+fn square_at_dbfs_rms(dbfs: f64, seconds: f64) -> Vec<f32> {
+    let amplitude = 10f64.powf(dbfs / 20.0);
     let n = (seconds * f64::from(RATE)) as usize;
-    let omega = 2.0 * std::f64::consts::PI * 1_000.0 / f64::from(RATE);
+    let half_period = 24; // ~1 kHz at 48 kHz
     (0..n)
-        .map(|i| (amplitude * (omega * i as f64).sin()) as f32)
+        .map(|i| {
+            let sign = if (i / half_period) % 2 == 0 {
+                1.0
+            } else {
+                -1.0
+            };
+            (amplitude * sign) as f32
+        })
         .collect()
 }
 
@@ -28,10 +42,20 @@ fn a_hot_wav_is_refused_before_the_device_opens() {
     // 0.1 dB over the absolute maximum. The refusal has to come from a process
     // that has opened nothing: an interlock that fires after the device is up
     // has already let the hazard exist.
-    let hot = sine_at_dbfs_rms(ABSOLUTE_MAX_DBFS_RMS + 0.1, 2.0);
+    let hot = square_at_dbfs_rms(ABSOLUTE_MAX_DBFS_RMS + 0.1, 2.0);
+    assert!(
+        hot.iter().all(|&v| v.abs() <= 1.0),
+        "this file is hot by RMS and INSIDE full scale, so only the windowed \
+         bound can refuse it"
+    );
     let refusal = check(&hot, RATE).expect_err("a hot file is refused");
     assert_eq!(refusal.code, ExitCode::BackstopRefused);
     assert_eq!(refusal.code.code(), 6);
+    assert!(
+        refusal.message.contains("window"),
+        "the WINDOWED bound is what fired, not the peak: {}",
+        refusal.message
+    );
 
     // And the ORDER, through the whole program: give it a hot file AND a
     // device UID that cannot resolve. If the device were opened first the exit
@@ -113,7 +137,7 @@ fn a_hot_sweep_padded_with_silence_is_still_refused() {
     // arbitrarily more as the lead-in grows — so a whole-file check is an
     // interlock a caller defeats by adding silence.
     let mut padded = vec![0.0f32; (0.5 * f64::from(RATE)) as usize];
-    padded.extend(sine_at_dbfs_rms(ABSOLUTE_MAX_DBFS_RMS + 0.1, 5.5));
+    padded.extend(square_at_dbfs_rms(ABSOLUTE_MAX_DBFS_RMS + 0.1, 5.5));
     padded.extend(std::iter::repeat_n(
         0.0f32,
         (1.7 * f64::from(RATE)) as usize,
@@ -133,6 +157,11 @@ fn a_hot_sweep_padded_with_silence_is_still_refused() {
 
     let refusal = check(&padded, RATE).expect_err("the window sees the sweep the padding hides");
     assert_eq!(refusal.code, ExitCode::BackstopRefused);
+    assert!(
+        refusal.message.contains("window"),
+        "the WINDOWED bound is what fired: {}",
+        refusal.message
+    );
 }
 
 #[test]
@@ -141,16 +170,14 @@ fn the_backstop_refuses_exactly_at_the_parents_ceiling() {
     // a copy. Two locally-declared constants kept in step by hand would pass an
     // equality assertion right up to the moment someone forgot; a bound derived
     // from the parent's number moves with it by construction.
-    let hot = sine_at_dbfs_rms(ABSOLUTE_MAX_DBFS_RMS + 0.1, 2.0);
-    let cool = sine_at_dbfs_rms(ABSOLUTE_MAX_DBFS_RMS - 0.1, 2.0);
+    let hot = square_at_dbfs_rms(ABSOLUTE_MAX_DBFS_RMS + 0.1, 2.0);
+    let cool = square_at_dbfs_rms(ABSOLUTE_MAX_DBFS_RMS - 0.1, 2.0);
+    // Both are inside full scale, so the peak bound cannot decide either one.
+    assert!(hot.iter().chain(&cool).all(|&v| v.abs() <= 1.0));
 
-    assert_eq!(
-        check(&hot, RATE)
-            .expect_err("above the ceiling")
-            .code
-            .code(),
-        6
-    );
+    let refusal = check(&hot, RATE).expect_err("above the ceiling");
+    assert_eq!(refusal.code.code(), 6);
+    assert!(refusal.message.contains("window"), "{}", refusal.message);
     check(&cool, RATE).expect("below the ceiling, so it plays");
 }
 
@@ -159,7 +186,8 @@ fn a_file_shorter_than_one_window_is_measured_whole_rather_than_skipped() {
     // A short file is still a file that can be hot, and "no complete window"
     // must not read as "nothing to check".
     let short_seconds = BACKSTOP_WINDOW_MS / 1000.0 / 4.0;
-    let hot = sine_at_dbfs_rms(ABSOLUTE_MAX_DBFS_RMS + 3.0, short_seconds);
+    let hot = square_at_dbfs_rms(ABSOLUTE_MAX_DBFS_RMS + 3.0, short_seconds);
+    assert!(hot.iter().all(|&v| v.abs() <= 1.0));
     assert!(check(&hot, RATE).is_err());
 }
 
@@ -168,7 +196,7 @@ fn a_full_scale_transient_is_refused_even_at_a_quiet_average() {
     // The two bounds fail differently: the windowed RMS catches a file levelled
     // too hot, and the peak catches one whose average is fine but which
     // contains a full-scale sample.
-    let mut quiet = sine_at_dbfs_rms(-40.0, 2.0);
+    let mut quiet = square_at_dbfs_rms(-40.0, 2.0);
     quiet[1000] = 1.5;
     let refusal = check(&quiet, RATE).expect_err("a transient over full scale is refused");
     assert!(refusal.message.contains("peak"), "{}", refusal.message);
