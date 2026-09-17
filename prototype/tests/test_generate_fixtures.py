@@ -48,13 +48,14 @@ def _load_generator():
 
 gen = _load_generator()
 
-# Stage directories a pending case addition is allowed to CREATE. Empty here:
-# this item adds no gen_*() case, and the cases that follow it write into
-# stages that already exist (fr/, fir/). An item that introduces a brand-new
-# stage name adds it here in the same commit -- that edit is the deliberate
-# decision the gate is asking for, and it is what catches a mis-named stage
-# (e.g. save_case("FR", ...) quietly minting fixtures/FR/).
-NEW_STAGES: frozenset[str] = frozenset()
+# Stage directories a pending case addition is allowed to CREATE. An item that
+# introduces a brand-new stage name adds it here in the same commit -- that edit
+# is the deliberate decision the gate is asking for, and it is what catches a
+# mis-named stage (e.g. save_case("FR", ...) quietly minting fixtures/FR/).
+#
+# "resample" is gen_resample_poly()'s stage (Stage 6, B12): the one Tier-2 case
+# for crates/paraeq-dsp/src/resample.rs, and the first case to write it.
+NEW_STAGES: frozenset[str] = frozenset({"resample"})
 
 # The interpreter is part of the toolchain even though PINNED_VERSIONS does not
 # name it: main() stamps platform.python_version() into fixtures/manifest.json,

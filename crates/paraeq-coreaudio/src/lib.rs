@@ -12,6 +12,12 @@ pub mod measure_aggregate;
 pub mod properties;
 pub mod render;
 pub mod tap;
+/// Re-export of [`paraeq_dsp::two_clock`] (Stage 6, B12). The marker layout,
+/// matched-filter location and skew fit moved down to the pure-math crate so
+/// `paraeq-measure`'s verification pass can reach them without depending on
+/// this one; the module file here is a one-line shim so
+/// `tests/test_measure_hardware.rs` keeps naming `paraeq_coreaudio::two_clock`
+/// exactly as it always has.
 pub mod two_clock;
 pub mod volume;
 

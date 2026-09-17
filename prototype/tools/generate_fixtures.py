@@ -38,7 +38,7 @@ from pathlib import Path
 import numpy as np
 import scipy
 from scipy.ndimage import gaussian_filter1d
-from scipy.signal import minimum_phase, sosfilt
+from scipy.signal import minimum_phase, resample_poly, sosfilt
 from scipy.signal.windows import blackmanharris, boxcar, hann, tukey
 
 from paraeq.correction.auto_fit import auto_fit_parametric_eq
@@ -451,6 +451,46 @@ def gen_min_phase_spectrum():
                "n_taps": int(h.size), "n_taps_out": int(mp.size)},
               {"h": h, "min_phase_taps": mp,
                "spectrum_im": spec.imag, "spectrum_re": spec.real})
+
+
+def gen_resample_poly():
+    """resample::resample_ratio vs scipy.signal.resample_poly, rational ratio (Tier 2).
+
+    The ONE Tier-2 case for a Tier-3 function. resample_ratio takes an arbitrary
+    real ratio and a sub-sample phase, for which no library is the authority --
+    but the RATIONAL-ratio, zero-phase special case is exactly what resample_poly
+    does, so for that case scipy is a real delegate rather than a transcription
+    of our own kernel.
+
+    What the delegate is authoritative about, and what it is not. Verified on
+    this pinned toolchain: resample_poly's output sample j is the input signal at
+    input time j*down/up, i.e. our index convention with frac_offset = 0 and no
+    residual filter delay -- that is the property the fixture pins, along with
+    the ratio itself and the kernel's broad shape. It is NOT authoritative to
+    many digits: resample_poly designs its FIR with firwin(..., ('kaiser', 5.0)),
+    whose passband ripples about 3e-3 on this signal, while a 32-tap kaiser-8.6
+    windowed sinc sits within 5e-5 of the exact band-limited answer. So the two
+    agree to scipy's accuracy, not to ours, and the Rust test's tolerances say so
+    out loud. A wrong convention, a reciprocal ratio or a broken kernel all miss
+    by orders of magnitude more.
+
+    The input is white noise brick-walled at 0.15 of the sample rate by an rfft
+    round trip and normalised to unit RMS. Band-limiting is not cosmetic: both
+    filters transition near Nyquist, so energy up there would grade the two
+    designs' transition bands against each other and nothing else. numpy's fft
+    is the only thing that touches the signal, so the case imports nothing from
+    paraeq.
+    """
+    rng = np.random.default_rng(56)
+    up, down, n, band_limit = 3, 2, 4096, 0.15
+    spectrum = np.fft.rfft(rng.standard_normal(n))
+    spectrum[np.fft.rfftfreq(n) > band_limit] = 0.0
+    x = np.fft.irfft(spectrum, n)
+    x = x / np.sqrt(np.mean(x**2))
+    save_case("resample", "poly_rational",
+              {"band_limit": band_limit, "down": down, "n_samples": n,
+               "sample_rate": SR, "up": up},
+              {"x": x, "y": resample_poly(x, up, down)})
 
 
 def gen_rms_average():
@@ -871,6 +911,7 @@ def main():
     gen_gaussian_smoothing()
     gen_logf()
     gen_min_phase_spectrum()
+    gen_resample_poly()
     gen_rms_average()
     gen_rms_average_weighted()
     gen_schroeder()

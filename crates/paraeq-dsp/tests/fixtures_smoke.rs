@@ -54,6 +54,7 @@ fn tier2_scipy_direct_fixtures_are_wellformed() {
         ("fr", "rms_average_weighted"),
         ("logf", "resample_db"),
         ("peq", "sosfilt_offline"),
+        ("resample", "poly_rational"),
         ("room", "schroeder_decay"),
     ]
     .iter()
