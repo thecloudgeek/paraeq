@@ -20,6 +20,7 @@ pub mod splice;
 pub mod spline;
 pub mod sweep;
 pub mod targets;
+pub mod two_clock;
 pub mod window;
 
 /// Re-exported so consumers (and this crate's integration tests) can name the

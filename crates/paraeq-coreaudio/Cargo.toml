@@ -12,6 +12,13 @@ objc2-core-audio = { workspace = true }
 objc2-core-audio-types = { workspace = true }
 objc2-core-foundation = { workspace = true }
 objc2-foundation = { workspace = true }
+# A NORMAL dependency since Stage 6 (B12), not a dev-dependency: `two_clock`
+# moved into paraeq-dsp and this crate's `src/two_clock.rs` re-exports it, so
+# lib code — not just tests — names the crate. Nothing new enters the build
+# graph; paraeq-dsp was already reachable transitively through paraeq-measure
+# below. Normal dependencies are visible to dev targets, so the `#[ignore]`d
+# hardware harness that also uses paraeq-dsp directly needs no other change.
+paraeq-dsp = { path = "../paraeq-dsp" }
 paraeq-engine = { path = "../paraeq-engine" }
 # The seam this crate implements (MS-22): paraeq-measure defines CaptureSource;
 # the dependency points INTO the measure crate (which depends only on
@@ -23,4 +30,3 @@ thiserror = { workspace = true }
 [dev-dependencies]
 ctrlc = "3.5"
 env_logger = "0.11"
-paraeq-dsp = { path = "../paraeq-dsp" }
