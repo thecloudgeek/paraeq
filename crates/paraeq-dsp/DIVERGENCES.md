@@ -162,9 +162,11 @@ differs from `prototype/paraeq/`, so a red parity test is always actionable.
     `paraeq-engine`'s `build_correction`, which instead **drops only the
     offending bands and counts them** in `BuildReport.bands_dropped`, refusing
     the whole configuration only when nothing survives. The count is logged at
-    `warn`; it is **not** on the wire — `EngineState` has no drop or
-    substitution count, so the Advanced drawer's surfacing of it is not built
-    (a follow-up alongside the drawer itself, Stage 7). The
+    `warn` and, **from Stage 6, is on the wire** — `EngineState` carries
+    `bands_dropped` and `sections_substituted`, because the verification gate
+    reads the first of them through `EngineFacts::bands_dropped()` and refuses
+    on `> 0`. The Advanced drawer's surfacing of it to the user is still not
+    built (Stage 7). The
     rationale is R1-3's own DECIDED text for the identical question one layer
     up: *"the auto front-end must never be bricked by one bad band… An error
     would mean no correction at all from one bad row."* Flagged `OPEN [OWNER]`

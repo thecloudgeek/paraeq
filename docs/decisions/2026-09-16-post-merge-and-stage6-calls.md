@@ -68,7 +68,7 @@ Each row is **Decision / reasoning / Confidence / Kind**, the shape the
 | **D-7** | R1-8's decay test cannot reach its own assertion | Keep the assertion (it pins the broadcast release rate, which is the meaningful invariant) and pump `ceil(1.7 · rate / block) + 2` silent blocks, written **as a formula** so it survives a geometry change | Arithmetic, verified: at 512 frames / 48 kHz the 0.1 crossing is at **159.4** blocks, and the spec's "100 silent" blocks only decay to `0.98565^100 = 0.236`. Recorded as a spec-text arithmetic defect at the test, the shape plan items 6 and 19 already use | High | Pin now |
 | **D-8** | Does a 4 Hz decaying meter need mitigation? | **Accept and flag.** No throttling, no slower meter | It does not hit disk (`desktop/src-tauri/src/state.rs`: engine-only ticks "never touch disk, not even to read"), and engine-hardening R1-8 states the decaying meter is explicitly **not** release-blocking. If the re-render cost proves real, the honest fix is a separate lighter meters event in Stage 7, not a slower meter | Medium | Ship + validate |
 | **D-9** | `design_rate` on a shared `CorrectionConfig` field or per variant? | **Per variant** | engine-hardening R1-6's own DECIDED block defers to the later 2026-07-21 record, which shows `Peq { bands, design_rate }`. A shared field forces the same refusal compare on `Peq`, which §Q1 says must **not** refuse; `paraeq-decide`'s `CorrectionPlan.design_rate` is already documented as "Provenance only — never the rate the engine designs at"; and the name `CorrectionKind` is already taken by `paraeq_decide::decisions` | High | Pin now |
-| **D-10** | A band illegal at the **new** rate: drop it, or refuse the whole set? | **Drop the offending bands and count them** in `BuildReport.bands_dropped` (logged at `warn`; publishing the count in `EngineState` is a Stage-7 follow-up, not built). Refuse the whole config only when nothing survives. Expanded below | engine-hardening R1-3's DECIDED rationale is directly on point: "the auto front-end must never be bricked by one bad band… An error would mean *no correction at all* from one bad row." **User-visible behaviour change** from the shell's whole-set `ClearCorrection`; recorded in `crates/paraeq-dsp/DIVERGENCES.md` #18 and flagged `OPEN [OWNER]` per **P3** | High (shape); Medium (product) | Ship + validate, `OPEN [OWNER]` |
+| **D-10** | A band illegal at the **new** rate: drop it, or refuse the whole set? | **Drop the offending bands and count them** in `BuildReport.bands_dropped` (logged at `warn`, and **published on `EngineState` from Stage 6**, because the verification gate reads it; the Advanced *drawer* that surfaces it to the user is still Stage 7). Refuse the whole config only when nothing survives. Expanded below | engine-hardening R1-3's DECIDED rationale is directly on point: "the auto front-end must never be bricked by one bad band… An error would mean *no correction at all* from one bad row." **User-visible behaviour change** from the shell's whole-set `ClearCorrection`; recorded in `crates/paraeq-dsp/DIVERGENCES.md` #18 and flagged `OPEN [OWNER]` per **P3** | High (shape); Medium (product) | Ship + validate, `OPEN [OWNER]` |
 | **D-11** | Build a re-derivable FIR variant now? | **Defer** to the Stage-6 FIR room path; ship `Fir { design_rate, firs }` under R1-6's refusal net | `fir::design_fir_correction(correction_db, n_taps, phase)` is **positional** — no Hz grid, no rate — so re-derivation is new DSP; `CorrectionPlan` carries no FIR shape at all; engine-hardening R1-6 says "stage 4 has no FIR path" and assigns the FIR room correction to stage 6. Precedent: R1-4's risk row — "If it slips, ship the wrapper + the existing fixture and hold the new fn." Record it in R1-6's RESOLVED block so a future session does not re-derive the question | High | Pin now |
 | **D-12** | Delete `eq::resend_decision`, or keep it? | **Keep it, re-pointed at `EngineState.correction_rate_mismatch`**, demoted from primary mechanism to fallback | engine-hardening R1-6's test table and its risks table both say the tests are "retained and re-pointed, not deleted" and "**Whoever merges the branch must not delete these.**" It still has two live jobs the engine cannot do: the first-ever stream (a persisted, hand-editable `settings.json` band set needs validating and re-stamping at a real rate) and supplying fresh design intent for a config the engine could not re-derive | High | Pin now |
 | **D-13** | Where does `validate_bands` live? | `paraeq-engine`, next to `validate_correction`; a thin desktop wrapper only for per-band UI strings. Split the rate-independent checks (command time) from the Nyquist check (build time) | **Already owner-decided**, not open: `docs/decisions/2026-07-22-owner-value-calls.md` — "`validate_bands` guard location \| `paraeq-engine` (next to `validate_correction`) \| Keeps `paraeq-dsp` free of policy"; engine-hardening R1-3 adds "Finalize at implementation." Coordinate with R1-3's remainder so the code moves exactly once | High | Already decided |
@@ -167,14 +167,25 @@ it **drops the offending bands and counts them** in
 **nothing** survives.
 
 **What "counts them" means today, precisely.** The count is returned on
-`BuildReport` and logged at `warn` by `build_correction`. It is **not**
-published: `EngineState` carries no drop or substitution count, and neither do
-the three hand-mirrored wire tripwires. R1-3's rationale below (and
+`BuildReport`, logged at `warn` by `build_correction`, and — **since Stage 6** —
+**published**: `EngineState` carries `bands_dropped` and
+`sections_substituted`, and so do all three hand-mirrored wire tripwires
+(`crates/paraeq-engine/tests/test_wire_format.rs`, `state.rs`'s `app_state`
+golden, `desktop/ui/src/ipc/types.ts`). R1-3's rationale below (and
 engine-hardening `:216`) says "the published count makes it visible in the
-Advanced drawer" — that drawer does not exist (Stage 7), and putting the
-count on the wire is a follow-up to be taken with it. Until then a dropped band
-is visible only in the controller log, which is the weaker half of this
-ruling's acceptability argument and part of why it stays `OPEN [OWNER]`.
+Advanced drawer" — **that drawer is still Stage 7**, and this paragraph
+originally deferred the publish with it because the drawer was the count's only
+consumer. It is not any more: **the Stage-6 verification gate is a second
+consumer** and refuses on `bands_dropped > 0`, since predicting the plan's
+response while the chain runs a subset of it would blame the chain for our own
+prediction fault. Without the publish there is no seam to read the count
+through, so there is no gate. Note what this changes and what it does not: the
+*decision* — drop the offending bands versus refuse the whole set — is
+untouched and stays `OPEN [OWNER]`. What it does remove is the sentence that
+used to follow, that a dropped band is "visible only in the controller log,
+which is the weaker half of this ruling's acceptability argument and part of
+why it stays `OPEN [OWNER]`" — that weakness is gone, so the owner may now want
+to close D-10.
 
 **Reasoning.** engine-hardening R1-3 already answered the identical question for
 Jury-unstable sections and gave the rationale in general terms: "the auto

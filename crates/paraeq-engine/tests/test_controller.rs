@@ -1252,3 +1252,168 @@ fn self_excluded_is_false_when_no_session() {
     }));
     assert!(!backend.is_running());
 }
+
+// ---------------------------------------------------------------------------
+// B18: the two `BuildReport` facts on the wire, and the non-publishing
+// `tap_activity()` accessor.
+//
+// `BuildReport { bands_dropped, preamp_db, sections_substituted }` records the
+// only two ways the INSTALLED cascade differs from the one the plan describes.
+// Until B18 both counts were logged at `warn` and thrown away, which was
+// defensible only while the Advanced drawer (Stage 7) was their sole consumer.
+// Stage 6's verification gate is a second consumer: it refuses on
+// `bands_dropped > 0`, because predicting the plan's response while the chain
+// runs a subset would blame the chain for our own prediction fault.
+//
+// `tap_activity()` goes the other way -- deliberately NOT on `EngineState`.
+// It is a monotonic per-block counter, so putting it in `effectively_equal`'s
+// compare set would emit a snapshot plus a Tauri event every tick, which is
+// the documented reason `frame_mismatch_blocks` is compared with `> 0`.
+// ---------------------------------------------------------------------------
+
+/// A band above the live Nyquist is dropped, counted, and PUBLISHED. The count
+/// rides the snapshot because the verification gate reads it through the
+/// engine-facts seam, and a seam can only carry what the wire carries.
+#[test]
+fn bands_dropped_reaches_the_published_snapshot() {
+    let (backend, handle) = spawn_engine();
+    assert!(wait_until(WAIT, || backend.is_running()));
+
+    // 30 kHz is above the mock's 24 kHz Nyquist; 1 kHz survives, so the
+    // correction still installs and only the one band is dropped.
+    handle.send(EngineCommand::SetCorrection(peq(vec![
+        peaking(1_000.0, -3.0, 1.0),
+        peaking(30_000.0, -3.0, 1.0),
+    ])));
+    assert!(wait_until(WAIT, || handle.state().bands_dropped == 1));
+    assert!(
+        handle.state().correction.is_some(),
+        "one dropped band must not refuse the whole set (D-10)"
+    );
+
+    // ...and it is session-scoped, like `auto_preamp_db`: with nothing
+    // installed there is no partially-installed cascade to report.
+    handle.send(EngineCommand::ClearCorrection);
+    assert!(wait_until(WAIT, || {
+        let s = handle.state();
+        s.bands_dropped == 0 && s.auto_preamp_db.is_none()
+    }));
+}
+
+/// The identity-substitution count reaches the wire too. It does NOT gate --
+/// `preamp_db` and the realized response both substitute identically, so the
+/// prediction already models it -- but a surprising residual needs a visible
+/// first thing to look at.
+#[test]
+fn sections_substituted_reaches_the_published_snapshot() {
+    let (backend, handle) = spawn_engine();
+    assert!(wait_until(WAIT, || backend.is_running()));
+
+    // `a2 = 2.0` puts a pole outside the unit circle, so `is_stable` rejects
+    // the row and `build_iir` swaps in the identity section.
+    handle.send(EngineCommand::SetCorrection(CorrectionConfig::Iir {
+        design_rate: 48_000.0,
+        sos_per_channel: vec![vec![[1.0, 0.0, 0.0, 1.0, 0.0, 2.0]]; 2],
+    }));
+    assert!(wait_until(WAIT, || handle.state().sections_substituted == 2));
+
+    handle.send(EngineCommand::ClearCorrection);
+    assert!(wait_until(WAIT, || handle.state().sections_substituted == 0));
+}
+
+/// `None` before the first start and after a teardown: there is no `RtShared`
+/// to read, and a witness window must be able to tell "nothing is flowing"
+/// from "I cannot see whether anything is flowing" and refuse on the second.
+#[test]
+fn tap_activity_is_none_before_start_and_after_teardown() {
+    let backend = MockBackend::new();
+    let probe = backend.clone();
+    let handle = EngineHandle::spawn(
+        backend,
+        EngineConfig {
+            enabled: false,
+            ..fast_config()
+        },
+    );
+    assert!(
+        handle.tap_activity().is_none(),
+        "a never-started engine has no realtime block to read"
+    );
+
+    handle.send(EngineCommand::Enable);
+    assert!(wait_until(WAIT, || probe.is_running()));
+    assert!(wait_until(WAIT, || handle.tap_activity().is_some()));
+
+    handle.send(EngineCommand::Disable);
+    assert!(wait_until(WAIT, || !probe.is_running()));
+    assert!(
+        wait_until(WAIT, || handle.tap_activity().is_none()),
+        "a teardown must retract the cell, not leave it naming a dead session"
+    );
+}
+
+/// The falsifier for "do not put it on `EngineState`": reading the activity
+/// must publish NOTHING. A monotonic per-block counter inside
+/// `effectively_equal` would emit a snapshot -- and a Tauri event, and a React
+/// re-render -- on every tick of every session.
+#[test]
+fn tap_activity_emits_no_snapshot_and_no_event() {
+    let (backend, handle) = spawn_engine();
+    assert!(wait_until(WAIT, || backend.is_running()));
+    // Park in the same steady state `self_excluded_change_always_publishes`
+    // uses: never pumping freezes the callback counter, so the watchdog sits
+    // in `NoInputDetected` and every metered field stays at its start value.
+    assert!(wait_until(WAIT, || matches!(
+        handle.state().status,
+        EngineStatus::NoInputDetected { .. }
+    )));
+    let snapshots = handle.subscribe();
+    let before = handle.state();
+
+    for _ in 0..100 {
+        let _ = handle.tap_activity();
+    }
+    // Give the controller several ticks to publish anything these reads might
+    // have provoked.
+    std::thread::sleep(Duration::from_millis(TICK_MS * 5));
+
+    assert!(
+        snapshots.try_recv().is_err(),
+        "reading tap activity published a snapshot"
+    );
+    assert!(
+        std::sync::Arc::ptr_eq(&before, &handle.state()),
+        "reading tap activity replaced the published snapshot"
+    );
+}
+
+/// The falsifier a `None` test cannot provide. Every rebuild -- device change,
+/// rate change, correction-triggered restart -- builds a FRESH `RtShared`, and
+/// a handle still holding the previous one reports `Some` and never advances.
+/// To a verification witness that reads as a dead tap, and it refuses every
+/// run.
+#[test]
+fn tap_activity_follows_a_rebuild() {
+    let (backend, handle) = spawn_engine();
+    assert!(wait_until(WAIT, || backend.is_running()));
+    backend.pump(512, 0.5);
+    assert!(wait_until(WAIT, || handle
+        .tap_activity()
+        .is_some_and(|a| a.nonzero_blocks > 0)));
+
+    backend.queue_event(BackendEvent::DefaultOutputChanged);
+    assert!(wait_until(WAIT, || backend.start_count() == 2));
+    assert!(wait_until(WAIT, || backend.is_running()));
+
+    let after_rebuild = handle.tap_activity().expect("a live session publishes");
+    for _ in 0..3 {
+        backend.pump(512, 0.5);
+    }
+    let advanced = handle.tap_activity().expect("a live session publishes");
+    assert!(
+        advanced.callbacks > after_rebuild.callbacks
+            && advanced.nonzero_blocks > after_rebuild.nonzero_blocks,
+        "the handle is holding a previous session's RtShared: \
+         {after_rebuild:?} -> {advanced:?}"
+    );
+}

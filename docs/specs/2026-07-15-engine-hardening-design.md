@@ -213,7 +213,7 @@ pub fn is_stable(sos: &[f64; 6]) -> bool {
 
 **Applied in `chain::build_iir`** (`chain.rs:234–251`) — the single funnel every SOS row passes through on its way to the realtime thread. Sections failing `is_stable` are replaced with the identity section `[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]` and counted; `build_iir` returns the substitution count so `controller.rs` can `log::warn!` and publish it.
 
-*Why identity, not error:* the auto front-end must never be bricked by one bad band. Dropping a band degrades audibly only as "that band did nothing," and the count makes it visible in the Advanced drawer. An error would mean *no correction at all* from one bad row. **(Shipped state, 2026-09-17: the count is returned on `BuildReport` and logged at `warn`; it is NOT on the wire — `EngineState` carries no substitution or drop count — and the Advanced drawer is Stage 7. Publishing the count is a follow-up to be taken with the drawer.)**
+*Why identity, not error:* the auto front-end must never be bricked by one bad band. Dropping a band degrades audibly only as "that band did nothing," and the count makes it visible in the Advanced drawer. An error would mean *no correction at all* from one bad row. **(Shipped state, corrected 2026-09-17: the count is returned on `BuildReport`, logged at `warn`, and — from Stage 6 — ON THE WIRE: `EngineState` carries `bands_dropped` and `sections_substituted`, and so do the three hand-mirrored tripwires. The Advanced drawer is still Stage 7; the publish no longer waits for it, because Stage 6's verification gate is a second consumer and refuses on `bands_dropped > 0`.)**
 
 *Why not `Result` on the designers:* they are golden-fixture-pinned against the Python oracle (`tests/test_biquad.rs`), the oracle itself is infallible, and a signature change churns every call site to buy a guarantee we can enforce more cheaply at the one boundary that matters.
 
@@ -438,8 +438,9 @@ pub struct CorrectionConfig {
 > re-derive the question.
 >
 > A **band that becomes illegal at the new rate is dropped** and counted in
-> `BuildReport.bands_dropped` (logged at `warn`; **not** published — see the
-> R1-3 note above); the whole configuration is refused only when nothing
+> `BuildReport.bands_dropped` (logged at `warn`, and **published on
+> `EngineState` from Stage 6** — see the R1-3 note above); the whole
+> configuration is refused only when nothing
 > survives. That is R1-3's own rule ("the auto front-end must never be bricked
 > by one bad band") one rate-change later. It is a user-visible change from the
 > shell's whole-set `ClearCorrection` — `crates/paraeq-dsp/DIVERGENCES.md` #18,

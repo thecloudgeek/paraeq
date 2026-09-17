@@ -308,6 +308,7 @@ mod tests {
         };
         let engine = EngineState {
             auto_preamp_db: Some(-9.5),
+            bands_dropped: 1,
             bypass: false,
             clipped_samples: 3,
             correction: Some("peq:1-band".into()),
@@ -320,6 +321,7 @@ mod tests {
             invalid_samples: 2,
             latency_ms: Some(62.3),
             output_peak: 1.5,
+            sections_substituted: 2,
             self_excluded: true,
             status: EngineStatus::Running,
             stream: Some(StreamInfo {
@@ -340,6 +342,7 @@ mod tests {
                 ],
                 "engine": {
                     "auto_preamp_db": -9.5,
+                    "bands_dropped": 1,
                     "bypass": false,
                     "clipped_samples": 3,
                     "correction": "peq:1-band",
@@ -352,6 +355,7 @@ mod tests {
                     "invalid_samples": 2,
                     "latency_ms": 62.3,
                     "output_peak": 1.5,
+                    "sections_substituted": 2,
                     "self_excluded": true,
                     "status": { "kind": "running" },
                     "stream": {

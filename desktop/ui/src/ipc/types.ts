@@ -52,6 +52,13 @@ export interface EngineState {
    *  running. Distinct from `EqState.preamp_db` (the user's manual trim,
    *  which rides `gain_db` and applies on both paths) -- the two compose. */
   auto_preamp_db: number | null;
+  /** R1-6 / D-10: bands the engine could not design at the live rate and
+   *  dropped, so the installed cascade is a SUBSET of the one that was asked
+   *  for. The measurement wizard's verification gate refuses on `> 0` --
+   *  grading a partial cascade against the full plan's prediction would blame
+   *  the chain for our own prediction fault. Session-scoped: `0` when nothing
+   *  is installed. */
+  bands_dropped: number;
   bypass: boolean;
   /** R1-8: output samples the +-1.0 clamp engaged on, counted per sample per
    *  channel and retained across a teardown. Nonzero while `auto_preamp_db`
@@ -74,6 +81,11 @@ export interface EngineState {
   /** R1-8: the maximum output sample, taken PRE-clamp, so an overshoot reads
    *  as (say) 1.99 rather than saturating at 1.0. */
   output_peak: number;
+  /** R1-3: SOS rows the stability funnel replaced with the identity section.
+   *  Evidence, not a refusal -- the response prediction substitutes
+   *  identically, so it already models this. Session-scoped, like
+   *  `bands_dropped`. */
+  sections_substituted: number;
   /** wizard/1 (MS-6): whether the engine's live capture excludes ParaEQ's own
    *  audio right now. `false` with `stream != null` is the documented
    *  fail-open path -- the measurement wizard refuses and asks for a restart.

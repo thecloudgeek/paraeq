@@ -11,6 +11,7 @@ use paraeq_engine::status::EngineStatus;
 fn engine_state_wire_format_is_pinned() {
     let state = EngineState {
         auto_preamp_db: Some(-9.5),
+        bands_dropped: 1,
         bypass: false,
         clipped_samples: 3,
         correction: Some("iir:2-band".into()),
@@ -23,6 +24,7 @@ fn engine_state_wire_format_is_pinned() {
         invalid_samples: 2,
         latency_ms: Some(62.3),
         output_peak: 1.5,
+        sections_substituted: 2,
         self_excluded: true,
         status: EngineStatus::NoInputDetected { since_ms: 1200 },
         stream: Some(StreamInfo {
@@ -36,6 +38,7 @@ fn engine_state_wire_format_is_pinned() {
         serde_json::to_value(&state).unwrap(),
         serde_json::json!({
             "auto_preamp_db": -9.5,
+            "bands_dropped": 1,
             "bypass": false,
             "clipped_samples": 3,
             "correction": "iir:2-band",
@@ -48,6 +51,7 @@ fn engine_state_wire_format_is_pinned() {
             "invalid_samples": 2,
             "latency_ms": 62.3,
             "output_peak": 1.5,
+            "sections_substituted": 2,
             "self_excluded": true,
             "status": { "kind": "no_input_detected", "since_ms": 1200 },
             "stream": {
