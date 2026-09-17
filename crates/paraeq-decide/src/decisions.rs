@@ -1,9 +1,9 @@
-//! The 21 decisions, their erased render view, and the mirror the Advanced
+//! The 22 decisions, their erased render view, and the mirror the Advanced
 //! drawer writes.
 
-use crate::decision::{Decision, Evidence, Invalidation, Rationale, Source};
+use crate::decision::{Decision, Evidence, InRange, Invalidation, Rationale, Source};
 use crate::profile::{AveragingMode, SmoothingMode};
-use paraeq_dsp::targets::TransducerClass;
+use paraeq_dsp::targets::{RoomTargetSpec, TransducerClass};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -17,10 +17,17 @@ use serde_json::Value;
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Decisions {
     pub align_spl_band: Decision<(f64, f64)>,
-    pub authority: Decision<AuthorityCurve>,
+    /// The preset NAME, not the 957-point curve: the drawer labels a control
+    /// with it and an override round-trips it. The **resolved**
+    /// [`AuthorityCurve`] is published in `Analysis` as a product.
+    pub authority: Decision<AuthorityPreset>,
     pub averaging: Decision<AveragingMode>,
     pub class: Decision<TransducerClass>,
-    pub correction_kind: Decision<CorrectionKind>,
+    /// Whether the two-clock resample was applied. The 22nd field.
+    pub clock_adjust: Decision<bool>,
+    /// The decision-table row is still named `correction_kind`; only the TYPE
+    /// was renamed, to stop it colliding with the engine's `CorrectionConfig`.
+    pub correction_kind: Decision<CorrectionForm>,
     pub correction_range: Decision<(f64, f64)>,
     pub fdw_post_cycles: Decision<f64>,
     pub fdw_pre_cycles: Decision<f64>,
@@ -62,7 +69,7 @@ impl Decisions {
     /// `rationale` + `evidence`; the drawer paints `domain` as a control.
     ///
     /// Exhaustive over every field — `tests/test_decisions.rs` derives its
-    /// expectation from the struct's own field list so a 22nd field cannot be
+    /// expectation from the struct's own field list so a 23rd field cannot be
     /// added without landing here.
     pub fn iter(&self) -> impl Iterator<Item = DecisionView<'_>> {
         [
@@ -70,6 +77,7 @@ impl Decisions {
             view("authority", &self.authority),
             view("averaging", &self.averaging),
             view("class", &self.class),
+            view("clock_adjust", &self.clock_adjust),
             view("correction_kind", &self.correction_kind),
             view("correction_range", &self.correction_range),
             view("fdw_post_cycles", &self.fdw_post_cycles),
@@ -110,10 +118,11 @@ pub struct DecisionView<'a> {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct Overrides {
     pub align_spl_band: Option<(f64, f64)>,
-    pub authority: Option<AuthorityCurve>,
+    pub authority: Option<AuthorityPreset>,
     pub averaging: Option<AveragingMode>,
     pub class: Option<TransducerClass>,
-    pub correction_kind: Option<CorrectionKind>,
+    pub clock_adjust: Option<bool>,
+    pub correction_kind: Option<CorrectionForm>,
     pub correction_range: Option<(f64, f64)>,
     pub fdw_post_cycles: Option<f64>,
     pub fdw_pre_cycles: Option<f64>,
@@ -143,27 +152,70 @@ pub struct Overrides {
 /// `authority::build_authority` constructs one, and deserialization is guarded,
 /// so `decide()` cannot fabricate a ceiling.
 ///
-/// OPEN for the owner — `authority`'s domain is still not expressible as
-/// written. The spec's decision table gives it as `Choice: Standard,
-/// Conservative (x0.5), Custom(curve)` while typing the decision
-/// `Decision<AuthorityCurve>`, so `Domain<AuthorityCurve>::Choice` can only
-/// hold concrete curves: the drawer can offer the two precomputed ones and a
-/// custom curve arrives via [`Overrides`], but the NAMES ("Standard",
-/// "Conservative") — the thing the drawer would actually label its control
-/// with, and the thing an override would round-trip — have nowhere to live.
-/// Either the domain becomes a `Choice` over a named `AuthorityPreset` that
-/// resolves to a curve, or the decision splits into a preset plus a derived
-/// curve. Left as the spec types it rather than invented here (plan item 10).
+/// **The former OPEN-for-owner note is CLOSED** (plan item 10). It read that
+/// the preset NAMES had nowhere to live, because the spec's decision table
+/// gives `authority` the domain `Choice: Standard, Conservative (x0.5),
+/// Custom(curve)` while typing the decision `Decision<AuthorityCurve>`, so
+/// `Domain<AuthorityCurve>::Choice` could hold only concrete curves.
+/// `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md` § D-D rules it:
+/// "Re-type to `Decision<AuthorityPreset>` with `{ Conservative,
+/// Custom(AuthorityCurve), Standard }`; put the **resolved** curve in
+/// `Analysis`." See [`AuthorityPreset`]. This type stays the re-export it
+/// became in Stage 5 and is still what the drawer plots.
 pub use paraeq_dsp::authority::AuthorityCurve;
 
+/// The `authority` decision's value: a NAME the drawer can label a control
+/// with, not a 957-point curve.
+///
+/// `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md` § D-D, verbatim:
+/// "Re-type to `Decision<AuthorityPreset>` with `{ Conservative,
+/// Custom(AuthorityCurve), Standard }`; put the **resolved** curve in
+/// `Analysis`. … It matches decision-engine's domain text verbatim, keeps
+/// `Decisions` at 21 fields so the exhaustiveness test stays green, keeps
+/// `AuthorityCurve` sealed, and makes an override round-trip a **name** rather
+/// than a 957-point curve."
+///
+/// The resolved curve is an `Analysis` field because `Analysis` is explicitly
+/// "products, not decisions" — there is exactly one resolved curve per run and
+/// nothing about it has a domain the drawer may edit directly. Resolution
+/// (which policy each preset selects) is a decision RULE and lands with the
+/// rules, not here.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub enum AuthorityPreset {
+    /// The spec's `Conservative (x0.5)` column: half the standard authority.
+    Conservative,
+    /// An explicit curve from the drawer. Sealed on the way in —
+    /// [`AuthorityCurve`] deserializes only through its guarded `TryFrom`, so an
+    /// override cannot fabricate a ceiling that skipped validation.
+    Custom(AuthorityCurve),
+    /// The default on every path.
+    Standard,
+}
+
+/// `authority` is a `Choice` over three named presets — unordered.
+impl InRange for AuthorityPreset {}
+
+/// Which SHAPE of correction the plan carries.
+///
+/// Renamed from `CorrectionKind` (plan item 11) so it stops colliding with the
+/// engine's `CorrectionConfig { Fir, Iir, Peq }` across the wire: two types
+/// named `*Kind` on one wire, with different variant sets, is the kind of
+/// collision a reader resolves by guessing. The `Decisions` field and the
+/// [`crate::RationaleKey`] keep the decision table's own row name,
+/// `correction_kind`, so no serialized key moves; only the type's name changes,
+/// and an externally-tagged enum does not put its own type name on the wire.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-pub enum CorrectionKind {
+pub enum CorrectionForm {
     MinPhaseFir,
     /// The default on all four paths: no added block latency onto an already
     /// 46–62 ms budget, and it can carry the per-band Q cap and excursion
     /// envelope as constraints.
     Peq,
 }
+
+/// `correction_kind` is a `Choice` over the two forms — the derived `Ord` is
+/// declaration order, which is not a magnitude.
+impl InRange for CorrectionForm {}
 
 /// The path ceiling on boost Q that `decide()` consumes.
 ///
@@ -180,7 +232,10 @@ pub enum CorrectionKind {
 /// The `PartialOrd` ruling and its OPEN-for-owner note travelled with the
 /// definition; read them there. `paraeq-dsp` cannot carry the answer, because
 /// `Domain` and `InRange` are this crate's types — `q_cap`'s domain is decided
-/// on this side, exactly as `TransducerClass`'s is.
+/// on this side, exactly as `TransducerClass`'s is, and § D-C decides it as a
+/// `Choice` over [`paraeq_dsp::authority::COUPLER_Q_CEILING`] and
+/// [`paraeq_dsp::authority::ROOM_Q_CEILING`]. The `InRange` impl that makes that
+/// domain answerable lives beside the trait, in [`crate::decision`].
 pub use paraeq_dsp::authority::QCapPolicy;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, PartialOrd, Serialize)]
@@ -208,3 +263,37 @@ pub enum WindowType {
     Rect,
     Tukey(f64),
 }
+
+impl TargetChoice {
+    /// The room path's parametric default, READ from
+    /// [`paraeq_dsp::targets::RoomTargetSpec::default`] rather than spelled as
+    /// literals here.
+    ///
+    /// `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md` § D-A rules
+    /// that `decide()`'s room `Parametric` default "**reads
+    /// `RoomTargetSpec::default()`** rather than carrying a literal", so an ears
+    /// ruling on the shelf costs one line in `paraeq-dsp` and nothing here. The
+    /// cross-crate field-for-field test is
+    /// `the_room_target_default_equals_room_target_spec_default`.
+    ///
+    /// `RoomTargetSpec::pivot_hz` has no home on this variant: the wire shape
+    /// the decision table names carries four numbers, and `build_room_target`
+    /// reads the pivot from the spec it is handed. The test pins the pivot
+    /// separately so the omission stays deliberate rather than silent.
+    pub fn room_default() -> Self {
+        let spec = RoomTargetSpec::default();
+        Self::Parametric {
+            shelf_db: spec.shelf_gain_db,
+            shelf_fc: spec.shelf_hz,
+            shelf_q: spec.shelf_q,
+            tilt_db_per_oct: spec.tilt_db_per_oct,
+        }
+    }
+}
+
+/// `target` is a `Choice` over the class-filtered candidate set plus
+/// `Parametric` — unordered.
+impl InRange for TargetChoice {}
+
+/// `window_type` is a `Choice` over the four window shapes — unordered.
+impl InRange for WindowType {}

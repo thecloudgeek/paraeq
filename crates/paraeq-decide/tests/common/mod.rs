@@ -6,15 +6,19 @@
 #![allow(dead_code)]
 
 use paraeq_decide::{
-    Analysis, AuthorityCurve, AveragingMode, CalFile, CalVariant, CapturePlan, CorrectionKind,
-    CorrectionPlan, Decision, DecisionSet, Decisions, Diagnostic, DiagnosticCode, Domain, Evidence,
-    EvidenceLabel, ImpulseResponse, Invalidation, MeasurementBundle, NoiseFloor, Overrides,
-    Position, QCapPolicy, Rationale, RationaleKey, Severity, SmoothingMode, Source, SweepPlan,
-    TargetChoice, TransducerClass, Unit, Verdict, WindowType,
+    Analysis, AuthorityCurve, AuthorityPreset, AveragingMode, CalFile, CalVariant, CapturePlan,
+    CaptureRouting, CaptureStats, CorrectionForm, CorrectionPlan, Decision, DecisionSet, Decisions,
+    Diagnostic, DiagnosticCode, Domain, Evidence, EvidenceLabel, ImpulseResponse, Invalidation,
+    MeasurementBundle, NoiseFloor, Overrides, Position, Rationale, RationaleKey, Severity,
+    SmoothingMode, Source, SweepPlan, TargetChoice, TransducerClass, TwoClockFit, Unit, Verdict,
+    Verification, VerificationReport, WindowType,
 };
-use paraeq_dsp::authority::{build_authority, AuthorityPolicy};
+use paraeq_dsp::authority::{
+    build_authority, AuthorityPolicy, Clamp, COUPLER_Q_CEILING, ROOM_Q_CEILING,
+};
 use paraeq_dsp::logf::LogGrid;
 use paraeq_dsp::targets::TargetCurve;
+use paraeq_dsp::PerChannel;
 
 pub fn decision<T>(
     value: T,
@@ -59,8 +63,12 @@ pub fn decisions() -> Decisions {
             Invalidation::Reanalyze,
         ),
         authority: decision(
-            authority_curve(),
-            Domain::Choice(vec![authority_curve()]),
+            AuthorityPreset::Standard,
+            Domain::Choice(vec![
+                AuthorityPreset::Conservative,
+                AuthorityPreset::Custom(authority_curve()),
+                AuthorityPreset::Standard,
+            ]),
             RationaleKey::Authority,
             Invalidation::Redesign,
         ),
@@ -81,9 +89,15 @@ pub fn decisions() -> Decisions {
             RationaleKey::Class,
             Invalidation::Recapture,
         ),
+        clock_adjust: decision(
+            true,
+            Domain::Choice(vec![false, true]),
+            RationaleKey::ClockAdjust,
+            Invalidation::Recapture,
+        ),
         correction_kind: decision(
-            CorrectionKind::Peq,
-            Domain::Choice(vec![CorrectionKind::MinPhaseFir, CorrectionKind::Peq]),
+            CorrectionForm::Peq,
+            Domain::Choice(vec![CorrectionForm::MinPhaseFir, CorrectionForm::Peq]),
             RationaleKey::CorrectionKind,
             Invalidation::Redesign,
         ),
@@ -169,16 +183,13 @@ pub fn decisions() -> Decisions {
             RationaleKey::PreampDb,
             Invalidation::Redesign,
         ),
+        // D-C: a two-item `Choice` over the two path policies, read from
+        // `paraeq_dsp::authority` rather than spelled as literals. The `Range`
+        // form this replaced answered `contains == false` for the room path's
+        // own value, which made the domain invariant unfalsifiable.
         q_cap: decision(
-            QCapPolicy::LogLinear {
-                hi: (10000.0, 3.0),
-                lo: (200.0, 10.0),
-            },
-            Domain::Range {
-                max: QCapPolicy::Ceiling(20.0),
-                min: QCapPolicy::Ceiling(1.0),
-                step: None,
-            },
+            ROOM_Q_CEILING,
+            Domain::Choice(vec![COUPLER_Q_CEILING, ROOM_Q_CEILING]),
             RationaleKey::QCap,
             Invalidation::Redesign,
         ),
@@ -211,9 +222,17 @@ pub fn decisions() -> Decisions {
                 shelf_q: 0.71,
                 tilt_db_per_oct: -0.9,
             },
-            Domain::Choice(vec![TargetChoice::Curve {
-                name: "bk_1974".to_string(),
-            }]),
+            Domain::Choice(vec![
+                TargetChoice::Curve {
+                    name: "bk_1974".to_string(),
+                },
+                TargetChoice::Parametric {
+                    shelf_db: 3.0,
+                    shelf_fc: 105.0,
+                    shelf_q: 0.71,
+                    tilt_db_per_oct: -0.9,
+                },
+            ]),
             RationaleKey::TargetRoomParametric,
             Invalidation::Reanalyze,
         ),
@@ -252,6 +271,10 @@ pub fn bundle() -> MeasurementBundle {
             variant: CalVariant::Plain,
         }),
         capture: CapturePlan {
+            chain_sensitivity_spl_per_dbfs: Some(104.0),
+            clock_adjusted: true,
+            clock_skew_ppm: Some(12.5),
+            input_present: true,
             input_rate: 48000,
             input_uid: "UMIK-1:7005770".to_string(),
             output_rate: 48000,
@@ -273,6 +296,7 @@ pub fn bundle() -> MeasurementBundle {
         },
         overrides: Overrides::default(),
         positions: vec![Position {
+            capture: capture_stats(),
             captured_at_ms: 1_752_537_600_000,
             index: 0,
             ir: ImpulseResponse {
@@ -281,6 +305,7 @@ pub fn bundle() -> MeasurementBundle {
                 samples: vec![vec![0.0, 1.0, 0.0], vec![0.0, 0.9, 0.0]],
             },
             label: "Position 1 (primary seat)".to_string(),
+            routing: CaptureRouting::Both,
         }],
         targets: vec![TargetCurve {
             name: "bk_1974".to_string(),
@@ -295,25 +320,100 @@ pub fn bundle() -> MeasurementBundle {
     }
 }
 
+/// A populated capture meter readout. Finite by construction: a digitally
+/// silent pass would carry `f64::NEG_INFINITY`, which serde_json writes as
+/// `null` and cannot read back (see [`paraeq_decide::CaptureStats`]).
+pub fn capture_stats() -> CaptureStats {
+    CaptureStats {
+        clipped_samples: 0,
+        peak_dbfs: -6.2,
+        rms_dbfs: -20.0,
+    }
+}
+
+/// A bundle carrying a populated verification pass, in the final shape.
+pub fn bundle_with_verification() -> MeasurementBundle {
+    MeasurementBundle {
+        verification: Some(verification()),
+        ..bundle()
+    }
+}
+
+pub fn verification() -> Verification {
+    Verification {
+        capture: capture_stats(),
+        gain_db: 0.0,
+        installed: correction_plan(),
+        // Differs from `installed.preamp_db` on purpose: the engine computes at
+        // the live rate over the surviving bands, folded min across channels.
+        installed_preamp_db: -4.1,
+        ir: ImpulseResponse {
+            peak: 2304,
+            sample_rate: 48000,
+            samples: vec![vec![0.0, 0.8, 0.0], vec![0.0, 0.7, 0.0]],
+        },
+        level_dbfs: -16.2,
+        position_index: 0,
+        routing: CaptureRouting::Both,
+        running_rate_hz: 48000.0,
+        two_clock: Some(TwoClockFit {
+            intercept_samples: 2304.5,
+            residual_peak_samples: 0.8,
+            residual_rms_samples: 0.31,
+            skew_ppm: 12.5,
+        }),
+    }
+}
+
+pub fn correction_plan() -> CorrectionPlan {
+    CorrectionPlan {
+        bands: PerChannel::new(vec![vec![paraeq_dsp::peq::EQBand {
+            filter_type: paraeq_dsp::peq::FilterType::Peaking,
+            fc: 47.0,
+            gain_db: -9.1,
+            q: 4.0,
+        }]])
+        .expect("one channel is not empty"),
+        clamps: vec![vec![
+            Clamp::BelowMinGain {
+                fc: 120.0,
+                gain_db: 1.2,
+            },
+            Clamp::GainToSigma {
+                from: 6.0,
+                to: 1.0,
+                sigma_db: 4.2,
+            },
+        ]],
+        design_rate: 48000.0,
+        dropped: vec![3],
+        preamp_db: -4.2,
+    }
+}
+
+pub fn verification_report() -> VerificationReport {
+    VerificationReport {
+        evidence: vec![Evidence::Scalar {
+            label: EvidenceLabel::ResidualVsPrediction,
+            unit: Unit::Db,
+            value: 0.4,
+        }],
+        gate_db: 6.0,
+        residual_rms_db: 0.4,
+    }
+}
+
 pub fn decision_set() -> DecisionSet {
     DecisionSet {
         analysis: Analysis {
+            authority: authority_curve(),
             averaged_db: vec![vec![0.0, -1.0], vec![0.1, -1.1]],
             excess_group_delay_s: vec![0.001, 0.0005],
             freqs_hz: vec![20.0, 1000.0],
             per_position_db: vec![vec![0.0, -1.0]],
             sigma_db: vec![0.7, 4.2],
         },
-        correction: Some(CorrectionPlan {
-            bands: vec![vec![paraeq_dsp::peq::EQBand {
-                filter_type: paraeq_dsp::peq::FilterType::Peaking,
-                fc: 47.0,
-                gain_db: -9.1,
-                q: 4.0,
-            }]],
-            design_rate: 48000.0,
-            preamp_db: -4.2,
-        }),
+        correction: Some(correction_plan()),
         decisions: decisions(),
         diagnostics: vec![Diagnostic {
             code: DiagnosticCode::TwoClock,
@@ -323,6 +423,7 @@ pub fn decision_set() -> DecisionSet {
             value: None,
         }],
         verdict: Verdict::ProceedWithWarnings,
+        verification: Some(verification_report()),
     }
 }
 
@@ -342,6 +443,17 @@ pub fn evidence() -> Vec<Evidence> {
             hz_hi: 20000.0,
             hz_lo: 200.0,
             label: EvidenceLabel::AuthoritySplit,
+        },
+        // The two units B6 added, each on the label that needs it.
+        Evidence::Scalar {
+            label: EvidenceLabel::TwoClockSkewPpm,
+            unit: Unit::PartsPerMillion,
+            value: 12.5,
+        },
+        Evidence::Scalar {
+            label: EvidenceLabel::TwoClockResidual,
+            unit: Unit::Samples,
+            value: 0.31,
         },
     ]
 }

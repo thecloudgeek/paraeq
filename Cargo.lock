@@ -2621,6 +2621,7 @@ name = "paraeq-decide"
 version = "0.1.0"
 dependencies = [
  "paraeq-dsp",
+ "proptest",
  "serde",
  "serde_json",
 ]
