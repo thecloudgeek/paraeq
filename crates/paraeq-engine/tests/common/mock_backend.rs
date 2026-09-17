@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use paraeq_engine::backend::{AudioBackend, BackendEvent, StreamInfo};
-use paraeq_engine::shared::RtProcessor;
+use paraeq_engine::shared::{RtProcessor, RtShared};
 use paraeq_engine::EngineError;
 
 /// One recorded backend call, in order.
@@ -204,6 +204,16 @@ impl MockBackend {
     /// A processor is installed (last `start` succeeded, no `stop` since).
     pub fn is_running(&self) -> bool {
         self.lock().processor.is_some()
+    }
+
+    /// The shared atomics the CONTROLLER handed to the last successful
+    /// `start`, for assertions on control-plane state the published
+    /// `EngineState` does not carry -- `decay_per_block` in particular, which
+    /// `start_with` derives from the geometry this backend reported. The real
+    /// backend keeps the same handle the same way (`RtProcessor::shared`);
+    /// nothing in production is widened for this.
+    pub fn shared(&self) -> Option<Arc<RtShared>> {
+        self.lock().processor.as_ref().map(RtProcessor::shared)
     }
 
     /// Drive one synchronous realtime callback: `frames` samples of constant
