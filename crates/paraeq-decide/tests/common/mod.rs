@@ -457,3 +457,345 @@ pub fn evidence() -> Vec<Evidence> {
         },
     ]
 }
+
+// ---------------------------------------------------------------------------
+// Synthetic bundles for the invariant and property tests (B7a).
+//
+// Still NOT policy. These build a PLAUSIBLE input — an impulse response whose
+// direct arrival sits where this architecture actually puts it (~46 ms: tap
+// latency plus propagation), followed by reflections and a decaying tail — so
+// that `decide()`'s analysis stage is exercised on data with real structure
+// rather than on a three-sample stub. Nothing here asserts what `decide()`
+// should choose.
+//
+// Determinism: the "randomness" is an xorshift64 seeded by the caller, so a
+// proptest seed reproduces a bundle exactly. `decide()` itself draws no
+// randomness at all; this is the TEST's generator, not the engine's.
+// ---------------------------------------------------------------------------
+
+/// The shape of one synthetic bundle. Fields alphabetical, per repo
+/// convention.
+#[derive(Clone, Copy, Debug)]
+pub struct SyntheticSpec {
+    /// Whether a mic calibration file is present. `None` is a refusal
+    /// condition B7c owns; the analysis stage must handle both.
+    pub cal: bool,
+    /// 1 (mono) or 2 (stereo). The seam the `PerChannel` container exists for.
+    pub channels: usize,
+    pub class: TransducerClass,
+    pub positions: usize,
+    pub sample_rate: u32,
+    pub seed: u64,
+}
+
+impl Default for SyntheticSpec {
+    /// A nine-position stereo bookshelf run at 48 kHz with a cal file: the
+    /// room path's own default shape (`PathProfile::positions_default`).
+    fn default() -> Self {
+        SyntheticSpec {
+            cal: true,
+            channels: 2,
+            class: TransducerClass::Bookshelf,
+            positions: 9,
+            sample_rate: 48_000,
+            seed: 0x5EED_1234_ABCD_0001,
+        }
+    }
+}
+
+/// xorshift64*, returning a value in `[-1.0, 1.0)`. Three lines of shift-xor
+/// with no dependency: the workspace has no RNG crate and this file must not
+/// add one for a test generator.
+fn noise(state: &mut u64) -> f64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    // 53 bits is f64's mantissa, so the division is exact.
+    ((*state >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+}
+
+/// One channel of a plausible impulse response: a direct arrival at `peak`,
+/// eight reflections inside the post-peak window, and an exponentially
+/// decaying noise tail. Finite by construction — a non-finite sample is a
+/// refusal condition, not an analysis input.
+fn impulse(peak: usize, len: usize, state: &mut u64) -> Vec<f64> {
+    let mut h = vec![0.0; len];
+    h[peak] = 1.0;
+    let post = len - peak;
+    for k in 1..=8 {
+        // Spread the reflections over the first half of the post-peak window.
+        let delay = (post * k) / 20;
+        if delay == 0 || peak + delay >= len {
+            continue;
+        }
+        let decay = (-(k as f64) / 3.0).exp();
+        h[peak + delay] += 0.4 * decay * noise(state);
+    }
+    for (offset, sample) in h[peak..].iter_mut().enumerate() {
+        let t = offset as f64 / post as f64;
+        *sample += 0.02 * (-4.0 * t).exp() * noise(state);
+    }
+    h
+}
+
+/// A plausible bundle for [`SyntheticSpec`]. `positions == 0` yields an empty
+/// position list, which the analysis stage must survive without panicking.
+pub fn synthetic_bundle(spec: SyntheticSpec) -> MeasurementBundle {
+    let profile = paraeq_decide::profile_for(spec.class);
+    let rate = spec.sample_rate;
+    // ~46 ms: "Direct-arrival index … ~46–64 ms into the capture on this
+    // architecture: tap latency + propagation" (`ImpulseResponse::peak`).
+    let peak = (0.046 * f64::from(rate)).round() as usize;
+    // 1100 ms of post-peak data: the decision-engine spec's own derivation of
+    // the store window, `[peak − 100 ms, peak + 1100 ms]`, and long enough that
+    // the coupler path's ungated 1000 ms right window fits inside the recording
+    // rather than being bounded by it. (The SHIPPED store window is +1500 ms,
+    // per the Stage-5 amendment; the shorter figure keeps a nine-position
+    // stereo 96 kHz fixture from being 40 MB of f64 in a debug test.)
+    let len = peak + (1.100 * f64::from(rate)).round() as usize;
+
+    let mut state = spec.seed | 1; // xorshift64 has a fixed point at 0.
+    let positions = (0..spec.positions)
+        .map(|index| Position {
+            capture: capture_stats(),
+            captured_at_ms: 1_752_537_600_000 + index as u64 * 30_000,
+            index,
+            ir: ImpulseResponse {
+                peak,
+                sample_rate: rate,
+                samples: (0..spec.channels)
+                    .map(|_| impulse(peak, len, &mut state))
+                    .collect(),
+            },
+            label: format!("Position {}", index + 1),
+            routing: CaptureRouting::Both,
+        })
+        .collect();
+
+    MeasurementBundle {
+        cal: spec.cal.then(|| CalFile {
+            content: "20.000\t-3.13\n20000.000\t1.20\n".to_string(),
+            curve: (vec![20.0, 20_000.0], vec![-3.13, 1.20]),
+            gain_db: None,
+            sensitivity_db: Some(-0.9),
+            serial: Some("7005770".to_string()),
+            variant: CalVariant::Plain,
+        }),
+        capture: CapturePlan {
+            chain_sensitivity_spl_per_dbfs: Some(104.0),
+            clock_adjusted: true,
+            clock_skew_ppm: Some(12.5),
+            input_present: true,
+            input_rate: rate,
+            input_uid: "UMIK-1:7005770".to_string(),
+            output_rate: rate,
+            output_uid: "BuiltInSpeakerDevice".to_string(),
+            self_excluded: true,
+            sweep: SweepPlan {
+                duration_s: 5.5,
+                f_end_hz: 20_000.0,
+                f_start_hz: profile.sweep_f_start_hz,
+                level_dbfs: -12.0,
+            },
+            sweep_rate: rate,
+        },
+        class: spec.class,
+        noise_floor: NoiseFloor {
+            freqs_hz: vec![20.0, 1000.0, 20_000.0],
+            rms_dbfs: vec![-62.0; spec.channels.max(1)],
+            spectrum_db: vec![vec![-70.0, -80.0, -85.0]; spec.channels.max(1)],
+        },
+        overrides: Overrides::default(),
+        positions,
+        targets: synthetic_targets(),
+        verification: None,
+    }
+}
+
+/// One candidate curve per transducer class, so the `target` decision's
+/// class-filtered `Choice` domain is never empty on any of the four paths.
+pub fn synthetic_targets() -> Vec<TargetCurve> {
+    vec![
+        TargetCurve {
+            name: "bk_1974".to_string(),
+            frequencies: vec![20.0, 1000.0, 20_000.0],
+            gains_db: vec![6.0, 0.0, -6.0],
+            category: None,
+            classes: vec![TransducerClass::Bookshelf, TransducerClass::Floorstander],
+            description: None,
+            source: None,
+        },
+        TargetCurve {
+            name: "flat".to_string(),
+            frequencies: vec![20.0, 1000.0, 20_000.0],
+            gains_db: vec![0.0, 0.0, 0.0],
+            category: None,
+            classes: vec![
+                TransducerClass::Bookshelf,
+                TransducerClass::Floorstander,
+                TransducerClass::InEar,
+                TransducerClass::OverEar,
+            ],
+            description: None,
+            source: None,
+        },
+        TargetCurve {
+            name: "harman_oe_2018".to_string(),
+            frequencies: vec![20.0, 1000.0, 20_000.0],
+            gains_db: vec![4.0, 0.0, -3.0],
+            category: None,
+            classes: vec![TransducerClass::OverEar],
+            description: None,
+            source: None,
+        },
+        TargetCurve {
+            name: "harman_ie_2019".to_string(),
+            frequencies: vec![20.0, 1000.0, 20_000.0],
+            gains_db: vec![5.0, 0.0, -4.0],
+            category: None,
+            classes: vec![TransducerClass::InEar],
+            description: None,
+            source: None,
+        },
+    ]
+}
+
+/// The four classes, in the order `TransducerClass` declares them.
+pub const EVERY_CLASS: [TransducerClass; 4] = [
+    TransducerClass::Bookshelf,
+    TransducerClass::Floorstander,
+    TransducerClass::InEar,
+    TransducerClass::OverEar,
+];
+
+/// A well-formed bundle for `class`: the path's own default position count, so
+/// `positions_n` echoes a value inside `PathProfile::positions_domain`.
+pub fn well_formed_bundle(class: TransducerClass) -> MeasurementBundle {
+    synthetic_bundle(SyntheticSpec {
+        class,
+        positions: paraeq_decide::profile_for(class).positions_default,
+        ..SyntheticSpec::default()
+    })
+}
+
+/// The smallest bundle each path still analyses: three positions (the decision
+/// table's own hard minimum, and `positions_domain`'s lower bound on both
+/// paths) and one channel.
+///
+/// For properties that are about the OVERRIDE path rather than about the
+/// capture — idempotence above all — the capture's size buys nothing and costs
+/// a full analysis pass per assertion. The channel count and the position count
+/// are varied in `test_props.rs` instead, where one generated field is
+/// overridden per case.
+pub fn minimal_bundle(class: TransducerClass) -> MeasurementBundle {
+    synthetic_bundle(SyntheticSpec {
+        channels: 1,
+        class,
+        positions: 3,
+        ..SyntheticSpec::default()
+    })
+}
+
+/// Replace `bundle.overrides.<id>` with `value`, through serde rather than 22
+/// match arms.
+///
+/// `DecisionView::id` IS the `Overrides` field name — guaranteed by
+/// `overrides_mirrors_decisions_field_for_field` — so this cannot fall behind a
+/// 23rd decision, which a hand-written match would.
+pub fn with_override(
+    bundle: &MeasurementBundle,
+    id: &str,
+    value: serde_json::Value,
+) -> MeasurementBundle {
+    let mut raw =
+        serde_json::to_value(Overrides::default()).expect("Overrides is plain derived data");
+    raw[id] = value;
+    let overrides: Overrides =
+        serde_json::from_value(raw).expect("an auto value is a legal override value");
+    MeasurementBundle {
+        overrides,
+        ..bundle.clone()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared invariant assertions (B7a). They live here rather than in
+// `test_invariants.rs` because every integration test file is its own crate:
+// `test_props.rs` cannot call a `pub fn` declared in `test_invariants.rs`.
+// ---------------------------------------------------------------------------
+
+fn in_domain<T>(id: &str, class: TransducerClass, d: &Decision<T>)
+where
+    T: paraeq_decide::decision::InRange + PartialEq + std::fmt::Debug,
+{
+    assert!(
+        d.domain.contains(&d.value),
+        "{class:?}: {id} = {:?} is outside its domain {:?}",
+        d.value,
+        d.domain
+    );
+}
+
+/// The spec's "every `Decision.value` is inside its `Domain`" invariant,
+/// written out field by field.
+///
+/// Not routed through `Decisions::iter()` on purpose: the erased view carries
+/// `domain` and `value` as `serde_json::Value`, and comparing those would
+/// re-implement `Domain::contains` in JSON instead of testing it.
+pub fn assert_every_value_in_domain(d: &Decisions, class: TransducerClass) {
+    in_domain("align_spl_band", class, &d.align_spl_band);
+    in_domain("authority", class, &d.authority);
+    in_domain("averaging", class, &d.averaging);
+    in_domain("class", class, &d.class);
+    in_domain("clock_adjust", class, &d.clock_adjust);
+    in_domain("correction_kind", class, &d.correction_kind);
+    in_domain("correction_range", class, &d.correction_range);
+    in_domain("fdw_post_cycles", class, &d.fdw_post_cycles);
+    in_domain("fdw_pre_cycles", class, &d.fdw_pre_cycles);
+    in_domain("flatness_target_db", class, &d.flatness_target_db);
+    in_domain("left_window_ms", class, &d.left_window_ms);
+    in_domain("low_corner_hz", class, &d.low_corner_hz);
+    in_domain("max_filters", class, &d.max_filters);
+    in_domain("positions_n", class, &d.positions_n);
+    in_domain("preamp_db", class, &d.preamp_db);
+    in_domain("q_cap", class, &d.q_cap);
+    in_domain("right_window_ms", class, &d.right_window_ms);
+    in_domain("shelves", class, &d.shelves);
+    in_domain("smoothing", class, &d.smoothing);
+    in_domain("target", class, &d.target);
+    in_domain("transition_hz", class, &d.transition_hz);
+    in_domain("window_type", class, &d.window_type);
+}
+
+/// Both halves of the spec's refusal invariant — "`verdict == Refuse ⟺
+/// correction.is_none()`" and "`verdict == Refuse ⟺ any diagnostic has
+/// `Severity::Refuse`" — plus the `ProceedWithWarnings` leg that makes the
+/// three-way verdict total rather than a two-way one with a spare variant.
+pub fn assert_refusal_is_consistent(set: &DecisionSet) {
+    let refusing = set
+        .diagnostics
+        .iter()
+        .any(|d| d.severity == Severity::Refuse);
+    let warning = set.diagnostics.iter().any(|d| d.severity == Severity::Warn);
+    assert_eq!(
+        set.verdict == Verdict::Refuse,
+        set.correction.is_none(),
+        "verdict {:?} against correction.is_none() = {}",
+        set.verdict,
+        set.correction.is_none()
+    );
+    assert_eq!(
+        set.verdict == Verdict::Refuse,
+        refusing,
+        "verdict {:?} against a Refuse-severity diagnostic being present = {refusing}",
+        set.verdict
+    );
+    if !refusing {
+        assert_eq!(
+            set.verdict == Verdict::ProceedWithWarnings,
+            warning,
+            "verdict {:?} against a Warn diagnostic being present = {warning}",
+            set.verdict
+        );
+    }
+}
