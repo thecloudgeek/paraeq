@@ -793,6 +793,36 @@ fn nonfinite_correction_output_fires_backstop_and_resets() {
         assert!(s.is_finite(), "output must never carry non-finite samples");
     }
 
+    // ORDER IS LOAD-BEARING, and this is what pins it. `chain.rs`'s fused
+    // pre-clamp scan runs the R1-2 `is_finite` backstop FIRST, so a sanitized
+    // sample is reported exactly once -- as `nonfinite_outputs` -- and never a
+    // second time as a clip or a peak. Hoisting the meter scan above the
+    // backstop leaves every other assertion in this file green while:
+    //   * `peak_out` becomes +inf, which `RtProcessor::process_block` then
+    //     LATCHES for the life of the session (`peak_out.max(decay *
+    //     peak_out())`, and `decay * inf == inf`), publishing a non-finite
+    //     `EngineState::output_peak` against a non-nullable TS `number`; and
+    //   * every zeroed sample is counted a second time in `clipped`, the
+    //     counter that is R1-1's falsifier (spec `§ Scope and Sequencing 3`).
+    //
+    // NOT `clipped == 0`: this divergent filter legitimately clips for the
+    // samples between |y| > 1.0 and the f32 overflow, and those are real
+    // clips. The invariant is that a sanitized sample is not ALSO one of them,
+    // i.e. no sample is reported twice.
+    assert!(
+        outcome0.peak_out.is_finite(),
+        "a zeroed non-finite sample must not reach peak_out (got {})",
+        outcome0.peak_out
+    );
+    let samples = (input.len() * BLOCK) as u32;
+    assert!(
+        outcome0.clipped + outcome0.nonfinite_outputs <= samples,
+        "each sample is reported at most once: {} clipped + {} sanitized > {samples} samples \
+         (the backstop must run BEFORE the meter scan)",
+        outcome0.clipped,
+        outcome0.nonfinite_outputs
+    );
+
     // Same block again, post-reset: bit-identical output (state healed,
     // not left saturated at inf).
     let (out1, outcome1) = chain_process(&mut chain, &input, false, 1.0);

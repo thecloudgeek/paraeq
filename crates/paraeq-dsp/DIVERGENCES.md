@@ -171,6 +171,24 @@ differs from `prototype/paraeq/`, so a red parity test is always actionable.
     — a reversal is one branch in one function. See
     `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md` §D-10.
 
+    **Amended (round-3 review): the fallback re-send is an EDGE, not a
+    level.** The replacement for the clear (`eq::resend_command`) keyed off
+    `EngineState::correction_rate_mismatch` being set, which is a level on a
+    LATCHING field: `send_correction` re-sets it on every refused rebuild, and
+    a re-send of the same bands at the same rate is refused identically
+    (`build_correction`'s Peq arm errors on `kept == 0 && bands_dropped > 0`, a
+    pure function of (bands, stream rate)). So nothing in the cycle could end
+    it, while R1-8's decaying `input_peak` made `publish` fire at the full tick
+    rate -- measured at ~4.5 redesigns and ~4.5 `correction refused` warn lines
+    per second, indefinitely, whenever every retained band sits at or above the
+    live Nyquist. The forwarder now carries `eq::ResendState` and answers each
+    refused rate once, dropping the memory as soon as the engine stops naming a
+    rate. The mismatch arm itself is KEPT, per R1-6 `§ Fix 4` and §D-12: a `Peq`
+    self-heals at the next legal rate without it, but a baked `Fir`/`Iir` the
+    engine cannot re-derive has no other repair. Pinned by
+    `desktop/src-tauri/src/eq.rs::resend_command_answers_a_standing_refusal_only_once`
+    and its three siblings.
+
 19. **An imported `Preamp:` line now composes with the engine's own
     auto-preamp.** Not an oracle divergence — recorded here for the same
     reason as #16 and #18, because it is user-visible and it changed in Phase

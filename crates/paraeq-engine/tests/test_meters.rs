@@ -1035,6 +1035,63 @@ fn decay_runs_on_all_zero_blocks_too() {
     assert_eq!(r.shared.peak_in_session(), 1.0);
 }
 
+/// The OUTPUT meter's release, which nothing pinned. `peak_out_bits`'s own doc
+/// says it is "released by the SAME `decay_per_block_bits` coefficient as
+/// `peak_in_bits`", and `EngineState::output_peak` repeats it -- but every
+/// other `peak_out` assertion in this file reads a rig driven at ONE amplitude,
+/// where a decayed meter and a monotonic session maximum are the same number.
+/// So dropping `decay *` from `RtProcessor::process_block`'s `peak_out` store
+/// (reverting the meter to the session statistic D-5 ruled against) left the
+/// whole workspace green.
+///
+/// D-5, verbatim: "Does `output_peak` decay, or is it a session max? **Decay
+/// it**, with the same `decay_per_block` coefficient as `input_peak`. No output
+/// session max." The stimulus and the `ceil(1.7 * rate / block) + 2` block
+/// count are the input test's, unchanged -- the release law is the same law.
+/// No correction is installed: `ChainOutcome::peak_out` is produced on the
+/// pass-through path too, and a filter's ring-up would only add noise.
+#[test]
+fn output_peak_decays_at_the_broadcast_release_rate() {
+    let mut r = rig(None, 0.0, false);
+    r.shared.set_decay_per_block(decay_per_block(BLOCK, RATE));
+
+    for _ in 0..10 {
+        pump_with(&mut r, &flat_block(1.0));
+    }
+    assert_eq!(
+        r.shared.peak_out(),
+        1.0,
+        "ten full-scale blocks pin the output meter at full scale"
+    );
+
+    let block_duration = BLOCK as f64 / RATE;
+    let expected_crossing = 1.7 / block_duration;
+    let silent_blocks = expected_crossing.ceil() as usize + 2;
+
+    let mut previous = r.shared.peak_out();
+    let mut crossing: Option<usize> = None;
+    for n in 1..=silent_blocks {
+        pump_with(&mut r, &flat_block(0.0));
+        let now = r.shared.peak_out();
+        assert!(
+            now < previous,
+            "silent block {n}: the output meter must fall monotonically \
+             ({previous} -> {now}); 1.0 forever means the release was dropped"
+        );
+        if crossing.is_none() && now < 0.1 {
+            crossing = Some(n);
+        }
+        previous = now;
+    }
+
+    let crossing = crossing.expect("the output meter must cross -20 dB within the release window");
+    assert!(
+        ((crossing as f64) - expected_crossing).abs() <= 1.0,
+        "crossed 0.1 at silent block {crossing}, expected {expected_crossing} +-1 \
+         (the same release law as `input_peak`, per D-5)"
+    );
+}
+
 /// The control-plane half: `start_with` must install the coefficient from the
 /// NEGOTIATED `StreamInfo` before the meter is read, or every field above is
 /// correct in isolation and dead in production. `RtShared::default()` is
@@ -1067,4 +1124,63 @@ fn start_installs_the_decay_coefficient_from_the_negotiated_geometry() {
         (state.input_peak_session - 1.0).abs() < 1e-6,
         "the session statistic stays at full scale while the meter falls"
     );
+}
+
+/// ...and this is the half the test above cannot see. It distinguishes 1.0
+/// from not-1.0 and nothing finer, so `decay_per_block(block_size, ..)` -- the
+/// chain's PROVISIONAL size instead of the size the backend reported -- passes
+/// it, and the release rate is then wrong in proportion wherever the two
+/// differ. Spec `R1-8 § Decay` is explicit about which: "Computing it from the
+/// *reported* geometry means the release rate stays correct at every buffer
+/// size and rate."
+///
+/// They only differ where the renegotiation loop never converges: `start_once`
+/// caps at `MAX_STARTS = 3` and then warns and ACCEPTS the mismatch, so the
+/// session runs a `block_size`-frame chain against a backend delivering
+/// `stream.buffer_frames`. Three reports that never settle script exactly that
+/// -- and the reported rate is off the default too, so both arguments are
+/// pinned, not just the first.
+#[test]
+fn the_installed_coefficient_uses_the_reported_geometry_not_the_requested_one() {
+    const CHAIN_FRAMES: usize = 128;
+    const REPORTED_FRAMES: usize = 64;
+    const REPORTED_RATE: f64 = 44_100.0;
+
+    let backend = MockBackend::new();
+    // Provisional 512 -> reported 256 -> chain 256, reported 128 -> chain 128,
+    // reported 64: still moving at the cap, so the session keeps a 128-frame
+    // chain while the backend delivers 64-frame blocks.
+    backend.queue_report(CHANNELS, 256);
+    backend.queue_report(CHANNELS, CHAIN_FRAMES);
+    backend.queue_report(CHANNELS, REPORTED_FRAMES);
+    backend.set_reported_sample_rate(REPORTED_RATE);
+
+    let handle = EngineHandle::spawn(backend.clone(), fast_config());
+    assert!(
+        wait_until(WAIT, || backend.start_count() >= 3 && backend.is_running()),
+        "the renegotiation loop must exhaust its three starts and accept the mismatch"
+    );
+
+    let shared = backend
+        .shared()
+        .expect("the accepted start installed a processor");
+    let installed = shared.decay_per_block();
+    assert_eq!(
+        installed,
+        decay_per_block(REPORTED_FRAMES, REPORTED_RATE),
+        "the coefficient must come from the REPORTED geometry \
+         ({REPORTED_FRAMES} frames / {REPORTED_RATE} Hz)"
+    );
+    assert_ne!(
+        installed,
+        decay_per_block(CHAIN_FRAMES, REPORTED_RATE),
+        "...and not from the chain's own {CHAIN_FRAMES}-frame block size"
+    );
+    assert_ne!(
+        installed,
+        decay_per_block(REPORTED_FRAMES, RATE),
+        "...nor from the default {RATE} Hz"
+    );
+
+    drop(handle);
 }

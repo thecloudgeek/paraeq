@@ -324,8 +324,10 @@ not decided here — see E1.
 
 ## Losing-spec text corrected alongside this record (P8)
 
-Every edit below lands in the same commit as this file. Each one is a spec (or
-doc-comment) sentence that asserted a shape this record supersedes.
+Each row is a spec, doc-comment or context sentence that asserted a shape this
+record supersedes. The first block landed in the same commit as this file; rows
+marked `(round-2 review)` / `(round-3 review)` were added by the review round
+that found them, in the commit that made the correction.
 
 | Where | What it said | What it says now |
 |---|---|---|
@@ -356,6 +358,10 @@ doc-comment) sentence that asserted a shape this record supersedes.
 | measurement-safety § SNR criterion and MS-21 | "`RtShared::peak_in` is a **monotonic session maximum with no decay** and there is **no clip counter at all**" | MS-21's three surviving grounds (signal path, release law, per-attempt reset), with a `CORRECTED (2026-09-17)` note recording that R1-8 retired the shape ground (round-2 review) |
 | measurement-suite § Known defects this spec inherits | the same superseded clause, in the coefficient-swap row | struck in place, since that section is a **scheduling index** and a closed defect must not be re-scheduled (round-2 review) |
 | ~90 `:NNN` spec citations in `paraeq-engine` and `desktop/src-tauri` doc comments, plus the short-form `spec:NNN` citations in the rescope plan and the cross-document `tap.rs:153-159` citations in five specs | bare line numbers, many of which no longer resolved (A2's 28-line R1-6 insertion moved everything below it, and several were written against other checkouts to begin with) | **content anchors** — a requirement id or a section name plus the phrase already quoted in the comment (`R1-8 § UI contract`, `R1-6 § Fix 4`, `MS-20`), which survive the next insertion (round-2 review) |
+| `docs/CONTEXT.md` — the stage-4 paragraph, the live-rate-curve divergence and the loud-band-validation divergence | "rate-change coefficient re-send now lives in the desktop forwarder (`eq::resend_decision`), re-validating bands at the new rate and issuing `ClearCorrection` on failure"; "redesigned server-side by `eq::resend_decision`"; validation "at every entry point — including the forwarder's rate-resend/first-stream path" | the carry-forward is closed in the ENGINE (`build_correction(.., stream_rate)`), the forwarder reduced to the refusal / first-stream fallback that hands the set over whole and can never clear it, and the band rules relocated to `paraeq_engine::controller` behind `validate_correction` (D-10, D-12, D-13; round-3 review). CLAUDE.md mandates reading this file before making changes, so a stale claim here is read as current (round-3 review) |
+| `desktop/src-tauri/src/engine_bridge.rs` (`start_forwarder` doc, step 1) and `desktop/src-tauri/src/eq.rs` (the `fc_23k_…` test doc) | "re-validate the bands at the live rate and re-send the correction (or `ClearCorrection` on failure)"; "the reason the forwarder re-checks bands at the NEW rate" | what each actually guards now: the whole-set hand-over (D-10) and `validate_band_at`'s exclusive Nyquist bound behind the edit-time message (D-13). `8d27016` updated the call sites and missed both (round-3 review) |
+| the three MS-6 citations in `paraeq-coreaudio` (`tap.rs`, `backend.rs`, `tests/test_exclusion_witness.rs`) | `measurement-safety-design.md:333`, correct when A3 wrote it and five lines stale afterwards — line 333 is now the **MS-1** row | the content anchor the sweep above adopted, `measurement-safety `MS-6``. The sweep scoped itself to `paraeq-engine` and `desktop/src-tauri`, so these were never reached (round-3 review) |
+| the two surviving cross-document `tap.rs:153-159` citations (measurement-suite § Research Basis, wizard § Research Basis) | a "fail-open fallback included" vouched for at lines that now hold the `self_excluded` / `desc` / `torn_down` struct fields — A3's insertion moved the exclusion-list build to `tap.rs:187` | "`tap.rs`'s `TapSystem::create` exclusion-list build", matching the eleven sites already converted. The row above claimed five specs and reached three (round-3 review) |
 
 **Two corrections to how these were previously characterized**, both load-bearing:
 
