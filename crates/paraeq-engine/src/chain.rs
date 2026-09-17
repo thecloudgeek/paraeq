@@ -61,7 +61,41 @@ impl Correction {
     /// channel-count change and reintroduce the click on that swap.
     /// Realtime-safe: a bounded memcpy over already-sized state, no
     /// allocation.
+    ///
+    /// # R1-1 x R1-7a: a swap that WEAKENS the preamp does not transplant
+    ///
+    /// The delay lines hold the OUTGOING cascade's un-preamped energy --
+    /// `preamp_lin` is applied after the cascade ([`RealtimeChain::process`])
+    /// -- and the INCOMING correction's `preamp_lin` is what multiplies that
+    /// tail on the very first block. When the incoming preamp gives LESS
+    /// headroom (`preamp_lin` larger, i.e. less attenuation) there is no room
+    /// left for the tail and the +-1.0 clamp engages hard: MEASURED at a
+    /// +12 dB band dragged flat under a full-scale 1 kHz sine, 68 clipped
+    /// samples at a pre-clamp peak of 2.64 on the block after the swap. Spec
+    /// `:571` calls exactly that a bug signal -- "a nonzero
+    /// `clipped_samples` while `auto_preamp_db` is active ... is R1-1's
+    /// falsifier" -- and the desktop reaches it ~10 times a second while a
+    /// band handle is being dragged down.
+    ///
+    /// So the transplant is skipped in that direction and the incoming
+    /// correction starts from clean state, which is bounded by its own
+    /// preamp. The other direction keeps R1-7a untouched: a tail carried
+    /// into MORE headroom can only get quieter.
+    ///
+    /// The cost is stated rather than hidden: R1-7a's "no step" bound does
+    /// not hold across a preamp-weakening swap any more, so dragging a
+    /// high-Q boost down restarts that band's ring-up. Scaling the adopted
+    /// state by `old.preamp_lin / self.preamp_lin` was measured as the
+    /// alternative -- it halves the overshoot (2.64 -> 1.73 on the same
+    /// stimulus) but cannot remove it, because R1-1 leaves ZERO design
+    /// margin by construction: the corrected path sits at exactly 1.0 at the
+    /// peak, so any transient at all clips. The fix that would let both hold
+    /// is a headroom constant, which wizard `:532` records as "recorded but
+    /// not taken" -- an owner call, not something to introduce quietly here.
     pub fn adopt_state_from(&mut self, old: &Correction, channels: usize) {
+        if self.preamp_lin > old.preamp_lin {
+            return;
+        }
         if let (CorrectionKind::Iir(new), CorrectionKind::Iir(old)) = (&mut self.kind, &old.kind) {
             if new.channels().min(channels) == old.channels().min(channels) {
                 new.adopt_state_from(old);
@@ -173,7 +207,8 @@ impl RealtimeChain {
     /// so a coefficient edit does not restart the filters from zero -- an
     /// audible step on every band drag otherwise (spec R1-7a). The
     /// transplant happens here, on the realtime thread, because this is
-    /// the only place the old processor still lives.
+    /// the only place the old processor still lives. It is conditional on
+    /// the two corrections' preamps: see [`Correction::adopt_state_from`].
     pub fn set_correction(&mut self, mut c: Option<Correction>) -> Option<Correction> {
         if let (Some(new), Some(old)) = (c.as_mut(), self.correction.as_ref()) {
             new.adopt_state_from(old, self.channels);

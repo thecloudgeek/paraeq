@@ -430,6 +430,68 @@ fn gain_only_swap_with_transplant_has_no_step() {
 }
 
 #[test]
+fn a_swap_to_a_weaker_preamp_starts_from_clean_state() {
+    // R1-1 x R1-7a. The transplant carries the outgoing cascade's
+    // UN-PREAMPED delay lines, and the INCOMING `preamp_lin` is what
+    // multiplies them on the first block. When the incoming correction has
+    // less headroom (a larger `preamp_lin`), that tail no longer fits under
+    // the +-1.0 clamp, so the transplant is skipped and the incoming
+    // correction starts clean. The opposite direction -- an incoming preamp
+    // with MORE headroom -- still transplants, because its tail can only get
+    // quieter. `test_meters.rs::a_swap_that_weakens_the_preamp_does_not_clip`
+    // is the audible half of the same rule.
+    const WARM: usize = 8;
+    let sos = peaking(100.0, 12.0, 10.0, 48000.0);
+    // The preamps `build_correction` computes for a +12 dB band and for the
+    // same band dragged flat. Identical COEFFICIENTS on both sides, so the
+    // state transplant is the only thing that can make two chains differ.
+    let strong = 10f64.powf(-12.0 / 20.0) as f32;
+    let weak = 1.0f32;
+
+    let warmed = |preamp: f32| {
+        let mut chain = RealtimeChain::new(2, BLOCK);
+        chain.set_correction(Some(build_iir(vec![vec![sos]], 2, BLOCK, preamp).0));
+        for b in 0..WARM {
+            chain_process(&mut chain, &sine100(b * BLOCK, BLOCK, 2), false, 1.0);
+        }
+        chain
+    };
+    let fresh_next_block = |preamp: f32| {
+        let mut chain = RealtimeChain::new(2, BLOCK);
+        chain.set_correction(Some(build_iir(vec![vec![sos]], 2, BLOCK, preamp).0));
+        chain_process(&mut chain, &sine100(WARM * BLOCK, BLOCK, 2), false, 1.0).0
+    };
+
+    // Weakening (12 dB of headroom -> none): no transplant, so the block
+    // after the swap is bit-identical to a chain that never ran.
+    let mut chain = warmed(strong);
+    chain.set_correction(Some(build_iir(vec![vec![sos]], 2, BLOCK, weak).0));
+    let (after, _) = chain_process(&mut chain, &sine100(WARM * BLOCK, BLOCK, 2), false, 1.0);
+    let clean = fresh_next_block(weak);
+    for ch in 0..2 {
+        for i in 0..BLOCK {
+            assert_eq!(
+                after[ch][i].to_bits(),
+                clean[ch][i].to_bits(),
+                "ch {ch} sample {i}: a preamp-weakening swap must not transplant state"
+            );
+        }
+    }
+
+    // Strengthening (no headroom -> 12 dB): R1-7a still applies, so the same
+    // block must NOT match a chain that never ran.
+    let mut chain = warmed(weak);
+    chain.set_correction(Some(build_iir(vec![vec![sos]], 2, BLOCK, strong).0));
+    let (after, _) = chain_process(&mut chain, &sine100(WARM * BLOCK, BLOCK, 2), false, 1.0);
+    let clean = fresh_next_block(strong);
+    let carried = (0..BLOCK).any(|i| after[0][i].to_bits() != clean[0][i].to_bits());
+    assert!(
+        carried,
+        "a swap to MORE headroom lost R1-7a's transplant; the skip is too broad"
+    );
+}
+
+#[test]
 fn iir_to_fir_swap_is_safe_noop() {
     // Cross-kind swap: no state can carry over (a FIR overlap tail cannot
     // be transplanted). Must not panic; the FIR behaves exactly as fresh.

@@ -44,7 +44,15 @@ export function clippedNotice(
   autoPreampDb: number | null,
 ): string | null {
   if (!Number.isFinite(clippedSamples) || clippedSamples <= 0) return null;
-  const count = clippedSamples.toLocaleString();
+  // Grouping pinned to en-US rather than the ambient locale. Every other
+  // number in this strip is already locale-INVARIANT -- `latency_ms.toFixed(1)`
+  // and `(sample_rate / 1000).toFixed(1)` always emit a "." decimal -- and the
+  // surrounding wording ("clipped", "samples", "degraded (frame mismatch)") is
+  // untranslated English, so an ambient separator would be the one localized
+  // token in the line. It also kept the frontend gate's colour dependent on
+  // whatever LANG the developer's shell exports: under de_DE this read
+  // "1.234" and `statusStrip.test.ts` went red on unrelated work.
+  const count = clippedSamples.toLocaleString("en-US");
   return autoPreampDb == null
     ? `clipped (${count} samples)`
     : `clipped (${count} samples — unexpected with auto-preamp)`;

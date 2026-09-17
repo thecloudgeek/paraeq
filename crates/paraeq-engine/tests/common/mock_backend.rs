@@ -29,6 +29,12 @@ struct Inner {
     /// Injected failures: while > 0, `start` records the call, decrements,
     /// and returns an error (leaving the backend stopped).
     fail_next_starts: usize,
+    /// `Some(n)`: the n-th `start` of the whole run (1-based) fails,
+    /// whichever attempt it is. `fail_next_starts` cannot express this --
+    /// it always fails from the NEXT start onwards, while the renegotiation
+    /// loop makes several starts inside ONE `start_once` with no chance for
+    /// the test thread to intervene between them.
+    fail_start_at: Option<usize>,
     /// The realtime processor moved in by the last successful `start`.
     processor: Option<RtProcessor>,
     /// Per-start sample-rate overrides: each successful `start` pops the
@@ -88,6 +94,7 @@ impl MockBackend {
                 calls: Vec::new(),
                 events: VecDeque::new(),
                 fail_next_starts: 0,
+                fail_start_at: None,
                 processor: None,
                 rates: VecDeque::new(),
                 reported_buffer_frames: None,
@@ -158,6 +165,14 @@ impl MockBackend {
     /// Make the next `n` calls to `start` fail.
     pub fn fail_next_starts(&self, n: usize) {
         self.lock().fail_next_starts = n;
+    }
+
+    /// Fail the `n`-th `start` of the whole run (1-based), leaving every
+    /// other start alone. Scripts the one window `fail_next_starts` cannot
+    /// reach: a geometry renegotiation whose RETRY start fails, all inside a
+    /// single `start_once`.
+    pub fn fail_start_number(&self, n: usize) {
+        self.lock().fail_start_at = Some(n);
     }
 
     /// Queue an event for the controller's next `poll_event`.
@@ -257,6 +272,14 @@ impl AudioBackend for MockBackend {
         });
         if inner.fail_next_starts > 0 {
             inner.fail_next_starts -= 1;
+            return Err(EngineError::Backend("injected start failure".into()));
+        }
+        let start_number = inner
+            .calls
+            .iter()
+            .filter(|c| matches!(c, Call::Start { .. }))
+            .count();
+        if inner.fail_start_at == Some(start_number) {
             return Err(EngineError::Backend("injected start failure".into()));
         }
         let (channels, buffer_frames) = match inner.reports.pop_front() {

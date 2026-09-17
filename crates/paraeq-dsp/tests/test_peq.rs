@@ -77,9 +77,11 @@ fn band_serde_roundtrip_and_golden_json() {
     .is_err());
 }
 
-/// The desktop's manual-preamp export writes the number it is handed (the
-/// value the engine is running at via `SetGainDb`), unlike the oracle-pinned
-/// `export_autoeq_format`.
+/// The caller-supplied export writes the number it is handed, unlike the
+/// oracle-pinned `export_autoeq_format` (a `0.0` literal) and unlike
+/// `export_autoeq_format_with_preamp` (the cascade-derived number, which R1-1
+/// made the desktop's `eq_export_autoeq` use). No production caller hands it a
+/// number today; the variant is kept for the one that will.
 #[test]
 fn export_with_preamp_db_writes_the_caller_s_preamp() {
     let peq = ParametricEQ {

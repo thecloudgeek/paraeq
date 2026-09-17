@@ -306,20 +306,32 @@ impl ParametricEQ {
     }
 
     /// [`Self::export_autoeq_format`] with a **caller-supplied** preamp in the
-    /// header.
+    /// header — neither the oracle's `0.0` literal nor the cascade-derived
+    /// [`Self::preamp_db`], but whatever number the caller hands over.
     ///
-    /// For the desktop app's manual-preamp export (`eq_export_autoeq` in
-    /// `desktop/src-tauri/src/commands.rs`): there the preamp is a number the
-    /// user typed and the engine is already running at (`SetGainDb`), so the
-    /// exported text must carry *that* value — neither the oracle's `0.0`
-    /// literal nor the cascade-derived [`Self::preamp_db`].
+    /// **No production caller today.** It was written for the desktop's
+    /// `eq_export_autoeq`, which used to export the number the user typed and
+    /// the engine was running at (`SetGainDb`). R1-1 repointed that command to
+    /// [`Self::export_autoeq_format_with_preamp`]: the exported preamp is now
+    /// the CASCADE-DERIVED number, because engine-hardening `:117` requires
+    /// the exported text to equal `EngineState.auto_preamp_db`, so other
+    /// people's EQ software gets the headroom ParaEQ absorbs internally. This
+    /// variant is kept for the caller that supplies its own number (the
+    /// daemon seam); every remaining call site is a test.
     ///
     /// Shares the `-0.0` guard with the other two exports, and only that: a
     /// preamp in `(-0.05, 0]` is zero to the precision the format carries, so
     /// it prints as `0.0 dB`, never `-0.0 dB`. Every other value — positive as
-    /// well as negative — is written verbatim, so the desktop's whole accepted
-    /// range (`PREAMP_MIN_DB..=PREAMP_MAX_DB`, i.e. -30..=+10) survives an
-    /// export/import round trip.
+    /// well as negative — is written verbatim, so any value handed to it across
+    /// the desktop's accepted range (`PREAMP_MIN_DB..=PREAMP_MAX_DB`, i.e.
+    /// -30..=+10) survives a FORMAT-level export/parse round trip
+    /// (`test_autoeq_parse.rs::export_then_parse_roundtrip`).
+    ///
+    /// That is a claim about this function's text, not about the app. At app
+    /// level a round trip is NOT level-neutral: `eq_import_autoeq` routes a
+    /// parsed `Preamp:` line to the user's trim while the engine derives its
+    /// own headroom from the same bands, so the two compose. See
+    /// `DIVERGENCES.md` #19.
     pub fn export_autoeq_format_with_preamp_db(&self, preamp_db: f64) -> String {
         self.export_autoeq_lines(preamp_db)
     }

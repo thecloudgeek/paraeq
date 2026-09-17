@@ -575,6 +575,164 @@ fn mismatch_flag_clears_when_a_re_derivable_config_arrives() {
     }));
 }
 
+/// R1-6 behaviour item 3, verbatim: "On refusal the controller sends **no**
+/// correction -- flat pass-through." The two spec test rows above cannot
+/// reach it. Both refuse across a REBUILD, and `start_with` has just built a
+/// fresh `RealtimeChain` that is already flat, so "send nothing" and "send an
+/// explicit `Correction(None)`" are indistinguishable there.
+///
+/// The state where the clear does work is a refusal arriving while a
+/// correction is LIVE: `EngineCommand::SetCorrection` stores the config and
+/// calls `send_correction()` with no stop and no rebuild. Delete the explicit
+/// clear and this is the only test in the workspace that notices -- the
+/// engine keeps the previous correction audible under a published "EQ paused
+/// -- correction must be redesigned" banner.
+#[test]
+fn a_refused_correction_replaces_a_live_one_with_flat_pass_through() {
+    const AMPLITUDE: f32 = 0.1;
+    let backend = MockBackend::new();
+    backend.set_reported_sample_rate(44_100.0);
+    let handle = EngineHandle::spawn(backend.clone(), fast_config());
+
+    // A real, audible correction at the live rate.
+    let config = peq(vec![peaking(1_000.0, 9.0, 1.0)], 44_100.0);
+    handle.send(EngineCommand::SetCorrection(config.clone()));
+    let input = impulse_block(AMPLITUDE);
+    let corrected = reference_response(&config, 44_100.0, AMPLITUDE);
+    let flat = input[0].clone();
+    assert!(
+        max_abs_diff(&corrected, &flat) > 1e-3,
+        "the band must be audible, or a stale correction would look like pass-through"
+    );
+    assert!(
+        wait_until(WAIT, || {
+            backend
+                .pump_samples(&input)
+                .is_some_and(|out| max_abs_diff(&out[0], &corrected) < 1e-6)
+        }),
+        "the correction never went live"
+    );
+
+    // Mid-session refusal: baked coefficients from another rate, no rebuild
+    // and no fresh chain. Gain is still 0 dB, so flat pass-through IS the
+    // input, bit for bit.
+    handle.send(EngineCommand::SetCorrection(baked_iir(0.5, 48_000.0)));
+    assert!(wait_until(WAIT, || handle.state().correction_rate_mismatch
+        == Some(44_100.0)));
+    assert!(
+        wait_until(WAIT, || {
+            backend
+                .pump_samples(&input)
+                .is_some_and(|out| max_abs_diff(&out[0], &flat) < 1e-6)
+        }),
+        "a refused correction left the PREVIOUS correction audible instead of failing open to flat"
+    );
+}
+
+/// `correction_rate_mismatch` and `auto_preamp_db` are SESSION-SCOPED, and
+/// their own docs say so: the flag names the LIVE stream's rate and the
+/// preamp names what the LIVE chain is applying, so with no session both
+/// statements are stale. Nothing pinned the invariant before this test --
+/// deleting `stop_session`'s two clearing lines left the whole workspace
+/// green, and a published snapshot with `stream == None` still renders the
+/// destructive "EQ paused -- correction must be redesigned for 44.1 kHz"
+/// chip while the engine is stopped.
+#[test]
+fn a_teardown_clears_the_session_scoped_publications() {
+    let backend = MockBackend::new();
+    backend.set_reported_sample_rate(44_100.0);
+    let handle = EngineHandle::spawn(backend.clone(), fast_config());
+
+    // Half 1: a refusal raises the flag, and a Disable must retract it.
+    handle.send(EngineCommand::SetCorrection(baked_iir(2.0, 48_000.0)));
+    assert!(wait_until(WAIT, || handle.state().correction_rate_mismatch
+        == Some(44_100.0)));
+    handle.send(EngineCommand::Disable);
+    assert!(wait_until(WAIT, || handle.state().stream.is_none()));
+    let stopped = handle.state();
+    assert_eq!(
+        stopped.correction_rate_mismatch, None,
+        "no stream, but the snapshot still names a rate the correction must be redesigned for"
+    );
+    assert_eq!(
+        stopped.auto_preamp_db, None,
+        "no stream, but the snapshot still reports an auto-preamp being applied"
+    );
+
+    // Half 2: the same for a correction that INSTALLED (the preamp half is
+    // reachable on every ordinary session, not only on a refusal).
+    handle.send(EngineCommand::Enable);
+    handle.send(EngineCommand::SetCorrection(peq(
+        vec![peaking(1_000.0, 9.0, 1.0)],
+        44_100.0,
+    )));
+    assert!(wait_until(WAIT, || handle
+        .state()
+        .auto_preamp_db
+        .is_some_and(|p| (p + 9.0).abs() < 0.05)));
+    handle.send(EngineCommand::Disable);
+    assert!(wait_until(WAIT, || handle.state().stream.is_none()));
+    let stopped = handle.state();
+    assert_eq!(stopped.auto_preamp_db, None);
+    assert_eq!(stopped.correction_rate_mismatch, None);
+}
+
+/// The other way to end up with no session: `start_once`'s geometry
+/// renegotiation. It does NOT route through `stop_session` -- it is a bare
+/// `stop()` + `self.session = None` -- so if the retry `start` then fails,
+/// `start_with` returns before assigning `self.session` and `publish()` emits
+/// `stream: None` carrying the aborted attempt's session-scoped fields.
+///
+/// Asserted as an invariant over every published snapshot, which is what the
+/// desktop actually consumes, rather than at one sampled instant: the stale
+/// window is bounded by one tick, and a point read would race it.
+#[test]
+fn a_failed_renegotiation_retry_clears_the_session_scoped_publications() {
+    let backend = MockBackend::new();
+    backend.set_reported_sample_rate(48_000.0);
+    // Start #1 converges (the chain's provisional geometry is 2 x 512).
+    backend.queue_report(CHANNELS, BLOCK);
+    let handle = EngineHandle::spawn(backend.clone(), fast_config());
+
+    // A retained correction the live rate refuses, so the flag is up before
+    // the rebuild and `start_with` re-raises it on the aborted attempt.
+    handle.send(EngineCommand::SetCorrection(baked_iir(0.5, 44_100.0)));
+    assert!(wait_until(WAIT, || handle.state().correction_rate_mismatch
+        == Some(48_000.0)));
+    let snapshots = handle.subscribe();
+
+    // Rebuild: start #2 reports a geometry the chain was not built for ->
+    // renegotiate; the retry (start #3) fails.
+    backend.queue_report(CHANNELS, BLOCK / 2);
+    backend.fail_start_number(3);
+    backend.queue_event(BackendEvent::DefaultOutputChanged);
+    assert!(
+        wait_until(WAIT, || backend.start_count() >= 4),
+        "the renegotiation + failed retry never happened"
+    );
+
+    let mut saw_stopped_snapshot = false;
+    for snapshot in std::iter::from_fn(|| snapshots.try_recv().ok()) {
+        let snapshot: std::sync::Arc<EngineState> = snapshot;
+        if snapshot.stream.is_some() {
+            continue;
+        }
+        saw_stopped_snapshot = true;
+        assert_eq!(
+            snapshot.correction_rate_mismatch, None,
+            "published a snapshot with NO stream but correction_rate_mismatch still set"
+        );
+        assert_eq!(
+            snapshot.auto_preamp_db, None,
+            "published a snapshot with NO stream but auto_preamp_db still set"
+        );
+    }
+    assert!(
+        saw_stopped_snapshot,
+        "no session-less snapshot was published; the invariant was never exercised"
+    );
+}
+
 /// The published `EngineState` is the only way the desktop learns any of
 /// this, so pin that the flag actually rides a snapshot (and is not merely
 /// controller-internal).

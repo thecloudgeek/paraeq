@@ -77,9 +77,12 @@ pub struct AppState {
 ///   and not `EngineFailed`'s "restart". The same diagnostic is what
 ///   `AbortReason::EngineStopped` maps to when the engine goes away mid-run.
 /// - **Release** by letting the token drop: at Result/Save, at cancel, and on
-///   every error exit. Declare it AFTER the `MeasurementSession`s it covers, so
-///   declaration-order drop releases it last -- strictly after MS-14's restore
-///   sequence (abort ramp, sink stop, volume restore).
+///   every error exit. Declare it BEFORE the `MeasurementSession`s it covers:
+///   Rust drops locals in REVERSE declaration order, so the lease declared
+///   first is released last -- strictly after MS-14's restore sequence (abort
+///   ramp, sink stop, volume restore) has run on the sessions declared after
+///   it. (Declaration order is only load-bearing on the panic path; `finish()`
+///   and `abort_now()` both run the restore eagerly at the call site.)
 ///
 /// One lease spans the whole run, not one per sweep: a session is one sweep, so
 /// a nine-position capture is nine sessions under a single lease.

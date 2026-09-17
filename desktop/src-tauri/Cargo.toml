@@ -17,8 +17,9 @@ tauri-build = { version = "2", features = [] }
 log = { workspace = true }
 paraeq-coreaudio = { path = "../../crates/paraeq-coreaudio" }
 # `serde`: this crate persists and IPCs `EQBand` (state.rs, profiles.rs,
-# settings.rs). The feature is off by default on paraeq-dsp so the realtime
-# crates never pull serde in, so this consumer asks for it explicitly.
+# settings.rs). The feature is off by default on paraeq-dsp, so every
+# consumer with a wire asks for it explicitly -- this one, paraeq-decide,
+# and (since R1-6 put `EQBand` inside `CorrectionConfig::Peq`) paraeq-engine.
 paraeq-dsp = { path = "../../crates/paraeq-dsp", features = ["serde"] }
 paraeq-engine = { path = "../../crates/paraeq-engine" }
 percent-encoding = "2"

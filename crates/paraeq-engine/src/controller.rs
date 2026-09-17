@@ -829,10 +829,18 @@ impl EngineHandle {
 /// A token parked inside a session seam is released between positions and
 /// re-arms fail-open in the middle of a capture.
 ///
-/// Declare it **after** the sessions it covers, so declaration-order drop
-/// releases it last -- strictly after MS-14's restore sequence (abort ramp,
-/// sink stop, volume restore). That is the same ordering trick `TapBackend`
-/// uses for its own teardown.
+/// Declare it **before** the sessions it covers, which is what "above" means
+/// in source order too: Rust drops LOCALS in REVERSE declaration order, so the
+/// lease declared first is released last -- strictly after MS-14's restore
+/// sequence (abort ramp, sink stop, volume restore) has run on the sessions
+/// declared after it.
+///
+/// Do not reach for `TapBackend`'s field-order trick here: that is the
+/// OPPOSITE rule (`backend.rs`, "Rust drops fields in declaration order"), and
+/// it applies to struct fields, which this token must never be. The worked
+/// example in the tree is
+/// `crates/paraeq-coreaudio/tests/test_measure_hardware.rs`, which declares
+/// the lease and then the session.
 ///
 /// # Release
 ///
@@ -1242,7 +1250,19 @@ impl<B: AudioBackend> Controller<B> {
             }
             // Renegotiate at the reported geometry. Stop errors are
             // non-fatal here (the backend contract keeps stop idempotent).
+            //
+            // This is a teardown, so it clears the same session-scoped
+            // publications `stop_session` does. Without that, a retry `start`
+            // that FAILS leaves `self.session` at `None` (`start_with`
+            // assigns it only after `start` returns Ok) while the aborted
+            // attempt's `send_correction` verdict is still standing, and the
+            // very next `publish` emits `stream: None` next to an
+            // `auto_preamp_db` nothing is applying and a
+            // `correction_rate_mismatch` naming a stream that is gone --
+            // which the desktop renders as "EQ paused, correction must be
+            // redesigned" beside "Engine: Stopped".
             let _ = self.backend.0.stop();
+            self.clear_session_scoped_publications();
             self.session = None;
             channels = info.channels;
             block_size = info.buffer_frames;
@@ -1322,17 +1342,30 @@ impl<B: AudioBackend> Controller<B> {
     /// the backend down, mark the watchdog stopped.
     fn stop_session(&mut self) {
         self.swap_pending = false;
-        // Session-scoped: the flag names the LIVE stream's rate, and the
-        // preamp names what the LIVE chain is applying. There is no longer a
-        // live stream, so both statements are stale. The COUNTERS are not
-        // cleared here -- see `Controller::clipped_samples`.
-        self.auto_preamp_db = None;
-        self.correction_rate_mismatch = None;
+        self.clear_session_scoped_publications();
         if let Some(mut s) = self.session.take() {
             s.control.drain_retired();
             let _ = self.backend.0.stop();
         }
         self.watchdog.stopped();
+    }
+
+    /// Retract the two published statements that are only true of a LIVE
+    /// stream: `correction_rate_mismatch` names the live stream's rate, and
+    /// `auto_preamp_db` names what the live chain is applying. With no
+    /// session both are stale, and the invariant is stated in each field's
+    /// own doc on [`EngineState`].
+    ///
+    /// The COUNTERS are deliberately NOT cleared here -- see
+    /// `Controller::clipped_samples`: a `Disable` must not blank the clip
+    /// count the user is looking at.
+    ///
+    /// Called from every path that ends a session: `stop_session` and
+    /// `start_once`'s renegotiation retry, which tears down without going
+    /// through it.
+    fn clear_session_scoped_publications(&mut self) {
+        self.auto_preamp_db = None;
+        self.correction_rate_mismatch = None;
     }
 
     /// Rebuild-on-change: full stop, then a fresh start from retained
@@ -1569,4 +1602,75 @@ fn effectively_equal(a: &EngineState, b: &EngineState) -> bool {
 /// dB -> linear amplitude (f64 math, f32 at the atomics boundary).
 fn db_to_linear(db: f32) -> f32 {
     10f64.powf(f64::from(db) / 20.0) as f32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A snapshot with every field at rest, so a test can move exactly one.
+    fn at_rest() -> EngineState {
+        EngineState {
+            auto_preamp_db: None,
+            bypass: false,
+            clipped_samples: 0,
+            correction: None,
+            correction_rate_mismatch: None,
+            enabled: true,
+            frame_mismatch_blocks: 0,
+            gain_db: 0.0,
+            input_peak: 0.0,
+            input_peak_session: 0.0,
+            invalid_samples: 0,
+            latency_ms: None,
+            output_peak: 0.0,
+            self_excluded: false,
+            status: EngineStatus::Stopped,
+            stream: None,
+        }
+    }
+
+    /// Every EXACTLY-compared field must be able to publish on its own.
+    ///
+    /// `effectively_equal` returning true makes `publish` return early, so
+    /// `self.state` is never stored and no subscriber event is emitted. The
+    /// integration suite can only reach a field's compare through whatever
+    /// state transition happens to move it, and several of these fields are
+    /// only ever moved in lockstep with another one -- `send_correction`
+    /// assigns `auto_preamp_db` and `correction_rate_mismatch` as one pair,
+    /// so no controller-level script can isolate the second of them at all.
+    /// Deleting either compare left the whole workspace green. This is the
+    /// direct guard: one field moved, one verdict.
+    #[test]
+    fn every_exact_compare_publishes_on_its_own() {
+        assert!(
+            effectively_equal(&at_rest(), &at_rest()),
+            "two identical snapshots must NOT publish, or the quantization is pointless"
+        );
+        /// One named single-field edit to an otherwise at-rest snapshot.
+        type Move = (&'static str, fn(&mut EngineState));
+        let moves: [Move; 6] = [
+            // R1-1: a number the app has promised to be able to explain.
+            ("auto_preamp_db", |s| s.auto_preamp_db = Some(-9.4)),
+            // R1-8 (`:566`): "the counters compare exactly -- a clip must publish".
+            ("clipped_samples", |s| s.clipped_samples = 1),
+            ("invalid_samples", |s| s.invalid_samples = 1),
+            // R1-6: the desktop's redesign trigger and the user's only
+            // disclosure that the EQ is paused.
+            ("correction_rate_mismatch", |s| {
+                s.correction_rate_mismatch = Some(44_100.0);
+            }),
+            ("enabled", |s| s.enabled = false),
+            // wizard/1: a safety witness must reach the UI on every change.
+            ("self_excluded", |s| s.self_excluded = true),
+        ];
+        for (field, apply) in moves {
+            let mut changed = at_rest();
+            apply(&mut changed);
+            assert!(
+                !effectively_equal(&at_rest(), &changed),
+                "a change to `{field}` ALONE must publish a fresh snapshot"
+            );
+        }
+    }
 }

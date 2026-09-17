@@ -33,6 +33,10 @@ describe("clippedNotice", () => {
     expect(clippedNotice(0, -9.4)).toBeNull();
   });
 
+  // The literal comma is safe because `clippedNotice` formats with an
+  // explicit "en-US" locale. Against the ambient locale this assertion was
+  // machine-dependent: under LANG=de_DE it produced "1.234" and failed, and
+  // nothing in .github/workflows/ci.yml or vitest.config.ts pins a locale.
   it("reports a plain clip count when no auto-preamp is running", () => {
     expect(clippedNotice(1234, null)).toBe("clipped (1,234 samples)");
   });

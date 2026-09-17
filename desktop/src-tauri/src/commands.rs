@@ -252,6 +252,28 @@ pub fn eq_export_autoeq(app: tauri::AppHandle, path: String) -> Result<(), Strin
 /// preamp path. Bands are applied first, so an invalid band set errors before
 /// the preamp is touched (no partial apply). Returns the [`ImportResult`] so the
 /// UI can report the band count and whether the preamp was clamped.
+///
+/// # The file's preamp COMPOSES with R1-1's auto-preamp -- `OPEN [OWNER]`
+///
+/// The parsed `Preamp:` line goes to `SetGainDb`, i.e. the user's trim on
+/// `gain_bits`, which applies on both chain paths. Since R1-1 the engine also
+/// derives its OWN preamp from the very bands `apply_bands` just installed and
+/// applies it on the corrected path, and AutoEq's `ParametricEq.txt`
+/// convention makes a file's preamp exactly `-max_gain` of its own bands
+/// (engine-hardening `:81`) -- the same quantity. So importing a boosting
+/// preset attenuates roughly twice: measured -6.8 (file) + -6.78 (engine) =
+/// -13.58 dB on the corrected path. ParaEQ's own export re-imported doubles by
+/// construction, because R1-1 made `eq_export_autoeq` write the
+/// cascade-derived number.
+///
+/// This is left as-is on purpose, not overlooked. Whether a file's `Preamp:`
+/// line is the user's trim or a headroom number the engine should re-derive is
+/// a product call with a `settings.json` migration behind it, and Phase A
+/// froze `EqState.preamp_db`'s meaning and persistence. It fails quiet, never
+/// loud, and the number is reported on import and editable in one field. See
+/// `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md` D-24 and
+/// `crates/paraeq-dsp/DIVERGENCES.md` #19. `desktop/ui/src/dialogs/
+/// AutoEqBrowser.tsx` and [`profiles_activate`] share the behaviour.
 #[tauri::command]
 pub fn eq_import_autoeq(app: tauri::AppHandle, path: String) -> Result<ImportResult, String> {
     let text = std::fs::read_to_string(&path).map_err(|e| format!("failed to read {path}: {e}"))?;
@@ -302,6 +324,10 @@ pub fn profiles_save(app: tauri::AppHandle, name: String) -> Result<(), String> 
 ///
 /// As in `apply_bands`, the live rate is provenance + user feedback: the
 /// engine re-derives the profile's bands at the stream's own rate.
+///
+/// A profile saved from an AutoEq import carries that file's preamp in
+/// `Profile.preamp_db`, so replaying it composes with R1-1's auto-preamp the
+/// same way [`eq_import_autoeq`] does -- see its `OPEN [OWNER]` note.
 #[tauri::command]
 pub fn profiles_activate(app: tauri::AppHandle, name: String) -> Result<(), String> {
     let shared = app.state::<AppShared>();

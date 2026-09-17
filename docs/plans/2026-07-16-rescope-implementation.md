@@ -307,10 +307,14 @@ type or in a test on the branch; none is invented policy.
    fade-out stays monotone while the mean goes to zero — all three MS-3
    properties from one identity, and the fade-in is not inflated.
    `test_stimulus.rs` pins the spec's measured worst case passing 1e-4 at both
-   −20 and −12 dBFS. What is still owed: the owner's ratification, and the spec
-   edit at `docs/specs/2026-07-15-measurement-safety-design.md:237`, which
-   still reads OPEN \[OWNER + NEEDS DATA\]. This is **not** the same open item
-   as the MMM level-safety gap in the same spec (escalation E4 below).
+   −20 and −12 dBFS. What is still owed: the owner's ratification. (The
+   spec edit landed in the same phase — measurement-safety's § Fade and DC
+   now reads "IMPLEMENTED IN THE SANCTIONED DIRECTION (2026-09-16) — OWNER
+   RATIFICATION PENDING", and the `OPEN [OWNER + NEEDS DATA]` marker is gone
+   from that file. This paragraph said the edit was still owed because it and
+   the edit were written by two agents in parallel.) This is **not** the same
+   open item as the MMM level-safety gap in the same spec (escalation E4
+   below).
 7. **MS-2's per-class dBFS column: cap, or starting point?** The spec calls
    the −20 dBFS coupler / −12 dBFS room "sweep level" column "a starting
    point for the solve, not the emitted level — the solve overrides it", yet

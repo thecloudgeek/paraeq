@@ -49,7 +49,7 @@ use paraeq_engine::chain::{build_fir, build_iir, Correction, RealtimeChain};
 use paraeq_engine::controller::{
     build_correction, decay_per_block, CorrectionConfig, EngineCommand, EngineConfig, EngineHandle,
 };
-use paraeq_engine::shared::{links, ControlLink, RtProcessor, RtShared};
+use paraeq_engine::shared::{links, ControlLink, RtMsg, RtProcessor, RtShared};
 use paraeq_engine::status::WatchdogConfig;
 
 const BLOCK: usize = 512;
@@ -69,7 +69,10 @@ fn db_to_lin(db: f64) -> f32 {
 /// controller would read. The `ControlLink` is held (never used) so the swap
 /// ring keeps both ends alive for `RtLink::poll`.
 struct Rig {
-    _control: ControlLink,
+    /// Held so the swap ring keeps both ends alive for `RtLink::poll`, and
+    /// used by the swap tests to push a correction through the REAL ring --
+    /// the same path `Controller::send_correction` uses.
+    control: ControlLink,
     proc_: RtProcessor,
     shared: Arc<RtShared>,
 }
@@ -86,7 +89,7 @@ fn rig(correction: Option<Correction>, gain_db: f64, bypass: bool) -> Rig {
     let mut chain = RealtimeChain::new(CHANNELS, BLOCK);
     chain.set_correction(correction);
     Rig {
-        _control: control,
+        control,
         proc_: RtProcessor::new(Arc::clone(&shared), rt, chain),
         shared,
     }
@@ -480,6 +483,149 @@ fn baked_iir_preamp_agrees_with_the_peq_preamp() {
     );
 }
 
+/// The baked arm's preamp must mirror `build_iir`'s R1-3 identity
+/// substitution, and nothing reached it before this test: every other baked
+/// case in the suite carries only stable rows.
+///
+/// `preamp::sos_preamp_db` evaluates a row failing `biquad::is_stable` AS
+/// THE IDENTITY SECTION, because that is what the funnel installs. Drop the
+/// mirror and one poisoned row turns the whole cascade's response NaN; the
+/// `if db > peak` fold discards NaN, `peak` stays `NEG_INFINITY`, and the
+/// function hands back 0.0 -- so the surviving +12 dB boost is installed
+/// live with `preamp_lin = 1.0`. Fail-unsafe in exactly the direction the
+/// preamp exists to prevent, and the module's own doc says so.
+#[test]
+fn the_baked_preamp_mirrors_the_identity_substitution_for_an_unstable_row() {
+    let boost = peaking(1_000.0, 12.0, 1.0).to_sos(RATE);
+    // `q = 0` designs NaN; spelling the NaN row out keeps the test about
+    // the funnel rather than about `EQBand`'s validation.
+    let poisoned = [f64::NAN, 0.0, 0.0, 1.0, 0.0, 0.0];
+    let config = CorrectionConfig::Iir {
+        design_rate: RATE,
+        sos_per_channel: vec![vec![boost, poisoned]; CHANNELS],
+    };
+    let (correction, report) =
+        build_correction(&config, CHANNELS, BLOCK, RATE).expect("one bad row must not refuse");
+    assert_eq!(
+        report.sections_substituted, CHANNELS,
+        "the unstable row must be funnelled to the identity, once per channel"
+    );
+    assert!(
+        (report.preamp_db + 12.0).abs() < 0.05,
+        "the preamp must still see the surviving +12 dB boost; it was {} dB \
+         (0.0 means the NaN response was folded away -- the mirror is gone)",
+        report.preamp_db
+    );
+
+    // ...and the number reaches the chain, so the boost is actually protected.
+    // -1 dBFS, not full scale: the baked grid carries no per-band `fc`, so it
+    // reads the peak a whisker low (-11.998 dB here) and full scale would sit
+    // a fraction of a dB over unity by construction. Without the mirror the
+    // same stimulus runs at +12 dB and clips continuously.
+    let mut r = rig(Some(correction), 0.0, false);
+    let level = db_to_lin(-1.0);
+    let mut n = 0;
+    for _ in 0..16 {
+        pump_with(&mut r, &sine_block(1_000.0, level, n, BLOCK));
+        n += BLOCK;
+    }
+    r.shared.clipped_samples.store(0, Ordering::Relaxed);
+    r.shared.peak_out_bits.store(0, Ordering::Relaxed);
+    for _ in 0..16 {
+        pump_with(&mut r, &sine_block(1_000.0, level, n, BLOCK));
+        n += BLOCK;
+    }
+    assert_eq!(
+        r.shared.clipped_samples.load(Ordering::Relaxed),
+        0,
+        "a cascade with one substituted row got no headroom for its surviving boost"
+    );
+    assert!(
+        r.shared.peak_out() > 0.8,
+        "the stimulus never reached the boost; the assertion would pass vacuously"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 5c: R1-1 x R1-7a -- a correction swap must not spend the preamp's headroom
+// ---------------------------------------------------------------------------
+
+/// `RealtimeChain::set_correction` transplants the OUTGOING correction's
+/// DF2T delay lines into the incoming one so a band edit is click-free
+/// (R1-7a), but that tail carries the outgoing cascade's **un-preamped**
+/// energy and the INCOMING `preamp_lin` is what multiplies it on the very
+/// first block. A swap that WEAKENS the preamp -- a boost dragged down, a
+/// band flattened, a preset loaded -- therefore hands boosted energy to a
+/// correction with no headroom left for it, and the +-1.0 clamp engages.
+///
+/// That is precisely the state R1-1 exists to prevent (spec `:571`: "a
+/// nonzero `clipped_samples` while `auto_preamp_db` is active is a bug
+/// signal ... it is R1-1's falsifier"), and the product reaches it on every
+/// band drag: `desktop/src-tauri/src/commands.rs::apply_bands` sends
+/// `SetCorrection` on each change and `desktop/ui/src/tabs/EqTab.tsx`
+/// applies at ~10 Hz DURING a pointer drag.
+///
+/// MEASURED on this exact stimulus before the fix: 68 clipped samples at a
+/// pre-clamp peak of 2.64 on the block after the swap.
+#[test]
+fn a_swap_that_weakens_the_preamp_does_not_clip() {
+    let boost = CorrectionConfig::Peq {
+        bands: vec![vec![peaking(1_000.0, 12.0, 1.0)]; CHANNELS],
+        design_rate: RATE,
+    };
+    // The band dragged flat: an identity cascade that needs no headroom, so
+    // its own steady-state output is exactly the input. Anything above unity
+    // after the swap came from the transplanted tail and nowhere else.
+    let flat = CorrectionConfig::Peq {
+        bands: vec![vec![peaking(1_000.0, 0.0, 1.0)]; CHANNELS],
+        design_rate: RATE,
+    };
+    let (boosted, boost_report) =
+        build_correction(&boost, CHANNELS, BLOCK, RATE).expect("a +12 dB band builds");
+    let (flattened, flat_report) =
+        build_correction(&flat, CHANNELS, BLOCK, RATE).expect("a 0 dB band builds");
+    assert!(
+        (boost_report.preamp_db + 12.0).abs() < 0.02,
+        "the outgoing correction must really be preamped; it was {} dB",
+        boost_report.preamp_db
+    );
+    assert_eq!(
+        flat_report.preamp_db, 0.0,
+        "the incoming correction must really have no headroom to spare"
+    );
+
+    let mut r = rig(Some(boosted), 0.0, false);
+    // Ring up to the steady state the preamp is computed for.
+    let start = pump_sine(&mut r, 1_000.0, 16, 0);
+    assert!(
+        r.shared.peak_out() > 0.99,
+        "the prologue never reached full scale; the swap would have nothing to overshoot"
+    );
+    r.shared.clipped_samples.store(0, Ordering::Relaxed);
+    r.shared.peak_out_bits.store(0, Ordering::Relaxed);
+
+    // Through the REAL swap ring, exactly as `send_correction` does it.
+    r.control
+        .send(RtMsg::Correction(Some(flattened)))
+        .expect("a fresh ring has room");
+    pump_sine(&mut r, 1_000.0, 4, start);
+
+    assert_eq!(
+        r.shared.clipped_samples.load(Ordering::Relaxed),
+        0,
+        "the clamp engaged on a correction swap while the auto-preamp was live"
+    );
+    let peak = r.shared.peak_out();
+    assert!(
+        peak <= 1.0 + 4.0 * f32::EPSILON,
+        "the swap overshot unity: output_peak was {peak}"
+    );
+    assert!(
+        peak > 0.99,
+        "the stimulus stopped mid-test ({peak}); the assertion would pass vacuously"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 6: publication
 // ---------------------------------------------------------------------------
@@ -571,6 +717,46 @@ fn auto_preamp_db_rides_the_published_snapshot() {
 
     handle.send(EngineCommand::ClearCorrection);
     assert!(wait_until(WAIT, || handle.state().auto_preamp_db.is_none()));
+}
+
+/// ...and a change to `auto_preamp_db` ALONE must publish. `effectively_equal`
+/// compares it exactly for this reason, and nothing else in the snapshot can
+/// carry the publish for it: `CorrectionConfig::descriptor()` is the band
+/// COUNT (`"peq:1-band"`), so editing one band's gain from +3 dB to +12 dB
+/// moves the preamp and leaves every other published field where it was.
+///
+/// `auto_preamp_db_rides_the_published_snapshot` above cannot see this --
+/// both of its transitions also flip the descriptor between `Some` and
+/// `None`, so they publish either way.
+#[test]
+fn a_preamp_only_change_publishes() {
+    let backend = MockBackend::new();
+    let handle = EngineHandle::spawn(backend.clone(), fast_config());
+
+    let set = |gain_db: f64| CorrectionConfig::Peq {
+        bands: vec![vec![peaking(1_000.0, gain_db, 1.0)]; CHANNELS],
+        design_rate: RATE,
+    };
+    handle.send(EngineCommand::SetCorrection(set(3.0)));
+    assert!(wait_until(WAIT, || handle
+        .state()
+        .auto_preamp_db
+        .is_some_and(|p| (p + 3.0).abs() < 0.02)));
+    let descriptor = handle.state().correction.clone();
+
+    handle.send(EngineCommand::SetCorrection(set(12.0)));
+    assert!(
+        wait_until(WAIT, || handle
+            .state()
+            .auto_preamp_db
+            .is_some_and(|p| (p + 12.0).abs() < 0.02)),
+        "a band edit that moved ONLY the preamp never reached the published snapshot"
+    );
+    assert_eq!(
+        handle.state().correction,
+        descriptor,
+        "the descriptor is a band COUNT, so it cannot have carried that publish"
+    );
 }
 
 // ---------------------------------------------------------------------------

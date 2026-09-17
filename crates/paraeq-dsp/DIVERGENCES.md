@@ -112,8 +112,13 @@ differs from `prototype/paraeq/`, so a red parity test is always actionable.
 16. **`ParametricEQ::export_autoeq_format_with_preamp_db` has no oracle
     counterpart either.** The prototype exporter hardcodes `Preamp: 0.0 dB`
     (parametric_eq.py:92-106) and never round-trips a preamp; the desktop app
-    must export the preamp the user set and the engine is running at
-    (`SetGainDb`). Deliberate UX fix, owner-approved 2026-07-13 — originally
+    must export a real preamp rather than a literal zero. (When this entry was
+    written that number was the preamp the user set and the engine was running
+    at, via `SetGainDb`. R1-1 changed WHICH number: `eq_export_autoeq` now calls
+    the sibling `export_autoeq_format_with_preamp`, the cascade-derived value,
+    per engine-hardening `:117`. The divergence from the oracle is unchanged;
+    only the source of the number moved.) Deliberate UX fix, owner-approved
+    2026-07-13 — originally
     landed on `feature/rust-port-tauri-shell` by giving `export_autoeq_format`
     itself a `preamp_db: f64` parameter, which the 2026-09-16 integration merge
     reworked into this third, additive method so the oracle-parity export stays
@@ -124,9 +129,11 @@ differs from `prototype/paraeq/`, so a red parity test is always actionable.
     number, spelled without the negative zero, and the parser accepts either
     spelling. Every other value is written verbatim, including the whole
     positive half of the desktop's accepted range (`eq.rs`:
-    `PREAMP_MIN_DB..=PREAMP_MAX_DB`, -30..=+10), so an export/import round trip
-    is lossless in both signs. Call site:
-    `desktop/src-tauri/src/commands.rs::eq_export_autoeq`; pinned by
+    `PREAMP_MIN_DB..=PREAMP_MAX_DB`, -30..=+10), so a FORMAT-level export/parse
+    round trip is lossless in both signs. (Format-level: the text a caller hands
+    this function parses back to the same number. An APP-level export/import
+    round trip is not level-neutral — see #19.) No production call site since
+    R1-1 repointed `eq_export_autoeq`; pinned by
     `test_peq.rs::export_with_preamp_db_writes_the_caller_s_preamp` (which
     covers -30, -6.5, -0.04, +0.1, +3.5, +6 and the +10 endpoint) and
     `test_autoeq_parse.rs::export_then_parse_roundtrip`.
@@ -153,12 +160,40 @@ differs from `prototype/paraeq/`, so a red parity test is always actionable.
     handoff carrying one band above the new 22.05 kHz Nyquist removes the
     user's **entire** EQ. Engine-hardening R1-6 moves that check into
     `paraeq-engine`'s `build_correction`, which instead **drops only the
-    offending bands, counts them, and publishes the count** for the Advanced
-    drawer, refusing the whole configuration only when nothing survives. The
+    offending bands and counts them** in `BuildReport.bands_dropped`, refusing
+    the whole configuration only when nothing survives. The count is logged at
+    `warn`; it is **not** on the wire — `EngineState` has no drop or
+    substitution count, so the Advanced drawer's surfacing of it is not built
+    (a follow-up alongside the drawer itself, Stage 7). The
     rationale is R1-3's own DECIDED text for the identical question one layer
     up: *"the auto front-end must never be bricked by one bad band… An error
     would mean no correction at all from one bad row."* Flagged `OPEN [OWNER]`
     — a reversal is one branch in one function. See
     `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md` §D-10.
+
+19. **An imported `Preamp:` line now composes with the engine's own
+    auto-preamp.** Not an oracle divergence — recorded here for the same
+    reason as #16 and #18, because it is user-visible and it changed in Phase
+    A. `eq_import_autoeq` (and the in-app AutoEq browser,
+    `AutoEqBrowser.tsx`) routes a parsed `Preamp:` line to the user's trim:
+    `EngineCommand::SetGainDb`, which rides `gain_bits` and applies on BOTH
+    chain paths. That wiring is owner-approved (2026-07-13; the prototype
+    silently dropped it) and unchanged. What changed is the other side: R1-1
+    gave the engine its own `Correction.preamp_lin`, derived from the very
+    bands the import just applied, on the corrected path. AutoEq's
+    `ParametricEq.txt` convention makes the file's preamp exactly
+    `−max_gain` of its own bands (engine-hardening `:81`; `peq.rs`'s
+    `preamp_db` doc says the same), i.e. numerically the quantity ParaEQ now
+    derives — so importing a boosting preset attenuates roughly twice.
+    Measured on a real-shaped preset: file `−6.8 dB` + engine `−6.78 dB`
+    = `−13.58 dB` on the corrected path, and `−6.8 dB` on the bypassed one
+    with no boost to compensate. ParaEQ's own export re-imported doubles by
+    construction, since R1-1 made the export write the cascade-derived
+    number. It fails QUIET, never loud, and the trim is visible and editable
+    in one field. Flagged **`OPEN [OWNER]`**: whether a file's `Preamp:` line
+    is a user trim or a headroom number the engine should re-derive is a
+    product call, and changing it means changing `EqState.preamp_db`
+    semantics and its persistence — both explicitly frozen for Phase A. See
+    `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md` §D-24.
 
 (add entries here as they are discovered during implementation)
