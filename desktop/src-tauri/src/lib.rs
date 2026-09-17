@@ -7,6 +7,10 @@ mod settings;
 mod setup;
 mod state;
 mod tray;
+// `pub`, unlike its neighbours: this is the measurement crate's seam, whose
+// only consumers live outside this module tree (the wizard spine, once it
+// lands, and a future headless driver).
+pub mod verify_seam;
 
 use state::{AppData, AppShared};
 use std::sync::Mutex;

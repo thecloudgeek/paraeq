@@ -220,6 +220,7 @@ fn to_device_info(list: Vec<devices::OutputDevice>) -> Vec<OutputDeviceInfo> {
 fn stopped_state() -> EngineState {
     EngineState {
         auto_preamp_db: None,
+        bands_dropped: 0,
         bypass: false,
         clipped_samples: 0,
         correction: None,
@@ -232,6 +233,9 @@ fn stopped_state() -> EngineState {
         invalid_samples: 0,
         latency_ms: None,
         output_peak: 0.0,
+        // No chain, so no installed cascade to describe -- the same
+        // session-scoped rule `auto_preamp_db: None` above follows.
+        sections_substituted: 0,
         // No handle, so no tap, so nothing is witnessed. Paired with
         // `stream: None` this reads as "the engine is not running", never as
         // the fail-open path having fired.

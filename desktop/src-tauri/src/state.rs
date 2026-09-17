@@ -98,17 +98,12 @@ pub struct AppShared {
     /// instead of reading a snapshot that is up to a controller tick stale.
     /// No lock: it is an atomic cell behind an `Arc`.
     ///
-    /// `dead_code` is allowed because the field is parked here for a STRUCTURAL
-    /// reason, not a stylistic one: the witness can only be taken at spawn, and
-    /// its first reader (the wizard's `Probe` precondition, which hands it to
-    /// `MeasurementSession::begin` as the `TapStatus` half of `SessionSeam`)
-    /// arrives with the wizard spine -- the same scope that takes the
-    /// measurement lease, per this struct's own doc comment above. Taking the
-    /// witness later than spawn is not an option, so
-    /// storing it early is not premature. Same reason `TapSystem::desc` carries
-    /// the attribute (`crates/paraeq-coreaudio/src/tap.rs`). Delete the
-    /// attribute, not the field, when the wizard lands.
-    #[allow(dead_code)]
+    /// Its first reader is
+    /// [`verify_seam::tap_status`](crate::verify_seam::tap_status), which hands
+    /// it to `MeasurementSession::begin` as the `TapStatus` half of
+    /// `SessionSeam` -- so the `#[allow(dead_code)]` this field used to carry
+    /// is gone, as that attribute's own note instructed ("delete the
+    /// attribute, not the field, when the wizard lands").
     pub exclusion_witness: ExclusionWitness,
     /// In-memory mirror of the durable [`Settings`] currently on disk, seeded at
     /// setup from the loaded file. `publish` compares the freshly-composed
@@ -308,6 +303,7 @@ mod tests {
         };
         let engine = EngineState {
             auto_preamp_db: Some(-9.5),
+            bands_dropped: 1,
             bypass: false,
             clipped_samples: 3,
             correction: Some("peq:1-band".into()),
@@ -320,6 +316,7 @@ mod tests {
             invalid_samples: 2,
             latency_ms: Some(62.3),
             output_peak: 1.5,
+            sections_substituted: 2,
             self_excluded: true,
             status: EngineStatus::Running,
             stream: Some(StreamInfo {
@@ -340,6 +337,7 @@ mod tests {
                 ],
                 "engine": {
                     "auto_preamp_db": -9.5,
+                    "bands_dropped": 1,
                     "bypass": false,
                     "clipped_samples": 3,
                     "correction": "peq:1-band",
@@ -352,6 +350,7 @@ mod tests {
                     "invalid_samples": 2,
                     "latency_ms": 62.3,
                     "output_peak": 1.5,
+                    "sections_substituted": 2,
                     "self_excluded": true,
                     "status": { "kind": "running" },
                     "stream": {

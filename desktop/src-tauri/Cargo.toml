@@ -22,6 +22,14 @@ paraeq-coreaudio = { path = "../../crates/paraeq-coreaudio" }
 # and (since R1-6 put `EQBand` inside `CorrectionConfig::Peq`) paraeq-engine.
 paraeq-dsp = { path = "../../crates/paraeq-dsp", features = ["serde"] }
 paraeq-engine = { path = "../../crates/paraeq-engine" }
+# `paraeq-measure` declares the measurement<->engine seam (`EngineFacts`,
+# `EngineControl`); this crate is its one production implementor, in
+# `verify_seam.rs`. The dependency points INTO the measure crate (which
+# depends only on paraeq-dsp), exactly as `paraeq-coreaudio`'s does, so
+# MS-1's "no Tauri, no CoreAudio, paraeq-dsp only" still holds over there.
+# A transitive path through `paraeq-coreaudio` does not make the crate
+# nameable, hence the explicit entry.
+paraeq-measure = { path = "../../crates/paraeq-measure" }
 percent-encoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde = { workspace = true }

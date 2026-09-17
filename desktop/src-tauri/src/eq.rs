@@ -329,6 +329,7 @@ mod tests {
     fn snapshot_with_stream(stream: Option<StreamInfo>) -> EngineState {
         EngineState {
             auto_preamp_db: None,
+            bands_dropped: 0,
             bypass: false,
             clipped_samples: 0,
             correction: None,
@@ -341,6 +342,7 @@ mod tests {
             invalid_samples: 0,
             latency_ms: None,
             output_peak: 0.0,
+            sections_substituted: 0,
             self_excluded: false,
             status: EngineStatus::Stopped,
             stream,

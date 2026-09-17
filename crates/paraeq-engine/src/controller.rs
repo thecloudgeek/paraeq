@@ -471,6 +471,20 @@ pub struct EngineState {
     /// multiply in linear and add in dB -- and which is never overwritten by
     /// it.
     pub auto_preamp_db: Option<f32>,
+    /// Bands the live rate could not design and [`build_correction`] dropped
+    /// ([`BuildReport::bands_dropped`]). The verification gate refuses on
+    /// `> 0`: a partially-installed cascade is not the plan's cascade, and
+    /// predicting the plan's response while the chain runs a subset would
+    /// blame the chain for our own prediction fault.
+    ///
+    /// Changes only at install, so `effectively_equal` compares it EXACTLY --
+    /// unlike a per-block counter, which would publish every tick (see
+    /// `frame_mismatch_blocks`, compared as `> 0`).
+    ///
+    /// Session-scoped, exactly like `auto_preamp_db` and for the same reason:
+    /// all three come off the SAME [`BuildReport`], and with no chain there is
+    /// no installed cascade to describe.
+    pub bands_dropped: usize,
     pub bypass: bool,
     /// Output samples the +-1.0 clamp engaged on (R1-8), counted per sample
     /// per channel over both chain paths. Retained across a torn-down session
@@ -539,6 +553,18 @@ pub struct EngineState {
     /// [`crate::shared::RtShared::peak_out_bits`] for why the spec's
     /// input-only decay is applied here too.
     pub output_peak: f32,
+    /// SOS rows the R1-3 stability funnel replaced with the identity section
+    /// ([`BuildReport::sections_substituted`]).
+    ///
+    /// Evidence, not a gate: `ParametricEQ::preamp_db` and the realized
+    /// response both substitute identically, so a prediction built from the
+    /// plan's bands already models it. Published so a surprising verification
+    /// residual has a visible first thing to look at instead of a `warn` line
+    /// nobody was watching.
+    ///
+    /// Compared exactly and session-scoped, for the same two reasons as
+    /// `bands_dropped`.
+    pub sections_substituted: usize,
     /// The MS-6 self-exclusion witness: whether the LIVE capture currently
     /// keeps ParaEQ's own audio out of ParaEQ's own tap, exactly as the
     /// backend reports it (measurement-safety `MS-6`, wizard `§ self_excluded Requirement`). The
@@ -624,6 +650,31 @@ impl Default for EngineConfig {
     }
 }
 
+/// Non-latching realtime activity counters, read straight off the live
+/// [`RtShared`] by [`EngineHandle::tap_activity`].
+///
+/// Deliberately NOT on [`EngineState`]. These are monotonic PER-BLOCK
+/// counters, so putting them in `effectively_equal`'s compare set would
+/// publish a fresh snapshot -- and, in the desktop, a Tauri event and a React
+/// re-render -- on every tick of every session. That is the same documented
+/// reason `frame_mismatch_blocks` is compared as `> 0` rather than exactly.
+/// Contrast `bands_dropped` / `sections_substituted`, which change only at
+/// install and are therefore safe to publish and compare exactly.
+///
+/// The measurement crate mirrors this shape in its own seam module rather than
+/// importing it (measurement-safety `MS-1`: `paraeq-measure` may not depend on
+/// `paraeq-engine`), so no type from here crosses that boundary.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TapActivity {
+    /// Total realtime callbacks observed since this session started
+    /// ([`RtShared::callbacks`]) -- "the system is rendering audio at all".
+    pub callbacks: u64,
+    /// Blocks carrying at least one nonzero input sample
+    /// ([`RtShared::nonzero_blocks`]) -- the raw "audio is flowing through the
+    /// tap" signal the watchdog gates `Running` on.
+    pub nonzero_blocks: u64,
+}
+
 /// Handle to a spawned engine controller thread.
 ///
 /// Dropping the handle sends [`EngineCommand::Shutdown`] and joins the
@@ -636,6 +687,16 @@ pub struct EngineHandle {
     /// shared atomic rather than an [`EngineCommand`] -- see
     /// [`EngineHandle::acquire_measurement_lease`].
     measurement_lease: Arc<AtomicBool>,
+    /// The LIVE session's [`RtShared`], republished by the controller on every
+    /// start and retracted on every teardown, so
+    /// [`tap_activity`](Self::tap_activity) can read the realtime counters
+    /// without going through a published snapshot. `None` means there is no
+    /// session.
+    ///
+    /// An `ArcSwap` for the same reason `state` is one: the controller thread
+    /// writes it, arbitrary threads read it, and a reader must never block the
+    /// control plane. Nothing on the REALTIME lane touches this cell.
+    rt: Arc<ArcSwap<Option<Arc<RtShared>>>>,
     state: Arc<ArcSwap<EngineState>>,
     subscribers: Arc<Mutex<Vec<SyncSender<Arc<EngineState>>>>>,
 }
@@ -649,6 +710,7 @@ impl EngineHandle {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let initial = Arc::new(EngineState {
             auto_preamp_db: None,
+            bands_dropped: 0,
             bypass: false,
             clipped_samples: 0,
             correction: None,
@@ -661,16 +723,21 @@ impl EngineHandle {
             invalid_samples: 0,
             latency_ms: None,
             output_peak: 0.0,
+            sections_substituted: 0,
             self_excluded: false,
             status: EngineStatus::Stopped,
             stream: None,
         });
         let measurement_lease = Arc::new(AtomicBool::new(false));
+        // No session yet, so there is no `RtShared` to name. `start_with`
+        // publishes one on the line after it builds it.
+        let rt = Arc::new(ArcSwap::new(Arc::new(None)));
         let state = Arc::new(ArcSwap::new(Arc::clone(&initial)));
         let subscribers: Arc<Mutex<Vec<SyncSender<Arc<EngineState>>>>> =
             Arc::new(Mutex::new(Vec::new()));
 
         let thread_lease = Arc::clone(&measurement_lease);
+        let thread_rt = Arc::clone(&rt);
         let thread_state = Arc::clone(&state);
         let thread_subscribers = Arc::clone(&subscribers);
         let join = std::thread::Builder::new()
@@ -680,6 +747,7 @@ impl EngineHandle {
                     auto_disabled: None,
                     auto_preamp_db: None,
                     backend: StopGuard(backend),
+                    bands_dropped: 0,
                     bypass: false,
                     clipped_samples: 0,
                     cmd_rx,
@@ -700,6 +768,8 @@ impl EngineHandle {
                     published: initial,
                     requested_buffer_frames: config.requested_buffer_frames,
                     ring_capacity: config.ring_capacity,
+                    rt: thread_rt,
+                    sections_substituted: 0,
                     session: None,
                     state: thread_state,
                     subscribers: thread_subscribers,
@@ -715,6 +785,7 @@ impl EngineHandle {
             cmd_tx,
             join: Some(join),
             measurement_lease,
+            rt,
             state,
             subscribers,
         }
@@ -729,6 +800,33 @@ impl EngineHandle {
     /// The latest published snapshot (lock-free read).
     pub fn state(&self) -> Arc<EngineState> {
         self.state.load_full()
+    }
+
+    /// The live session's realtime activity counters, or `None` when there is
+    /// no session.
+    ///
+    /// NON-PUBLISHING, and that is the point: it reads the shared atomics
+    /// directly and goes through neither `publish` nor `effectively_equal`, so
+    /// it emits no [`EngineState`] snapshot and no subscriber event no matter
+    /// how often it is called. See [`TapActivity`] for why these counters are
+    /// not on the wire.
+    ///
+    /// `None` before the first start and after a teardown -- there is no
+    /// `RtShared` to read. A caller witnessing "is audio flowing right now"
+    /// must treat `None` as *cannot witness* and refuse, rather than reading it
+    /// as *nothing is flowing*.
+    ///
+    /// One narrow window reports `Some` with both counters at zero and no live
+    /// stream: a `start` that FAILED after the fresh `RtShared` was published
+    /// (the controller retries on the next tick, which republishes). That
+    /// direction is the safe one -- a witness sees a tap that is not moving and
+    /// refuses -- and `EngineState::stream` is `None` throughout, so a caller
+    /// that also gates on the snapshot never mistakes it for a live session.
+    pub fn tap_activity(&self) -> Option<TapActivity> {
+        self.rt.load().as_ref().as_ref().map(|shared| TapActivity {
+            callbacks: shared.callbacks.load(Ordering::Relaxed),
+            nonzero_blocks: shared.nonzero_blocks.load(Ordering::Relaxed),
+        })
     }
 
     /// Subscribe to snapshots published from now on.
@@ -936,6 +1034,9 @@ struct Controller<B: AudioBackend> {
     /// `BuildReport`, cleared on a refusal, a clear, and teardown.
     auto_preamp_db: Option<f32>,
     backend: StopGuard<B>,
+    /// Mirror of [`EngineState::bands_dropped`], from the same `BuildReport`
+    /// as `auto_preamp_db` and set/cleared in lockstep with it.
+    bands_dropped: usize,
     bypass: bool,
     /// Last `RtShared::clipped_samples` observed at snapshot time. Retained
     /// across a torn-down session (SHELL's `frame_mismatch_blocks` pattern):
@@ -987,6 +1088,12 @@ struct Controller<B: AudioBackend> {
     published: Arc<EngineState>,
     requested_buffer_frames: Option<usize>,
     ring_capacity: usize,
+    /// The cell [`EngineHandle::tap_activity`] reads. Written ONLY on this
+    /// thread: published one expression after each fresh `RtShared` is built
+    /// (`start_with`) and retracted in `clear_session_scoped_publications`.
+    rt: Arc<ArcSwap<Option<Arc<RtShared>>>>,
+    /// Mirror of [`EngineState::sections_substituted`]; see `bands_dropped`.
+    sections_substituted: usize,
     session: Option<Session>,
     state: Arc<ArcSwap<EngineState>>,
     subscribers: Arc<Mutex<Vec<SyncSender<Arc<EngineState>>>>>,
@@ -1289,6 +1396,14 @@ impl<B: AudioBackend> Controller<B> {
         request: Option<usize>,
     ) -> Result<StreamInfo, EngineError> {
         let shared = Arc::new(RtShared::default());
+        // Construct-and-publish, one expression apart, so the handle's cell
+        // can never name a PREVIOUS session's `RtShared`. Every rebuild --
+        // device change, rate change, correction install, renegotiation --
+        // reaches this line, and a stale `Arc` would be `Some` and frozen:
+        // `tap_activity` would report a tap that never advances, which a
+        // verification witness reads as a dead tap and refuses on, every run.
+        // Control thread only; the realtime lane never touches this cell.
+        self.rt.store(Arc::new(Some(Arc::clone(&shared))));
         // Retained params re-applied to the fresh shared state BEFORE start.
         shared.bypass.store(self.bypass, Ordering::Relaxed);
         shared.set_gain(db_to_linear(self.gain_db));
@@ -1350,22 +1465,35 @@ impl<B: AudioBackend> Controller<B> {
         self.watchdog.stopped();
     }
 
-    /// Retract the two published statements that are only true of a LIVE
-    /// stream: `correction_rate_mismatch` names the live stream's rate, and
-    /// `auto_preamp_db` names what the live chain is applying. With no
-    /// session both are stale, and the invariant is stated in each field's
-    /// own doc on [`EngineState`].
+    /// Retract the published statements that are only true of a LIVE stream:
+    /// `correction_rate_mismatch` names the live stream's rate, and
+    /// `auto_preamp_db`, `bands_dropped` and `sections_substituted` all
+    /// describe what the live chain is applying -- they come off ONE
+    /// [`BuildReport`] and are set and cleared together. With no session all
+    /// four are stale, and the invariant is stated in each field's own doc on
+    /// [`EngineState`].
+    ///
+    /// The `rt` cell is retracted here for the same reason: with no session it
+    /// names an [`RtShared`] nothing is writing, and a frozen `Some` reads to
+    /// a verification witness as a dead tap rather than as "no session".
     ///
     /// The COUNTERS are deliberately NOT cleared here -- see
     /// `Controller::clipped_samples`: a `Disable` must not blank the clip
-    /// count the user is looking at.
+    /// count the user is looking at. `bands_dropped` and
+    /// `sections_substituted` are not counters in that sense: they are
+    /// properties of an installed cascade, not a running tally of realtime
+    /// events, and there is no cascade to have a property of once the session
+    /// is gone.
     ///
     /// Called from every path that ends a session: `stop_session` and
     /// `start_once`'s renegotiation retry, which tears down without going
     /// through it.
     fn clear_session_scoped_publications(&mut self) {
         self.auto_preamp_db = None;
+        self.bands_dropped = 0;
         self.correction_rate_mismatch = None;
+        self.rt.store(Arc::new(None));
+        self.sections_substituted = 0;
     }
 
     /// Rebuild-on-change: full stop, then a fresh start from retained
@@ -1391,23 +1519,26 @@ impl<B: AudioBackend> Controller<B> {
             // is no refusal to report and no preamp is being applied. The
             // stored config is applied (and judged) at the next start.
             self.auto_preamp_db = None;
+            self.bands_dropped = 0;
             self.swap_pending = false;
             self.correction_rate_mismatch = None;
+            self.sections_substituted = 0;
             return;
         };
         let stream_rate = s.stream.sample_rate;
-        let (msg, mismatch, auto_preamp_db) = match self.correction.as_ref() {
+        let (msg, mismatch, report) = match self.correction.as_ref() {
             None => (RtMsg::Correction(None), None, None),
             Some(config) => match build_correction(config, s.channels, s.block_size, stream_rate) {
-                // `report`'s drop/substitution counts are already logged by
-                // `build_correction`; its preamp is R1-1's `auto_preamp_db`
-                // and is published (the drawer must be able to explain the
-                // number the engine applied -- spec `R1-1 §6`).
-                Ok((correction, report)) => (
-                    RtMsg::Correction(Some(correction)),
-                    None,
-                    Some(report.preamp_db as f32),
-                ),
+                // The whole `BuildReport` is published, not just logged: its
+                // preamp is R1-1's `auto_preamp_db` (the drawer must be able
+                // to explain the number the engine applied -- spec `R1-1 §6`),
+                // and its two counts are the only record of how the INSTALLED
+                // cascade differs from the one the caller asked for. Stage 6's
+                // verification gate refuses on `bands_dropped > 0`, so the
+                // counts have to reach the wire to be readable at all.
+                Ok((correction, report)) => {
+                    (RtMsg::Correction(Some(correction)), None, Some(report))
+                }
                 Err(e) => {
                     log::warn!(
                         "correction refused at {stream_rate} Hz ({e}); \
@@ -1420,8 +1551,10 @@ impl<B: AudioBackend> Controller<B> {
         match s.control.send(msg) {
             Ok(()) => {
                 self.swap_pending = false;
-                self.auto_preamp_db = auto_preamp_db;
+                self.auto_preamp_db = report.map(|r| r.preamp_db as f32);
+                self.bands_dropped = report.map_or(0, |r| r.bands_dropped);
                 self.correction_rate_mismatch = mismatch;
+                self.sections_substituted = report.map_or(0, |r| r.sections_substituted);
             }
             // Ring-full: the built correction was dropped (control plane --
             // safe); nothing reached the chain, so the published verdict is
@@ -1485,6 +1618,7 @@ impl<B: AudioBackend> Controller<B> {
         }
         let next = EngineState {
             auto_preamp_db: self.auto_preamp_db,
+            bands_dropped: self.bands_dropped,
             bypass: self.bypass,
             clipped_samples: self.clipped_samples,
             correction: self.correction.as_ref().map(CorrectionConfig::descriptor),
@@ -1497,6 +1631,7 @@ impl<B: AudioBackend> Controller<B> {
             invalid_samples: self.invalid_samples,
             latency_ms,
             output_peak,
+            sections_substituted: self.sections_substituted,
             // Straight from the backend -- the controller never infers this.
             // A backend with no live capture answers `false` (trait contract),
             // which is what makes the `(self_excluded, stream)` pair honest
@@ -1576,10 +1711,17 @@ pub fn decay_per_block(buffer_frames: usize, sample_rate: f64) -> f32 {
 /// rebuild, and a changed preamp must publish -- it is a number the app has
 /// promised to be able to explain. The two new peaks go through the existing
 /// 1e-3 quantization, exactly like `input_peak`.
+///
+/// `bands_dropped` and `sections_substituted` extend that same argument rather
+/// than opening a new one: they come off the same `BuildReport` as
+/// `auto_preamp_db`, change only at install, and are what the verification
+/// gate reads to decide whether the installed cascade IS the plan's. A
+/// quantized or `> 0` compare there would hide the second dropped band.
 fn effectively_equal(a: &EngineState, b: &EngineState) -> bool {
     let q_latency = |l: Option<f64>| l.map(|v| (v * 10.0).round() as i64);
     let q_peak = |p: f32| (f64::from(p) * 1000.0).round() as i64;
     a.auto_preamp_db == b.auto_preamp_db
+        && a.bands_dropped == b.bands_dropped
         && a.bypass == b.bypass
         && a.clipped_samples == b.clipped_samples
         && a.correction == b.correction
@@ -1592,6 +1734,7 @@ fn effectively_equal(a: &EngineState, b: &EngineState) -> bool {
         && a.invalid_samples == b.invalid_samples
         && q_latency(a.latency_ms) == q_latency(b.latency_ms)
         && q_peak(a.output_peak) == q_peak(b.output_peak)
+        && a.sections_substituted == b.sections_substituted
         // EXACT, unlike the quantized meters above: a safety witness must
         // reach the UI on every change, and it only ever has two values.
         && a.self_excluded == b.self_excluded
@@ -1612,6 +1755,7 @@ mod tests {
     fn at_rest() -> EngineState {
         EngineState {
             auto_preamp_db: None,
+            bands_dropped: 0,
             bypass: false,
             clipped_samples: 0,
             correction: None,
@@ -1624,6 +1768,7 @@ mod tests {
             invalid_samples: 0,
             latency_ms: None,
             output_peak: 0.0,
+            sections_substituted: 0,
             self_excluded: false,
             status: EngineStatus::Stopped,
             stream: None,
@@ -1641,6 +1786,10 @@ mod tests {
     /// so no controller-level script can isolate the second of them at all.
     /// Deleting either compare left the whole workspace green. This is the
     /// direct guard: one field moved, one verdict.
+    ///
+    /// This array must list EVERY field `effectively_equal` compares exactly:
+    /// adding a compare without adding a row here leaves that compare
+    /// unguarded, and nothing else in the suite will notice.
     #[test]
     fn every_exact_compare_publishes_on_its_own() {
         assert!(
@@ -1649,9 +1798,15 @@ mod tests {
         );
         /// One named single-field edit to an otherwise at-rest snapshot.
         type Move = (&'static str, fn(&mut EngineState));
-        let moves: [Move; 6] = [
+        let moves: [Move; 8] = [
             // R1-1: a number the app has promised to be able to explain.
             ("auto_preamp_db", |s| s.auto_preamp_db = Some(-9.4)),
+            // R16 (b2): verification gate 2 refuses on `bands_dropped > 0`,
+            // so a second dropped band must not be hidden by the first.
+            ("bands_dropped", |s| s.bands_dropped = 1),
+            // R16 (b2): evidence for the same gate -- not a refusal, but the
+            // first thing to look at when a residual surprises someone.
+            ("sections_substituted", |s| s.sections_substituted = 1),
             // R1-8 (`R1-8 § Publish`): "the counters compare exactly -- a clip must publish".
             ("clipped_samples", |s| s.clipped_samples = 1),
             ("invalid_samples", |s| s.invalid_samples = 1),
