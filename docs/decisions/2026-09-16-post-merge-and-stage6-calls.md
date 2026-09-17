@@ -82,7 +82,8 @@ Each row is **Decision / reasoning / Confidence / Kind**, the shape the
 | **D-21** | Publish lease state on the wire (`measurement_active`)? | **No** | The wizard spec asks for exactly one new `EngineState` field. The lease's effect is observable behaviourally (the tap is not destroyed) and in the controller log. Additive later if the Advanced drawer wants it | High | Pin now |
 | **D-22** | Does the lease block `Disable` / `Shutdown`? | **No** | User intent and app exit outrank a lease; blocking `Shutdown` would hang quit (`EngineHandle::drop` sends `Shutdown` and joins). The wizard spec names **one** mechanism ("suspends the fail-open watchdog"), not all teardown paths. The wizard aborts instead, via D-17's `AbortReason::EngineStopped` | High | Pin now |
 | **D-23** | Where in the measurement spine is the lease acquired? | **Acquire at `Probe`, release at Result/Save, cancel, or any error exit**, as a scope-local RAII token declared **before** the sessions it covers, so reverse-declaration drop releases it last | The wizard spec's spine lists "engine lease" in the `Probe` box, which already precedes every session. Rust drops LOCALS in reverse declaration order (only struct FIELDS drop in declaration order), so "declared after the sessions" — as this row read until 2026-09-17 — releases the lease FIRST, re-arming fail-open while MS-14's restore sequence is still running. Not parked in `AppShared` — a token in long-lived state is not released by a panic | High | Pin now |
-| **D-24** | An imported/loaded file's `Preamp:` line now composes with R1-1's auto-preamp — is it a user trim or a headroom number? | **Not decided this phase. Behaviour unchanged: it keeps riding `gain_bits` as the user's trim, so an AutoEq preset attenuates roughly twice.** Recorded rather than fixed | D-6 rules how the two preambles compose, but its premise throughout is a number the **user typed**; no record contemplates one arriving from a file. AutoEq's `ParametricEq.txt` preamp is exactly `−max_gain` of its own bands (engine-hardening `:81`), i.e. the quantity R1-1 now derives, so the two stack: measured `−6.8` (file, both paths) + `−6.78` (engine, corrected path) = `−13.58 dB`. The Phase-A plan freezes this deliberately — "**No `AppData`/`EqState` change.** `EqState.preamp_db` keeps meaning 'the user's trim' ... unchanged persistence" — and the import path is named nowhere in R1-1's file list, so changing it is a product call with a persistence migration behind it, not a review fix. It fails quiet, never loud, and the number is shown on import and editable in one field. **P3**: ship the value, flag it, state the retune signal — the signal is the owner reporting that an imported preset sounds too quiet. Recorded in `crates/paraeq-dsp/DIVERGENCES.md` #19 | High (that it composes); Low (that composing is right) | `OPEN [OWNER]` |
+| **D-24** | An imported/loaded file's `Preamp:` line now composes with R1-1's auto-preamp — is it a user trim or a headroom number? | **Not decided this phase. Behaviour unchanged: it keeps riding `gain_bits` as the user's trim, so an AutoEq preset attenuates roughly twice.** Recorded rather than fixed | D-6 rules how the two preambles compose, but its premise throughout is a number the **user typed**; no record contemplates one arriving from a file. AutoEq's `ParametricEq.txt` preamp is exactly `−max_gain` of its own bands (engine-hardening `R1-1 §2`), i.e. the quantity R1-1 now derives, so the two stack: measured `−6.8` (file, both paths) + `−6.78` (engine, corrected path) = `−13.58 dB`. The Phase-A plan freezes this deliberately — "**No `AppData`/`EqState` change.** `EqState.preamp_db` keeps meaning 'the user's trim' ... unchanged persistence" — and the import path is named nowhere in R1-1's file list, so changing it is a product call with a persistence migration behind it, not a review fix. It fails quiet, never loud, and the number is shown on import and editable in one field. **P3**: ship the value, flag it, state the retune signal — the signal is the owner reporting that an imported preset sounds too quiet. Recorded in `crates/paraeq-dsp/DIVERGENCES.md` #19 | High (that it composes); Low (that composing is right) | `OPEN [OWNER]` |
+| **D-25** | R1-1's preamp rides inside `Correction`, and R1-7a transplants DF2T state across a swap. On a swap into LESS headroom the transplanted tail clips. Scale the state, or skip the transplant? | **Skip the transplant when the incoming `preamp_lin` is larger** (less attenuation); the incoming correction starts from clean state, bounded by its own preamp | R1-1 outranks R1-7a in this spec's own ordering: R1-1 is **Critical / Blocks release** and R1-7a is **Medium**, and R1-8's *UI contract* paragraph makes a nonzero `clipped_samples` under a live `auto_preamp_db` R1-1's falsifier by name. Measured on the real chain: a +12 dB band dragged flat under a full-scale 1 kHz sine gives 68 clipped samples at a pre-clamp peak of 2.64, reached ~10x a second while a handle is dragged. *(rejected)* scaling the adopted state by `old.preamp_lin / self.preamp_lin` — measured, it only halves the overshoot (2.64 -> 1.73), because R1-1 leaves ZERO design margin by construction. **The cost is real and stated:** R1-7a's "no step" bound no longer holds on a preamp-weakening swap, i.e. the click returns on every downward drag of the cascade's peak band. **P4** (conservative direction: audible ring-up beats audible clipping). Recorded in `crates/paraeq-dsp/DIVERGENCES.md` #20, and engine-hardening R1-7a carries an AMENDED block | High (that R1-1 wins); Medium (that skipping beats a headroom constant) | Ship + validate, `OPEN [OWNER]` |
 
 ### D-1, expanded — the preamp carrier
 
@@ -110,10 +111,13 @@ already disagree, and engine-hardening has the fuller record:
    pass-through (bypass, `frame_mismatch`, no correction) must not attenuate,
    because there is no boost to compensate."
 4. **A/B parity is the consequence, and it is the decisive one.** `gain_bits` is
-   read once and applied on **both** chain paths — `crates/paraeq-engine/src/chain.rs:217`
-   (corrected) and `:252` (pass-through). So under a `SetGainDb` carrier,
-   pressing Bypass leaves the auto-attenuation in place and the bypassed side is
-   quieter than the corrected side by the whole preamp — up to ~10 dB of silent
+   read once and applied on **both** chain paths — the `* gain` multiply in
+   `crates/paraeq-engine/src/chain.rs`'s corrected loop and again in its
+   pass-through loop (`chain.rs:217` and `:252` **as the tree stood at the
+   fork point `e44d93a`**, when this was ruled; R1-1 has since moved both, and
+   the corrected one now reads `* preamp_lin * gain`). So under a `SetGainDb`
+   carrier, pressing Bypass leaves the auto-attenuation in place and the
+   bypassed side is quieter than the corrected side by the whole preamp — up to ~10 dB of silent
    bias in the product's headline A/B control, which is also the wizard's own
    answer to "it removed my bass". That is exactly what (3) forbids. What no
    spec does is **reconcile** (3) with decision-engine's `SetGainDb` sentence;
@@ -191,6 +195,59 @@ user's **entire** EQ. Under this ruling only that band goes. Recorded in
 **Confidence:** High on the shape (it is R1-3's own rule), Medium on the product
 call. Flagged `OPEN [OWNER]` per **P3** — a reversal is one branch in one
 function.
+
+---
+
+### D-25, expanded — R1-1 vs R1-7a on a preamp-weakening swap
+
+**Decision.** `Correction::adopt_state_from` gains a third no-op condition:
+it returns without transplanting when `self.preamp_lin > old.preamp_lin`, i.e.
+when the incoming correction has LESS headroom than the outgoing one.
+
+**Why the conflict exists at all.** R1-7a preserves DF2T delay state across a
+coefficient swap so a band edit does not click. R1-1 then put `preamp_lin`
+inside `Correction`, applied AFTER the cascade — so the delay lines hold the
+OUTGOING cascade's un-preamped energy while the INCOMING `preamp_lin`
+multiplies that tail on the first block. Swapping into less headroom leaves no
+room for it and the last-resort ±1.0 clamp engages hard. The two items were
+specified independently and R1-7a shipped first, so no spec line contemplates
+the interaction.
+
+**Why R1-1 wins.** engine-hardening ranks them itself — R1-1 is **Critical**
+/ *Blocks release: YES* ("the spec's stated headroom mechanism does not
+exist"), R1-7a is **Medium**. And R1-8's *UI contract* paragraph makes the
+clipping the falsifier of R1-1's central claim: "a nonzero `clipped_samples`
+while `auto_preamp_db` is active is a bug signal… it is R1-1's falsifier."
+Choosing a click over a falsified safety claim is **P4**, the conservative
+direction.
+
+**What it costs, stated rather than hidden.** R1-7a's "no step" bound no
+longer holds across a preamp-weakening swap. In practice that is every
+downward drag of whichever band owns the cascade's peak: `build_correction`
+re-derives the preamp on every swap, so lowering that band raises
+`preamp_lin` and trips the skip. The other direction is untouched (a tail
+carried into MORE headroom can only get quieter), and a cut-only set never
+reaches the condition at all (`preamp_lin == 1.0` on both sides). Pinned in
+both directions by `crates/paraeq-engine/tests/test_chain.rs`
+(`a_swap_to_a_weaker_preamp_starts_from_clean_state`,
+`gain_only_swap_with_transplant_has_no_step`) and
+`tests/test_meters.rs::a_swap_that_weakens_the_preamp_does_not_clip`.
+
+**The rejected alternative, measured.** Scaling the adopted state by
+`old.preamp_lin / self.preamp_lin` halves the overshoot (2.64 → 1.73 on the
+same stimulus) and cannot remove it: R1-1 leaves ZERO design margin by
+construction — the corrected path sits at exactly 1.0 at the cascade's peak,
+so any transient at all clips.
+
+**Confidence:** High that R1-1 outranks R1-7a here; Medium that skipping is
+better than the third option. Flagged `OPEN [OWNER]` per **P3**: the fix that
+would let BOTH properties hold is a headroom constant. wizard-design's Open
+Question 5 records "no headroom constant" as **DECIDED (2026-07-21)**, but
+that decision is about the AutoEq **export** convention, not about realtime
+swap margin — so this is a genuinely new question wearing a closed question's
+clothes, and it is an owner call rather than something to introduce quietly
+in a review fix. Retune signal: the owner reports a click when dragging a
+boost down.
 
 ---
 
@@ -294,6 +351,11 @@ doc-comment) sentence that asserted a shape this record supersedes.
 | wizard Open Question 2 | "Leaning: 1-position" | closed: 1 in auto, all-N offered in guided (D-H) |
 | measurement-safety § Fade and DC (MS-3) | "OPEN [OWNER + NEEDS DATA]" | **implemented in one of the two sanctioned directions** (the envelope-shaped DC block in `crates/paraeq-measure/src/stimulus.rs`), **owner ratification pending** — see below |
 | measurement-safety § Targets and caps table | MMM mentioned only in a note under the table | an explicit `OPEN [NEEDS DATA]` **MMM row inside the table** (E4) |
+| engine-hardening R1-7a § Fix | `adopt_state_from(&mut self, old: &Correction)`, "a no-op across kinds and across a channel-count change" — two conditions, two parameters | the shipped three-parameter signature and a **third** no-op condition (a preamp-weakening swap), in an `AMENDED (2026-09-17)` block, with the cost stated and flagged `OPEN [OWNER]` (D-25, round-2 review) |
+| engine-hardening R1-7a § Effort + § Item Summary | "Blocks release: R1-7a YES" with no shipped-state note | the same, plus a shipped-state note that the click survives in the preamp-weakening direction (D-25, round-2 review) |
+| measurement-safety § SNR criterion and MS-21 | "`RtShared::peak_in` is a **monotonic session maximum with no decay** and there is **no clip counter at all**" | MS-21's three surviving grounds (signal path, release law, per-attempt reset), with a `CORRECTED (2026-09-17)` note recording that R1-8 retired the shape ground (round-2 review) |
+| measurement-suite § Known defects this spec inherits | the same superseded clause, in the coefficient-swap row | struck in place, since that section is a **scheduling index** and a closed defect must not be re-scheduled (round-2 review) |
+| ~90 `:NNN` spec citations in `paraeq-engine` and `desktop/src-tauri` doc comments, plus the short-form `spec:NNN` citations in the rescope plan and the cross-document `tap.rs:153-159` citations in five specs | bare line numbers, many of which no longer resolved (A2's 28-line R1-6 insertion moved everything below it, and several were written against other checkouts to begin with) | **content anchors** — a requirement id or a section name plus the phrase already quoted in the comment (`R1-8 § UI contract`, `R1-6 § Fix 4`, `MS-20`), which survive the next insertion (round-2 review) |
 
 **Two corrections to how these were previously characterized**, both load-bearing:
 

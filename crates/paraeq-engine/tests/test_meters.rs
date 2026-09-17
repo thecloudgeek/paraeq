@@ -1,8 +1,8 @@
 //! R1-8 meters (clip counter + output peak) and R1-1's engine half (the
 //! `Correction.preamp_lin` carrier), including **the falsifier**.
 //!
-//! Spec: `docs/specs/2026-07-15-engine-hardening-design.md` R1-1 (`:46-119`)
-//! and R1-8 (`:517-582`). The two ship together because `:38` says so
+//! Spec: `docs/specs/2026-07-15-engine-hardening-design.md` R1-1 (`R1-1`)
+//! and R1-8 (`R1-8`). The two ship together because `§ Scope and Sequencing 3` says so
 //! verbatim: *"R1-8's clip counter is R1-1's falsifier. Ship them together or
 //! R1-1's central claim (\"the clamp never engages\") is unfalsifiable."*
 //!
@@ -11,20 +11,22 @@
 //!
 //! Two reconciliations of the spec's own test table are pinned here by name:
 //!
-//! * `output_peak` is **pre-clamp**. The fix snippet at `:558` takes
-//!   `let a = v.abs();` BEFORE `*o = v.clamp(-1.0, 1.0)`, so the row at `:577`
-//!   asserting `output_peak == 1.0` for a full-scale sine at +6 dB is a
-//!   spec-text defect: pre-clamp it is ~2.0. A post-clamp peak carries no
+//! * `output_peak` is **pre-clamp**. The fix snippet at
+//!   `R1-8 § Output peak + clip count` takes `let a = v.abs();` BEFORE
+//!   `*o = v.clamp(-1.0, 1.0)`, so the row at `R1-8 § Tests` asserting
+//!   `output_peak == 1.0` for a full-scale sine at +6 dB was a spec-text
+//!   defect: pre-clamp it is ~2.0. The row has since been restated as
+//!   `~= 2.0` (D-4). A post-clamp peak carries no
 //!   information the clip counter does not (it saturates at exactly 1.0
 //!   precisely when `clipped_samples > 0`), and pre-clamp is the number that
-//!   proves the preamp is right -- which `:571` says is the drawer's job.
-//! * The decaying-`input_peak` row (`:579`) asks for a stimulus that cannot
+//!   proves the preamp is right -- which `R1-8 § UI contract` says is the drawer's job.
+//! * The decaying-`input_peak` row (`R1-8 § Tests`) asks for a stimulus that cannot
 //!   reach its own assertion: "10 full-scale blocks then 100 silent" only
 //!   decays to `0.98565^100 = 0.236`, while the -20 dB crossing it asserts is
 //!   at 159.4 blocks. The assertion is kept (it pins the broadcast release
 //!   rate) and the silent-block count is written as the formula
 //!   `ceil(1.7 * rate / block) + 2`. Section 7 below; it landed after the
-//!   clip counter because R1-8's release gate (`:582`) splits the two -- the
+//!   clip counter because R1-8's release gate (`R1-8 § Effort`) splits the two -- the
 //!   counter blocks release as R1-1's falsifier, the meter does not.
 //!
 //! One measured finding the falsifier surfaced, recorded here because the
@@ -32,9 +34,9 @@
 //! steady state is exactly 1.0, and the IIR filter's SWITCH-ON RING-UP
 //! overshoots it by one f32 ULP, clipping 6 samples out of the prologue's
 //! 16384. Inaudible, but it means `clipped_samples > 0` while
-//! `auto_preamp_db` is active -- which spec `:571` calls a bug signal -- can
+//! `auto_preamp_db` is active -- which spec `R1-8 § UI contract` calls a bug signal -- can
 //! fire on an entirely healthy transient. The honest fix is a headroom
-//! constant, which wizard `:532` records as "recorded but not taken", so it
+//! constant, which wizard `§ Open Questions 5` records as "recorded but not taken", so it
 //! stays an owner call and is NOT introduced here.
 
 mod common;
@@ -186,7 +188,7 @@ fn fast_config() -> EngineConfig {
 // 1-3: R1-8's gain/clamp scan, on both chain paths
 // ---------------------------------------------------------------------------
 
-/// Test 1 (spec `:578`). Full-scale 1 kHz sine at -6 dB: the clamp never
+/// Test 1 (spec `R1-8 § Tests`). Full-scale 1 kHz sine at -6 dB: the clamp never
 /// engages and `output_peak` reports the signal. Consistent under BOTH the
 /// pre- and post-clamp readings of `output_peak`, which is why it is the safe
 /// one to write first.
@@ -215,10 +217,11 @@ fn no_clip_below_unity_and_output_peak_tracks_the_signal() {
     );
 }
 
-/// Test 2 (spec `:577`, restated). Same sine at +6 dB: the clamp engages and
-/// `output_peak` reports the overshoot PRE-clamp (~1.995), not the clamped
-/// 1.0 the spec row prints. The name records the reconciliation so nobody
-/// re-derives the spec defect -- see this file's header.
+/// Test 2 (spec `R1-8 § Tests`, restated). Same sine at +6 dB: the clamp
+/// engages and `output_peak` reports the overshoot PRE-clamp (~1.995), not
+/// the clamped 1.0 that row used to print. The name records the
+/// reconciliation so nobody re-derives the spec defect -- see this file's
+/// header.
 #[test]
 fn clip_counter_rises_and_output_peak_reports_the_overshoot_pre_clamp() {
     let mut r = rig(
@@ -243,7 +246,7 @@ fn clip_counter_rises_and_output_peak_reports_the_overshoot_pre_clamp() {
     );
 }
 
-/// Test 3 (spec `:554`, "fuse into the gain/clamp loops -- **both** of
+/// Test 3 (spec `R1-8 § Output peak + clip count`, "fuse into the gain/clamp loops -- **both** of
 /// them"). The pass-through loop is the one most likely to be forgotten, and
 /// it is reached two ways: user bypass, and a frame count the active
 /// correction cannot take.
@@ -291,12 +294,12 @@ fn pass_through_path_also_counts_clips() {
 // 4-5: R1-1's carrier
 // ---------------------------------------------------------------------------
 
-/// Test 4 (spec `:99`, verbatim: "Critically, **the preamp applies only on
+/// Test 4 (spec `R1-1 §4`, verbatim: "Critically, **the preamp applies only on
 /// the corrected path** -- `chain.rs:181-185`'s pass-through ... must not
 /// attenuate, because there is no boost to compensate").
 ///
 /// This is the test that FAILS under the rejected `SetGainDb` carrier
-/// (engine-hardening Decisions Log `:20`), which would put the preamp on
+/// (engine-hardening Decisions Log `§ Decisions Log`), which would put the preamp on
 /// `gain_bits` -- read once and applied on both paths -- so pressing Bypass
 /// would leave the whole auto-attenuation in place and bias the product's
 /// headline A/B control. It is therefore the mechanical decider for the
@@ -326,7 +329,7 @@ fn preamp_does_not_attenuate_the_bypassed_path() {
     );
 }
 
-/// Test 5 -- **THE FALSIFIER** (spec `:116` and `:580`, the same row twice).
+/// Test 5 -- **THE FALSIFIER** (spec `R1-1 § Tests` and `R1-8 § Tests`, the same row twice).
 /// A +12 dB band, a full-scale sine at its `fc`, the computed auto-preamp
 /// live: `clipped_samples == 0`. Without R1-8's counter this claim is an
 /// assertion; with it, it is a measurement.
@@ -335,7 +338,7 @@ fn preamp_does_not_attenuate_the_bypassed_path() {
 /// steady-state output at `fc` is exactly 1.0 against a strict `a > 1.0`
 /// clip test, so f32 rounding and the DF2T switch-on transient can each push
 /// it over. Two mitigations, neither of which is a headroom constant
-/// (wizard `:532` records the inter-sample-peak alternative as "recorded but
+/// (wizard `§ Open Questions 5` records the inter-sample-peak alternative as "recorded but
 /// not taken", so introducing one quietly here would be a silent spec
 /// change):
 ///
@@ -392,7 +395,7 @@ fn auto_preamp_prevents_the_clamp_from_engaging_the_falsifier() {
 }
 
 /// Test 5b -- the FIR arm's falsifier. `build_fir` is dispatched live from
-/// `build_correction`, so its preamp is NOT dead code: spec `:101`, verbatim,
+/// `build_correction`, so its preamp is NOT dead code: spec `R1-1 §5`, verbatim,
 /// *"For the FIR arm, 'the realized cascade' is the FIR's own magnitude
 /// response -- `preamp_lin = 1.0 / max(1.0, max|H(f)|)` over the same grid,
 /// computed with one FFT of the tap vector on the control plane."*
@@ -647,7 +650,7 @@ fn the_baked_preamp_mirrors_the_identity_substitution_for_an_unstable_row() {
 /// band flattened, a preset loaded -- therefore hands boosted energy to a
 /// correction with no headroom left for it, and the +-1.0 clamp engages.
 ///
-/// That is precisely the state R1-1 exists to prevent (spec `:571`: "a
+/// That is precisely the state R1-1 exists to prevent (spec `R1-8 § UI contract`: "a
 /// nonzero `clipped_samples` while `auto_preamp_db` is active is a bug
 /// signal ... it is R1-1's falsifier"), and the product reaches it on every
 /// band drag: `desktop/src-tauri/src/commands.rs::apply_bands` sends
@@ -719,7 +722,7 @@ fn a_swap_that_weakens_the_preamp_does_not_clip() {
 // 6: publication
 // ---------------------------------------------------------------------------
 
-/// Test 6 (spec `:566`, "the **counters compare exactly** -- a clip must
+/// Test 6 (spec `R1-8 § Publish`, "the **counters compare exactly** -- a clip must
 /// publish"). The meters reach `EngineState`, and a tick in which ONLY
 /// `clipped_samples` moved still emits a fresh snapshot: under SHELL's
 /// `frame_mismatch_blocks`-style `> 0` compare the second clip would be
@@ -787,7 +790,7 @@ fn clip_count_is_retained_across_a_teardown() {
     );
 }
 
-/// `auto_preamp_db` is the number the Advanced drawer explains (spec `:106`:
+/// `auto_preamp_db` is the number the Advanced drawer explains (spec `R1-1 §6`:
 /// "The auto front-end must never apply a number it cannot explain"), so it
 /// has to ride the published snapshot, not just live inside `build_correction`.
 #[test]
@@ -849,7 +852,7 @@ fn a_preamp_only_change_publishes() {
 }
 
 // ---------------------------------------------------------------------------
-// 7: R1-8's decaying `input_peak` -- the meter half (spec `:515-528`, `:579`)
+// 7: R1-8's decaying `input_peak` -- the meter half (spec `R1-8 § Decay`, `R1-8 § Tests`)
 // ---------------------------------------------------------------------------
 
 /// The coefficient itself. It is the one piece of arithmetic in R1-8 that can
@@ -857,13 +860,13 @@ fn a_preamp_only_change_publishes() {
 /// realtime lane then applies it blindly, one multiply per block, for the
 /// life of the session.
 ///
-/// Spec `:525`: `decay = 10^( -(20/1.7) * (block_size/sample_rate) / 20 )` --
+/// Spec `R1-8 § Decay`: `decay = 10^( -(20/1.7) * (block_size/sample_rate) / 20 )` --
 /// the broadcast-standard 20 dB / 1.7 s release, computed from the REPORTED
 /// geometry so the release is the same WALL-CLOCK rate at every buffer size
-/// and sample rate, which a hardcoded constant would not be (spec `:528`).
+/// and sample rate, which a hardcoded constant would not be (spec `R1-8 § Decay`).
 #[test]
 fn the_decay_coefficient_is_the_broadcast_release_rate() {
-    // Spec `:528`: "At 512 frames / 48 kHz (10.67 ms/block) that is 0.1255
+    // Spec `R1-8 § Decay`: "At 512 frames / 48 kHz (10.67 ms/block) that is 0.1255
     // dB/block -> decay = 0.98565." Exactly: (20/1.7) * (512/48000) =
     // 0.1254902 dB/block, and 10^(-0.1254902/20) = 0.9856563.
     let d = decay_per_block(BLOCK, RATE);
@@ -889,7 +892,7 @@ fn the_decay_coefficient_is_the_broadcast_release_rate() {
     assert_eq!(decay_per_block(BLOCK, 0.0), 1.0, "0 Hz must not decay");
 }
 
-/// Spec `:579`, with this plan's reconciliation of its stimulus. The row asks
+/// Spec `R1-8 § Tests`, with this plan's reconciliation of its stimulus. The row asks
 /// for "10 full-scale blocks then 100 silent" and a crossing of 0.1 (-20 dB)
 /// within `1.7 s / block_duration` blocks +-1 -- but at 512/48 kHz the
 /// crossing is at 159.4 blocks and 100 blocks only reach `0.98565^100 =
@@ -938,7 +941,7 @@ fn input_peak_decays_at_the_broadcast_release_rate() {
     assert_eq!(
         r.shared.peak_in_session(),
         1.0,
-        "the session statistic never decays (spec `:552`)"
+        "the session statistic never decays (spec `R1-8 § Keep the session max`)"
     );
 }
 
@@ -999,7 +1002,7 @@ fn the_session_peak_holds_while_the_meter_follows_a_quieter_block() {
 }
 
 /// The concrete regression the hoist exists for. A literal transcription of
-/// spec `:518`'s snippet leaves the store inside `process_block`'s
+/// spec `R1-8 § Decay`'s snippet leaves the store inside `process_block`'s
 /// `if peak == 0.0 { .. } else { .. }` else-branch, so SILENCE -- the exact
 /// case a decaying meter exists for -- never decays at all: the meter would
 /// hold full scale forever after the music stopped. The spec does not mention

@@ -279,7 +279,7 @@ because they interact with the rescope:
 ### The closed-loop verification problem, and its resolution
 
 `tap.rs:26-48` calls `CATapDescription::initStereoGlobalTapButExcludeProcesses`
-and `tap.rs:153-154` builds the exclusion list as `vec![own]`. This is
+and `tap.rs`'s `TapSystem::create` exclusion-list build builds the exclusion list as `vec![own]`. This is
 **deliberate and correct**: it exists so that a measurement sweep played by ParaEQ
 reaches the output device unprocessed and unmuted, which is what makes the
 measurement an uncontaminated measurement of the raw transducer (2026-07-02 spec
@@ -316,7 +316,7 @@ which is exactly what self-exclusion prevents. Two resolutions were considered:
 One caveat must be carried into the implementation plan: self-exclusion has a
 **documented fail-open fallback**. If `translate_pid` returns 0 after a 200 ms
 retry the exclusion list is empty and ParaEQ's own audio *is* tapped
-(`tap.rs:154-159`, logging "watch for feedback"). On that degraded path the
+(`tap.rs`'s `TapSystem::create` exclusion-list build, logging "watch for feedback"). On that degraded path the
 measurement sweep would be processed. The measurement runtime must read the
 exclusion state from the engine and **refuse to measure** rather than silently
 produce a correction-contaminated capture.
@@ -556,7 +556,7 @@ contract — follow the companion.
 | Brittle cal parser | `compensation.rs:11` dispatches on a leading double-quote; `:60` hardcodes `.skip(2)` | UMIK-1 0-degree files have **one** header line; 90-degree files have **two**. On a single-header file `skip(2)` silently drops the first data row and `linear_interp_edge_hold` then edge-holds from the wrong point. Do **not** state a failure rate — verifiers disagreed on whether real files ship quoted or bare, and the "80%" statistic is not established. The robust fix is REW's own documented rule: **"Only lines which begin with a number are loaded, others are ignored."** The oracle (`prototype/paraeq/measurement/compensation.py`, `np.loadtxt(skiprows=2)`) shares the flaw — **both must change together** or you manufacture a divergence, and the Tier-1 fixture regenerates in lockstep. |
 | Stale coefficients on rate change | `controller.rs:105` `build_correction(config, channels, block_size)` takes no sample rate | A 48 → 44.1 kHz switch (AirPods, routine) silently shifts every filter ~8.8%. A product that certifies its own residual cannot have this. |
 | No time axis on `deconvolve` | `deconvolution.rs:6` `deconvolve(recorded, sweep, _sample_rate) -> Vec<f64>` — takes the rate and **discards** it | Every gating operation needs *t = 0*. Must return `ImpulseResponse { samples, peak, sample_rate }`. |
-| Coefficient swap discards state | `chain.rs:89` `set_correction` is a `mem::replace` | The new processor starts from **zeroed** state, discarding up to 4095 samples of FIR overlap tail. `equaliser`'s `BiquadFilter.setCoefficients(_:setup:resetState:)` with `resetState: false` on incremental edits preserves delay state — which is how it avoids clicks with no crossfade at all. Note the engine has **no** smoothing/ramping/crossfade (grep-verified), no denormal handling, no clip counter, and `input_peak` is a monotonic session max with no decay. |
+| Coefficient swap discards state | `chain.rs:89` `set_correction` is a `mem::replace` | The new processor starts from **zeroed** state, discarding up to 4095 samples of FIR overlap tail. `equaliser`'s `BiquadFilter.setCoefficients(_:setup:resetState:)` with `resetState: false` on incremental edits preserves delay state — which is how it avoids clicks with no crossfade at all. Note the engine has **no** smoothing/ramping/crossfade (grep-verified) and no denormal handling. *(Corrected 2026-09-17: this row also said “no clip counter, and `input_peak` is a monotonic session max with no decay”. Both were closed by engine-hardening R1-8 — `clipped_samples` exists and `input_peak` decays, with the monotonic statistic split out as `input_peak_session`. This is a scheduling index, so the closed items are struck rather than left to be re-scheduled; MS-21 is unaffected, see measurement-safety's SNR criterion section.)* |
 | No IR windowing of a *measured* IR | — | State this precisely. `fir.rs:85` `windowed_ir()` **does** apply a Hann window to a **designed** impulse response, live on both arms of `design_fir_correction`. What is true is that **nothing time-gates a measured IR**. |
 | Sweep output level has no home | — | Not a regression — **a forward-looking requirement**. The `SWEEP_AMPLITUDE = 0.5` lives at `prototype/app/wizard/measurement_wizard.py:39`, the **playback layer**, which is not ported (there is no sweep playback path anywhere in Rust; `generate_sweep`'s only caller is its own test). `sweep.rs` faithfully matches its oracle `prototype/paraeq/measurement/sweep.py`, which is *also* unscaled, and the peak-1.0 convention is deliberate — `noise.py`'s docstring: "normalized to a peak of 1.0 so the caller can apply any output amplitude," and CLAUDE.md scopes `paraeq-dsp` to pure math. For reference, the prototype's actual sweep is **−9 dBFS RMS = 3 dB above REW's −12 dBFS default and 6 dB below REW's −3 dBFS maximum**. The −6 dBFS output-level policy has **no home in the Rust tree**, and R5 must create one. |
 

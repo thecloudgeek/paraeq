@@ -105,7 +105,7 @@ pub fn design_correction(bands: &[EQBand], sample_rate: f64) -> Option<Correctio
 /// 1. **The engine published a refusal** (`correction_rate_mismatch` is set).
 ///    The config it holds cannot be re-derived at the live rate, and the
 ///    desktop is the only layer still holding the design intent, so it
-///    re-sends. This is the field the spec says to key off (`:424`).
+///    re-sends. This is the field the spec says to key off (`R1-6 § Fix 4`).
 /// 2. **The first-ever stream** (`last_rate == None`), which is how a
 ///    correction queued before the stream geometry was known -- and the
 ///    persisted, hand-editable `settings.json` bands -- get validated at a
@@ -533,7 +533,7 @@ mod tests {
     /// `resend_changed_rate_triggers`; a bare rate change no longer needs a
     /// desktop re-send, because the engine re-derived the correction at the
     /// new rate inside the same start. Re-pointed, not deleted -- the spec
-    /// requires this suite to survive (`:434`).
+    /// requires this suite to survive (`R1-6 § Tests`).
     #[test]
     fn changed_rate_alone_no_longer_triggers() {
         let snap = snapshot_with_stream(Some(stream_at(44_100.0)));
@@ -541,7 +541,7 @@ mod tests {
     }
 
     /// ...and this is what replaces it: the engine's published refusal is the
-    /// trigger now (spec `:424`).
+    /// trigger now (spec `R1-6 § Fix 4`).
     #[test]
     fn mismatch_flag_triggers() {
         let mut snap = snapshot_with_stream(Some(stream_at(44_100.0)));
@@ -658,7 +658,7 @@ mod tests {
             );
         }
     }
-    /// R1-1 spec `:117` (the "Export/engine agreement" test row): the number
+    /// R1-1's `§ Tests` table, "Export/engine agreement" row: the number
     /// in the exported text equals `EngineState.auto_preamp_db`. This is the
     /// test that catches a preamp recomputed on a different grid -- the whole
     /// reason `build_correction` calls `ParametricEQ::preamp_db()` verbatim

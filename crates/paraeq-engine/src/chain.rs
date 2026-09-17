@@ -22,13 +22,13 @@ pub enum CorrectionKind {
 /// A ready-to-run correction (built + warmed up off-thread) TOGETHER WITH the
 /// preamp that protects it.
 ///
-/// R1-1 (spec `:85-99`): the preamp must swap **atomically with the correction
+/// R1-1 (spec `R1-1 §4`): the preamp must swap **atomically with the correction
 /// it protects**. Routing it through `RtShared::gain_bits` would not -- the
 /// correction arrives through the `rtrb` swap ring and the gain through a
 /// relaxed store, with no ordering between them, so a +12 dB boost could run
 /// un-preamped for a window. Carrying it here makes the swap one move.
 ///
-/// The engine-hardening Decisions Log (`:20`) records the same call and the
+/// The engine-hardening spec's `§ Decisions Log` records the same call and the
 /// alternative it rejected, verbatim: *"Preamp carrier | A `preamp_lin` field
 /// **inside** `Correction`, applied only on the corrected path | (rejected) A
 /// second atomic alongside `gain_bits` (correction and preamp would swap
@@ -37,7 +37,7 @@ pub struct Correction {
     pub kind: CorrectionKind,
     /// Linear auto-preamp, `10^(preamp_db/20)` with `preamp_db <= 0`, so it
     /// is always in `(0, 1]`. Applied ONLY on the corrected path
-    /// ([`RealtimeChain::process`]) -- spec `:99`, verbatim: "Critically,
+    /// ([`RealtimeChain::process`]) -- spec `R1-1 §4`, verbatim: "Critically,
     /// **the preamp applies only on the corrected path** -- ... the
     /// pass-through ... must not attenuate, because there is no boost to
     /// compensate." It composes with the user's trim (`RtShared::gain_bits`)
@@ -72,7 +72,7 @@ impl Correction {
     /// left for the tail and the +-1.0 clamp engages hard: MEASURED at a
     /// +12 dB band dragged flat under a full-scale 1 kHz sine, 68 clipped
     /// samples at a pre-clamp peak of 2.64 on the block after the swap. Spec
-    /// `:571` calls exactly that a bug signal -- "a nonzero
+    /// `R1-8 § UI contract` calls exactly that a bug signal -- "a nonzero
     /// `clipped_samples` while `auto_preamp_db` is active ... is R1-1's
     /// falsifier" -- and the desktop reaches it ~10 times a second while a
     /// band handle is being dragged down.
@@ -90,8 +90,16 @@ impl Correction {
     /// stimulus) but cannot remove it, because R1-1 leaves ZERO design
     /// margin by construction: the corrected path sits at exactly 1.0 at the
     /// peak, so any transient at all clips. The fix that would let both hold
-    /// is a headroom constant, which wizard `:532` records as "recorded but
-    /// not taken" -- an owner call, not something to introduce quietly here.
+    /// is a headroom constant, which wizard `§ Open Questions 5` records as
+    /// "recorded but not taken" -- but on the EXPORT convention, not on
+    /// realtime swap margin, so it is an owner call and not something to
+    /// introduce quietly here.
+    ///
+    /// Recorded outside this file too, because it narrows a release-blocking
+    /// item: engine-hardening R1-7a carries an `AMENDED (2026-09-17)` block,
+    /// `crates/paraeq-dsp/DIVERGENCES.md` #20 states the user-visible cost,
+    /// and `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md` D-25
+    /// holds the ruling with its rejected alternative. `OPEN [OWNER]`.
     pub fn adopt_state_from(&mut self, old: &Correction, channels: usize) {
         if self.preamp_lin > old.preamp_lin {
             return;
@@ -123,7 +131,7 @@ pub struct ChainOutcome {
     /// Samples (per channel, not per frame: a fully-clipped stereo block of
     /// 512 frames counts 1024) whose value exceeded the +-1.0 clamp on THIS
     /// block, measured before the clamp. Counted on both paths -- the
-    /// pass-through clamps too (spec `:554`: "**both** of them"). Non-finite
+    /// pass-through clamps too (spec `R1-8 § Output peak + clip count`: "**both** of them"). Non-finite
     /// correction outputs are zeroed by the backstop BEFORE this scan and are
     /// never counted here; they are `nonfinite_outputs`.
     pub clipped: u32,
@@ -141,14 +149,16 @@ pub struct ChainOutcome {
     /// Largest `|sample|` this block produced, taken PRE-clamp, so it reports
     /// the real overshoot rather than saturating at 1.0.
     ///
-    /// The spec contradicts itself here and this is the reconciliation: its
-    /// fix snippet (`:558`) takes `let a = v.abs();` before the clamp, while
-    /// its test row (`:577`) asserts `output_peak == 1.0` for a full-scale
-    /// sine at +6 dB, which is only true post-clamp (pre-clamp it is ~2.0).
+    /// The spec contradicted itself here and this is the reconciliation: its
+    /// fix snippet (`R1-8 § Output peak + clip count`) takes `let a = v.abs();`
+    /// before the clamp, while its test row (`R1-8 § Tests`) USED TO assert
+    /// `output_peak == 1.0` for a full-scale sine at +6 dB, which is only true
+    /// post-clamp (pre-clamp it is ~2.0). That row now reads `~= 2.0` with a
+    /// pointer to D-4; this comment records why.
     /// Pre-clamp wins on three grounds: a post-clamp peak carries no
     /// information [`ChainOutcome::clipped`] does not (it saturates at exactly
     /// 1.0 precisely when `clipped > 0`); pre-clamp is the number that proves
-    /// the preamp is right, which `:571` makes the Advanced drawer's job; and
+    /// the preamp is right, which `R1-8 § UI contract` makes the Advanced drawer's job; and
     /// both then derive from the one quantity `a`, so they cannot disagree.
     pub peak_out: f32,
 }
@@ -355,9 +365,9 @@ impl RealtimeChain {
             // Pass-through: gain + clamp, pure f32 path, no scratch needed.
             // Tolerates ANY input/output shape (zip stops at the shorter).
             //
-            // The same meter scan, because this path clamps too (spec `:554`:
+            // The same meter scan, because this path clamps too (spec `R1-8 § Output peak + clip count`:
             // "fuse into the gain/clamp loops -- **both** of them"), but NO
-            // preamp multiply: spec `:99` -- bypass / frame-mismatch / no
+            // preamp multiply: spec `R1-1 §4` -- bypass / frame-mismatch / no
             // correction "must not attenuate, because there is no boost to
             // compensate." Applying it here would make the bypassed side of
             // the product's headline A/B control quieter than the corrected

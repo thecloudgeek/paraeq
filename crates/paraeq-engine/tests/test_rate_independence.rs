@@ -13,7 +13,7 @@
 //!    refuse on an EXACT rate mismatch and fail open to flat.
 //! 2. **Controller integration** against `MockBackend`, whose per-start rate
 //!    queue scripts an AirPods-style handoff. These assert the spec's own
-//!    test table (`:430-435`) plus gap 3 (`:407`): the refusal is published in
+//!    test table (`R1-6 § Tests`) plus gap 3 (`R1-6 § gap 3`): the refusal is published in
 //!    the same start that used to install stale coefficients, with no
 //!    `tick_ms` window of audible wrong-EQ.
 //!
@@ -230,7 +230,7 @@ fn baked_iir_and_fir_refuse_on_rate_mismatch() {
     assert!(build_correction(&fir, CHANNELS, BLOCK, 48_000.0).is_ok());
 }
 
-/// Test 5. Spec `:420` — "**Exact comparison**, not a tolerance": device
+/// Test 5. Spec `R1-6 § Fix 2` — "**Exact comparison**, not a tolerance": device
 /// rates are f64s that round-trip exactly, and a fuzzy compare would silently
 /// accept a genuinely different rate.
 #[test]
@@ -242,7 +242,7 @@ fn rate_compare_is_exact_not_tolerant() {
     );
 }
 
-/// Test 6. R1-3's precedent (spec `:216`, "never bricked by one bad band")
+/// Test 6. R1-3's precedent (spec `R1-3 § Why identity, not error`, "never bricked by one bad band")
 /// applied to the Nyquist half: a band that is legal at 48 kHz but at/above
 /// Nyquist at 44.1 kHz is DROPPED and counted, and the rest still design.
 /// 23 kHz is the pivot the desktop's own suite already uses -- below 48 kHz's
@@ -271,7 +271,7 @@ fn peq_band_at_or_above_new_nyquist_is_dropped_and_counted() {
 
 /// Test 7. ...but when NOTHING survives there is no correction to install, so
 /// the whole config is refused and the controller fails open to flat
-/// (spec `:422`: "audibly un-EQ'd is always better than audibly wrong-EQ'd").
+/// (spec `R1-6 § Fix 3`: "audibly un-EQ'd is always better than audibly wrong-EQ'd").
 #[test]
 fn peq_with_every_band_above_nyquist_refuses_and_fails_open() {
     let config = peq(
@@ -290,7 +290,7 @@ proptest! {
 
     /// Test 8. The hostile box, mirroring R1-3's own proptest
     /// (`test_chain.rs::hostile_box_never_installs_unstable_sections`,
-    /// spec `:226`): whatever reaches `build_correction`, it never panics and
+    /// spec `R1-3 § Tests`): whatever reaches `build_correction`, it never panics and
     /// never installs a section failing the strict Jury form. `design_rate`
     /// is deliberately hostile too -- for `Peq` it must never matter.
     #[test]
@@ -497,7 +497,7 @@ fn rate_unchanged_installs_with_no_flag() {
     assert_eq!(handle.state().correction_rate_mismatch, None);
 }
 
-/// Test 13 — gap 3 (spec `:407`). The refusal is visible on the FIRST
+/// Test 13 — gap 3 (spec `R1-6 § gap 3`). The refusal is visible on the FIRST
 /// snapshot that carries the new rate: there is no `tick_ms` (250 ms) window
 /// in which the stale coefficients are live and audible while the desktop
 /// waits to be told.

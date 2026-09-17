@@ -249,7 +249,10 @@ R7 ship (signed DMG, notarization, PLD 2024/2853 posture decision).
 
    - **Quantity: `residual_vs_prediction`.** Rig error cancels in the
      difference, so this is the only claim that is about ParaEQ rather than
-     about the rig (wizard:396, :400 — "Report it, plot it, never gate on it").
+     about the rig (wizard's Verification section: "`residual_vs_prediction`
+     is rig-independent, and it is therefore the honest claim and the pass/fail
+     gate", and "`residual_vs_target` is rig-dependent. Report it, plot it,
+     never gate on it").
      The shipped type already decided it: `crates/paraeq-decide/src/bundle.rs`
      carries `Verification { ir, installed, position_index }` with `installed`
      present **only** so the prediction can be re-derived, and no target at all.
@@ -263,14 +266,18 @@ R7 ship (signed DMG, notarization, PLD 2024/2853 posture decision).
      inputs (`flatness_target_db`, `correction_range`, `authority`) are already
      there.
    - **Positions:** 1 in auto (the primary seat), all-N offered in guided —
-     wizard:529's own lean, and `Verification::position_index` is singular.
+     wizard's Open Question 2 ("Verification at N positions or 1?"), whose
+     pre-2026-09-16 text leaned that way (it now records this very ruling as
+     DECIDED), and `Verification::position_index` is singular.
      N-position is additive later as a `Vec<Verification>`.
    - **Helper packaging:** a new workspace member `crates/paraeq-stimulus` with
      one `[[bin]]`, installed to `Contents/MacOS/paraeq-stimulus`. Decisive
      ground: Stage 6 must be testable headless before any wizard UI exists, and
      a `desktop/`-owned binary cannot be spawned from a headless
-     `paraeq-measure` test. measurement-suite:162 ("in `desktop/`") is the
-     losing text.
+     `paraeq-measure` test. measurement-suite's Architecture list was the
+     losing text ("the thin Tauri/UI wiring plus the `paraeq-stimulus` helper
+     binary in `desktop/`"); it has since been corrected in place to name the
+     workspace member.
    - **Threshold: ESCALATED [OWNER + NEEDS DATA], not decided.** Ship the
      mechanism as `VERIFICATION_RESIDUAL_MULTIPLE = 2.0` read off
      `decisions.flatness_target_db.value`, and rule the number separately — it
@@ -342,9 +349,9 @@ type or in a test on the branch; none is invented policy.
    It is the smaller of the two options the spec itself sanctions and the only
    one with no `Decisions`/`Overrides` shape churn: the drawer's control
    becomes a two-item select over the two path policies, which is what the
-   value actually is. decision-engine:334 is the losing text. **Must land
-   before the `fixtures/decide/` freeze** — domains are serialized into
-   `expected.json`, so ruling this afterwards is a fixture-invalidating
+   value actually is. decision-engine's Decisions table, `q_cap` row, is the
+   losing text. **Must land before the `fixtures/decide/` freeze** — domains
+   are serialized into `expected.json`, so ruling this afterwards is a fixture-invalidating
    change. Rationale in
    `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md`.
 10. **`authority`'s domain is unexpressible as typed.** Spec: "Choice:
@@ -354,7 +361,7 @@ type or in a test on the branch; none is invented policy.
     round-trip) have nowhere to live.
     **Resolved 2026-09-16:** re-type to `Decision<AuthorityPreset>` with
     `{ Conservative, Custom(AuthorityCurve), Standard }`, and put the
-    **resolved** curve in `Analysis`. This matches decision-engine:333's domain
+    **resolved** curve in `Analysis`. This matches the `authority` row's domain
     text verbatim, keeps `Decisions` at 21 fields so the exhaustiveness test
     stays green, keeps `AuthorityCurve` sealed, and makes an override
     round-trip a **name** rather than a 957-point curve. It is what the
@@ -391,8 +398,9 @@ type or in a test on the branch; none is invented policy.
     room `Parametric` default **reads `RoomTargetSpec::default()`** instead of
     carrying a literal of its own, so there is exactly one source — which ships
     **+4.0** today and sits inside decision-engine's own `0.0..=6.0` domain, so
-    nothing is invalidated by shipping it. decision-engine:371 is the losing
-    text. The number itself remains **OPEN \[OWNER\]**: a ruling costs one line
+    nothing is invalidated by shipping it. decision-engine's "Room `Parametric`
+    domains" sentence (`shelf_db ∈ 0.0..=6.0`) is the losing text. The number
+    itself remains **OPEN \[OWNER\]**: a ruling costs one line
     at `crates/paraeq-dsp/src/targets.rs:515`, and the cross-crate test above
     keeps `decide()` in step with it automatically.
 14. **`align_spl` default band: two specs, two numbers.** **CLOSED
@@ -411,8 +419,8 @@ type or in a test on the branch; none is invented policy.
     states for the σ endpoints. Extra support: the spec's own midband reference
     `M` — what `low_corner_hz` is measured against — is defined over
     200 Hz–2 kHz, so this makes the alignment band and the midband reference
-    the same band. decision-engine:328 is the losing text. **Closed**; no owner
-    input needed.
+    the same band. decision-engine's Decisions table, `align_spl_band` row, is
+    the losing text. **Closed**; no owner input needed.
 
 ## Open questions raised by implementing Stage 5
 
@@ -543,11 +551,11 @@ grounds are in `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md`.
     beats an undocumented one.
 25. **`DiagnosticCode` has no numbering contract while `MeasurementDiagnostic`
     has one.** `paraeq-measure`'s `MeasurementDiagnostic` carries MS-20's
-    stable numbered, append-only contract (measurement-safety:347; the
-    implementation's own header states numbers are "never reused and never
-    reordered" and that "additions are cheap — that is the point of the
-    contract"). MS-21, the adjacent row at :348, is the separate capture
-    peak/clip metering requirement and is already implemented in
+    stable numbered, append-only contract (**measurement-safety MS-20**, in
+    the Requirements table; the implementation's own header states numbers are
+    "never reused and never reordered" and that "additions are cheap — that is
+    the point of the contract"). **MS-21**, the adjacent row, is the separate
+    capture peak/clip metering requirement and is already implemented in
     `crates/paraeq-measure/src/capture.rs`. `paraeq-decide`'s `DiagnosticCode`
     has no such contract, yet `fixtures/decide/expected.json` and every session
     log will key on it. **Default: adopt the same contract** — explicit
@@ -561,9 +569,12 @@ grounds are in `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md`.
     level-safety row does not exist.** **ESCALATED — see E3 and E4 below.** The
     owner decided on 2026-07-22 that MMM is the room easy-mode default with
     discrete sweeps as the precision option; three specs still list MMM as Out
-    of Scope and were never updated (wizard:557, room-dsp:1054,
-    measurement-suite:598); none of the seven stages contains MMM work; and
-    measurement-safety:145 explicitly forbids reusing the sweep caps for it.
+    of Scope and were never updated (each spec's **Out of Scope** list —
+    wizard's "MMM (moving microphone measurement)", room-dsp's "Multi-position
+    optimization / MMM", measurement-suite's "MMM (moving microphone
+    method)"); none of the seven stages contains MMM work; and
+    measurement-safety's per-class caps table explicitly forbids reusing the
+    sweep caps for it.
     Two consequences bite immediately: `CaptureMethod` changes `bundle.json`,
     so **`fixtures/decide/` cannot be frozen until the scope call is made**,
     and the level-safety gap sits on the *default* room journey rather than on
@@ -580,11 +591,11 @@ ruled from this file.
 
 **E1. The verification residual threshold — the `2×` multiplier.**
 **OPEN \[OWNER + NEEDS DATA\].** Blocks the constant behind cross-spec question
-5, and the credibility of what wizard:297 calls "the single most important
-refusal in the product" — but it does **not** block building the gate. The
-mechanism ships either way. `2 · flatness_target_db` evaluates to **2.0 dB** on
+5, and the credibility of what wizard's refusal table calls "the single most
+important refusal in the product" — but it does **not** block building the
+gate. The mechanism ships either way. `2 · flatness_target_db` evaluates to **2.0 dB** on
 the coupler (`flatness_target_db = 1.0`) and **6.0 dB** in a room (3.0). Set
-against that, wizard:337's own results-screen example of a *passing*
+against that, wizard's own results-screen mock of a *passing*
 verification is "to within **1.8 dB RMS** across 20–240 Hz". So the coupler gate
 refuses the spec's own success story by 0.2 dB, and the room gate is more than
 3× looser than the spec's own expectation of a good result. The number was
@@ -602,11 +613,13 @@ correction that A/Bs correctly still refuses*). But the owner should see the
 **E2. How a genuine TCC silent failure is detected *during* a measurement
 session.** **OPEN \[OWNER\].** Blocks Stage 6's verification wiring and the
 wizard's refusal table; does not block the post-merge lease work, which ships
-either way. wizard:416 requires that "a genuine TCC silent failure during a
-measurement session is still a `Refuse`". But the same section explains why the
-tap legitimately sees zeros throughout — `Direct` captures are tap-excluded **by
-design** — and `EngineStatus::NoInputDetected` means exactly "no nonzero sample
-since start". Read literally, that sentence refuses 100% of wizard runs.
+either way. wizard's "The fail-open watchdog — a second interlock"
+Requirement says the lease "must not suppress the watchdog's *reporting*: a
+genuine TCC silent failure during a measurement session is still a `Refuse`".
+But the same section explains why the tap legitimately sees zeros throughout
+— `Direct` captures are tap-excluded **by design** — and
+`EngineStatus::NoInputDetected` means exactly "no nonzero sample since
+start". Read literally, that sentence refuses 100% of wizard runs.
 **Recommended split:** the measurement lease suspends only the auto-disable;
 `NoInputDetected` keeps being reported and logged but is not blocking during a
 `Direct` capture; and the TCC witness moves to the **verify** gate, where it is
@@ -631,16 +644,20 @@ for the right reason; (c) ship `CaptureMethod { DiscreteSweep }` as a
 one-variant enum now, so adding `MovingMic` later is additive and
 `bundle.json`'s shape is stable. **Recommended: (c)** — the cheapest hedge; it
 costs one enum and unblocks the freeze without committing the schedule.
-Natural companion call: measurement-suite:571's schedule contingency ("correct
-below the transition only if the date slips"), which is also OPEN \[OWNER\].
+Natural companion call: measurement-suite's "Scope doubling" risk row and its
+schedule contingency ("correct below the transition only if the date slips"),
+which is also OPEN \[OWNER\].
 
 **E4. The MMM level-safety row.** **OPEN \[OWNER + NEEDS DATA\].** Blocks any
-MMM capture actually running; contingent on E3. measurement-safety:145,
-verbatim: the per-class caps table "has no row for the **Moving Microphone
-Method (MMM)** … MMM plays continuous pink noise — continuous energy with a
-different crest factor than a sweep — so hearing-exposure and driver-heating
-limits differ; the sweep caps above must **not** be reused unexamined. MMM
-needs its own level-safety row, derived from real pink-noise measurements." The
+MMM capture actually running; contingent on E3. measurement-safety's
+per-class caps table carries an explicit **`OPEN [NEEDS DATA]`** note under it
+about the **Moving Microphone Method (MMM)**: MMM plays continuous pink noise
+— continuous energy with a different crest factor than a sweep — so
+hearing-exposure and driver-heating limits differ, the sweep caps above must
+**not** be reused unexamined, and MMM needs its own level-safety row derived
+from real pink-noise measurements. (As of 2026-09-16 that table also carries a
+deliberately EMPTY MMM row, so the gap is visible in the table itself; this
+paragraph quoted the pre-rewrite wording until 2026-09-17.) The
 spec therefore forbids the only available default, and MMM is now the *default*
 room journey — so this is a safety gap on the path most novices will take.
 **Recommended: refuse the MMM path entirely until the row exists** (quiet is
@@ -682,11 +699,12 @@ t=0, accepting the two-clock warning — which redesigns the capture side, so
 finding out late is expensive.
 
 **E7. The `fixtures/decide/` freeze sign-off.** **OPEN \[OWNER\].** Blocks the
-freeze by definition: decision-engine:574 says the expected values "are
-reviewed by the owner once and then frozen", which is an owner gate an agent
-cannot default. What the owner is being asked to sign: eight `notes.md` files
-(one paragraph each — what the case exercises, the expected verdict, the
-diagnostics it should raise), written **before** the bless, plus the eight
+freeze by definition: decision-engine's "Golden bundles (the workhorse)" item
+says the expected values "are reviewed by the owner once and then frozen",
+which is an owner gate an agent cannot default. What the owner is being asked
+to sign: eight `notes.md` files (one paragraph each — what the case
+exercises, the expected verdict, the diagnostics it should raise), written
+**before** the bless, plus the eight
 `expected.json` the bless produces. Without the notes, "reviewed once" means
 reading several hundred KB of `Analysis` curves. **Recommended: do not schedule
 this until** items 9, 10, 13, 14 and 15, item 11's type reconciliations,

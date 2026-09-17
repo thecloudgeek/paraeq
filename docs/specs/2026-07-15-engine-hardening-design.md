@@ -502,7 +502,7 @@ impl IIRProcessor {
 }
 ```
 
-and on `Correction`, a kind-aware `adopt_state_from(&mut self, old: &Correction)` that is a no-op across kinds (Fir↔Iir) and across a channel-count change. Then `chain.rs:88` becomes:
+and on `Correction`, a kind-aware `adopt_state_from(&mut self, old: &Correction, channels: usize)` that is a no-op across kinds (Fir↔Iir) and across a channel-count change. Then `chain.rs:88` becomes:
 
 ```rust
 pub fn set_correction(&mut self, mut c: Option<Correction>) -> Option<Correction> {
@@ -512,6 +512,31 @@ pub fn set_correction(&mut self, mut c: Option<Correction>) -> Option<Correction
     std::mem::replace(&mut self.correction, c)
 }
 ```
+
+> **AMENDED (2026-09-17) — a THIRD no-op condition, and the `channels` parameter.**
+> The shipped signature takes `channels` (the live stream's channel count) so a
+> set-count artifact is not misread as a channel-count change. And the shipped
+> transplant is **also a no-op when the incoming correction has LESS headroom**
+> than the outgoing one (`self.preamp_lin > old.preamp_lin`). R1-1 landed after
+> this section was written: the delay lines hold the outgoing cascade's
+> un-preamped energy, and the incoming `preamp_lin` is what multiplies that tail
+> on the first block, so carrying it into less headroom engages the ±1.0 clamp
+> hard — measured at 68 clipped samples, pre-clamp peak 2.64, on a +12 dB band
+> dragged flat under a full-scale 1 kHz sine. That is exactly what R1-8's
+> *UI contract* paragraph calls R1-1's falsifier, and the EQ tab reaches it ~10
+> times a second while a band handle is dragged down.
+>
+> **The cost, stated:** R1-7a's "no step" bound no longer holds across a
+> preamp-weakening swap, so dragging a boost down restarts that band's ring-up
+> — the click this item is release-blocking for, in that one direction. The
+> other direction is untouched (a tail carried into MORE headroom can only get
+> quieter), as are cut-only sets, which sit at `preamp_lin == 1.0` on both
+> sides. Scaling the adopted state by `old.preamp_lin / self.preamp_lin` was
+> measured as the alternative and only halves the overshoot (2.64 → 1.73),
+> because R1-1 leaves zero design margin by construction. The fix that would
+> let both properties hold is a headroom constant, which is an owner call.
+> `OPEN [OWNER]`. See `crates/paraeq-dsp/DIVERGENCES.md` #20 and
+> `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md` §D-25.
 
 **Is this realtime-safe?** Yes. The transplant is a bounded memcpy over `zi` — `Vec<[f64; 2]>`, one entry per section per channel. A 10-band stereo EQ is 40 f64 = 320 bytes. No allocation occurs because `build_iir` already sized the new `zi` (`iir.rs:23`). It happens on the RT thread inside `RtLink::poll` (`shared.rs:150–163`), which is where the old processor still lives — a control-plane transplant is impossible for exactly that reason.
 
@@ -538,7 +563,7 @@ An overlap tail **cannot** be transplanted: the tail is `x_prev ⊛ h_old`, and 
 | FIR swap over a full-scale sine | `paraeq-engine` synthetic | No output discontinuity exceeds the input's per-sample slew; after `W` samples output matches the new FIR's steady state to 1e-12; the retired convolver reaches the retire ring **exactly once** |
 | Proptest: arbitrary Correction pairs, arbitrary swap point | `paraeq-engine` | Output finite and within ±1.0 |
 
-**Effort:** R1-7a ~0.5 day; R1-7b ~2 days. **Blocks release: R1-7a YES** (the EQ tab ships with drag interactions). **R1-7b only if the FIR path ships in R1** — cross-ref the roadmap.
+**Effort:** R1-7a ~0.5 day; R1-7b ~2 days. **Blocks release: R1-7a YES** (the EQ tab ships with drag interactions). **R1-7b only if the FIR path ships in R1** — cross-ref the roadmap. **(Shipped state, 2026-09-17: R1-7a landed, then narrowed by R1-1 — see the AMENDED block above. The click is gone on every swap except one that weakens the preamp, which is every downward drag of the cascade's peak band. `OPEN [OWNER]`.)**
 
 ---
 
@@ -677,7 +702,7 @@ Order-of-magnitude arithmetic: single-partition ≈ 32768·log₂(32768) = 491k 
 - **The cal-file parser** (`compensation.rs:11` dispatching on a leading double-quote, `:60` hardcoding `.skip(2)`). It is brittle to real-world UMIK-1 header variation and silently drops the first data row on single-header files, and the robust fix is REW's own documented rule — *"Only lines which begin with a number are loaded, others are ignored"*. But it is a **measurement-path** defect, not an engine defect, and the oracle (`prototype/paraeq/measurement/compensation.py`, `np.loadtxt(skiprows=2)`) shares the flaw, so both must change together or a divergence is manufactured. It belongs to the measurement spec.
 - **The `fixtures/manifest.json` scipy pin.** The manifest is a *generated provenance record* (`generate_fixtures.py:235–239` writes `scipy.__version__` at runtime); the only dependency *declaration* is `prototype/pyproject.toml:16` `"scipy>=1.10"`, a floor. Nothing enforces 1.18.0, and regenerating under a newer scipy silently rewrites the manifest. This is a real latent defect — and it is a **fixture-provenance** defect, not an engine one. It is owned by the master spec's R0 (`measurement-suite-design.md`) and detailed in `room-dsp-design.md`.
 - **The `-6 dBFS` output-level policy.** The prototype's `SWEEP_AMPLITUDE = 0.5` lives at `prototype/app/wizard/measurement_wizard.py:39` — the **playback** layer, which is not ported (there is no sweep playback path anywhere in Rust; `generate_sweep`'s only caller is its own test). `sweep.rs` faithfully matches its oracle `prototype/paraeq/measurement/sweep.py`, which is also unscaled, and the peak-1.0 convention is deliberate (`noise.py`: *"normalized to a peak of 1.0 so the caller can apply any output amplitude"*). **This is not a regression.** It is a forward-looking gap: the output-level policy has no home in the Rust tree, and stage 6 must create one. That belongs to the measurement spec.
-- **Closed-loop verification.** Measuring the *corrected* output requires the stimulus to go through the engine, which tap self-exclusion (`tap.rs:26–48`, `:153–154`) prevents by design — and correctly so: the 2026-07-02 spec (line 147) states *"correction state cannot contaminate the measurement."* Do **not** pre-convolve the sweep with the active correction; that defeats the design. The answer is a **helper child process** playing the stimulus (not excluded from the tap) — see the `afplay` reference in `crates/paraeq-coreaudio/tests/test_hardware.rs`. Measurement spec.
+- **Closed-loop verification.** Measuring the *corrected* output requires the stimulus to go through the engine, which tap self-exclusion (`tap.rs:26–48`, the `TapSystem::create` exclusion-list build) prevents by design — and correctly so: the 2026-07-02 spec (line 147) states *"correction state cannot contaminate the measurement."* Do **not** pre-convolve the sweep with the active correction; that defeats the design. The answer is a **helper child process** playing the stimulus (not excluded from the tap) — see the `afplay` reference in `crates/paraeq-coreaudio/tests/test_hardware.rs`. Measurement spec.
 - **`fr::average_measurements`'s dB-domain averaging.** It has **zero non-test callers** in Rust today, and the prototype smooths 1/6-octave *before* averaging (`measurement_wizard.py:481–484`), which is the regime REW explicitly endorses (*"dB averaging may be useful when averaging smoothed traces to derive an EQ target"*). This is a **latent design decision for new room code**, not a live bug. Room-DSP spec.
 - **Two-clock risk (UMIK-1 at its own rate vs. the output device).** The 2026-07-02 spec's claim that "the Farina method tolerates their small clock skew (prototype proved it)" was proven for an **ungated coupler magnitude** measurement. Gating needs a trustworthy t=0 and an undistorted IR shape; the claim does not transfer. This is the biggest unscheduled cost in the rescope, and it is a measurement-path problem. It touches R1-3 only as a *motivation* (a band designed at one rate installed at another), which R1-6 closes.
 
@@ -711,7 +736,7 @@ Verified against the code at `179cd34` (and `feature/rust-port-tauri-shell` wher
 | **R1-4** Boost caps in autofit (`autofit.rs:13`, `:19`, `:30–35`, `:71`) | **Critical** — symmetric picking + uncapped gain aims maximum boost at non-minimum-phase modal dips that cannot be filled | 2–3 days (gated on `authority.rs`) | **Yes** |
 | **R1-5** `kAudioSubDeviceInputChannelsKey: 0` (`tap.rs:57–61`) | **High** — dissolves the mic-samples-as-tap-input limitation (`backend.rs:121–130`) *and* removes a spurious mic prompt that would be indistinguishable from the measurement prompt | ~1 hour + hardware run | **Yes** |
 | **R1-6** Sample-rate coefficient staleness (`controller.rs:105`; partially closed on the stage-4 branch) | **High** — every filter detunes by ~8% on a rate switch; "the tap follows your device automatically" must be true before it is said | 1–2 days (after the stage-4 merge) | **Yes** |
-| **R1-7a** IIR state preservation on swap (`chain.rs:88–90`) | **Medium** — a click on every band edit; the EQ tab *is* a drag interaction | ~0.5 day | **Yes** |
+| **R1-7a** IIR state preservation on swap (`chain.rs:88–90`) | **Medium** — a click on every band edit; the EQ tab *is* a drag interaction | ~0.5 day | **Yes** (shipped 2026-09-17, narrowed by R1-1: still clicks on a preamp-WEAKENING swap — see R1-7a's AMENDED block, `OPEN [OWNER]`) |
 | **R1-7b** FIR crossfade on swap (`convolver.rs:70`, `:97`) | **Medium** — up to 32256 discarded tail samples for a room FIR | ~2 days | Only if the FIR path ships in R1 |
 | **R1-8** Meters: clip counter + output peak (`chain.rs:171`, `:183` clamp invisibly) | **Medium** — the clamp engages silently; without the counter, R1-1's central claim is unfalsifiable | ~1 day | **Yes** (clip counter) |
 | **R1-8** Meters: decaying `input_peak` (`shared.rs:237–240` monotonic session max) | **Low** — a session statistic wearing a meter's clothes | (in the above) | No |

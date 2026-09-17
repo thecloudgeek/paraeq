@@ -132,7 +132,7 @@ pub struct BuildReport {
     pub bands_dropped: usize,
     /// R1-1's auto-preamp for the correction that was actually installed, in
     /// dB, always `<= 0`. Published as [`EngineState::auto_preamp_db`] -- the
-    /// number the Advanced drawer has to be able to explain (spec `:106`:
+    /// number the Advanced drawer has to be able to explain (spec `R1-1 §6`:
     /// "The auto front-end must never apply a number it cannot explain") --
     /// and `10^(preamp_db/20)` is what rides into the chain as
     /// [`Correction::preamp_lin`].
@@ -184,7 +184,7 @@ pub fn validate_band(band: &EQBand) -> Result<(), String> {
 /// [`validate_band`] plus the rate-dependent Nyquist bound: `fc` must lie in
 /// the OPEN interval `(0, sample_rate / 2)`. At `fc >= sample_rate / 2` the
 /// biquad math is finite but meaningless (aliased around Nyquist -- spec
-/// `:188`), which `paraeq_dsp::biquad::is_stable` does not catch, so it is
+/// `R1-3 § Defect`), which `paraeq_dsp::biquad::is_stable` does not catch, so it is
 /// checked explicitly here.
 pub fn validate_band_at(band: &EQBand, sample_rate: f64) -> Result<(), String> {
     let nyquist = sample_rate / 2.0;
@@ -265,11 +265,11 @@ fn validate_correction(config: &CorrectionConfig) -> Option<String> {
 /// ignored). A band that is not designable there -- at or above the new
 /// Nyquist -- is DROPPED and counted in the [`BuildReport`] rather than
 /// failing the whole set, mirroring R1-3's "never bricked by one bad band"
-/// (spec `:216`); the config is refused only when nothing survives.
+/// (spec `R1-3 § Why identity, not error`); the config is refused only when nothing survives.
 ///
 /// `Fir` / `Iir` carry baked coefficients that cannot be re-derived, so they
 /// are refused unless `design_rate == stream_rate` -- an EXACT comparison,
-/// not a tolerance (spec `:420`: device-reported rates round-trip exactly in
+/// not a tolerance (spec `R1-6 § Fix 2`: device-reported rates round-trip exactly in
 /// f64 and a fuzzy compare would silently accept a genuinely different rate).
 ///
 /// On `Err` the caller sends no correction at all: flat pass-through, the
@@ -277,11 +277,11 @@ fn validate_correction(config: &CorrectionConfig) -> Option<String> {
 ///
 /// R1-1: every arm also computes its auto-preamp here, from the SAME realized
 /// cascade that reaches the chain, and hands it to `build_iir`/`build_fir` so
-/// it swaps atomically with the coefficients it protects (spec `:101`). It is
+/// it swaps atomically with the coefficients it protects (spec `R1-1 §5`). It is
 /// computed AFTER the Nyquist drop and from the surviving bands, because the
 /// headroom that matters is the headroom the installed filters need. `Peq`
 /// calls `ParametricEQ::preamp_db()` verbatim -- one implementation shared
-/// with the AutoEQ export, so spec `:117`'s export/engine agreement holds and
+/// with the AutoEQ export, so spec `R1-1 § Tests`'s export/engine agreement holds and
 /// the band-`fc` grid union stays intact; the two baked arms use
 /// [`crate::preamp`], which is the same idea without the bands. A
 /// multi-channel config takes the WORST channel's preamp.
@@ -299,7 +299,7 @@ pub fn build_correction(
     // STRUCTURAL guard only -- the builders assert on these, and this
     // function must never panic even when called outside the controller's
     // `SetCorrection` pre-screen. Bad *values* are dropped band by band
-    // below, not refused wholesale (R1-3, spec `:216`).
+    // below, not refused wholesale (R1-3, spec `R1-3 § Why identity, not error`).
     if let Some(reason) = structural_defect(config) {
         return Err(EngineError::InvalidConfig(reason));
     }
@@ -379,9 +379,9 @@ pub fn build_correction(
                      and were dropped; the rest of the correction still applies"
                 );
             }
-            // R1-1, spec `:101`: `ParametricEQ::preamp_db()` VERBATIM, on the
+            // R1-1, spec `R1-1 §5`: `ParametricEQ::preamp_db()` VERBATIM, on the
             // surviving bands at the live rate -- the same call the AutoEQ
-            // export makes, so the two numbers agree exactly (spec `:117`)
+            // export makes, so the two numbers agree exactly (spec `R1-1 § Tests`)
             // and the band-`fc` grid union that makes high-Q peaks exact
             // stays intact. The worst channel wins: a stereo config must not
             // clip on the loud side because the quiet side needed less
@@ -461,7 +461,7 @@ pub struct EngineState {
     /// R1-1's computed auto-preamp for the correction currently installed, in
     /// dB and always `<= 0`; `None` when no correction is running. The
     /// Advanced drawer explains it ("we pulled you down 9.4 dB to make room
-    /// for the 45 Hz boost" -- spec `:106`), and decision-engine `:340` gives
+    /// for the 45 Hz boost" -- spec `R1-1 §6`), and decision-engine `§ Decisions Log preamp_db row` gives
     /// the user-facing wording verbatim.
     ///
     /// Session-scoped, like `correction_rate_mismatch` and for the same
@@ -477,7 +477,7 @@ pub struct EngineState {
     /// so a `Disable` does not blank the count the user is looking at.
     ///
     /// A nonzero value while `auto_preamp_db` is active is a BUG SIGNAL and
-    /// the spec says so (`:571`): it is R1-1's falsifier.
+    /// the spec says so (`R1-8 § UI contract`): it is R1-1's falsifier.
     pub clipped_samples: u64,
     /// Short descriptor of the retained correction, e.g. `"iir:5-band"`.
     pub correction: Option<String>,
@@ -490,7 +490,7 @@ pub struct EngineState {
     /// so a teardown clears it. The desktop keys its redesign off this field
     /// rather than diffing rates itself, so the daemon seam inherits the
     /// behavior and the refusal lands in the same call that used to install
-    /// stale coefficients (spec `:424`, gap 3 at `:407`).
+    /// stale coefficients (spec `R1-6 § Fix 4`, gap 3 at `R1-6 § gap 3`).
     pub correction_rate_mismatch: Option<f64>,
     /// The controller's current enabled flag: `true` between an
     /// [`EngineCommand::Enable`] (or an enabled spawn) and the next
@@ -506,7 +506,7 @@ pub struct EngineState {
     pub frame_mismatch_blocks: u64,
     pub gain_db: f32,
     /// Input METER: the largest recent input |sample|, released at the
-    /// broadcast-standard 20 dB / 1.7 s (R1-8, spec `:515`). It answers "how
+    /// broadcast-standard 20 dB / 1.7 s (R1-8, spec `R1-8 § Decay`). It answers "how
     /// loud is the music right now"; `input_peak_session` answers "how loud
     /// did it ever get".
     ///
@@ -520,7 +520,7 @@ pub struct EngineState {
     /// not a slower meter.
     pub input_peak: f32,
     /// Maximum input |sample| since this session started (R1-8's session
-    /// statistic, spec `:552`). `input_peak` is the meter; this one never
+    /// statistic, spec `R1-8 § Keep the session max`). `input_peak` is the meter; this one never
     /// decays.
     pub input_peak_session: f32,
     /// Non-finite samples zeroed at the capture boundary and by the chain's
@@ -541,7 +541,7 @@ pub struct EngineState {
     pub output_peak: f32,
     /// The MS-6 self-exclusion witness: whether the LIVE capture currently
     /// keeps ParaEQ's own audio out of ParaEQ's own tap, exactly as the
-    /// backend reports it (measurement-safety `:336`, wizard `:412`). The
+    /// backend reports it (measurement-safety `MS-6`, wizard `§ self_excluded Requirement`). The
     /// measurement wizard refuses to begin a `Direct` capture when it is
     /// `false` -- an "uncorrected" baseline that was silently corrected is
     /// worse than no baseline, and feedback is live into a coupler that may be
@@ -1302,7 +1302,7 @@ impl<B: AudioBackend> Controller<B> {
         // REPORTED -- the same reason the correction is built below rather
         // than above: only `start` knows the effective rate and buffer size.
         //
-        // The spec (`:521`) says "before the backend starts -- so the RT
+        // The spec (`R1-8 § Decay`) says "before the backend starts -- so the RT
         // thread is not yet running and there is no race"; that ordering is
         // not achievable for a number derived from the negotiated stream, and
         // it does not need to be. This is a single relaxed store to a FRESH
@@ -1321,7 +1321,7 @@ impl<B: AudioBackend> Controller<B> {
             stream: stream.clone(),
         });
 
-        // R1-6 gap 3 (spec `:407`). The stored correction is re-applied
+        // R1-6 gap 3 (spec `R1-6 § gap 3`). The stored correction is re-applied
         // AFTER `start` returns, so it is built at the rate the backend just
         // REPORTED. Building it earlier is what made a rate switch re-send
         // coefficients designed for the old rate -- live and audible for a
@@ -1402,7 +1402,7 @@ impl<B: AudioBackend> Controller<B> {
                 // `report`'s drop/substitution counts are already logged by
                 // `build_correction`; its preamp is R1-1's `auto_preamp_db`
                 // and is published (the drawer must be able to explain the
-                // number the engine applied -- spec `:106`).
+                // number the engine applied -- spec `R1-1 §6`).
                 Ok((correction, report)) => (
                     RtMsg::Correction(Some(correction)),
                     None,
@@ -1527,10 +1527,10 @@ impl<B: AudioBackend> Controller<B> {
 /// decay = 10 ^ ( -(20.0 / 1.7) * (buffer_frames / sample_rate) / 20.0 )
 /// ```
 ///
-/// the broadcast-standard 20 dB / 1.7 s release (spec `:525`), expressed per
+/// the broadcast-standard 20 dB / 1.7 s release (spec `R1-8 § Decay`), expressed per
 /// BLOCK so the realtime lane applies it with one multiply and never needs a
 /// clock -- which `shared.rs`'s realtime-lane contract forbids it, and which
-/// the spec's own Decisions Log (`:28`) rejects by name along with the
+/// the spec's own Decisions Log (`§ Decisions Log`) rejects by name along with the
 /// alternative of decaying on the controller thread ("needs an atomic
 /// swap-on-read that races the RT store").
 ///
@@ -1563,7 +1563,7 @@ pub fn decay_per_block(buffer_frames: usize, sample_rate: f64) -> f32 {
 /// a change in the rate it names must publish. It has no chatter to prevent
 /// -- in a healthy session it is pinned at `None`.
 ///
-/// R1-8 (`:566`) says "the **counters compare exactly** -- a clip must
+/// R1-8 (`R1-8 § Publish`) says "the **counters compare exactly** -- a clip must
 /// publish", which reads as a contradiction of the `> 0` rule above. Both
 /// hold, scoped, and the asymmetry is deliberate: `clipped_samples` and
 /// `invalid_samples` compare EXACTLY because in a healthy session they are
@@ -1652,7 +1652,7 @@ mod tests {
         let moves: [Move; 6] = [
             // R1-1: a number the app has promised to be able to explain.
             ("auto_preamp_db", |s| s.auto_preamp_db = Some(-9.4)),
-            // R1-8 (`:566`): "the counters compare exactly -- a clip must publish".
+            // R1-8 (`R1-8 § Publish`): "the counters compare exactly -- a clip must publish".
             ("clipped_samples", |s| s.clipped_samples = 1),
             ("invalid_samples", |s| s.invalid_samples = 1),
             // R1-6: the desktop's redesign trigger and the user's only

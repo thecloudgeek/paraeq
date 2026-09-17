@@ -38,14 +38,14 @@ pub struct RtShared {
     /// stereo block of 512 frames counts 1024, so the drawer must not divide
     /// by the channel count. R1-8's release-blocking half: it is R1-1's
     /// falsifier, and a nonzero count while `auto_preamp_db` is active is a
-    /// BUG SIGNAL, not a user error (spec `:571`).
+    /// BUG SIGNAL, not a user error (spec `R1-8 § UI contract`).
     pub clipped_samples: AtomicU64,
     /// Per-block multiplicative release coefficient for `peak_in_bits` and
     /// `peak_out_bits`, as f32 bits (control writes ONCE per start, rt reads
     /// every block). R1-8's decay without a clock on the realtime lane: the
     /// controller computes it from the negotiated `StreamInfo` at
     /// `start_with`, the rt lane spends one multiply per block applying it
-    /// (spec `:515-530`).
+    /// (spec `R1-8 § Decay`).
     ///
     /// DEFAULTS TO 1.0 -- no decay, i.e. the monotonic peak hold this field
     /// replaces. 0.0 would look like a safer default and is not: it turns the
@@ -71,16 +71,16 @@ pub struct RtShared {
     pub nonzero_blocks: AtomicU64,
     /// Input METER, as f32 bits (rt writes): the largest input |sample| in
     /// this block, or the previous value released by `decay_per_block_bits`,
-    /// whichever is larger. R1-8's decaying half (spec `:515`) -- it falls at
+    /// whichever is larger. R1-8's decaying half (spec `R1-8 § Decay`) -- it falls at
     /// the broadcast-standard 20 dB / 1.7 s, so it answers "how loud is the
     /// music right now", which a session maximum cannot. The session maximum
     /// lives on in `peak_in_session_bits`.
     pub peak_in_bits: AtomicU32,
     /// Maximum input |sample| seen SINCE THE SESSION STARTED, as f32 bits
     /// (rt writes) -- the monotonic session statistic, kept because it is
-    /// genuinely useful and free (spec `:552`). It is the ONLY monotonic
+    /// genuinely useful and free (spec `R1-8 § Keep the session max`). It is the ONLY monotonic
     /// peak: `peak_in_bits` decays, so each field now means exactly one
-    /// thing (spec `:532`).
+    /// thing (spec `R1-8 § Keep the session max`).
     pub peak_in_session_bits: AtomicU32,
     /// Output METER, as f32 bits (rt writes), taken PRE-clamp (see
     /// [`crate::chain::ChainOutcome::peak_out`]) so it reports the real
@@ -90,7 +90,7 @@ pub struct RtShared {
     /// The spec specifies decay only for the input peak, and this applies its
     /// own reasoning to the output one: R1-8's defect statement is that a
     /// non-decaying peak is "a session statistic wearing a meter's clothes"
-    /// (spec `:505`), and `:571` makes "the Advanced drawer shows output peak"
+    /// (spec `R1-8 § Defect`), and `R1-8 § UI contract` makes "the Advanced drawer shows output peak"
     /// a meter's job. One coefficient also means the two numbers read
     /// comparably, which is the whole point of showing them together. There
     /// is no output session maximum: nothing asks for one, and
@@ -328,7 +328,7 @@ impl RtProcessor {
         } else {
             shared.nonzero_blocks.fetch_add(1, Ordering::Relaxed);
             // The session statistic, with the monotonic logic unchanged
-            // (spec `:552`). This one stays inside the branch: an all-zero
+            // (spec `R1-8 § Keep the session max`). This one stays inside the branch: an all-zero
             // block can never raise a maximum.
             if peak > shared.peak_in_session() {
                 shared
@@ -336,7 +336,7 @@ impl RtProcessor {
                     .store(peak.to_bits(), Ordering::Relaxed);
             }
         }
-        // R1-8's meter (spec `:518`), HOISTED OUT of the zero/nonzero branch
+        // R1-8's meter (spec `R1-8 § Decay`), HOISTED OUT of the zero/nonzero branch
         // on purpose: the spec's snippet replaces a store that sat in the
         // `else`, and transcribing it there leaves SILENCE never decaying --
         // the meter would hold full scale forever after the music stopped,

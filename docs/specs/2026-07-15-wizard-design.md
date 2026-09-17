@@ -356,7 +356,7 @@ Neither Dirac nor Sonarworks re-measures. Verification is what *earns* auto mode
 
 ### The hard part
 
-The tap excludes ParaEQ's own process (`tap.rs:26-48`, `initStereoGlobalTapButExcludeProcesses`; `tap.rs:153-154`, `excluded = vec![own]`) **on purpose** — design spec line 147: *"correction state cannot contaminate the measurement."* That is correct and stays. But it means a naive re-measure plays the sweep on the direct stream, which the tap never sees, so it measures the **uncorrected** response. To measure the corrected output, the stimulus must come from a process that is **not** excluded.
+The tap excludes ParaEQ's own process (`tap.rs:26-48`, `initStereoGlobalTapButExcludeProcesses`; `tap.rs`'s `TapSystem::create` exclusion-list build, `excluded = vec![own]`) **on purpose** — design spec line 147: *"correction state cannot contaminate the measurement."* That is correct and stays. But it means a naive re-measure plays the sweep on the direct stream, which the tap never sees, so it measures the **uncorrected** response. To measure the corrected output, the stimulus must come from a process that is **not** excluded.
 
 **Do not pre-convolve the sweep with the active `CorrectionConfig`.** It defeats the design, and worse, it verifies the wrong thing: it measures the filter's *math* (which the golden fixtures already cover) while skipping the engine — the coefficient install, the preamp gain stage, the ±1.0 clamp, the DF2T state, the FIR overlap tail, the sample-rate binding. Those are exactly the things verification exists to catch.
 
@@ -407,7 +407,7 @@ The band is `correction_range ∩ { f : authority.at(f).max_boost_db > 0 || max_
 
 ### The fail-open hazard — a hard interlock
 
-`tap.rs:154-159` documents a fail-open: if `translate_pid` returns 0 after a 200 ms retry, the exclusion list is **empty**, ParaEQ's own audio **is** tapped, and the code logs `"own process not in HAL registry after retry — no self-exclusion (watch for feedback)"`. In normal operation that is a defensible warning. **For the wizard it is fatal**, and silently so: a `Direct` baseline capture would be tapped, corrected, and re-played — so the "uncorrected" reference is silently corrected, every subsequent inference is garbage, and feedback is live into a coupler that may be on someone's head.
+`tap.rs`'s `TapSystem::create` exclusion-list build documents a fail-open: if `translate_pid` returns 0 after a 200 ms retry, the exclusion list is **empty**, ParaEQ's own audio **is** tapped, and the code logs `"own process not in HAL registry after retry — no self-exclusion (watch for feedback)"`. In normal operation that is a defensible warning. **For the wizard it is fatal**, and silently so: a `Direct` baseline capture would be tapped, corrected, and re-played — so the "uncorrected" reference is silently corrected, every subsequent inference is garbage, and feedback is live into a coupler that may be on someone's head.
 
 **Requirement:** `EngineState` gains `self_excluded: bool` (it currently carries `bypass, correction, gain_db, input_peak, latency_ms, status, stream` — `controller.rs:133-143`). The wizard **refuses** to begin any `Direct` capture when `self_excluded == false`. Remedy: restart ParaEQ.
 

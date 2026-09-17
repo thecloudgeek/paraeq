@@ -8,7 +8,7 @@
 //!
 //! The `Peq` arm does NOT live here: it calls
 //! `paraeq_dsp::peq::ParametricEQ::preamp_db()` verbatim, because that is the
-//! same function the AutoEQ export calls and spec `:117` requires the two
+//! same function the AutoEQ export calls and spec `R1-1 § Tests` requires the two
 //! numbers to agree exactly. What is here is the same idea applied to the two
 //! arms that arrive with coefficients already baked, where there are no bands
 //! to hand `ParametricEQ`:
@@ -20,7 +20,7 @@
 //!   a very high-Q baked row can therefore read slightly low. That is the
 //!   honest cost of baked coefficients and one more reason `Peq` is the
 //!   preferred config shape (R1-6 / Open Q1).
-//! * `Fir` -- spec `:101`, verbatim: *"For the FIR arm, 'the realized
+//! * `Fir` -- spec `R1-1 §5`, verbatim: *"For the FIR arm, 'the realized
 //!   cascade' is the FIR's own magnitude response -- `preamp_lin = 1.0 /
 //!   max(1.0, max|H(f)|)` over the same grid, computed with one FFT of the
 //!   tap vector on the control plane."*
@@ -92,7 +92,7 @@ pub fn sos_preamp_db(sos_per_channel: &[Vec<[f64; 6]>], sample_rate: f64) -> f64
 /// max|H(f)|)` over every channel, i.e. `preamp_lin = 1/max(1, max|H|)`
 /// expressed in dB so every arm reports one kind of number.
 ///
-/// One real FFT per channel of the zero-padded tap vector (spec `:101`), on
+/// One real FFT per channel of the zero-padded tap vector (spec `R1-1 §5`), on
 /// the control plane.
 pub fn fir_preamp_db(firs: &[Vec<f64>]) -> f64 {
     let Some(longest) = firs.iter().map(Vec::len).max() else {

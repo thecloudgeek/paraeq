@@ -196,4 +196,42 @@ differs from `prototype/paraeq/`, so a red parity test is always actionable.
     semantics and its persistence — both explicitly frozen for Phase A. See
     `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md` §D-24.
 
+20. **A coefficient swap that WEAKENS the auto-preamp restarts the filter
+    state instead of transplanting it.** Not an oracle divergence -- the
+    prototype has no realtime swap path at all -- but recorded here for the
+    same reason as #16, #18 and #19: it is user-visible and it changed in
+    Phase A. R1-7a's `Correction::adopt_state_from` preserves DF2T delay
+    state across a coefficient swap so a band edit does not click. R1-1 then
+    put `preamp_lin` inside `Correction`, and the delay lines hold the
+    OUTGOING cascade's un-preamped energy while the INCOMING `preamp_lin`
+    multiplies that tail on the first block -- so a swap into LESS headroom
+    has no room for it and the last-resort +-1.0 clamp engages hard.
+    Measured: a +12 dB band dragged flat under a full-scale 1 kHz sine, 68
+    clipped samples at a pre-clamp peak of 2.64 on the block after the swap,
+    which is precisely what engine-hardening's R1-8 *UI contract* paragraph
+    calls R1-1's falsifier -- and the EQ tab reaches it ~10 times a second
+    while a handle is being dragged. The transplant is therefore SKIPPED in
+    that direction (`crates/paraeq-engine/src/chain.rs`,
+    `if self.preamp_lin > old.preamp_lin { return; }`) and the incoming
+    correction starts from clean state, bounded by its own preamp.
+
+    **The cost:** R1-7a's "no step" bound no longer holds across a
+    preamp-weakening swap, so dragging a boost DOWN restarts that band's
+    ring-up -- the click R1-7a is release-blocking for, in that one
+    direction. The other direction is untouched, and a cut-only set never
+    reaches the condition (`preamp_lin == 1.0` on both sides). Scaling the
+    adopted state by `old.preamp_lin / self.preamp_lin` was measured as the
+    alternative and only halves the overshoot (2.64 -> 1.73): R1-1 leaves
+    ZERO design margin by construction, so the corrected path sits at
+    exactly 1.0 at the peak and any transient clips. Pinned in both
+    directions by `crates/paraeq-engine/tests/test_chain.rs`
+    (`a_swap_to_a_weaker_preamp_starts_from_clean_state`) and
+    `tests/test_meters.rs` (`a_swap_that_weakens_the_preamp_does_not_clip`).
+    Flagged **`OPEN [OWNER]`**: the fix that would let BOTH properties hold
+    is a headroom constant, and wizard-design's Open Question 5 records "no
+    headroom constant" as DECIDED (2026-07-21) on the EXPORT convention, not
+    on realtime swap margin -- so re-opening it is a product call, not
+    something to introduce quietly. See
+    `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md` D-25.
+
 (add entries here as they are discovered during implementation)

@@ -62,11 +62,11 @@ pub trait AudioBackend: Send {
     fn poll_event(&mut self) -> Option<BackendEvent>;
 
     /// Whether the backend's LIVE capture excludes this process's own audio
-    /// right now -- the MS-6 witness (measurement-safety `:336`). The
+    /// right now -- the MS-6 witness (measurement-safety `MS-6`). The
     /// controller publishes it as
     /// [`EngineState::self_excluded`](crate::controller::EngineState), and the
     /// measurement wizard refuses to begin a `Direct` capture when it is
-    /// `false` (wizard `:412`): an "uncorrected" baseline that was silently
+    /// `false` (wizard `§ self_excluded Requirement`): an "uncorrected" baseline that was silently
     /// corrected is worse than no baseline, and feedback is live.
     ///
     /// Contract: `false` whenever nothing is running -- before the first

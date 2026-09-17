@@ -229,7 +229,7 @@ pub fn eq_export_autoeq(app: tauri::AppHandle, path: String) -> Result<(), Strin
         data.bands.clone()
     };
     let rate = live_rate(&shared);
-    // R1-1 (spec `:117`): the exported preamp is the COMPUTED one -- the same
+    // R1-1 (spec `R1-1 § Tests`): the exported preamp is the COMPUTED one -- the same
     // `ParametricEQ::preamp_db()` the engine hands `build_correction`, so the
     // text names the number the engine is applying (`EngineState`'s
     // `auto_preamp_db`). It is deliberately NOT `data.preamp_db`, the user's
@@ -260,7 +260,7 @@ pub fn eq_export_autoeq(app: tauri::AppHandle, path: String) -> Result<(), Strin
 /// derives its OWN preamp from the very bands `apply_bands` just installed and
 /// applies it on the corrected path, and AutoEq's `ParametricEq.txt`
 /// convention makes a file's preamp exactly `-max_gain` of its own bands
-/// (engine-hardening `:81`) -- the same quantity. So importing a boosting
+/// (engine-hardening `R1-1 §2`) -- the same quantity. So importing a boosting
 /// preset attenuates roughly twice: measured -6.8 (file) + -6.78 (engine) =
 /// -13.58 dB on the corrected path. ParaEQ's own export re-imported doubles by
 /// construction, because R1-1 made `eq_export_autoeq` write the

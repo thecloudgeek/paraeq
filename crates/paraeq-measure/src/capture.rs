@@ -52,8 +52,10 @@ pub const CLIP_BLOCK_FRACTION: f64 = 0.30;
 
 /// Per-block peak decay, in dB per block.
 ///
-/// A decaying peak, unlike the engine's monotonic session maximum, answers
-/// "how hot is the signal now". 1.5 dB per block is ~11 ms of 20 dB fall at
+/// A decaying peak answers "how hot is the signal now", which the engine's
+/// `input_peak_session` (its monotonic statistic) cannot -- and this release
+/// is MS-21's own, not the broadcast 20 dB / 1.7 s the engine's `input_peak`
+/// now falls at. 1.5 dB per block is ~11 ms of 20 dB fall at
 /// 512 frames / 48 kHz — fast enough to track a sweep's level as it climbs,
 /// slow enough that a meter driven off it does not flicker.
 pub const PEAK_DECAY_DB_PER_BLOCK: f64 = 1.5;
