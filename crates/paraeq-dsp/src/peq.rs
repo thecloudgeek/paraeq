@@ -1,5 +1,37 @@
 //! Parametric EQ container + AutoEQ text export.
 //! Oracle: prototype/paraeq/correction/parametric_eq.py
+//!
+//! Test tier: 1 + 2 + 3. Tier 1 is the oracle transcriptions —
+//! `ParametricEQ::frequency_response`, `export_autoeq_format` and
+//! `parse_autoeq`, pinned byte-for-byte against `fixtures/peq/two_band` and
+//! `fixtures/autoeq_parser.json`. **Those stay frozen.** The realized-cascade
+//! additions below declare their own tiers, one per function, because a `pub`
+//! DSP function with no declared tier is exactly what CLAUDE.md's rule exists
+//! to prevent:
+//!
+//! - [`sosfilt`] — **Tier 2**, delegate `scipy.signal.sosfilt(sos, x, zi=None)`
+//!   (`fixtures/peq/sosfilt_offline`). It takes an EXPLICITLY supplied SOS array
+//!   and no `self`, which is what makes it reachable from a fixture at all.
+//! - [`ParametricEQ::realized_sos`] — **Tier 3.** The `biquad::IDENTITY`
+//!   substitution for rows failing `biquad::is_stable` is OUR policy
+//!   (`DIVERGENCES.md` #14, mirroring `build_iir`'s R1-3 funnel), not scipy's,
+//!   and `biquad`'s designers are already Tier-1 pinned — so the fold has
+//!   nothing left to delegate to and an analytic test is the honest oracle.
+//! - [`ParametricEQ::realized_response`] — **Tier 3 (composition).** The
+//!   magnitude kernel is already Tier-1 fixture-pinned through
+//!   `frequency_response`; what this composes it with is the Tier-3 policy fold
+//!   above, at a CALLER-SUPPLIED rate. Declaring it Tier 2 with a scipy
+//!   reference it cannot consume would be the false "a delegate exists" claim
+//!   `authority.rs` forbids. `frequency_response` is NOT refactored to share a
+//!   kernel with it — that would edit a frozen function for no behavioural
+//!   gain; two tests pin the agreement and the disagreement instead.
+//! - [`ParametricEQ::apply_offline`] — **Tier 3 (composition).** Exactly
+//!   `sosfilt(&self.realized_sos(rate_hz), x)`: a Tier-2-graded primitive
+//!   composed with a Tier-3-declared policy fold. Both halves are graded; the
+//!   composition itself has no independent delegate, so three tests pin it.
+//! - [`ParametricEQ::preamp_grid`] — **Tier 3.** The grid is R1-1's own
+//!   decision (quoted on [`ParametricEQ::preamp_db`]), so there is nothing to
+//!   delegate to.
 
 use crate::biquad;
 use crate::DspError;
@@ -206,6 +238,36 @@ impl ParametricEQ {
         if self.bands.is_empty() {
             return 0.0;
         }
+        // The grid and the realized fold both used to live inline here. They
+        // are [`Self::preamp_grid`] and [`Self::realized_response`] now, for
+        // one reason: the verification residual predicts the installed cascade
+        // and MUST use the same two, or it reports an engine fault that is
+        // really a prediction fault. Factored out, not copied, so they cannot
+        // drift. Behaviour is unchanged — same grid, same substitution, same
+        // rate, same fold.
+        let peak = self
+            .realized_response(&self.preamp_grid(), self.sample_rate)
+            .into_iter()
+            .fold(f64::NEG_INFINITY, f64::max);
+        if peak > BIAS_CEILING_DB {
+            -peak
+        } else {
+            0.0
+        }
+    }
+
+    /// The analysis grid [`Self::preamp_db`] evaluates on — **Tier 3**, no
+    /// oracle: the grid is R1-1's own decision, stated on `preamp_db`.
+    ///
+    /// The sorted, deduplicated union of a 1/48-octave log grid over
+    /// `[1.0, 0.499·sample_rate]`, every band's `fc` clamped into that range,
+    /// and the two endpoints.
+    ///
+    /// Public because a test — and B13's gate-2 recomputation — must be able to
+    /// evaluate [`Self::realized_response`] on THE SAME grid `preamp_db` used.
+    /// Without that, the two peaks differ by construction and any assertion
+    /// relating them is a lottery on grid density.
+    pub fn preamp_grid(&self) -> Vec<f64> {
         // .max(1.0) keeps the range non-empty (and fc's clamp valid) for
         // degenerate sample rates; unreachable for real audio rates.
         let f_max = (0.499 * self.sample_rate).max(1.0);
@@ -218,30 +280,89 @@ impl ParametricEQ {
             grid.push(f);
         }
         grid.push(f_max);
+        // A peaking band's maximum sits at its fc, so unioning fc in makes the
+        // peak exact regardless of grid density — the one feature a plain log
+        // grid would lose.
         for band in &self.bands {
             grid.push(band.fc.clamp(1.0, f_max));
         }
         grid.sort_by(f64::total_cmp);
         grid.dedup();
-        let sos: Vec<[f64; 6]> = self
-            .combined_sos()
-            .into_iter()
-            .map(|row| {
+        grid
+    }
+
+    /// The cascade the engine ACTUALLY INSTALLS, designed at `rate_hz` —
+    /// **Tier 3**, the `biquad::IDENTITY` substitution being our own policy.
+    ///
+    /// Rows failing [`biquad::is_stable`] are replaced by [`biquad::IDENTITY`],
+    /// mirroring `build_iir`'s R1-3 stability funnel, so one `q = 0`/NaN design
+    /// leaves the rest of the cascade running instead of turning the whole
+    /// response NaN.
+    ///
+    /// **`rate_hz` is an argument, not `self.sample_rate`, and that is the
+    /// point.** R1-6 re-designs at the LIVE stream rate;
+    /// `CorrectionPlan::design_rate` is "Provenance only — never the rate the
+    /// engine designs at". Predicting at `design_rate` while the engine runs at
+    /// another rate manufactures a bilinear-warp residual at HF and blames the
+    /// chain for it. [`Self::combined_sos`] hardcodes `self.sample_rate` and is
+    /// left alone; this is the variant that takes the rate from its caller.
+    pub fn realized_sos(&self, rate_hz: f64) -> Vec<[f64; 6]> {
+        self.bands
+            .iter()
+            .map(|b| {
+                let row = b.to_sos(rate_hz);
                 if biquad::is_stable(&row) {
                     row
                 } else {
                     biquad::IDENTITY
                 }
             })
-            .collect();
-        let peak = biquad::sos_frequency_response_db(&sos, &grid, self.sample_rate)
-            .into_iter()
-            .fold(f64::NEG_INFINITY, f64::max);
-        if peak > BIAS_CEILING_DB {
-            -peak
-        } else {
-            0.0
+            .collect()
+    }
+
+    /// Magnitude response of [`Self::realized_sos`] on `freqs`, dB — **Tier 3
+    /// (composition)**.
+    ///
+    /// The same shape [`Self::frequency_response`] has, differing ONLY in where
+    /// the sections come from (realized, at a caller-supplied rate) and
+    /// therefore in what it answers: `frequency_response` is the cascade AS
+    /// DESIGNED, this is the cascade AS INSTALLED. With every row stable and
+    /// `rate_hz == self.sample_rate` the two agree, and a test says so; with one
+    /// unstable row they must NOT, and a second test says that.
+    ///
+    /// This is `H(f)` in the verification level book — the installed bands'
+    /// realized cascade magnitude, preamp EXCLUDED. The preamp is added by the
+    /// caller as a constant offset; a safety interlock may not be conditioned on
+    /// the hypothesis it is testing.
+    ///
+    /// `frequency_response` is deliberately NOT refactored into a shared kernel:
+    /// it is Tier-1 fixture-pinned, and editing frozen code to host a parameter
+    /// it never varies buys nothing a test does not.
+    pub fn realized_response(&self, freqs: &[f64], rate_hz: f64) -> Vec<f64> {
+        if self.bands.is_empty() {
+            // Same explicit special case `frequency_response` carries: the
+            // generic empty cascade is unity gain plus the +1e-10 floor, i.e.
+            // 20*log10(1 + 1e-10) != 0.0 exactly.
+            return vec![0.0; freqs.len()];
         }
+        biquad::sos_frequency_response_db(&self.realized_sos(rate_hz), freqs, rate_hz)
+    }
+
+    /// Filter `x` through the realized cascade at `rate_hz`, zero initial state
+    /// — **Tier 3 (composition)**, exactly
+    /// `sosfilt(&self.realized_sos(rate_hz), x)`.
+    ///
+    /// The correction-aware render: what a buffer sounds like after the
+    /// correction the engine is running. B13's verification marker template
+    /// needs it so the marker it correlates against is the marker the corrected
+    /// chain will actually emit.
+    ///
+    /// Offline and stateless by construction — no `zi` survives a call — so the
+    /// output depends on the input alone and never on what was rendered before
+    /// it. This is NOT the realtime path; `paraeq-engine` owns that and keeps
+    /// its own state.
+    pub fn apply_offline(&self, x: &[f64], rate_hz: f64) -> Vec<f64> {
+        sosfilt(&self.realized_sos(rate_hz), x)
     }
 
     /// parametric_eq.py:92-106 — ParametricEQ.export_autoeq_format:
@@ -364,4 +485,47 @@ impl ParametricEQ {
         }
         lines.join("\n")
     }
+}
+
+/// Zero-state cascaded direct-form-II-transposed filtering of `x` by an
+/// explicitly supplied SOS array — **Tier 2**, delegate
+/// `scipy.signal.sosfilt(sos, x, zi=None)` (`fixtures/peq/sosfilt_offline`).
+///
+/// A free function taking the sections as an ARGUMENT, with the same signature
+/// shape scipy's has and no `self`. That is deliberate: its caller
+/// [`ParametricEQ::apply_offline`] derives its sections from
+/// `realized_sos(rate_hz)`, so a fixture's arbitrary SOS array could never
+/// reach the filtering through that door — a fixture hung on `apply_offline`
+/// would have graded the policy fold and nothing about the arithmetic.
+///
+/// Per section, following scipy's `_sosfilt` exactly:
+///
+/// ```text
+///   y[n] = b0·x[n] + z0
+///   z0   = b1·x[n] − a1·y[n] + z1
+///   z1   = b2·x[n] − a2·y[n]
+/// ```
+///
+/// `a0` (column 3) is IGNORED, as scipy ignores it: the rows are assumed
+/// already normalized, which is how `biquad.rs` emits them (`row()` divides
+/// through by `a0`). A row with `a0 != 1` therefore means something different
+/// here than a reader might expect, and the same different thing it means to
+/// scipy.
+///
+/// Zero initial state on every call. No filter state survives, so the same
+/// input always produces bit-identical output.
+pub fn sosfilt(sos: &[[f64; 6]], x: &[f64]) -> Vec<f64> {
+    let mut y = x.to_vec();
+    for row in sos {
+        let (b0, b1, b2, a1, a2) = (row[0], row[1], row[2], row[4], row[5]);
+        let (mut z0, mut z1) = (0.0f64, 0.0f64);
+        for v in &mut y {
+            let xn = *v;
+            let yn = b0 * xn + z0;
+            z0 = b1 * xn - a1 * yn + z1;
+            z1 = b2 * xn - a2 * yn;
+            *v = yn;
+        }
+    }
+    y
 }

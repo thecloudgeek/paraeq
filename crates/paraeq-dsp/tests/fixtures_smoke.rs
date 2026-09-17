@@ -44,11 +44,16 @@ fn sweep_fixture_array_lengths_match_json() {
 #[test]
 fn tier2_scipy_direct_fixtures_are_wellformed() {
     let mut cases: Vec<(String, String)> = [
+        ("fir", "min_phase_spectrum"),
+        ("fr", "complex_spectrum"),
+        ("fr", "excess_group_delay"),
         ("fr", "gaussian_sigma2"),
         ("fr", "gaussian_sigma32"),
         ("fr", "gaussian_sigma8"),
         ("fr", "rms_average"),
+        ("fr", "rms_average_weighted"),
         ("logf", "resample_db"),
+        ("peq", "sosfilt_offline"),
         ("room", "schroeder_decay"),
     ]
     .iter()
