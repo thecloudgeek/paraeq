@@ -186,7 +186,301 @@ fn am_gaussian_tracks_scipy_within_method_accuracy() {
     }
 }
 
+#[test]
+fn complex_spectrum_matches_the_numpy_rfft_fixture() {
+    // Magnitude AND phase. `compute_frequency_response` pins the magnitude half
+    // only; `fdw::apply_fdw` and `logf::resample_complex_to_log_grid` both need
+    // the complex spectrum, so the phase half needs its own reference.
+    //
+    // The fixture's n_samples (1024) is deliberately shorter than its n_fft
+    // (4096): np.fft.rfft zero-pads UP TO n_fft and never truncates, so this is
+    // the case that exercises realfft's padding rather than the easy path.
+    let c = Case::load("fr", "complex_spectrum");
+    let n_fft = c.param_u64("n_fft") as usize;
+    let sr = c.param_u64("sample_rate") as u32;
+    // 1e-12, the `logf/resample_db` bar, not the tier table's looser 1e-9:
+    // realfft's packing costs far less than that here. Measured worst bin
+    // against numpy, on a spectrum peaking at 21.3: 1.1e-14 absolute (the axis
+    // itself is bit-identical).
+    let (freqs, spectrum) = fr::complex_spectrum(&c.array("ir"), sr, Some(n_fft)).unwrap();
+    assert_allclose(&freqs, &c.array("freqs"), 1e-12, 1e-9, "rfftfreq");
+    let re: Vec<f64> = spectrum.iter().map(|z| z.re).collect();
+    let im: Vec<f64> = spectrum.iter().map(|z| z.im).collect();
+    assert_allclose(&re, &c.array("spectrum_re"), 1e-12, 1e-12, "spectrum re");
+    assert_allclose(&im, &c.array("spectrum_im"), 1e-12, 1e-12, "spectrum im");
+}
+
+#[test]
+fn complex_spectrum_magnitude_equals_compute_frequency_response() {
+    // The Tier-1 frozen function is the CONTRACT for the magnitude half. Bit
+    // equality, not a tolerance: both go through the same realfft plan, so any
+    // daylight between them means one of the two grew its own FFT path — which
+    // is exactly the drift this test exists to stop.
+    let c = Case::load("fr", "complex_spectrum");
+    let ir = c.array("ir");
+    let n_fft = c.param_u64("n_fft") as usize;
+    let sr = c.param_u64("sample_rate") as u32;
+    let (freqs_complex, spectrum) = fr::complex_spectrum(&ir, sr, Some(n_fft)).unwrap();
+    let (freqs_mag, mag_db) = fr::compute_frequency_response(&ir, sr, Some(n_fft)).unwrap();
+    assert_eq!(freqs_complex, freqs_mag, "the two axes must be identical");
+    let from_complex: Vec<f64> = spectrum
+        .iter()
+        .map(|z| 20.0 * z.norm().max(1e-10).log10())
+        .collect();
+    assert_eq!(from_complex, mag_db, "magnitude must agree bit for bit");
+}
+
+#[test]
+fn excess_group_delay_matches_the_scipy_reference_fixture() {
+    // The stencil is the contract (see the generator's docstring): unwrap each
+    // phase, difference, then np.gradient against the omega COORDINATE ARRAY on
+    // the linear rfft axis. omega is not exactly uniform in float, so numpy
+    // takes its non-uniform branch and the uniform central difference is NOT a
+    // substitute.
+    let c = Case::load("fr", "excess_group_delay");
+    let n_fft = c.param_u64("n_fft") as usize;
+    let sr = c.param_u64("sample_rate") as u32;
+    // Measured worst bin against numpy: 1.8e-15 s absolute, against EGD values
+    // of 1.7…14.7 ms. The absolute floor is set just above that rather than at
+    // it, because the interesting bins are the near-zero ones where the
+    // relative term buys nothing.
+    let egd = fr::excess_group_delay_s(&c.array("ir"), sr, n_fft).unwrap();
+    assert_allclose(&egd, &c.array("egd_s"), 1e-9, 1e-14, "egd_s");
+}
+
+#[test]
+fn weighted_rms_average_and_sigma_match_the_numpy_weighted_fixture() {
+    // Same construction as `rms_average_and_sigma_match_numpy_fixture` above —
+    // same seed, same five pre-aligned curves — plus the weight vector
+    // LowSnrSoft produces. Reusing the construction is what makes
+    // `weighted_with_equal_weights_equals_the_unweighted_one` a claim about the
+    // WEIGHTING rather than about two unrelated data sets.
+    let c = Case::load("fr", "rms_average_weighted");
+    let meas = c.array2("measurements");
+    let freqs = c.array("freqs");
+    let weights = c.array("weights");
+    let rows: Vec<Vec<f64>> = (0..meas.rows)
+        .map(|r| meas.data[r * meas.cols..(r + 1) * meas.cols].to_vec())
+        .collect();
+    let set = fr::align_spl(&rows, &freqs, (200.0, 2000.0)).unwrap();
+    for (j, o) in set.offsets_db().iter().enumerate() {
+        assert!(o.abs() < 1e-12, "offset[{j}] = {o}, expected float noise");
+    }
+    assert_allclose(
+        &fr::average_measurements_rms_weighted(&set, &weights).unwrap(),
+        &c.array("rms_db"),
+        1e-12,
+        1e-12,
+        "weighted rms_db",
+    );
+    assert_allclose(
+        &fr::sigma_db_weighted(&set, &weights).unwrap(),
+        &c.array("sigma_db"),
+        1e-12,
+        1e-12,
+        "weighted sigma_db",
+    );
+}
+
 // ---------------------------------------------------------------- Tier 3
+
+/// The analytic derotated spectrum of a sparse tap set, evaluated directly on
+/// `freqs` — the `test_fdw.rs::exact_derotated_spectrum` oracle, restated here
+/// because integration-test binaries do not share helpers. Each tap's phase is
+/// referenced to `reference_samples`, so the bulk delay is gone by construction
+/// rather than removed by the function under test.
+fn exact_derotated_spectrum(
+    freqs: &[f64],
+    paths: &[(usize, f64)],
+    reference_samples: f64,
+    sample_rate: f64,
+) -> Vec<Complex<f64>> {
+    freqs
+        .iter()
+        .map(|&f| {
+            let mut acc = Complex::new(0.0, 0.0);
+            for &(d, a) in paths {
+                let ph =
+                    -2.0 * std::f64::consts::PI * f * (d as f64 - reference_samples) / sample_rate;
+                acc += Complex::new(a * ph.cos(), a * ph.sin());
+            }
+            acc
+        })
+        .collect()
+}
+
+#[test]
+fn derotate_matches_the_test_helper_oracle() {
+    // logf.rs:122-124, verbatim: "The caller must derotate (remove the bulk
+    // delay) BEFORE calling: at 20 kHz a 50 ms delay winds ~1000 full turns and
+    // no log grid could sample it." The only implementations before this one
+    // were the test helpers in test_fdw.rs; the fdw.rs precedent is that the
+    // oracle is written first and the shipping path is graded against it.
+    //
+    // No fixture: X_k · e^{+j2πf_kτ} has no library delegate, so a numpy case
+    // would pin one line of our own algebra against itself.
+    const SR: f64 = 48_000.0;
+    let paths = [(240usize, 1.0f64), (360, 0.5), (1200, -0.25)];
+    let reference = 240.0;
+    let freqs: Vec<f64> = (0..512)
+        .map(|k| 20.0 * (1000.0f64).powf(k as f64 / 511.0))
+        .collect();
+    // The RAW spectrum still carries the bulk delay.
+    let raw: Vec<Complex<f64>> = exact_derotated_spectrum(&freqs, &paths, 0.0, SR);
+    let derotated = fr::derotate(&raw, &freqs, reference / SR);
+    let want = exact_derotated_spectrum(&freqs, &paths, reference, SR);
+    for (i, (got, exp)) in derotated.iter().zip(&want).enumerate() {
+        let d = (got - exp).norm();
+        assert!(
+            d < 1e-12,
+            "bin {i} @ {:.1} Hz: {got:?} vs {exp:?}",
+            freqs[i]
+        );
+    }
+}
+
+#[test]
+fn derotating_by_zero_is_the_identity() {
+    // The falsifier for a sign error that only shows up off zero: a zero delay
+    // must return the input untouched, bit for bit.
+    let freqs = [20.0, 200.0, 2000.0, 20_000.0];
+    let spectrum: Vec<Complex<f64>> = vec![
+        Complex::new(1.0, 0.0),
+        Complex::new(0.0, -1.0),
+        Complex::new(-0.5, 0.25),
+        Complex::new(3.0, 4.0),
+    ];
+    assert_eq!(fr::derotate(&spectrum, &freqs, 0.0), spectrum);
+}
+
+#[test]
+fn egd_is_zero_for_a_minimum_phase_ir() {
+    // h = δ(t₀) + 0.5·δ(t₀+τ). |g| < 1 puts both zeros INSIDE the unit circle,
+    // so H is already minimum-phase, the reconstruction returns it, and the
+    // excess is identically zero.
+    //
+    // Budget: the homomorphic chain's `+ 1e-7 · min(|H|)` guard against log(0)
+    // perturbs the reconstruction slightly, so "zero" is float-plus-epsilon
+    // rather than exact. Measured on this IR: 4.0e-10 s worst bin. 1e-8 s is
+    // that with ~25× headroom and is still four orders below the 5 ms the
+    // non-minimum-phase case below reports — a half=True regression (which
+    // halves the phase, not the excess) would not hide here, but a sign error
+    // in the phase difference would.
+    const SR: u32 = 48_000;
+    let mut ir = vec![0.0; 2048];
+    ir[0] = 1.0;
+    ir[240] = 0.5;
+    let egd = fr::excess_group_delay_s(&ir, SR, 8192).unwrap();
+    let worst = egd.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    assert!(
+        worst < 1e-8,
+        "minimum-phase EGD should vanish, worst {worst:e} s"
+    );
+}
+
+#[test]
+fn egd_mean_is_the_excess_delay_for_a_non_minimum_phase_two_path_ir() {
+    // h = δ(t₀) + 2·δ(t₀+τ). |g| > 1 reflects the zeros OUTSIDE the unit
+    // circle, so the excess is an all-pass. Its group delay has mean exactly τ,
+    // ripples with period 1/τ in frequency, and spans
+    // [τ(1−|a|)/(1+|a|), τ(1+|a|)/(1−|a|)] with a = 1/g = 0.5.
+    //
+    // τ = 240 samples at 48 kHz = 5 ms ⇒ mean 5 ms, ripple period 200 Hz,
+    // range 1.67 … 15 ms. The upper end is approached, not attained: the
+    // all-pass peak is narrow and the 8192-point rfft axis (5.86 Hz spacing)
+    // does not land on it, so the measured max is 14.67 ms.
+    const SR: u32 = 48_000;
+    const TAU_S: f64 = 240.0 / 48_000.0;
+    let mut ir = vec![0.0; 2048];
+    ir[0] = 1.0;
+    ir[240] = 2.0;
+    let n_fft = 8192;
+    let egd = fr::excess_group_delay_s(&ir, SR, n_fft).unwrap();
+
+    // Drop the two end bins: np.gradient is one-sided (edge_order=1) there, so
+    // they are the one place the stencil is not the interior stencil.
+    let interior = &egd[1..egd.len() - 1];
+    let mean = interior.iter().sum::<f64>() / interior.len() as f64;
+    assert!(
+        (mean - TAU_S).abs() < 1e-5,
+        "mean EGD {mean:e} s, expected τ = {TAU_S:e} s"
+    );
+
+    let lo = interior.iter().fold(f64::INFINITY, |m, v| m.min(*v));
+    let hi = interior.iter().fold(f64::NEG_INFINITY, |m, v| m.max(*v));
+    let a = 0.5;
+    assert!(
+        (lo - TAU_S * (1.0 - a) / (1.0 + a)).abs() < 1e-5,
+        "min EGD {lo:e} s, expected {:e}",
+        TAU_S * (1.0 - a) / (1.0 + a)
+    );
+    assert!(
+        hi > 0.9 * TAU_S * (1.0 + a) / (1.0 - a) && hi <= TAU_S * (1.0 + a) / (1.0 - a),
+        "max EGD {hi:e} s, expected just under {:e}",
+        TAU_S * (1.0 + a) / (1.0 - a)
+    );
+
+    // Ripple period 1/τ = 200 Hz, read off the local maxima's spacing.
+    let df = f64::from(SR) / n_fft as f64;
+    let peaks: Vec<usize> = (1..egd.len() - 1)
+        .filter(|&i| egd[i] > egd[i - 1] && egd[i] > egd[i + 1])
+        .collect();
+    assert!(peaks.len() > 100, "too few ripple peaks: {}", peaks.len());
+    let spacing_hz = (peaks[peaks.len() - 1] - peaks[0]) as f64 * df / (peaks.len() - 1) as f64;
+    assert!(
+        (spacing_hz - 1.0 / TAU_S).abs() < 1.0,
+        "ripple spacing {spacing_hz} Hz, expected {} Hz",
+        1.0 / TAU_S
+    );
+}
+
+#[test]
+fn weighted_with_equal_weights_equals_the_unweighted_one() {
+    // BIT equality, which is the claim worth making: with wᵢ ≡ 1, `w·x == x`
+    // exactly and `Σw == N` exactly, so the weighted accumulation visits the
+    // same values in the same order as the unweighted one. Anything looser here
+    // would let a reordered summation through, and a reordered summation is how
+    // a "harmless" refactor of the frozen unweighted path would first show up.
+    let c = Case::load("fr", "rms_average");
+    let meas = c.array2("measurements");
+    let freqs = c.array("freqs");
+    let rows: Vec<Vec<f64>> = (0..meas.rows)
+        .map(|r| meas.data[r * meas.cols..(r + 1) * meas.cols].to_vec())
+        .collect();
+    let set = fr::align_spl(&rows, &freqs, (200.0, 2000.0)).unwrap();
+    let ones = vec![1.0; meas.rows];
+    assert_eq!(
+        fr::average_measurements_rms_weighted(&set, &ones).unwrap(),
+        fr::average_measurements_rms(&set),
+    );
+    assert_eq!(
+        fr::sigma_db_weighted(&set, &ones).unwrap(),
+        fr::sigma_db(&set)
+    );
+}
+
+#[test]
+fn weighted_estimators_reject_a_bad_weight_vector() {
+    // A weight vector that does not index the positions, a negative weight, a
+    // non-finite weight, and an all-zero vector (Σw = 0 ⇒ a division by zero
+    // that would surface as NaN curves deep in `authority.rs`).
+    let c = Case::load("fr", "rms_average");
+    let meas = c.array2("measurements");
+    let freqs = c.array("freqs");
+    let rows: Vec<Vec<f64>> = (0..meas.rows)
+        .map(|r| meas.data[r * meas.cols..(r + 1) * meas.cols].to_vec())
+        .collect();
+    let set = fr::align_spl(&rows, &freqs, (200.0, 2000.0)).unwrap();
+    for bad in [
+        vec![1.0; meas.rows - 1],
+        vec![1.0, 1.0, -0.5, 1.0, 1.0],
+        vec![1.0, 1.0, f64::NAN, 1.0, 1.0],
+        vec![0.0; meas.rows],
+    ] {
+        assert!(fr::average_measurements_rms_weighted(&set, &bad).is_err());
+        assert!(fr::sigma_db_weighted(&set, &bad).is_err());
+    }
+}
 
 #[test]
 fn power_averaging_floors_correctly() {

@@ -10,13 +10,20 @@
 //!
 //! The room additions below are STRICTLY ADDITIVE — new functions, never
 //! modified ones. Test tier: 2 + 3. Tier 2 pins `average_measurements_rms` and
-//! `sigma_db` against numpy references at 1e-12 and the Alvarez–Mazorra
-//! Gaussian against `scipy.ndimage.gaussian_filter1d` at the method's MEASURED
-//! accuracy — 0.03/0.06/0.13 dB for σ = 2/8/32 bins (the AM recursion is by
-//! construction an approximation, and its second-difference discretization
-//! floor makes the spec's 1e-3 dB unattainable at any K; the transfer-function
-//! argument lives in `test_fr_room.rs`). Tier 3 pins the power-mean inequality
-//! and the null-floor formula.
+//! `sigma_db` **and their weighted variants** against numpy references at
+//! 1e-12, `complex_spectrum` against `np.fft.rfft` / `np.fft.rfftfreq`,
+//! `excess_group_delay_s` against `scipy.signal.minimum_phase(..., half=False)`
+//! plus numpy's `unwrap`/`gradient`, and the Alvarez–Mazorra Gaussian against
+//! `scipy.ndimage.gaussian_filter1d` at the method's MEASURED accuracy —
+//! 0.03/0.06/0.13 dB for σ = 2/8/32 bins (the AM recursion is by construction
+//! an approximation, and its second-difference discretization floor makes the
+//! spec's 1e-3 dB unattainable at any K; the transfer-function argument lives
+//! in `test_fr_room.rs`). Tier 3 pins the power-mean inequality, the null-floor
+//! formula, `derotate` against the in-crate `exact_derotated_spectrum` oracle
+//! (there is no library delegate for `X_k · e^{+j2πf_kτ}`, so a fixture would
+//! pin one line of our own algebra against itself), and the two closed-form EGD
+//! invariants — zero for a minimum-phase IR, mean exactly τ for a two-path IR
+//! with |g| > 1.
 
 use crate::{logf::LogGrid, Complex, DspError};
 use realfft::RealFftPlanner;
@@ -319,6 +326,113 @@ pub fn sigma_db(set: &AlignedSet) -> Vec<f64> {
     var.iter().map(|s| (s / n_pos).sqrt()).collect()
 }
 
+/// Weighted power/RMS spatial average — [`average_measurements_rms`] with a
+/// per-position reliability weight. Room path ONLY.
+/// `out_dB[i] = 10·log10( Σ_j w_j·10^(m_j[i]/10) / Σ_j w_j )`
+///
+/// The de-weighting `LowSnrSoft` applies: a position whose sweep came back
+/// short of the SNR budget still carries information, so it is down-weighted
+/// rather than dropped. Dropping it would change `N` and therefore the null
+/// floor `10·log10((N−k)/N)` that [`average_measurements_rms`] documents;
+/// weighting leaves the ensemble intact.
+///
+/// `weights` is index-parallel to `set.measurements_db()`. Unlike the unweighted
+/// pair, this takes an input the [`AlignedSet`] type cannot vouch for, so it
+/// validates and returns `Result`: a ragged, negative, non-finite or all-zero
+/// weight vector would otherwise surface as NaN curves inside `authority.rs`,
+/// where the confidence signal silently stops meaning anything.
+///
+/// Equal weights reproduce [`average_measurements_rms`] BIT for bit — `1.0·x`
+/// is exactly `x` and `Σ1.0` is exactly `N` — which is what
+/// `weighted_with_equal_weights_equals_the_unweighted_one` asserts.
+pub fn average_measurements_rms_weighted(
+    set: &AlignedSet,
+    weights: &[f64],
+) -> Result<Vec<f64>, DspError> {
+    let sum_w = validate_weights(set, weights)?;
+    let bins = set.measurements_db.first().map_or(0, Vec::len);
+    let mut power_sum = vec![0.0; bins];
+    for (m, w) in set.measurements_db.iter().zip(weights) {
+        for (p, v) in power_sum.iter_mut().zip(m) {
+            *p += w * 10f64.powf(v / 10.0);
+        }
+    }
+    Ok(power_sum
+        .iter()
+        .map(|p| 10.0 * (p / sum_w).log10())
+        .collect())
+}
+
+/// Weighted per-frequency inter-position standard deviation, dB — [`sigma_db`]
+/// with the same per-position reliability weights.
+///
+/// THE CONVENTION IS STATED BECAUSE NUMPY HAS NO DELEGATE FOR IT. `np.average`
+/// takes weights; `np.std` does not. These are **reliability weights** with
+/// **ddof = 0**:
+///
+/// ```text
+///   x̄_w = Σ w_i·x_i / Σ w_i
+///   σ²  = Σ w_i·(x_i − x̄_w)² / Σ w_i
+/// ```
+///
+/// NOT frequency weights, which would divide by `Σw − 1` and read a weight of
+/// 0.25 as "a quarter of an observation". A de-weighted position is one
+/// position measured less confidently, not a fractional position, so the
+/// population denominator is the right one and the fixture grades that choice.
+pub fn sigma_db_weighted(set: &AlignedSet, weights: &[f64]) -> Result<Vec<f64>, DspError> {
+    let sum_w = validate_weights(set, weights)?;
+    let bins = set.measurements_db.first().map_or(0, Vec::len);
+    let mut mean = vec![0.0; bins];
+    for (m, w) in set.measurements_db.iter().zip(weights) {
+        for (a, v) in mean.iter_mut().zip(m) {
+            *a += w * v;
+        }
+    }
+    for a in &mut mean {
+        *a /= sum_w;
+    }
+    let mut var = vec![0.0; bins];
+    for (m, w) in set.measurements_db.iter().zip(weights) {
+        for ((s, v), a) in var.iter_mut().zip(m).zip(&mean) {
+            let d = v - a;
+            *s += w * (d * d);
+        }
+    }
+    Ok(var.iter().map(|s| (s / sum_w).sqrt()).collect())
+}
+
+/// Shared precondition for the two weighted estimators; returns `Σw`.
+///
+/// `Σw > 0` is the load-bearing one: it is the divisor in both, so an all-zero
+/// vector is a division by zero that produces NaN rather than an error, and NaN
+/// σ(f) makes `authority.rs` back off from features that are perfectly
+/// correctable — a silent loss of correction, not a crash.
+fn validate_weights(set: &AlignedSet, weights: &[f64]) -> Result<f64, DspError> {
+    if weights.len() != set.measurements_db.len() {
+        return Err(DspError::InvalidInput(format!(
+            "{} weights for {} positions (must be index-parallel)",
+            weights.len(),
+            set.measurements_db.len()
+        )));
+    }
+    if let Some((j, w)) = weights
+        .iter()
+        .enumerate()
+        .find(|(_, w)| !w.is_finite() || **w < 0.0)
+    {
+        return Err(DspError::InvalidInput(format!(
+            "weight {j} is {w}; weights must be finite and >= 0"
+        )));
+    }
+    let sum_w = weights.iter().sum::<f64>();
+    if sum_w <= 0.0 {
+        return Err(DspError::InvalidInput(
+            "weights sum to 0; there would be nothing left to average".into(),
+        ));
+    }
+    Ok(sum_w)
+}
+
 /// Coherent (vector) average. ALWAYS `Err` for `n > 1` — a tripwire, kept so the
 /// error is discoverable rather than the operation reinvented. It collapses
 /// toward the incoherent floor `−10·log10(N)` once position spread approaches a
@@ -501,4 +615,202 @@ fn variable_gaussian_smooth(magnitude_db: &[f64], grid: &LogGrid) -> Vec<f64> {
             num / den
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Analysis primitives (decision-engine, analysis stage) — additive.
+// ---------------------------------------------------------------------------
+
+/// The COMPLEX linear-axis spectrum, plus its frequency axis — Tier 2 against
+/// `np.fft.rfft` / `np.fft.rfftfreq` (`fixtures/fr/complex_spectrum`).
+///
+/// [`compute_frequency_response`] returns magnitude only, and two consumers
+/// need the phase: `fdw::apply_fdw` takes `&[Complex<f64>]`, and
+/// `logf::resample_complex_to_log_grid` (`logf.rs`) requires a complex
+/// linear-axis spectrum. Rather than widen the Tier-1 frozen function, this is
+/// the complex sibling; `complex_spectrum_magnitude_equals_compute_frequency_response`
+/// is the test that stops the two growing separate FFT paths.
+///
+/// `n_fft` is a zero-PAD length, never a truncation: `np.fft.rfft(x, n)` pads
+/// `x` up to `n` and only drops samples when `x` is longer, which is the same
+/// `min(ir.len(), n)` copy [`compute_frequency_response`] makes.
+pub fn complex_spectrum(
+    ir: &[f64],
+    sample_rate: u32,
+    n_fft: Option<usize>,
+) -> Result<(Vec<f64>, Vec<Complex<f64>>), DspError> {
+    let n = n_fft.unwrap_or(ir.len());
+    if n == 0 {
+        return Err(DspError::InvalidInput(
+            "FFT length is 0 (empty impulse response, or explicit n_fft=0)".into(),
+        ));
+    }
+    let mut planner = RealFftPlanner::<f64>::new();
+    let fft = planner.plan_fft_forward(n);
+    let mut input = vec![0.0; n];
+    let m = ir.len().min(n);
+    input[..m].copy_from_slice(&ir[..m]);
+    let mut spectrum = fft.make_output_vec();
+    fft.process(&mut input, &mut spectrum).unwrap();
+    let freqs: Vec<f64> = (0..spectrum.len())
+        .map(|i| i as f64 * sample_rate as f64 / n as f64)
+        .collect();
+    Ok((freqs, spectrum))
+}
+
+/// Remove a bulk delay from a spectrum: `X_k · e^{+j2πf_kτ}`.
+///
+/// Tier 3, graded against the analytic `exact_derotated_spectrum` oracle in
+/// `tests/test_fr_room.rs` (the `fdw.rs` precedent: the oracle is written
+/// first, the shipping path is graded against it). There is no library delegate
+/// for one line of complex algebra, and a numpy fixture would pin our own
+/// arithmetic against a transcription of itself.
+///
+/// MANDATORY before resampling onto a log grid. `logf.rs`, verbatim: "The
+/// caller must derotate (remove the bulk delay) BEFORE calling: at 20 kHz a
+/// 50 ms delay winds ~1000 full turns and no log grid could sample it."
+///
+/// Sign: the measured spectrum of an IR whose energy starts at `τ` carries
+/// `e^{−j2πfτ}`, so removing it MULTIPLIES by the conjugate, `e^{+j2πfτ}`.
+/// `delay_s == 0.0` therefore returns the input bit for bit.
+pub fn derotate(spectrum: &[Complex<f64>], freqs_hz: &[f64], delay_s: f64) -> Vec<Complex<f64>> {
+    if delay_s == 0.0 {
+        return spectrum.to_vec();
+    }
+    spectrum
+        .iter()
+        .zip(freqs_hz)
+        .map(|(x, f)| {
+            let ph = 2.0 * std::f64::consts::PI * f * delay_s;
+            x * Complex::new(ph.cos(), ph.sin())
+        })
+        .collect()
+}
+
+/// Excess group delay, seconds, on the LINEAR rfft axis of `n_fft` —
+/// **Evidence only in v1**. It is an input to no decision.
+///
+/// Tier 2 (`fixtures/fr/excess_group_delay`, scipy + numpy) **plus** Tier 3
+/// (two closed-form invariants in `tests/test_fr_room.rs`). Measured group
+/// delay minus the group delay of the minimum-phase reconstruction of the same
+/// magnitude, "the EGD trace computed as REW does it"
+/// (`docs/decisions/2026-07-21-decision-engine-open-questions.md`). Flat over a
+/// region ⇒ that region is minimum-phase ⇒ a boost there is meaningful.
+///
+/// Reaches `paraeq-decide` as `Analysis::excess_group_delay_s`, a declared and
+/// serialized field that until now nothing computed, and is attached as
+/// `EvidenceLabel::ExcessGroupDelay`. The gate that would consume it ships in
+/// v1.1 behind `EgdGate::Off`; do not build it here.
+///
+/// # The discretization IS the contract
+///
+/// Three choices, all pinned by the fixture, because the derivative is where a
+/// transcription would hide:
+///
+/// 1. **Unwrap each phase separately, then difference.** Unwrapping the
+///    difference instead would fold the two wrap sequences together.
+/// 2. **Differentiate against the `omega` COORDINATE ARRAY**, numpy's
+///    non-uniform `np.gradient` stencil — see [`gradient_against`]. A uniform
+///    central difference is close but not the same function.
+/// 3. **On the linear rfft axis.** Resampling onto a log grid happens
+///    afterwards, in the caller, never inside the derivative.
+///
+/// It consumes [`crate::fir::minimum_phase_spectrum`] (half=False), NOT the
+/// private `half=True` port that `design_fir_correction` uses: half=True halves
+/// the phase, and an EGD built on it would be `φ_meas − ½·φ_min` — wrong
+/// everywhere and plausible-looking.
+pub fn excess_group_delay_s(
+    ir: &[f64],
+    sample_rate: u32,
+    n_fft: usize,
+) -> Result<Vec<f64>, DspError> {
+    let (freqs, measured) = complex_spectrum(ir, sample_rate, Some(n_fft))?;
+    if freqs.len() < 3 {
+        return Err(DspError::InvalidInput(format!(
+            "excess_group_delay_s: n_fft {n_fft} gives {} bins; the derivative needs at least 3",
+            freqs.len()
+        )));
+    }
+    let minimum = crate::fir::minimum_phase_spectrum(ir, n_fft)?;
+    debug_assert_eq!(minimum.len(), measured.len());
+    let phase_measured = unwrap_phase(&measured);
+    let phase_minimum = unwrap_phase(&minimum);
+    let excess: Vec<f64> = phase_measured
+        .iter()
+        .zip(&phase_minimum)
+        .map(|(m, n)| m - n)
+        .collect();
+    let omega: Vec<f64> = freqs
+        .iter()
+        .map(|f| 2.0 * std::f64::consts::PI * f)
+        .collect();
+    Ok(gradient_against(&excess, &omega)
+        .into_iter()
+        .map(|g| -g)
+        .collect())
+}
+
+/// `np.unwrap(np.angle(spectrum))`, transcribed.
+///
+/// The running correction accumulates against the RAW differences, exactly as
+/// numpy does (`up[1:] = p[1:] + cumsum(ph_correct)`); accumulating against
+/// already-corrected samples is the off-by-one that makes an unwrap drift.
+/// `rem_euclid` is numpy's float `mod` for a positive divisor: fmod, then add
+/// the divisor back if the sign disagrees.
+///
+/// The `|dd| < π ⇒ correction = 0` clause is numpy's and is kept even though
+/// `ddmod == dd` there anyway: it makes the no-wrap case EXACTLY zero rather
+/// than float dust, which is what lets the two phases below cancel cleanly.
+fn unwrap_phase(spectrum: &[Complex<f64>]) -> Vec<f64> {
+    use std::f64::consts::PI;
+    let two_pi = 2.0 * PI;
+    let raw: Vec<f64> = spectrum.iter().map(|z| z.im.atan2(z.re)).collect();
+    let mut out = raw.clone();
+    let mut cumulative = 0.0;
+    for i in 1..raw.len() {
+        let dd = raw[i] - raw[i - 1];
+        let mut ddmod = (dd + PI).rem_euclid(two_pi) - PI;
+        // numpy's boundary_ambiguous rule: a difference that lands exactly on
+        // -pi came from a rising phase, so it wraps up, not down.
+        if ddmod == -PI && dd > 0.0 {
+            ddmod = PI;
+        }
+        if dd.abs() >= PI {
+            cumulative += ddmod - dd;
+        }
+        out[i] = raw[i] + cumulative;
+    }
+    out
+}
+
+/// `np.gradient(f, x)` for a 1-D coordinate array — numpy's NON-uniform branch,
+/// with `edge_order = 1`.
+///
+/// Always the non-uniform stencil, deliberately. numpy switches to a uniform
+/// formula only when `(diff(x) == diff(x)[0]).all()`, and the axis this is used
+/// on — `omega = 2π·rfftfreq` — does NOT satisfy that in floating point (16
+/// distinct spacings at n_fft = 8192, spread 4.4e-11). Branching on the same
+/// test here would buy nothing: where the axis really is uniform the two
+/// formulas agree to ~1e-17, far below the 1e-9 the fixture is graded at, and a
+/// branch is one more thing to get wrong.
+///
+/// Interior weights come from the two LOCAL spacings, so the second-order
+/// accuracy survives an uneven axis; the ends are plain one-sided differences,
+/// which is numpy's `edge_order = 1` default. Term order matches numpy's
+/// `a*f[:-2] + b*f[1:-1] + c*f[2:]` — verified bit-identical against numpy on
+/// this axis.
+fn gradient_against(f: &[f64], x: &[f64]) -> Vec<f64> {
+    let n = f.len();
+    let mut out = vec![0.0; n];
+    for i in 1..n - 1 {
+        let hs = x[i] - x[i - 1];
+        let hd = x[i + 1] - x[i];
+        let a = -hd / (hs * (hs + hd));
+        let b = (hd - hs) / (hs * hd);
+        let c = hs / (hd * (hs + hd));
+        out[i] = a * f[i - 1] + b * f[i] + c * f[i + 1];
+    }
+    out[0] = (f[1] - f[0]) / (x[1] - x[0]);
+    out[n - 1] = (f[n - 1] - f[n - 2]) / (x[n - 1] - x[n - 2]);
+    out
 }

@@ -1,0 +1,38 @@
+{
+ "arrays": {
+  "freqs": {
+   "file": "complex_spectrum.freqs.f64",
+   "len": 2049,
+   "shape": [
+    2049
+   ]
+  },
+  "ir": {
+   "file": "complex_spectrum.ir.f64",
+   "len": 1024,
+   "shape": [
+    1024
+   ]
+  },
+  "spectrum_im": {
+   "file": "complex_spectrum.spectrum_im.f64",
+   "len": 2049,
+   "shape": [
+    2049
+   ]
+  },
+  "spectrum_re": {
+   "file": "complex_spectrum.spectrum_re.f64",
+   "len": 2049,
+   "shape": [
+    2049
+   ]
+  }
+ },
+ "params": {
+  "n_fft": 4096,
+  "n_samples": 1024,
+  "sample_rate": 48000
+ },
+ "scalars": {}
+}
