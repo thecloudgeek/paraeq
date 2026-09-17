@@ -1,17 +1,17 @@
-//! Pure analysis for the two-clock experiment (measurement-suite/9): timing
-//! markers, matched-filter marker location, and least-squares clock-skew
-//! estimation. No FFI, no unsafe.
+//! Pure analysis and assembly for the two-clock problem: the timing markers a
+//! stimulus is bracketed with, matched-filter marker location, least-squares
+//! clock-skew estimation, and the reject bound on the adjustment that comes out
+//! of it.
 //!
-//! **Moved here from `paraeq-coreaudio` in Stage 6 (build plan B12).** The
-//! header this replaces said the module lived there "only because the
-//! `#[ignore]`d hardware harness (tests/test_measure_hardware.rs) that feeds
-//! it real captures lives here; it can migrate to a policy crate later" — this
-//! is that migration. `paraeq-measure` needs marker recovery for the
-//! verification pass, and the MS-1 dependency gate in
-//! `.github/workflows/ci.yml` forbids that crate from depending on
-//! `paraeq-coreaudio`, so the analysis comes down to the pure-math crate.
-//! `paraeq_coreaudio::two_clock` is a re-export of this module, so the hardware
-//! harness compiles unchanged. Nothing below this header changed.
+//! **Moved here from `paraeq-coreaudio` in Stage 6 (build plan B12).** This
+//! module's own header used to say it lived there "only because the `#[ignore]`d
+//! hardware harness (tests/test_measure_hardware.rs) that feeds it real captures
+//! lives here; it can migrate to a policy crate later" — this is that migration,
+//! taken because `paraeq-measure` needs marker recovery for the verification
+//! pass while CI forbids that crate from depending on `paraeq-coreaudio` (the
+//! MS-1 dependency gate in `.github/workflows/ci.yml`). There is no FFI and no
+//! `unsafe` here and there never was. `paraeq_coreaudio::two_clock` is now a
+//! re-export of this module, so the hardware harness compiles unchanged.
 //!
 //! Method: the adopted two-clock resolution is REW's bracketed-timing-marker
 //! skew estimate + resample (decision doc 2026-07-21 §Q6, ~12 ppm typical).
@@ -20,17 +20,95 @@
 //! (sub-sample, after parabolic refinement) arrival times even through a
 //! loudspeaker + room + mic chain. Playing markers at known positions on the
 //! OUTPUT clock and locating them on the CAPTURE clock gives, via a linear
-//! fit, the clock-rate ratio (skew, in ppm) and the per-marker residuals
-//! (the t=0 jitter the specs demand data for).
+//! fit, the clock-rate ratio (skew, in ppm) and the per-marker residuals.
 //!
 //! Sign convention: positive [`SkewEstimate::skew_ppm`] means the capture
 //! clock runs FAST relative to the playback clock (more capture samples
 //! elapse between markers than playback samples).
 //!
-//! Test tier: 3 — analytic invariants (a synthetic capture with a known
-//! inserted skew must return that skew; a marker train embedded at known
-//! offsets must be found exactly). The hardware numbers themselves come only
-//! from the `#[ignore]`d harness on the owner's rig.
+//! # Four markers, not two — and why the residual figure depends on it
+//!
+//! [`estimate_skew`] fits **two** parameters (an intercept and a slope). A
+//! two-marker bracket therefore has **zero residual degrees of freedom**: the
+//! fitted line passes exactly through both points and every entry of
+//! [`SkewEstimate::residuals_samples`] is identically `0.0`. That figure is
+//! surfaced to the user as evidence, so it must not be fiction — hence
+//! [`MarkerLayout::markers_per_end`] defaults to **2**, giving four markers, two
+//! degrees of freedom and a real `residual_peak_samples`.
+//!
+//! Two clusters of two is admittedly a weaker figure than four markers spread
+//! evenly across the file: it mostly measures **intra-cluster** jitter, because
+//! the two members of a pair sit 0.30 s apart while the pairs themselves sit a
+//! whole sweep apart. It is nonetheless a **real** number rather than an
+//! algebraic zero, and it is what the tight-bracket geometry allows — the
+//! bracket has to hug the sweep or the file grows without buying anything.
+//! Pinned by `four_markers_give_a_nonzero_residual_figure_and_two_do_not`.
+//!
+//! # Marker LEVEL is the caller's, and it is never 1.0
+//!
+//! [`default_marker`] is documented at peak **1.0**, and splicing it verbatim
+//! into a file whose sweep sits at `L_verify ≈ −18 dBFS RMS` would put a
+//! full-scale 50 ms burst into the transducer — louder than anything the
+//! measurement caps table validated, and on the Direct path that burst is
+//! tap-**excluded**, i.e. the one signal the engine's safety clamps never see
+//! (`docs/specs/2026-07-15-measurement-safety-design.md`, the self-exclusion
+//! invariant). So [`bracket`] takes `marker_scale` as an argument and the
+//! caller passes the **realized peak of the levelled sweep**, `max|sweep|`. One
+//! rule on both paths. Pinned by `markers_never_exceed_the_sweep_peak`.
+//!
+//! # The matched-filter template is an ARGUMENT, never built inside
+//!
+//! [`locate`] takes the template it correlates against. That asymmetry is the
+//! only difference between the two capture paths and it must be visible at the
+//! call site:
+//!
+//! - **Direct (baseline)** passes the raw marker, [`layout_marker`].
+//! - **Helper (verification)** passes the marker **filtered through the
+//!   installed correction**, `peq.apply_offline(layout_marker(..), rate) ×
+//!   preamp_lin`.
+//!
+//! The reason is that the verification marker traverses the correction cascade
+//! on its way to the mic, so correlating a *raw* template against a
+//! *chain-shaped* marker biases the peak by the cascade's group delay in the
+//! marker's 2–8 kHz band. That bias is **common-mode across both ends of the
+//! bracket**, so it lands entirely in [`SkewEstimate::intercept_samples`] —
+//! which is exactly the number used as `t = 0` — and it is invisible to a
+//! residual-scatter gate. Filtering the template is unbiased by construction
+//! (the autocorrelation of `h*m` peaks at zero lag) and it corrects magnitude
+//! shaping as well as phase. Pinned by
+//! `the_correction_biases_the_intercept_and_the_filtered_template_removes_it`
+//! and by `skew_is_invariant_to_the_correction`.
+//!
+//! # Test tiers
+//!
+//! The three functions that moved keep their original declaration verbatim:
+//!
+//! > Test tier: 3 — analytic invariants (a synthetic capture with a known
+//! > inserted skew must return that skew; a marker train embedded at known
+//! > offsets must be found exactly). The hardware numbers themselves come only
+//! > from the `#[ignore]`d harness on the owner's rig.
+//!
+//! — and that covers [`default_marker`], [`marker_chirp`], [`find_marker_train`]
+//! and [`estimate_skew`]. The items added by the move declare their own:
+//!
+//! - [`MarkerLayout`] and [`SweepSpan`] — plain data. **No tier**, stated rather
+//!   than omitted, because a silent omission reads as an oversight. They carry
+//!   no arithmetic of their own; the arithmetic is in the three functions below
+//!   and is graded there.
+//! - [`MAX_CLOCK_ADJUST_PPM`] — a `[NEEDS DATA]` constant, not a computation.
+//!   **No tier.**
+//! - [`bracket`] — **Tier 3.** Splicing at known offsets and scaling by a
+//!   supplied factor has no library delegate, and a numpy transcription of our
+//!   own layout would launder the layout into a fixture, which is the one thing
+//!   `prototype/tools/generate_fixtures.py`'s Tier-2 rule forbids ("the
+//!   fixture's provenance is the library, not our own ported code").
+//! - [`expected_marker_positions`] and [`layout_marker`] — **Tier 3**, same
+//!   reason: they are the layout, and the layout is ours. The invariant that
+//!   matters is that assembly and analysis agree, which is an in-crate
+//!   round trip (`expected_marker_positions_matches_the_assembled_offsets`,
+//!   `the_default_layouts_marker_is_exactly_default_marker`).
+//! - [`locate`] — **Tier 3.** It is a thin adapter over [`find_marker_train`],
+//!   which the declaration above already covers for the same reason.
 
 /// One located marker in a capture.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -55,7 +133,13 @@ pub struct SkewEstimate {
     /// (playback start latency + acoustic propagation).
     pub intercept_samples: f64,
     /// Per-marker residuals from the fit, in capture samples — the t=0
-    /// jitter figure the two-clock risk row asks for.
+    /// jitter figure the two-clock risk row asks for, **and only with three or
+    /// more markers**. The fit has two parameters, so a two-marker bracket has
+    /// zero residual degrees of freedom and every entry here is identically
+    /// `0.0`: the line passes exactly through both points. That is why
+    /// [`MarkerLayout::markers_per_end`] is 2 and the product's bracket carries
+    /// four. With four markers the figure is real but weighted toward
+    /// intra-pair jitter — see the module header.
     pub residuals_samples: Vec<f64>,
     pub residual_peak_samples: f64,
     pub residual_rms_samples: f64,
@@ -260,6 +344,316 @@ pub fn estimate_skew(expected: &[f64], measured: &[f64]) -> Option<SkewEstimate>
         residual_rms_samples: residual_rms,
         skew_ppm: (slope - 1.0) * 1e6,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Added with the Stage 6 move (build plan B12): the bracket layout, its
+// assembly and recovery halves, and §Q6's reject bound on the adjustment.
+// ---------------------------------------------------------------------------
+
+/// §Q6's "clock adjustment too large" reject bound, in parts per million.
+///
+/// `docs/decisions/2026-07-21-decision-engine-open-questions.md` §Q6, verbatim:
+/// "set a **'clock adjustment too large' reject bound** from that data (REW
+/// warns above its own bound)". A credibility ladder that gates
+/// [`SkewEstimate::residual_peak_samples`] **only** would bless an absurd
+/// `skew_ppm` that happens to fit tightly — four markers on a straight line fit
+/// a straight line perfectly no matter how steep it is — and then stretch the
+/// capture by half a percent on the strength of it. This constant is the only
+/// thing between that fit and that resample; the consumer refuses above it.
+///
+/// **`[NEEDS DATA]`.** Cut against §Q6's own measured figure — "Only 12 ppm …
+/// when output and input are on different devices" — with an order of magnitude
+/// of headroom, so a real rig has room to be worse than REW's without being
+/// refused, while a mis-scaled fit (a factor of two is 500 000 ppm) cannot pass.
+/// Retune it from the first hardware runs; it is a starting value, not a
+/// measurement. Pinned by `an_absurd_ppm_with_a_tight_fit_still_refuses`.
+pub const MAX_CLOCK_ADJUST_PPM: f64 = 200.0;
+
+/// The shipped bracket, and the only one the product assembles.
+///
+/// ```text
+///  0.50 lead-in │ M1a 0.05 │ 0.25 │ M1b 0.05 │ 0.25 │ SWEEP T │ 0.25 │ M2a 0.05 │ 0.25 │ M2b 0.05 │ 0.50 tail
+/// ```
+///
+/// 2.20 s of overhead, so a sweep capped at 5.5 s per class produces a 7.70 s
+/// file. `markers_per_end = 2` is the four-marker bracket the module header
+/// argues for. Pinned by `the_default_layout_costs_two_point_two_seconds`.
+pub const DEFAULT_MARKER_LAYOUT: MarkerLayout = MarkerLayout {
+    guard_gap_s: 0.25,
+    lead_in_s: 0.50,
+    marker_s: 0.05,
+    markers_per_end: 2,
+    pair_gap_s: 0.25,
+    tail_s: 0.50,
+};
+
+/// Where the timing markers sit, in seconds on the PLAYBACK clock.
+///
+/// Recorded with every capture, because two captures that are aligned by
+/// different means cannot be subtracted: the verification pass compares a
+/// corrected measurement against an uncorrected baseline, and that subtraction
+/// is only apples-to-apples if both were bracketed the same way.
+///
+/// See [`DEFAULT_MARKER_LAYOUT`] for the timeline this describes. Fields are in
+/// alphabetical order, not timeline order — the diagram is the timeline.
+///
+/// Durations that are negative, `NaN` or absurd collapse to zero frames rather
+/// than panicking; the resulting file is short and unbracketed, and [`locate`]
+/// then returns `None`, which is the caller's refusal path.
+///
+/// **No test tier** — plain data, no arithmetic of its own. See the module
+/// header.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MarkerLayout {
+    /// Silence between the lead-in marker pair and the sweep, and between the
+    /// sweep and the trailing pair.
+    pub guard_gap_s: f64,
+    /// Silence before the first marker. It exists so the first marker cannot
+    /// fall before the capture's first sample when the capture starts late.
+    pub lead_in_s: f64,
+    /// Length of one marker chirp. [`DEFAULT_MARKER_LAYOUT`] uses 0.05, which
+    /// makes [`layout_marker`] exactly [`default_marker`].
+    pub marker_s: f64,
+    /// Markers at EACH end, so the train has `2 × markers_per_end` members.
+    /// 2 is the shipped value; 1 is degenerate (the fit then has zero residual
+    /// degrees of freedom — see the module header) and 3 is what the hardware
+    /// harness uses.
+    pub markers_per_end: usize,
+    /// Silence between the two markers of one pair.
+    pub pair_gap_s: f64,
+    /// Silence after the last marker.
+    pub tail_s: f64,
+}
+
+impl MarkerLayout {
+    /// Frames from the sweep's last sample to the first trailing marker's start
+    /// is [`MarkerLayout::guard_gap_s`]; this is that gap in frames.
+    pub fn guard_gap_frames(&self, sample_rate_hz: f64) -> usize {
+        frames(self.guard_gap_s, sample_rate_hz)
+    }
+
+    /// Frames of silence before the first marker.
+    pub fn lead_in_frames(&self, sample_rate_hz: f64) -> usize {
+        frames(self.lead_in_s, sample_rate_hz)
+    }
+
+    /// Length of one marker in frames. Equals `layout_marker(..).len()` by
+    /// construction: both round `marker_s × rate`.
+    pub fn marker_frames(&self, sample_rate_hz: f64) -> usize {
+        frames(self.marker_s, sample_rate_hz)
+    }
+
+    /// Total markers in the train, `2 × markers_per_end`. This is the count
+    /// [`locate`] asks [`find_marker_train`] for and the length
+    /// [`expected_marker_positions`] returns.
+    pub fn markers(&self) -> usize {
+        2 * self.markers_per_end
+    }
+
+    /// Frames of silence between the two markers of one pair.
+    pub fn pair_gap_frames(&self, sample_rate_hz: f64) -> usize {
+        frames(self.pair_gap_s, sample_rate_hz)
+    }
+
+    /// Start-to-start spacing inside a pair, in frames: one marker plus one
+    /// pair gap. The tightest spacing anywhere in the train, which is what sets
+    /// [`locate`]'s matched-filter exclusion radius.
+    pub fn pair_step_frames(&self, sample_rate_hz: f64) -> usize {
+        self.marker_frames(sample_rate_hz) + self.pair_gap_frames(sample_rate_hz)
+    }
+
+    /// Frame index of the sweep's first sample in an assembled file.
+    pub fn sweep_start(&self, sample_rate_hz: f64) -> usize {
+        let lead = self.lead_in_frames(sample_rate_hz);
+        if self.markers_per_end == 0 {
+            return lead;
+        }
+        lead + (self.markers_per_end - 1) * self.pair_step_frames(sample_rate_hz)
+            + self.marker_frames(sample_rate_hz)
+            + self.guard_gap_frames(sample_rate_hz)
+    }
+
+    /// Frames of silence after the last marker.
+    pub fn tail_frames(&self, sample_rate_hz: f64) -> usize {
+        frames(self.tail_s, sample_rate_hz)
+    }
+
+    /// Total length of the assembled file, in frames, for a sweep of
+    /// `sweep_len` samples.
+    pub fn total_len(&self, sweep_len: usize, sample_rate_hz: f64) -> usize {
+        let after_sweep = self.sweep_start(sample_rate_hz) + sweep_len;
+        if self.markers_per_end == 0 {
+            return after_sweep + self.tail_frames(sample_rate_hz);
+        }
+        after_sweep
+            + self.guard_gap_frames(sample_rate_hz)
+            + (self.markers_per_end - 1) * self.pair_step_frames(sample_rate_hz)
+            + self.marker_frames(sample_rate_hz)
+            + self.tail_frames(sample_rate_hz)
+    }
+}
+
+/// Where the sweep sits inside an assembled, bracketed file.
+///
+/// The verification level book measures `level_dbfs` over the SWEEP SPAN and
+/// not over the file, because the lead-in, the gaps and the tail are silence
+/// and would drag the RMS down by an amount that depends on the layout rather
+/// than on the level. This is the span it means.
+///
+/// **No test tier** — plain data. See the module header.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SweepSpan {
+    /// Sweep length in samples. Identical to the input sweep's length:
+    /// [`bracket`] copies, never resamples or re-levels.
+    pub len: usize,
+    /// Frame index of the sweep's first sample.
+    pub start: usize,
+}
+
+/// Splice `sweep` into a bracketed file: lead-in, a marker pair, a guard, the
+/// sweep, a guard, a marker pair, a tail.
+///
+/// `marker_scale` is the linear amplitude each marker is scaled to. Pass the
+/// **realized peak of the levelled sweep**, `max|sweep|` — see the module
+/// header's level section for why the raw peak-1.0 marker must not be spliced
+/// verbatim. A scale that is not a finite number in `[0, 1]` is clamped into
+/// range (`NaN` becomes 0), because a `NaN` or out-of-range sample cannot be
+/// written to a WAV and a silently missing marker fails loudly one step later:
+/// [`locate`] returns `None` and the caller refuses.
+///
+/// The returned [`SweepSpan`] locates the sweep, whose samples are copied
+/// **bit-identically** — the gaps around it are silence, so nothing is added
+/// into the span and the span's RMS is the sweep's RMS.
+///
+/// **Tier 3.** See the module header.
+pub fn bracket(
+    sweep: &[f64],
+    layout: &MarkerLayout,
+    marker_scale: f64,
+    sample_rate_hz: f64,
+) -> (Vec<f64>, SweepSpan) {
+    let start = layout.sweep_start(sample_rate_hz);
+    let total = layout.total_len(sweep.len(), sample_rate_hz);
+    let mut out = vec![0.0; total];
+    out[start..start + sweep.len()].copy_from_slice(sweep);
+
+    let scale = if marker_scale.is_finite() {
+        marker_scale.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if scale > 0.0 {
+        let marker = layout_marker(layout, sample_rate_hz);
+        for position in expected_marker_positions(layout, sweep.len(), sample_rate_hz) {
+            let at = position as usize;
+            // Added rather than assigned: the marker regions are silence by
+            // construction, so this is the same value, and if a future layout
+            // ever overlapped something the overlap would be audible rather
+            // than silently overwritten.
+            for (i, &m) in marker.iter().enumerate() {
+                if at + i < total {
+                    out[at + i] += scale * m;
+                }
+            }
+        }
+    }
+    (
+        out,
+        SweepSpan {
+            len: sweep.len(),
+            start,
+        },
+    )
+}
+
+/// Marker START positions in an assembled file, in PLAYBACK-clock samples, in
+/// order: the lead-in pair, then the trailing pair.
+///
+/// This is the `expected` half of [`estimate_skew`]'s fit. It is a single pure
+/// function so that assembly ([`bracket`]) and analysis ([`locate`] plus the
+/// fit) cannot disagree about where the markers are — the one bug class that
+/// would produce a confident, wrong `t = 0`.
+///
+/// **Tier 3.** See the module header.
+pub fn expected_marker_positions(
+    layout: &MarkerLayout,
+    sweep_len: usize,
+    sample_rate_hz: f64,
+) -> Vec<f64> {
+    let count = layout.markers_per_end;
+    let mut positions = Vec::with_capacity(2 * count);
+    if count == 0 {
+        return positions;
+    }
+    let step = layout.pair_step_frames(sample_rate_hz);
+    let lead = layout.lead_in_frames(sample_rate_hz);
+    for k in 0..count {
+        positions.push((lead + k * step) as f64);
+    }
+    let trailing =
+        layout.sweep_start(sample_rate_hz) + sweep_len + layout.guard_gap_frames(sample_rate_hz);
+    for k in 0..count {
+        positions.push((trailing + k * step) as f64);
+    }
+    positions
+}
+
+/// The marker chirp a given layout splices: a Hann-windowed 2→8 kHz linear
+/// chirp of `layout.marker_s` seconds, peak 1.0 before [`bracket`] scales it.
+///
+/// [`default_marker`] is the `marker_s = 0.05` case and stays the definition of
+/// the band; this function exists so the caller building [`locate`]'s template
+/// reads the length off the same layout the file was assembled from instead of
+/// guessing. Pinned by `the_default_layouts_marker_is_exactly_default_marker`.
+///
+/// **Tier 3.** See the module header.
+pub fn layout_marker(layout: &MarkerLayout, sample_rate_hz: f64) -> Vec<f64> {
+    marker_chirp(sample_rate_hz, layout.marker_s, 2_000.0, 8_000.0)
+}
+
+/// Locate a layout's whole marker train in `capture` and return the members'
+/// CAPTURE-clock positions, in order.
+///
+/// `template` is the waveform to correlate against and is deliberately **not**
+/// built here — see the module header. Pass [`layout_marker`] on the baseline
+/// path and the correction-filtered marker on the verification path.
+///
+/// The exclusion radius handed to [`find_marker_train`] is **half the tightest
+/// start-to-start spacing in the train**, which is the within-pair step
+/// (0.15 s for [`DEFAULT_MARKER_LAYOUT`], against a 0.30 s spacing). Half, not
+/// the whole step: the zones must not tile the correlation, or there are no
+/// off-peak samples left, no noise floor can be estimated and
+/// [`find_marker_train`] refuses for want of a credibility judgment.
+///
+/// Returns `None` exactly when [`find_marker_train`] does — most importantly
+/// when a picked peak fails its own credibility floor ("every picked peak must
+/// clear 6× the off-peak correlation RMS (≈15.6 dB), else the train is not
+/// credibly present"), which is the first thing that fails when the
+/// verification sweep is quiet. That branch is load-bearing: the caller maps it
+/// to its own refusal rather than to a generic not-found.
+///
+/// **Tier 3.** See the module header.
+pub fn locate(
+    capture: &[f64],
+    template: &[f64],
+    layout: &MarkerLayout,
+    sample_rate_hz: f64,
+) -> Option<Vec<f64>> {
+    let separation = layout.pair_step_frames(sample_rate_hz) / 2;
+    let hits = find_marker_train(capture, template, layout.markers(), separation.max(1))?;
+    Some(hits.iter().map(|hit| hit.position).collect())
+}
+
+/// Seconds to frames, rounding to nearest, with every unrepresentable answer
+/// collapsing to zero rather than to a panic or a wrapped length.
+fn frames(seconds: f64, sample_rate_hz: f64) -> usize {
+    let n = (seconds * sample_rate_hz).round();
+    if n.is_finite() && n > 0.0 && n < usize::MAX as f64 {
+        n as usize
+    } else {
+        0
+    }
 }
 
 #[cfg(test)]
