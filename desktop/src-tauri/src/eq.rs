@@ -93,6 +93,20 @@ pub fn design_correction(bands: &[EQBand], sample_rate: f64) -> Option<Correctio
     })
 }
 
+/// The forwarder's carried re-send bookkeeping. Two questions, both of which
+/// need memory across snapshots:
+///
+/// * `last_rate` -- "have we seen a stream yet" (see [`resend_decision`]).
+/// * `resent_for` -- the refused rate the forwarder has ALREADY supplied
+///   design intent for. `EngineState::correction_rate_mismatch` latches until
+///   a rebuild succeeds, so without this the forwarder would answer the same
+///   standing refusal on every published snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ResendState {
+    pub last_rate: Option<f64>,
+    pub resent_for: Option<f64>,
+}
+
 /// The forwarder's redesign trigger, pure and unit-tested -- now a FALLBACK,
 /// not the rate-change mechanism.
 ///
@@ -114,6 +128,14 @@ pub fn design_correction(bands: &[EQBand], sample_rate: f64) -> Option<Correctio
 /// `last_rate` has correspondingly narrowed to "have we seen a stream yet";
 /// the rate it carries is only echoed back for the caller's bookkeeping.
 ///
+/// **This is a LEVEL predicate on a LATCHING field, not an edge.**
+/// `correction_rate_mismatch` is re-set by `send_correction` on every refused
+/// rebuild, so it is still `Some(..)` on the snapshot that follows our own
+/// re-send -- and the re-send cannot clear it, because the same bands at the
+/// same rate are refused identically. Deciding whether the forwarder has
+/// ALREADY answered this refusal is [`resend_command`]'s job, through
+/// [`ResendState`]; call that, not this, from a loop over snapshots.
+///
 /// Returns `None` when there is no stream, no bands, or neither case applies.
 pub fn resend_decision(
     last_rate: Option<f64>,
@@ -134,9 +156,29 @@ pub fn resend_decision(
 }
 
 /// The forwarder's whole correction reconcile, pure so it can be tested
-/// without a Tauri app handle: given the last-seen rate, the engine snapshot
-/// and the desktop's band set, return the command to send and the rate to
-/// record as `last_rate`.
+/// without a Tauri app handle: given its carried [`ResendState`], the engine
+/// snapshot and the desktop's band set, return the command to send -- and
+/// advance the state.
+///
+/// **It fires on the EDGE of a refusal, not its level**, which is the whole
+/// reason the state is carried. [`resend_decision`] answers "the engine is
+/// asking for design intent at this rate", and it keeps saying so: the flag
+/// latches (`send_correction` re-sets it on every refused rebuild) and a
+/// re-send of the same bands at the same rate is refused identically, because
+/// `build_correction`'s Peq arm errors on `kept == 0 && bands_dropped > 0`, a
+/// pure function of (bands, stream rate). Nothing in that cycle can end it.
+/// Answering on the level therefore redesigns, refuses and logs once per
+/// PUBLISHED SNAPSHOT -- and since R1-8's `input_peak` decays every block,
+/// `publish` fires at the full tick rate (4 Hz by default) for as long as
+/// audio plays. Measured: ~4.5 re-sends and ~4.5 `correction refused` warn
+/// lines per second, indefinitely, for a state the app has already disclosed
+/// as "EQ paused".
+///
+/// One re-send per refused rate is enough, and the mismatch arm is kept
+/// rather than dropped: the engine self-heals a `Peq` by itself at the next
+/// legal rate (`test_rate_independence.rs::a_refused_peq_installs_itself_at_the_next_legal_rate`),
+/// but a baked `Fir`/`Iir` it cannot re-derive has no other repair, and that
+/// is the fallback R1-6 § Fix 4 and D-12 both say to keep.
 ///
 /// **It does not gate the band set, and it can never clear one.** The
 /// forwarder used to re-validate every band at the live rate here and send a
@@ -163,13 +205,29 @@ pub fn resend_decision(
 /// [`validate_bands`] keeps its job — the indexed, user-facing message on an
 /// EDIT — at the two command call sites. It was never the safety wall here.
 pub fn resend_command(
-    last_rate: Option<f64>,
+    state: &mut ResendState,
     snapshot: &EngineState,
     bands: &[EQBand],
-) -> Option<(EngineCommand, f64)> {
-    let rate = resend_decision(last_rate, snapshot, !bands.is_empty())?;
+) -> Option<EngineCommand> {
+    // The engine is no longer naming a rate: forget what we last supplied, so
+    // the NEXT refusal is a fresh edge. Deliberately before the `?` below --
+    // it must run on every snapshot, including ones with no bands and no
+    // stream, or a refusal that clears while the user has no EQ loaded would
+    // leave `resent_for` armed against the refusal after it.
+    let refused = snapshot.correction_rate_mismatch.is_some();
+    if !refused {
+        state.resent_for = None;
+    }
+
+    let rate = resend_decision(state.last_rate, snapshot, !bands.is_empty())?;
+    if refused && state.resent_for == Some(rate) {
+        return None;
+    }
+
     let config = design_correction(bands, rate)?;
-    Some((EngineCommand::SetCorrection(config), rate))
+    state.last_rate = Some(rate);
+    state.resent_for = if refused { Some(rate) } else { None };
+    Some(EngineCommand::SetCorrection(config))
 }
 
 /// The outcome of a successful AutoEQ file import, returned to the UI so it can
@@ -326,11 +384,21 @@ mod tests {
         assert!(validate_bands(&[peaking(1_000.0, 3.0, 1.0)], 48_000.0).is_ok());
     }
 
-    /// The reviewer-added rate-revalidation case, and the reason the forwarder
-    /// re-checks bands at the NEW rate: fc = 23 kHz is legal at 96 kHz and
-    /// 48 kHz (below Nyquist) but `>= Nyquist` at 44.1 kHz, where designing it
-    /// would emit NaN/Inf coefficients. `validate_bands` MUST reject it at
-    /// 44.1 kHz and accept it at 48/96 kHz.
+    /// The rate-DEPENDENT half of the relocated band guard (D-13): fc = 23 kHz
+    /// is legal at 96 kHz and 48 kHz (below Nyquist) but `>= Nyquist` at
+    /// 44.1 kHz, where designing it would emit NaN/Inf coefficients. This pins
+    /// `paraeq_engine::controller::validate_band_at`'s exclusive Nyquist bound
+    /// at both sides of 22.05 kHz, and with it the edit-time message the user
+    /// actually reads.
+    ///
+    /// It is NOT about the forwarder. The forwarder used to re-check bands at
+    /// the new rate and clear the whole set on failure; D-10 ruled against
+    /// that and 8d27016 removed it (see [`resend_command`], and
+    /// `resend_command_hands_over_a_band_illegal_at_the_live_rate` below,
+    /// which drives this same 23 kHz pivot to assert the opposite). What
+    /// happens to this band at install time is that `build_correction` DROPS
+    /// and COUNTS it -- pinned in the engine by
+    /// `test_rate_independence.rs::peq_band_at_or_above_new_nyquist_is_dropped_and_counted`.
     #[test]
     fn fc_23k_valid_at_96k_and_48k_but_rejected_at_44100() {
         let band = [peaking(23_000.0, 3.0, 1.0)];
@@ -589,9 +657,9 @@ mod tests {
             "the premise: this set does NOT pass the user-facing check at 44.1 kHz"
         );
 
-        let (cmd, rate) =
-            resend_command(None, &snap, &bands).expect("the first stream must re-send");
-        assert_eq!(rate, 44_100.0);
+        let mut state = ResendState::default();
+        let cmd = resend_command(&mut state, &snap, &bands).expect("the first stream must re-send");
+        assert_eq!(state.last_rate, Some(44_100.0));
         match cmd {
             EngineCommand::SetCorrection(CorrectionConfig::Peq {
                 bands: sets,
@@ -612,20 +680,122 @@ mod tests {
         let bands = [peaking(23_000.0, -3.0, 1.0)];
         let mut snap = snapshot_with_stream(Some(stream_at(44_100.0)));
         snap.correction_rate_mismatch = Some(44_100.0);
-        let (cmd, _) = resend_command(Some(44_100.0), &snap, &bands).expect("a refusal re-sends");
+        let mut state = ResendState {
+            last_rate: Some(44_100.0),
+            resent_for: None,
+        };
+        let cmd = resend_command(&mut state, &snap, &bands).expect("a refusal re-sends");
         assert!(matches!(cmd, EngineCommand::SetCorrection(_)));
     }
 
-    /// It stays a pure pass-through of [`resend_decision`]'s verdict: no
-    /// trigger, no command.
+    /// ...ONCE. `correction_rate_mismatch` latches -- the engine re-sets it
+    /// on every refused rebuild, and re-sending the same bands at the same
+    /// rate is refused identically -- so answering on its LEVEL redesigns,
+    /// refuses and logs on every published snapshot. R1-8's decaying
+    /// `input_peak` makes that the full tick rate (4 Hz by default) for as
+    /// long as audio plays.
+    #[test]
+    fn resend_command_answers_a_standing_refusal_only_once() {
+        let bands = [peaking(23_000.0, -3.0, 1.0)];
+        let mut snap = snapshot_with_stream(Some(stream_at(44_100.0)));
+        snap.correction_rate_mismatch = Some(44_100.0);
+
+        let mut state = ResendState::default();
+        assert!(
+            resend_command(&mut state, &snap, &bands).is_some(),
+            "the first snapshot carrying the refusal must supply design intent"
+        );
+        for n in 1..=5 {
+            assert!(
+                resend_command(&mut state, &snap, &bands).is_none(),
+                "snapshot {n} re-answered a refusal already answered"
+            );
+        }
+    }
+
+    /// ...and the suppression is scoped to that one refusal. Once the engine
+    /// stops naming a rate the memory is dropped, so a LATER refusal -- the
+    /// AirPods 44.1 -> 48 -> 44.1 kHz round trip -- is answered again.
+    #[test]
+    fn a_cleared_then_re_raised_refusal_is_answered_again() {
+        let bands = [peaking(23_000.0, -3.0, 1.0)];
+        let mut refused = snapshot_with_stream(Some(stream_at(44_100.0)));
+        refused.correction_rate_mismatch = Some(44_100.0);
+        let healthy = snapshot_with_stream(Some(stream_at(48_000.0)));
+
+        let mut state = ResendState::default();
+        assert!(resend_command(&mut state, &refused, &bands).is_some());
+        assert!(resend_command(&mut state, &refused, &bands).is_none());
+
+        // The engine installed the set at a legal rate by itself; no flag, so
+        // nothing to send -- but the memory of the refusal must go.
+        assert!(
+            resend_command(&mut state, &healthy, &bands).is_none(),
+            "a healthy snapshot is not a re-send trigger"
+        );
+        assert_eq!(state.resent_for, None, "the refusal memory must be dropped");
+
+        assert!(
+            resend_command(&mut state, &refused, &bands).is_some(),
+            "a refusal raised again after a healthy snapshot is a new edge"
+        );
+    }
+
+    /// A refusal that names a DIFFERENT rate is a different refusal, even
+    /// with no healthy snapshot in between.
+    #[test]
+    fn a_refusal_at_another_rate_is_a_new_edge() {
+        let bands = [peaking(23_000.0, -3.0, 1.0)];
+        let mut at_44 = snapshot_with_stream(Some(stream_at(44_100.0)));
+        at_44.correction_rate_mismatch = Some(44_100.0);
+        let mut at_32 = snapshot_with_stream(Some(stream_at(32_000.0)));
+        at_32.correction_rate_mismatch = Some(32_000.0);
+
+        let mut state = ResendState::default();
+        assert!(resend_command(&mut state, &at_44, &bands).is_some());
+        assert!(resend_command(&mut state, &at_44, &bands).is_none());
+        assert!(
+            resend_command(&mut state, &at_32, &bands).is_some(),
+            "32 kHz is a rate the forwarder has not supplied intent for"
+        );
+    }
+
+    /// The flag clears while the user happens to have no EQ loaded. The
+    /// memory must still be dropped -- the reset deliberately runs before
+    /// the no-bands bail-out -- or the next refusal goes unanswered.
+    #[test]
+    fn the_refusal_memory_clears_even_with_no_bands() {
+        let bands = [peaking(23_000.0, -3.0, 1.0)];
+        let mut refused = snapshot_with_stream(Some(stream_at(44_100.0)));
+        refused.correction_rate_mismatch = Some(44_100.0);
+        let healthy = snapshot_with_stream(Some(stream_at(44_100.0)));
+
+        let mut state = ResendState::default();
+        assert!(resend_command(&mut state, &refused, &bands).is_some());
+        assert!(resend_command(&mut state, &healthy, &[]).is_none());
+        assert_eq!(state.resent_for, None);
+        assert!(resend_command(&mut state, &refused, &bands).is_some());
+    }
+
+    /// It stays a pass-through of [`resend_decision`]'s verdict whenever the
+    /// edge gate is not in play: no trigger, no command.
     #[test]
     fn resend_command_is_none_when_nothing_triggers() {
         let bands = [peaking(1_000.0, 3.0, 1.0)];
         let snap = snapshot_with_stream(Some(stream_at(48_000.0)));
-        assert!(resend_command(Some(48_000.0), &snap, &bands).is_none());
+        let mut seen = ResendState {
+            last_rate: Some(48_000.0),
+            resent_for: None,
+        };
+        assert!(resend_command(&mut seen, &snap, &bands).is_none());
+        let mut fresh = ResendState::default();
         assert!(
-            resend_command(None, &snap, &[]).is_none(),
+            resend_command(&mut fresh, &snap, &[]).is_none(),
             "no bands, nothing to send"
+        );
+        assert_eq!(
+            fresh.last_rate, None,
+            "nothing sent, nothing to record as seen"
         );
     }
 

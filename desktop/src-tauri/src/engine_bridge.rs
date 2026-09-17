@@ -136,11 +136,13 @@ pub fn publish_current(app: &tauri::AppHandle) {
 /// BEFORE the handle was stored so no early snapshot is missed) and reconciles
 /// each published snapshot:
 ///
-/// 1. On an engine-published redesign refusal (or the first stream),
-///    re-validate the bands at the live rate and re-send the correction (or
-///    `ClearCorrection` on failure) -- the R1-6 fallback path. A bare rate
-///    change does NOT come through here any more: the engine re-derives a
-///    `Peq` correction at the new rate itself.
+/// 1. On an engine-published redesign refusal (or the first stream), hand the
+///    band set over WHOLE as a fresh `SetCorrection` -- the R1-6 fallback
+///    path. It never re-validates and never clears: the engine drops only the
+///    bands that are illegal at the live rate (D-10). A bare rate change does
+///    NOT come through here any more, because the engine re-derives a `Peq`
+///    correction at the new rate itself. The refusal is answered on its EDGE,
+///    which is what [`eq::ResendState`] is carried for.
 /// 2. On a device change, refresh the selectable device list.
 /// 3. Publish the snapshot (emit + persist).
 ///
@@ -150,9 +152,10 @@ pub fn start_forwarder(app: tauri::AppHandle, rx: Receiver<Arc<EngineState>>) {
     std::thread::Builder::new()
         .name("paraeq-forwarder".into())
         .spawn(move || {
-            // "Have we seen a stream yet", since R1-6: the rate it carries is
-            // bookkeeping, not the redesign trigger.
-            let mut last_rate: Option<f64> = None;
+            // Since R1-6 this is bookkeeping, not the redesign trigger:
+            // "have we seen a stream yet", plus the refused rate we have
+            // already supplied design intent for. See `eq::ResendState`.
+            let mut resend = eq::ResendState::default();
             let mut last_device_uid: Option<String> = None;
             loop {
                 match rx.recv_timeout(RECV_TIMEOUT) {
@@ -164,13 +167,13 @@ pub fn start_forwarder(app: tauri::AppHandle, rx: Receiver<Arc<EngineState>>) {
                         //    seen. The set goes over WHOLE -- the engine
                         //    drops only the bands that are illegal at the
                         //    live rate (D-10); clearing here used to lose
-                        //    the user's entire EQ, unrecoverably. See
+                        //    the user's entire EQ, unrecoverably. Once per
+                        //    refusal, not once per snapshot: the flag latches
+                        //    and this loop runs at the publish rate. See
                         //    `eq::resend_command`.
                         let bands = { shared.data.lock().unwrap().bands.clone() };
-                        if let Some((cmd, rate)) = eq::resend_command(last_rate, &snapshot, &bands)
-                        {
+                        if let Some(cmd) = eq::resend_command(&mut resend, &snapshot, &bands) {
                             send_cmd(&shared, cmd);
-                            last_rate = Some(rate);
                         }
 
                         // 2. Device change -> refresh the selectable list.

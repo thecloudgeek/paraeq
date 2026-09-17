@@ -81,7 +81,7 @@ pub fn deinterleave_sanitize_channel(
     invalid
 }
 
-/// MS-6's witness (docs/specs/2026-07-15-measurement-safety-design.md:333) as a
+/// MS-6's witness (measurement-safety `MS-6`) as a
 /// cloneable handle: a live read-back of whether the backend's current tap
 /// excludes ParaEQ's own process.
 ///

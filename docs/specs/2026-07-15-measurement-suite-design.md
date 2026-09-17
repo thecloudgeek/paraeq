@@ -705,7 +705,8 @@ bundled CSVs carry `category:` of `reference`, `in-ear` or `over-ear`.
 `compensation.rs:11` dispatches on a leading double-quote; `:60` is `.skip(2)`.
 `chain.rs:89` is a `mem::replace`; `chain.rs:171,183` clamp to ±1.0.
 `iir.rs:52-58` is textbook DF2T; `iir.rs:66` is `reset()`. `tap.rs:26-48`,
-`:57-61` and `:153-159` are as described, fail-open fallback included.
+`:57-61` and `tap.rs`'s `TapSystem::create` exclusion-list build are as
+described, fail-open fallback included.
 `backend.rs:121-130` carries the input-stream KNOWN LIMITATION; `:195` computes
 `out_sample_time − in_sample_time`. `controller.rs:105` `build_correction` takes
 no sample rate. `test_props.rs:7-42` holds four 64-case stability proptests.

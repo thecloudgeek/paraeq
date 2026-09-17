@@ -134,7 +134,7 @@ pub struct TapSystem {
     pub format: AudioStreamBasicDescription,
     pub device: AudioObjectID,
     pub device_uid: String,
-    /// MS-6's witness (docs/specs/2026-07-15-measurement-safety-design.md:333):
+    /// MS-6's witness (measurement-safety `MS-6`):
     /// `translate_pid(getpid()) != 0` at create time, i.e. our own HAL process
     /// object was found and handed to
     /// [`CATapDescription::initStereoGlobalTapButExcludeProcesses`]. `false`

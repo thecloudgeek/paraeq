@@ -1,4 +1,4 @@
-//! MS-6's producer half (docs/specs/2026-07-15-measurement-safety-design.md:333)
+//! MS-6's producer half (measurement-safety `MS-6`)
 //! — the tap self-exclusion witness `paraeq-measure` polls before it emits a
 //! single sample.
 //!
