@@ -201,3 +201,34 @@ fn both_crates_tabulate_the_same_room_sweep_start() {
         );
     }
 }
+
+/// MS-17's chain-sensitivity envelope is tabulated in two crates too:
+/// `TransducerCaps.sensitivity_envelope_spl_per_dbfs` here and
+/// `PathProfile.sensitivity_envelope_spl_per_dbfs` in paraeq-decide. Same
+/// crate-DAG necessity as the sweep start above, same dev-dependency link, same
+/// instruction on failure: **this** table owns the numbers, because a solved
+/// sensitivity outside the envelope refuses before a sample is emitted — a
+/// safety limit, not an analysis parameter. `decide()` carries a copy only so
+/// the class cross-check can run without dragging the capture layer into a pure
+/// crate.
+///
+/// The consequence of a drift is user-visible and one-directional: if the
+/// decide-side copy is WIDER, `decide()` grades a chain the capture layer has
+/// already refused; if it is NARROWER, `decide()` reports `WrongTransducer` on
+/// hardware that measured perfectly well. Both read to the user as "ParaEQ
+/// won't measure my headphones".
+#[test]
+fn both_crates_tabulate_the_same_sensitivity_envelope() {
+    for class in [
+        TransducerClass::Bookshelf,
+        TransducerClass::Floorstander,
+        TransducerClass::InEar,
+        TransducerClass::OverEar,
+    ] {
+        assert_eq!(
+            caps_for(class).sensitivity_envelope_spl_per_dbfs,
+            paraeq_decide::profile_for(class).sensitivity_envelope_spl_per_dbfs,
+            "{class:?}: the two MS-17 envelope tables have drifted apart"
+        );
+    }
+}
