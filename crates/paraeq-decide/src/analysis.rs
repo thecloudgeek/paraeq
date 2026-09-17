@@ -503,6 +503,18 @@ fn curve_on_grid(
     let derotated = derotate(&spectrum, &freqs_linear, applied_left_ms / 1000.0);
     let resampled =
         resample_complex_to_log_grid(&freqs_linear, &derotated, grid, RESAMPLE_PREFILTER).ok()?;
+    // `apply_fdw` reads `post_cycles` ONLY, and that is by design: "`spec.pre_cycles`
+    // does not enter: it is a pre-peak noise gate, not a resolution control",
+    // realized in the TIME domain by `gating.rs` as a fixed left gate of
+    // `FdwSpec::left_gate_s(f_min) = pre_cycles / f_min`.
+    //
+    // On this architecture that gate never binds, and the arithmetic says why:
+    // the default 3 cycles at the grid's 20 Hz is 150 ms of pre-peak window
+    // against the ~46-64 ms the Mac's audio path leaves before the impulse
+    // arrives. `left_window_ms` is already clamped to `t_peak`, so the left gate
+    // it produces is the SHORTER of the two and the pre-lobe is satisfied by
+    // construction. Recorded here because "the `fdw_pre_cycles` decision has no
+    // effect" is otherwise a thing a reader discovers by experiment.
     let windowed = match settings.fdw {
         Some(spec) => apply_fdw(&resampled, grid, &spec).ok()?,
         None => resampled,
