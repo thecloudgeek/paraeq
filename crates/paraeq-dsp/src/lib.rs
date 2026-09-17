@@ -46,7 +46,30 @@ pub enum DspError {
 /// so this container is the DSP side of that seam. Spec:
 /// docs/specs/2026-07-15-room-dsp-design.md, "`PerChannel<T>` — new, in
 /// `lib.rs`".
-#[derive(Clone, Debug)]
+///
+/// **The serde derive is a FROZEN WIRE SHAPE, not a convenience** (Stage 6, B6
+/// item 5). `paraeq_decide::CorrectionPlan.bands` becomes
+/// `PerChannel<Vec<EQBand>>`, `CorrectionPlan` derives `Deserialize`/
+/// `Serialize` unconditionally, and `paraeq-decide` turns this crate's `serde`
+/// feature on unconditionally — so from that point on this container's wire
+/// form lands in every `fixtures/decide/<case>/expected.json`.
+/// `#[serde(transparent)]` is what keeps that form the **bare array** the plain
+/// `Vec<Vec<EQBand>>` already produced, which is why the type change costs no
+/// fixture diff at all. Pinned by
+/// `paraeq-decide`'s `a_per_channel_bands_field_serializes_as_a_bare_array`.
+///
+/// `PartialEq` for the reason [`crate::peq::EQBand`] already carries it: the
+/// decision engine's idempotence property compares whole plans field for field.
+///
+/// **Known gap, recorded deliberately:** `transparent` deserialization does NOT
+/// route through [`PerChannel::new`], so a `[]` on the wire yields a
+/// zero-channel value that the constructor refuses. Guarding it would need
+/// `serde(try_from = …)`, which is incompatible with `transparent` and would
+/// move the wire form — the ruling pins the wire form. Producers must not emit
+/// an empty channel list; consumers that care check [`PerChannel::channels`].
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(transparent))]
 pub struct PerChannel<T>(Vec<T>);
 
 impl<T> PerChannel<T> {
