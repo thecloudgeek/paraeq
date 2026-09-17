@@ -26,13 +26,101 @@ jobs:
       - run: cargo test --workspace --all-features
       # MS-1 (2026-07-15 measurement-safety-design.md): the level policy stays
       # reachable from a future headless `paraeqd` and testable against mocks
-      # only while it depends on neither Tauri nor CoreAudio. The hardware side
-      # arrives through the `seam` traits, so this must stay empty.
-      - name: paraeq-measure depends on no Tauri and no CoreAudio
+      # only while it depends on paraeq-dsp and nothing else in this workspace.
+      # "No Tauri and no CoreAudio" was always shorthand for that — the crate's
+      # own manifest comment says "paraeq-dsp ONLY among the workspace crates" —
+      # and a `paraeq-engine` or `paraeq-decide` edge would have passed the
+      # narrower grep while breaking the rule. The hardware and engine sides
+      # arrive through the `seam` / `engine_seam` traits.
+      - name: paraeq-measure depends on paraeq-dsp only
         run: |
-          if cargo tree -p paraeq-measure -e normal | grep -Eiq 'tauri|core-?audio'; then
+          if cargo tree -p paraeq-measure -e normal \
+               | grep -Eiq 'tauri|core-?audio|paraeq-engine|paraeq-decide'; then
             cargo tree -p paraeq-measure -e normal
             echo "::error::paraeq-measure gained a forbidden dependency (MS-1)"
+            exit 1
+          fi
+
+      # R-B11-a. The verification helper links neither Tauri nor paraeq-decide.
+      #
+      # It deliberately does NOT grep for `paraeq-measure`. paraeq-coreaudio
+      # depends on paraeq-measure unconditionally, so the moment the helper
+      # depends on paraeq-coreaudio — which the architecture spec explicitly
+      # permits — `cargo tree` shows paraeq-measure whatever the helper's own
+      # manifest says. That is a fact about the shipped graph, not an opinion,
+      # and whether the TRANSITIVE link is in scope is an open owner question.
+      # A gate that cannot pass is not a gate: do not "fix" this by adding the
+      # word. The manifest half of the rule is R-B11-d below.
+      - name: paraeq-stimulus links no Tauri and no paraeq-decide
+        run: |
+          if cargo tree -p paraeq-stimulus -e normal | grep -Eiq 'tauri|paraeq-decide'; then
+            cargo tree -p paraeq-stimulus -e normal
+            echo "::error::paraeq-stimulus gained a forbidden dependency"
+            exit 1
+          fi
+
+      # R-B11-b. No level policy, no class table, no session state in the child.
+      # This is the USE half of the helper's dependency rule: the helper plays
+      # the bytes the parent levelled and decides nothing about how loud they
+      # are.
+      #
+      # TEXTUAL on purpose: a doc comment naming one of these identifiers fails
+      # this step, which is intended. Point the child's docs at the parent's FILE
+      # (crates/paraeq-measure/src/level.rs) instead of at the parent's TYPE.
+      # Naming a parent FILE is legal — R-B11-d is a dependency gate (manifest +
+      # `paraeq_measure::` paths), not a prose gate.
+      #
+      # A comment-stripping variant was rejected: grep cannot parse Rust, and a
+      # gate that is almost right about what is code is worse than one that is
+      # exactly right about what is text.
+      - name: paraeq-stimulus carries no level or class policy
+        run: |
+          if grep -rnE 'SweepLevel|TransducerClass|caps_for|LevelLadder|MeasurementSession|SPL' \
+               crates/paraeq-stimulus/src/; then
+            echo "::error::paraeq-stimulus names the parent's level policy"
+            exit 1
+          fi
+
+      # R-B11-c. The child declares no ceiling constant of its own. It imports
+      # ABSOLUTE_MAX_DBFS_RMS through paraeq-coreaudio's re-export and compares
+      # against it directly, so the two cannot drift: two hand-synced constants
+      # pass an equality assertion right up to the moment someone forgets.
+      # R-B11-b's identifier list would not catch a copied constant, which is
+      # why this has its own grep. A `use` line does not match, which is the
+      # point.
+      - name: paraeq-stimulus declares no level constant
+        run: |
+          if grep -rnE \
+               '^[[:space:]]*(pub[[:space:]]+)?(const|static)[[:space:]]+[A-Z_]*(DBFS|CEILING|MAX_LEVEL)[A-Z_]*[[:space:]]*:[[:space:]]*f(32|64)[[:space:]]*=' \
+               crates/paraeq-stimulus/src/; then
+            echo "::error::paraeq-stimulus declared its own level ceiling"
+            exit 1
+          fi
+
+      # R-B11-d. A DEPENDENCY gate, not a token gate: it greps the child's
+      # MANIFEST for a forbidden dependency line and the child's `src/` and
+      # `tests/` for a path INTO either crate. It deliberately does not grep for
+      # the bare token, because the child's doc comments name parent FILES on
+      # purpose — that pointer is the anti-drift device that keeps the child's
+      # f32 emit guard and the parent's f64 one from diverging silently.
+      # The manifest half also counts `[[bin]]`, which is the architecture
+      # spec's own "one [[bin]]" made countable.
+      - name: paraeq-stimulus declares and names neither paraeq-measure nor paraeq-decide
+        run: |
+          if grep -nE '^[[:space:]]*paraeq-(measure|decide)[[:space:]]*=' \
+               crates/paraeq-stimulus/Cargo.toml; then
+            echo "::error::paraeq-stimulus declared a forbidden dependency"
+            exit 1
+          fi
+          bins=$(grep -c '^\[\[bin\]\]' crates/paraeq-stimulus/Cargo.toml)
+          if [ "$bins" != "1" ]; then
+            echo "::error::paraeq-stimulus must declare exactly one [[bin]], found $bins"
+            exit 1
+          fi
+          if grep -rnE \
+               'paraeq_(measure|decide)::|extern[[:space:]]+crate[[:space:]]+paraeq_(measure|decide)' \
+               crates/paraeq-stimulus/src crates/paraeq-stimulus/tests; then
+            echo "::error::paraeq-stimulus names a path into a forbidden crate"
             exit 1
           fi
 
