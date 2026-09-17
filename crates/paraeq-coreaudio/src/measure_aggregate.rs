@@ -638,6 +638,42 @@ fn capture_callback(
 /// The realtime half of the stimulus path: drains the mono stimulus ring into
 /// the aggregate's output buffers, one frame at a time, honouring the routing.
 ///
+/// Write ONE mono sample into ONE interleaved frame per `routing`.
+///
+/// The whole of the routing policy, in one place, so the in-process stimulus
+/// path and the helper's [`DeviceRenderer`](crate::render::DeviceRenderer)
+/// cannot disagree about what `Only(n)` means on a device with fewer than
+/// `n + 1` channels. Extracted from [`StimulusPath::fill`] verbatim, including
+/// its refusal to fall back — that refusal is the interesting half, and two
+/// copies of it is two chances to lose it.
+///
+/// `dst` is one HAL output buffer, `channels` its interleave factor, `frame`
+/// the frame index inside it. REALTIME LANE: no allocation, no locks, no
+/// logging, no branches beyond the routing match itself.
+#[inline]
+pub(crate) fn write_frame(
+    dst: &mut [f32],
+    channels: usize,
+    frame: usize,
+    routing: StimulusRouting,
+    sample: f32,
+) {
+    match routing {
+        StimulusRouting::Both => {
+            for ch in 0..channels {
+                dst[frame * channels + ch] = sample;
+            }
+        }
+        StimulusRouting::Only(ch) if ch < channels => {
+            dst[frame * channels + ch] = sample;
+        }
+        // A routing the device cannot honour plays silence rather than falling
+        // back to channel 0: silence is an obvious failure, a wrong channel is
+        // a plausible wrong answer.
+        StimulusRouting::Only(_) => {}
+    }
+}
+
 /// Lives on the realtime thread inside the IOProc closure. No locks, no
 /// allocation, no logging — the same contract `capture_callback`'s input half
 /// keeps.
@@ -686,20 +722,7 @@ impl StimulusPath {
                     underrun += (frames - frame) as u64;
                     break;
                 };
-                match self.routing {
-                    StimulusRouting::Both => {
-                        for ch in 0..channels {
-                            buf[frame * channels + ch] = sample;
-                        }
-                    }
-                    StimulusRouting::Only(ch) if ch < channels => {
-                        buf[frame * channels + ch] = sample;
-                    }
-                    // A routing the device cannot honour plays silence rather
-                    // than falling back to channel 0: silence is an obvious
-                    // failure, a wrong channel is a plausible wrong answer.
-                    StimulusRouting::Only(_) => {}
-                }
+                write_frame(buf, channels, frame, self.routing, sample);
             }
             break;
         }
@@ -826,6 +849,18 @@ impl paraeq_measure::StimulusSink for StimulusOutput {
     }
 }
 
+/// ~2 seconds of no progress at the device's own block cadence, floored so a
+/// tiny block size cannot make the timeout trigger-happy.
+///
+/// Module-level rather than an associated const on the private [`StallGuard`],
+/// because the helper child process's own pacing loop
+/// ([`DeviceRenderer`](crate::render::DeviceRenderer)) has to bound itself by
+/// the SAME number: two stall bounds would mean the in-process abort and the
+/// cross-process abort give up at different times, and the child's exit code 5
+/// is defined as this bound. `pub const` on the associated const would have
+/// leaked the private type.
+pub const STALL_SECONDS: f64 = 2.0;
+
 /// Bounds how long [`StimulusOutput::emit`] will wait on a device that has
 /// stopped consuming.
 ///
@@ -847,21 +882,17 @@ struct StallGuard {
 }
 
 impl StallGuard {
-    /// ~2 seconds of no progress at the device's own block cadence, floored so
-    /// a tiny block size cannot make the timeout trigger-happy.
-    const STALL_SECONDS: f64 = 2.0;
-
     fn new(format: &StreamFormat) -> Self {
         let sleep = block_sleep(format);
         Self {
             idle: 0,
-            limit: ((Self::STALL_SECONDS / sleep.as_secs_f64()).ceil() as usize).max(8),
+            limit: ((STALL_SECONDS / sleep.as_secs_f64()).ceil() as usize).max(8),
             sleep,
         }
     }
 
     /// Record whether this iteration made progress, then wait. `Err` once the
-    /// device has been stationary for [`Self::STALL_SECONDS`].
+    /// device has been stationary for [`STALL_SECONDS`].
     fn observe(&mut self, progressed: bool) -> Result<(), MeasureError> {
         if progressed {
             self.idle = 0;
@@ -872,7 +903,7 @@ impl StallGuard {
                     "output device stopped consuming the stimulus for {:.1} s — \
                      abandoning the emit so the session can tear down and restore \
                      the pre-measurement volume",
-                    Self::STALL_SECONDS
+                    STALL_SECONDS
                 )));
             }
         }
@@ -1249,6 +1280,71 @@ mod tests {
             vec![0.0, 0.5, 0.0, 0.6],
             "a stereo coupler measures one side at a time"
         );
+    }
+
+    #[test]
+    fn the_renderer_and_the_stimulus_path_write_identical_frames_for_identical_input() {
+        // Two realtime output paths exist by design — one writes into the
+        // measurement aggregate the mic is captured from, the other opens a
+        // device-only IOProc in the helper child process — and the thing they
+        // must never disagree about is what lands in which channel. Drive both
+        // over the same samples, on every routing that has a distinct answer,
+        // and compare buffers.
+        for routing in [
+            StimulusRouting::Both,
+            StimulusRouting::Only(0),
+            StimulusRouting::Only(1),
+            // The refusal: a channel the device cannot honour plays silence
+            // rather than falling back to channel 0. This is the arm a second
+            // `match` would most plausibly get wrong.
+            StimulusRouting::Only(5),
+        ] {
+            let samples = [0.1f32, -0.2, 0.3, -0.4];
+
+            let (mut in_tx, in_rx) = RingBuffer::<f32>::new(16);
+            let (mut re_tx, re_rx) = RingBuffer::<f32>::new(16);
+            for &v in &samples {
+                in_tx.push(v).expect("room");
+                re_tx.push(v).expect("room");
+            }
+
+            let mut path = StimulusPath {
+                consumer: in_rx,
+                inner: Arc::new(StimulusInner::default()),
+                routing,
+            };
+            let mut render = crate::render::RenderFill::new(
+                re_rx,
+                Arc::new(crate::render::RenderInner::default()),
+                routing,
+            );
+
+            // 4 frames x 2 channels interleaved, pre-filled with a value
+            // neither path may leave behind.
+            let mut in_storage = vec![0.0f32; 8];
+            let mut re_storage = vec![0.0f32; 8];
+            let mut in_list = AudioBufferList {
+                mNumberBuffers: 1,
+                mBuffers: [buffer_over(&mut in_storage, 2)],
+            };
+            let mut re_list = AudioBufferList {
+                mNumberBuffers: 1,
+                mBuffers: [buffer_over(&mut re_storage, 2)],
+            };
+            // SAFETY: each list points at live, aligned, exclusively-owned f32
+            // storage that outlives the view, holds one in-bounds buffer, and
+            // the two storages are distinct allocations.
+            let mut in_view = unsafe { BufferListMut::new(NonNull::from(&mut in_list)) };
+            // SAFETY: as above, for the renderer's own storage.
+            let mut re_view = unsafe { BufferListMut::new(NonNull::from(&mut re_list)) };
+            path.fill(&mut in_view);
+            render.fill(&mut re_view);
+
+            assert_eq!(
+                in_storage, re_storage,
+                "the two realtime output paths disagree at {routing:?}"
+            );
+        }
     }
 
     #[test]

@@ -106,6 +106,18 @@ pub fn deinterleave_sanitize_channel(
 /// read-back for a tap's exclusion list, so this witnesses that we looked up
 /// our own process object and passed it to the tap description — strictly
 /// weaker than "the HAL is excluding us".
+///
+/// **This is the ONLY production `TapStatus`, and the realtime-activity witness
+/// deliberately lives somewhere else.** A natural-looking extension is to hang
+/// "is audio actually flowing through the tap?" off this same trait, since both
+/// facts are about the tap. It does not fit: `ExclusionWitness` is one
+/// `Arc<AtomicBool>` with no path to `RtShared`'s per-block counters, so the
+/// activity fact would need a second implementor beside this one — two seams
+/// reporting about one tap, free to disagree, which is exactly the defect
+/// `self_excluded` was moved onto a live witness to avoid. The activity witness
+/// is therefore a CONTROLLER fact, on
+/// `paraeq_measure::EngineFacts::tap_activity`, and this trait keeps its single
+/// method and its single production impl.
 #[derive(Clone, Debug, Default)]
 pub struct ExclusionWitness(Arc<AtomicBool>);
 
