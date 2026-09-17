@@ -14,6 +14,12 @@
 //! [`ROOM_Q_CEILING`] log-linear from 10.0 at 200 Hz to 3.0 at 10 kHz), and
 //! [`authority_band_mask`]. Each is a policy constant or one composition step,
 //! closed form, and adds no fixture case.
+//! The EGD gate (v1.1, [`EgdGate::Off`] by default) is Tier 3 against a
+//! synthetic two-path IR whose excess group delay is known in closed form; see
+//! `measurement-suite:590` for why it is off in v1. There is no oracle for it
+//! either — no library computes "peak-to-peak over a 1/3-octave band", and the
+//! threshold it compares against is a `[NEEDS DATA]` starting value, so a
+//! fixture would pin an untuned guess. No fixture case.
 //! Spec: docs/specs/2026-07-15-room-dsp-design.md, "`authority.rs` — new".
 //!
 //! # Why authority is confidence-derived, not threshold-derived
@@ -263,6 +269,79 @@ pub const ROOM_Q_CEILING: QCapPolicy = QCapPolicy::LogLinear {
     lo: (200.0, 10.0),
 };
 
+/// Half the width of the EGD test band, in octaves. A 1/3-octave band centred
+/// at `f_c` spans `f_c·2^(−1/6) .. f_c·2^(+1/6)`, i.e. `0.2315·f_c` wide.
+///
+/// Numerically equal to [`DEFAULT_MIN_DIP_WIDTH_OCT`] and semantically
+/// unrelated to it: that one is the *narrow-dip veto* width, this one is the
+/// *analysis window* the EGD flatness test averages over. Two spec sentences,
+/// two constants, so a ruling on either moves only its own.
+const EGD_BAND_HALF_OCT: f64 = 1.0 / 6.0;
+
+/// The EGD flatness threshold, as a fraction of the centre frequency's period:
+/// a band is flat when its peak-to-peak excess group delay is under
+/// `EGD_FLATNESS_PERIODS / f_c` seconds.
+///
+/// `decision-engine-design.md` § Authority 2, verbatim: "peak-to-peak EGD
+/// deviation within the band `< 1/(4·f_c)` (a quarter period — self-scaling:
+/// 5 ms at 50 Hz, 0.5 ms at 500 Hz)". `0.25` is that `1/4`, named once so the
+/// owner's ruling costs one line.
+///
+/// **OPEN \[OWNER + NEEDS DATA\].** `docs/decisions/2026-07-21-decision-engine-open-questions.md`
+/// § Q4 ships this as a *starting value*: the framing is settled (a quarter
+/// period is a 90° excess-phase cap; 180° can invert polarity within the band,
+/// 1/8 rejects real modal peaks whose EGD is never perfectly zero), but the
+/// exact multiplier "needs rooms". The retune signal, from that section:
+///
+/// - **Loosen toward `1/(2·f_c)`** if the gate keeps vetoing bass peaks that
+///   are otherwise obviously correctable (low σ, clean single-pole shape) and a
+///   re-measure after a manual boost shows the multi-position average improved
+///   with no headroom-limiter trip.
+/// - **Tighten toward `1/(8·f_c)`** if a passing band, once boosted, fails to
+///   lift the multi-position average, trips the excursion limiter, or adds
+///   audible ringing.
+/// - **Cross-check against σ(f):** "in an untreated room the EGD gate and the
+///   σ(f) ceiling should flag the same nulls; systematic disagreement is the
+///   signal to retune."
+///
+/// That cross-check is why [`egd_flat_mask`] ships in v1 even though
+/// [`EgdGate`] does not — the owner cannot observe the disagreement without the
+/// mask. What is deferred is *acting* on it.
+pub const EGD_FLATNESS_PERIODS: f64 = 0.25;
+
+/// Whether the excess-group-delay gate is armed. **Ships [`EgdGate::Off`].**
+///
+/// `measurement-suite-design.md` § Out of Scope, verbatim: "**Excess-group-delay
+/// authority masking** — **v1.1**, not v1. It is the sharpest differentiator,
+/// and it is still deferred: three cheaper guards cover the same failure in v1
+/// (RMS averaging refuses nulls structurally, σ(f) flags them as
+/// position-dependent, asymmetric cut/boost never fills them). Clean seam:
+/// `fir.rs`'s `minimum_phase_homomorphic` already provides the reference."
+///
+/// Five specs say the *masking* is v1.1 and one says v1; the decision record
+/// (`2026-07-21`, § Q4) is both the majority side and the later document:
+/// "σ(f) (Q5) is the **primary** shipping authority; EGD is the deferred
+/// refinement, and the two are belt-and-braces." So the **trace** ships in v1
+/// as Evidence ([`crate::fr::excess_group_delay_s`], reaching `paraeq-decide`
+/// as `Analysis::excess_group_delay_s`), the **gate** ships in v1.1, and this
+/// flag — not the presence of a mask argument — is what separates them.
+///
+/// The flag lives on the policy rather than being implied by
+/// [`build_authority_gated`]'s mask argument on purpose: a caller that computes
+/// the mask for the owner's σ-vs-EGD cross-check must be able to compute it
+/// *without* changing what the corrector does.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum EgdGate {
+    /// v1: the mask is ignored, `build_authority_gated` is `build_authority`.
+    #[default]
+    Off,
+    /// v1.1: bands the mask marks non-flat get `max_boost_db = 0`.
+    /// `periods` is the flatness threshold — [`EGD_FLATNESS_PERIODS`] is the
+    /// shipped starting value, and it is carried here rather than read from the
+    /// constant so that the owner's retune is a policy value, not a recompile.
+    On { periods: f64 },
+}
+
 /// The policy inputs to [`build_authority`]. Every field is a named constant
 /// with a documented provenance, so an owner ruling changes data, not code.
 #[derive(Clone, Debug, PartialEq)]
@@ -284,9 +363,17 @@ pub struct AuthorityPolicy {
     /// The path ceiling on boost Q, composed with the gain-dependent cap by
     /// [`max_q_for_boost_capped`]. Default [`ROOM_Q_CEILING`].
     ///
-    /// Last, because the fields above are in the spec's composition order and
-    /// the Q ceiling is the last step of it.
+    /// Last of the v1 fields, because those are in the spec's composition order
+    /// and the Q ceiling is the last step of it.
     pub q_ceiling: QCapPolicy,
+    /// Whether [`build_authority_gated`] applies the EGD mask. Default
+    /// [`EgdGate::Off`] — the v1 contract.
+    ///
+    /// After [`Self::q_ceiling`] because it is not part of the v1 composition
+    /// order at all: it is the v1.1 addition, appended so every existing
+    /// `..Self::default()` literal still reads top to bottom in the spec's
+    /// order.
+    pub egd_gate: EgdGate,
 }
 
 impl Default for AuthorityPolicy {
@@ -300,6 +387,7 @@ impl Default for AuthorityPolicy {
             boost_ratio: DEFAULT_BOOST_RATIO,
             min_dip_width_oct: DEFAULT_MIN_DIP_WIDTH_OCT,
             q_ceiling: ROOM_Q_CEILING,
+            egd_gate: EgdGate::Off,
         }
     }
 }
@@ -596,8 +684,55 @@ pub fn build_authority(
     sigma_db: &[f64],
     policy: &AuthorityPolicy,
 ) -> Result<AuthorityCurve, DspError> {
+    // The v1 path, and the whole of it: no evidence, therefore no gate, and
+    // `build_authority_gated` with `None` is this function line for line.
+    build_authority_gated(grid, sigma_db, None, policy)
+}
+
+/// [`build_authority`] plus the **v1.1** excess-group-delay gate.
+///
+/// `egd_flat` is [`egd_flat_mask`]'s answer on the same grid: `true` where the
+/// region is flat enough in excess group delay to be treated as locally
+/// minimum-phase, and therefore boostable. The mask is applied **iff**
+/// `policy.egd_gate` is [`EgdGate::On`] **and** `egd_flat` is `Some`; where it
+/// applies and the bin is `false`, `max_boost_db` becomes `0.0` and `max_q` is
+/// recomputed at that zero boost. `max_cut_db` is never touched — the spec
+/// gates boosts only (`decision-engine-design.md` § Authority 2, "Excess-group-delay
+/// gate (**boost only**) … Bands failing the test get `boost_ceiling = 0`").
+///
+/// **Two independent conditions, on purpose.**
+///
+/// - A mask alone can never arm the gate. That is [`EgdGate`]'s whole job, and
+///   it is why the flag lives on the policy: the owner's σ-vs-EGD cross-check
+///   (`2026-07-21` § Q4) computes the mask on every bundle in v1 and must not
+///   change a single ceiling by doing so.
+/// - Missing evidence never silently vetoes. `None` is an all-true mask, not an
+///   all-false one. σ(f) is the primary shipping authority, and a fail-closed
+///   EGD arm would zero boost on every bundle whose IR could not be derotated —
+///   a silent, global behaviour change caused by *absent* data.
+///
+/// With `None` or an all-`true` mask the result is **bit-for-bit**
+/// [`build_authority`]'s, which `tests/test_authority.rs` pins with `to_bits()`
+/// rather than `==`.
+///
+/// # Errors
+///
+/// [`build_authority`]'s errors, plus `InvalidInput` when `egd_flat` is `Some`
+/// and does not match the grid. That length is checked in **both** gate states:
+/// a mask of the wrong shape is a caller bug either way, and refusing it while
+/// the gate is `Off` is what stops it lying dormant until the owner arms the
+/// flag in v1.1.
+pub fn build_authority_gated(
+    grid: &LogGrid,
+    sigma_db: &[f64],
+    egd_flat: Option<&[bool]>,
+    policy: &AuthorityPolicy,
+) -> Result<AuthorityCurve, DspError> {
     validate_policy(policy)?;
     if sigma_db.len() != grid.len() {
+        // The message names `build_authority` in both entry points: that is the
+        // shipped constructor, and this function is the same constructor behind
+        // a flag, not a second one.
         return Err(DspError::InvalidInput(format!(
             "build_authority: {} sigma values for a {}-point grid",
             sigma_db.len(),
@@ -611,19 +746,43 @@ pub fn build_authority(
             "build_authority: sigma must be finite and non-negative".into(),
         ));
     }
+    if let Some(mask) = egd_flat {
+        if mask.len() != grid.len() {
+            return Err(DspError::InvalidInput(format!(
+                "build_authority_gated: {} EGD mask values for a {}-point grid",
+                mask.len(),
+                grid.len()
+            )));
+        }
+    }
+    // Resolved once, outside the loop, so the two conditions are visibly ANDed
+    // in one place rather than re-tested per bin.
+    let gate: Option<&[bool]> = match policy.egd_gate {
+        EgdGate::Off => None,
+        EgdGate::On { .. } => egd_flat,
+    };
     let span = policy.sigma_none_db - policy.sigma_full_db;
     let freqs = grid.freqs().to_vec();
     let mut excursion = Vec::with_capacity(freqs.len());
     let mut max_boost_db = Vec::with_capacity(freqs.len());
     let mut max_cut_db = Vec::with_capacity(freqs.len());
     let mut max_q = Vec::with_capacity(freqs.len());
-    for (&f, &sigma) in freqs.iter().zip(sigma_db) {
+    for (i, (&f, &sigma)) in freqs.iter().zip(sigma_db).enumerate() {
         let e = excursion_db(&policy.excursion, f);
         let w = ((policy.sigma_none_db - sigma) / span).clamp(0.0, 1.0);
         let cut = e * w;
-        let boost = policy.boost_ratio * cut;
+        let mut boost = policy.boost_ratio * cut;
+        if let Some(mask) = gate {
+            if !mask[i] {
+                boost = 0.0;
+            }
+        }
         excursion.push(e);
         max_cut_db.push(cut);
+        // Recomputed from the gated boost, not the ungated one, so the curve's
+        // documented invariant `max_q[i] == max_q_for_boost(freqs[i],
+        // max_boost_db[i])` survives the gate. A zeroed boost gets the LOOSEST
+        // cap, which costs nothing: no boost can be placed there to use it.
         max_q.push(max_q_for_boost(f, boost));
         max_boost_db.push(boost);
     }
@@ -636,6 +795,78 @@ pub fn build_authority(
         min_dip_width_oct: policy.min_dip_width_oct,
         sigma_db: sigma_db.to_vec(),
     })
+}
+
+/// Which bins of `grid` sit in a region flat enough in excess group delay to be
+/// treated as locally minimum-phase — **the evidence the v1.1 gate consumes,
+/// computed in v1.**
+///
+/// `decision-engine-design.md` § Authority 2, verbatim: "The test, per
+/// 1/3-octave band centred at `f_c`: peak-to-peak EGD deviation within the band
+/// `< 1/(4·f_c)` (a quarter period — self-scaling: 5 ms at 50 Hz, 0.5 ms at
+/// 500 Hz)." `periods` is that `1/4`; see [`EGD_FLATNESS_PERIODS`].
+///
+/// # What the caller must do first
+///
+/// `egd_s` is the excess-group-delay trace **on `grid`**, one value per bin, in
+/// seconds. [`crate::fr::excess_group_delay_s`] produces it on the LINEAR rfft
+/// axis — "Resampling onto a log grid happens afterwards, in the caller, never
+/// inside the derivative" — so the caller bridges the two with
+/// [`crate::logf::resample_db_to_log_grid`], the crate's one resampler
+/// (`Prefilter::None` is plain `np.interp`; the `_db` in its name is a
+/// misnomer here, it resamples any scalar trace). **No resampler is added
+/// here**: a second one would be a second answer to "what is the EGD at this
+/// bin", which is exactly the drift `logf` exists to prevent.
+///
+/// # Why a `Vec<bool>` and not a `Result`
+///
+/// It follows [`authority_band_mask`]: a mask that cannot be computed grades
+/// **nothing** as flat rather than grading everything. All-`false` is returned
+/// when `egd_s` does not match the grid or `periods` is not finite and
+/// positive, and one bin is `false` when any EGD sample in its band is
+/// non-finite. That is the opposite of [`build_authority_gated`]'s `None` —
+/// deliberately, and the two are not in tension: `None` there means *no
+/// evidence was offered*, while a malformed slice here means *evidence was
+/// offered and is unusable*. The first must not veto; the second must not
+/// license.
+pub fn egd_flat_mask(grid: &LogGrid, egd_s: &[f64], periods: f64) -> Vec<bool> {
+    let freqs = grid.freqs();
+    if egd_s.len() != freqs.len() || !(periods.is_finite() && periods > 0.0) {
+        return vec![false; freqs.len()];
+    }
+    let lo_ratio = 2f64.powf(-EGD_BAND_HALF_OCT);
+    let hi_ratio = 2f64.powf(EGD_BAND_HALF_OCT);
+    freqs
+        .iter()
+        .map(|&f_c| {
+            if !f_c.is_finite() || f_c <= 0.0 {
+                return false;
+            }
+            // `LogGrid` is strictly increasing by construction, so the band is
+            // one contiguous slice and a binary search finds its ends.
+            let first = freqs.partition_point(|&f| f < f_c * lo_ratio);
+            let last = freqs.partition_point(|&f| f <= f_c * hi_ratio);
+            let band = &egd_s[first..last];
+            if band.iter().any(|e| !e.is_finite()) {
+                return false;
+            }
+            let mut lo = f64::INFINITY;
+            let mut hi = f64::NEG_INFINITY;
+            for &e in band {
+                if e < lo {
+                    lo = e;
+                }
+                if e > hi {
+                    hi = e;
+                }
+            }
+            // `f_c` is one of the band's own members, so an empty band is
+            // impossible and this subtraction is always a real peak-to-peak.
+            // The comparison is written positively: a NaN that somehow reached
+            // it answers `false`, i.e. "not flat", never "flat".
+            hi - lo < periods / f_c
+        })
+        .collect()
 }
 
 /// Which bins of `grid` are inside **the authority band**, the one definition
@@ -942,6 +1173,18 @@ fn validate_policy(policy: &AuthorityPolicy) -> Result<(), DspError> {
              LogLinear, strictly increasing finite positive breakpoints, got {:?}",
             policy.q_ceiling
         )));
+    }
+    // Unreachable on the v1 path: `EgdGate::Off` carries no number, so this arm
+    // can only fire for a policy that armed the v1.1 gate. Positive requirement
+    // like every other check here — a NaN threshold would make every
+    // peak-to-peak comparison false, i.e. veto EVERY boost, which is the one
+    // failure the gate is least likely to be blamed for.
+    if let EgdGate::On { periods } = policy.egd_gate {
+        if !(periods.is_finite() && periods > 0.0) {
+            return Err(DspError::InvalidInput(format!(
+                "AuthorityPolicy: egd_gate periods must be finite and > 0, got {periods}"
+            )));
+        }
     }
     Ok(())
 }
