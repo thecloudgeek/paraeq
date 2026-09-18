@@ -35,6 +35,7 @@ pub mod profile;
 mod rationale;
 mod refusal;
 mod rules;
+pub mod verification;
 
 pub use bundle::{
     CalFile, CalVariant, CapturePlan, CaptureRouting, CaptureStats, ImpulseResponse,
@@ -58,6 +59,7 @@ pub use paraeq_dsp::targets::TransducerClass;
 pub use profile::{
     profile_for, AuthorityKind, AveragingMode, CouplingPath, GatingMode, PathProfile, SmoothingMode,
 };
+pub use verification::VERIFICATION_RESIDUAL_MULTIPLE;
 
 /// Decide everything, from one measurement.
 ///
@@ -159,7 +161,15 @@ pub fn decide(bundle: &MeasurementBundle) -> DecisionSet {
     let preamp_db = rules::preamp_decision(bundle, &fit.bands, design_rate);
     let decisions = rules::assemble(analysis_decisions, design, preamp_db);
 
-    let diagnostics = refusal::diagnostics(bundle, &decisions, &products);
+    let mut diagnostics = refusal::diagnostics(bundle, &decisions, &products);
+    // B8's rows are APPENDED to the refusal table's, never interleaved: B7c's
+    // order is the frozen shape `fixtures/decide/<case>/expected.json` compares
+    // as a list. A verification block only ever ADDS refusals — it can never
+    // clear a row the table earned or turn a Refuse into a Proceed.
+    let verified = verification::verify(bundle, &decisions, &authority_curve, &grid);
+    if let Some(outcome) = &verified {
+        diagnostics.extend(outcome.diagnostics.iter().cloned());
+    }
     let verdict = verdict_for(&diagnostics);
     DecisionSet {
         analysis: Analysis {
@@ -198,9 +208,9 @@ pub fn decide(bundle: &MeasurementBundle) -> DecisionSet {
         decisions,
         diagnostics,
         verdict,
-        // B8 fills this from the bundle's `verification` block. `Option` keeps
+        // Present iff the bundle carried a `verification` block. `Option` keeps
         // every case that carries no verification byte-stable.
-        verification: None,
+        verification: verified.map(|outcome| outcome.report),
     }
 }
 

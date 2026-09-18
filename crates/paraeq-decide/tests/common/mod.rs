@@ -346,29 +346,163 @@ pub fn bundle_with_verification() -> MeasurementBundle {
     }
 }
 
+/// The verification pass [`bundle_with_verification`] carries, and the one the
+/// refusal-table tests attach to their own clean cohort.
+///
+/// **It is a pass a CORRECT engine would have produced**, not an arbitrary
+/// populated value: `decide()`'s verification gate grades any bundle that
+/// carries one, so a fixture whose routing, channel count, level or armed
+/// preamp did not add up would earn a refusal from B8 and every test that
+/// attaches it would be asserting against that refusal instead of its own row.
+/// Built by [`verified_bundle`] against the same `OverEar` cohort
+/// `flat_bundle(TransducerClass::OverEar, 5)` produces.
 pub fn verification() -> Verification {
-    Verification {
+    verified_bundle(&VerifiedSpec::default())
+        .verification
+        .expect("verified_bundle always carries one")
+}
+
+/// What a verification pass is made of, for [`verified_bundle`].
+#[derive(Clone, Debug)]
+pub struct VerifiedSpec {
+    /// Per ENGINE channel. The capture's channel count is `bands.len()`, so a
+    /// `Both` routing over divergent rows is representable and refusable.
+    pub bands: Vec<Vec<paraeq_dsp::peq::EQBand>>,
+    pub class: TransducerClass,
+    /// Provenance on the plan, deliberately settable apart from
+    /// [`Self::running_rate_hz`]: the prediction must be evaluated at the rate
+    /// the ENGINE ran at, never at the rate the bands were fitted at.
+    pub design_rate: f64,
+    pub positions: usize,
+    pub routing: CaptureRouting,
+    pub running_rate_hz: f64,
+}
+
+impl Default for VerifiedSpec {
+    /// The coupler cohort `flat_bundle(TransducerClass::OverEar, 5)` builds, and
+    /// the level book's own worked example: one **+6 dB boost**, so
+    /// `preamp_db = -6.0`, `L_verify = L_measure - 6.0` and `K = +6.0`. Every
+    /// preamp term in the accounting is therefore load-bearing in the default
+    /// fixture rather than only in the tests that opt into one.
+    fn default() -> Self {
+        VerifiedSpec {
+            bands: vec![vec![paraeq_dsp::peq::EQBand {
+                filter_type: paraeq_dsp::peq::FilterType::Peaking,
+                fc: 120.0,
+                gain_db: 6.0,
+                q: 1.5,
+            }]],
+            class: TransducerClass::OverEar,
+            design_rate: 48_000.0,
+            positions: 5,
+            routing: CaptureRouting::Both,
+            running_rate_hz: 48_000.0,
+        }
+    }
+}
+
+/// A bundle whose verification pass is EXACTLY what the level book predicts for
+/// an engine that did what we designed — so the residual is zero and every
+/// deviation a test introduces is the thing that test is about.
+///
+/// Baseline positions are bare deltas, the flattest curve this pipeline can
+/// produce. The verification IR is that same delta driven through the REALIZED
+/// cascade at `running_rate_hz` and scaled by `10^(2·preamp_db/20)`.
+///
+/// **The square is the level book, not a typo.** One factor is MS-19's
+/// re-levelling — the file is emitted at `L_verify = L_measure + preamp_db` —
+/// and the other is the preamp the corrected path applies from inside
+/// `Correction`. `K` cancels the first and `D` cancels the second, which is why
+/// the residual is zero only when BOTH terms are accounted for.
+pub fn verified_bundle(spec: &VerifiedSpec) -> MeasurementBundle {
+    let channels = spec.bands.len();
+    let mut bundle = synthetic_bundle(SyntheticSpec {
+        channels,
+        class: spec.class,
+        positions: spec.positions,
+        ..SyntheticSpec::default()
+    });
+    for position in &mut bundle.positions {
+        let peak = position.ir.peak;
+        let len = position.ir.samples[0].len();
+        for channel in position.ir.samples.iter_mut() {
+            *channel = sos_impulse(&[], peak, len);
+        }
+        position.routing = spec.routing;
+    }
+
+    // The engine's own fold: `min` over channels of the realized preamp at the
+    // LIVE rate. "The worst channel wins."
+    let armed_preamp_db = spec
+        .bands
+        .iter()
+        .map(|bands| eq_at(bands, spec.running_rate_hz).preamp_db())
+        .fold(f64::INFINITY, f64::min);
+    let scale = 10f64.powf(2.0 * armed_preamp_db / 20.0);
+
+    let peak = bundle.positions[0].ir.peak;
+    let len = bundle.positions[0].ir.samples[0].len();
+    let predicted = match spec.routing {
+        CaptureRouting::Both => spec.bands.first().cloned().unwrap_or_default(),
+        CaptureRouting::Only(n) => spec.bands.get(n as usize).cloned().unwrap_or_default(),
+    };
+    let sos = eq_at(&predicted, spec.running_rate_hz).realized_sos(spec.running_rate_hz);
+    let corrected: Vec<f64> = sos_impulse(&sos, peak, len)
+        .into_iter()
+        .map(|sample| sample * scale)
+        .collect();
+
+    bundle.verification = Some(Verification {
         capture: capture_stats(),
         gain_db: 0.0,
-        installed: correction_plan(),
-        // Differs from `installed.preamp_db` on purpose: the engine computes at
-        // the live rate over the surviving bands, folded min across channels.
-        installed_preamp_db: -4.1,
-        ir: ImpulseResponse {
-            peak: 2304,
-            sample_rate: 48000,
-            samples: vec![vec![0.0, 0.8, 0.0], vec![0.0, 0.7, 0.0]],
+        installed: CorrectionPlan {
+            bands: PerChannel::new(spec.bands.clone()).expect("at least one channel"),
+            clamps: vec![
+                vec![Clamp::GainToSigma {
+                    from: 6.0,
+                    to: 1.0,
+                    sigma_db: 4.2,
+                }];
+                channels
+            ],
+            design_rate: spec.design_rate,
+            dropped: Vec::new(),
+            // `decide()`'s own number at the DESIGN rate over all bands, which
+            // is a different quantity from the engine's armed one above and is
+            // deliberately left to differ when the two rates differ.
+            preamp_db: spec
+                .bands
+                .iter()
+                .map(|bands| eq_at(bands, spec.design_rate).preamp_db())
+                .fold(f64::INFINITY, f64::min),
         },
-        level_dbfs: -16.2,
+        installed_preamp_db: armed_preamp_db,
+        ir: ImpulseResponse {
+            peak,
+            sample_rate: bundle.capture.input_rate,
+            samples: vec![corrected; channels],
+        },
+        // MS-19: `L_verify = L_measure + preamp_db`, and `preamp_db <= 0`.
+        level_dbfs: bundle.capture.sweep.level_dbfs + armed_preamp_db,
         position_index: 0,
-        routing: CaptureRouting::Both,
-        running_rate_hz: 48000.0,
+        routing: spec.routing,
+        running_rate_hz: spec.running_rate_hz,
         two_clock: Some(TwoClockFit {
             intercept_samples: 2304.5,
             residual_peak_samples: 0.8,
             residual_rms_samples: 0.31,
             skew_ppm: 12.5,
         }),
+    });
+    bundle
+}
+
+/// `bands` as a cascade at `rate_hz`. The `sample_rate` field is set to the same
+/// rate so `preamp_db()` — which reads it — answers the live-rate number.
+pub fn eq_at(bands: &[paraeq_dsp::peq::EQBand], rate_hz: f64) -> paraeq_dsp::peq::ParametricEQ {
+    paraeq_dsp::peq::ParametricEQ {
+        bands: bands.to_vec(),
+        sample_rate: rate_hz,
     }
 }
 
