@@ -428,6 +428,81 @@ fn clipping_refuses_per_position_on_peak_and_per_session_on_sustain() {
     assert!(!has_code(&decide(&brief), DiagnosticCode::ClippingSession));
 }
 
+/// Both clipping rows at the exact number the spec writes, from the side the
+/// spec puts it on.
+///
+/// Each row is one comparison, and each is stated inclusively on a different
+/// side: "any sample **`≥ −0.3 dBFS`**" loses the position, and REW's sustained
+/// rule fires **above** 0.30 rather than at it. Every other test here stands a
+/// few tenths clear of both lines, so flipping either comparison — `>=` to `>`,
+/// `<=` to `<` — changes no answer any of them checks. On real captures those
+/// are the two most common readings there are: a sweep set just under full
+/// scale peaks within a tenth of a dB of the line constantly.
+///
+/// **They are inclusive in opposite directions because the quantities are.**
+/// `-0.3 dBFS` is a peak, and a peak AT the line is a sample that reached it —
+/// the position is gone. `0.30` is a fraction of a pass, and the row is a
+/// SUSTAINED-clipping rule: a pass that clipped for exactly three tenths of its
+/// length is the most the rule tolerates, not the least it refuses.
+#[test]
+fn the_two_clipping_rows_are_inclusive_at_exactly_their_own_thresholds() {
+    // The position row: exactly −0.3 dBFS fires. Ruling R-A1 makes it a
+    // position-scoped refusal, so the session survives on the other four.
+    let mut at_the_line = clean();
+    at_the_line.positions[3].capture = CaptureStats {
+        peak_dbfs: -0.3,
+        ..capture_stats()
+    };
+    let set = decide(&at_the_line);
+    let diagnostic = only_diagnostic(&set, DiagnosticCode::ClippingPosition);
+    assert_eq!(diagnostic.severity, Severity::RefusePosition);
+    assert_eq!(diagnostic.position, Some(3));
+    assert_eq!(diagnostic.value, Some(-0.3));
+
+    let mut under = clean();
+    under.positions[3].capture = CaptureStats {
+        peak_dbfs: -0.3 - 1e-6,
+        ..capture_stats()
+    };
+    assert!(
+        !has_code(&decide(&under), DiagnosticCode::ClippingPosition),
+        "a hair under the line is under it"
+    );
+
+    // The session row: 5.5 s at 48 kHz is 264 000 samples, and 79 200 of them
+    // is exactly 0.30 — the division is exact in f64, which the assertion
+    // states rather than assumes, because "exactly at the threshold" is the
+    // whole case.
+    let mut at_thirty_percent = clean();
+    let sweep_samples = at_thirty_percent.capture.sweep.duration_s
+        * f64::from(at_thirty_percent.capture.sweep_rate);
+    assert_eq!(
+        79_200.0 / sweep_samples,
+        0.30,
+        "precondition: this fixture must land ON the threshold, not near it"
+    );
+    at_thirty_percent.positions[1].capture = CaptureStats {
+        clipped_samples: 79_200,
+        ..capture_stats()
+    };
+    assert!(
+        !has_code(&decide(&at_thirty_percent), DiagnosticCode::ClippingSession),
+        "exactly 0.30 is the most the sustained rule tolerates"
+    );
+
+    let mut one_sample_more = clean();
+    one_sample_more.positions[1].capture = CaptureStats {
+        clipped_samples: 79_201,
+        ..capture_stats()
+    };
+    let set = decide(&one_sample_more);
+    assert_eq!(
+        only_diagnostic(&set, DiagnosticCode::ClippingSession).severity,
+        Severity::Refuse,
+        "and one sample past it refuses the session"
+    );
+}
+
 /// The same bundle with a FLAT silence-capture spectrum at `level_dbfs`.
 ///
 /// Flat on purpose: since ruling R-A8 the two level rows read the SPECTRUM and
@@ -470,6 +545,41 @@ fn noise_floor_too_high_refuses() {
     ));
 }
 
+/// The analysed band level the SNR fixtures put the cohort at.
+///
+/// The two SNR rows overlap with Dirac's `-24 dBFS` noise-floor gate: at
+/// `clean()`'s own level a floor 15 dB under it sits well above `-24`, so
+/// `NoiseFloorTooHigh` fires alongside and a test meant for one row grades two.
+/// `-20 dBFS` — the level the fixture's own `CaptureStats` already claims — puts
+/// every floor these tests use below the gate.
+const SNR_CAPTURE_DBFS: f64 = -20.0;
+
+/// The factor that puts `clean()`'s analysed band level at
+/// [`SNR_CAPTURE_DBFS`], measured against a floor so far down it cannot move
+/// `correction_range` and therefore cannot move the band the level is read over.
+///
+/// Returned rather than applied so a caller that builds many cohorts pays for
+/// the probe once.
+fn snr_capture_scale() -> f64 {
+    let probe = decide(&with_flat_floor(-160.0));
+    10f64.powf((SNR_CAPTURE_DBFS - snr_band_rms(&probe, 0)) / 20.0)
+}
+
+/// [`with_flat_floor`] at `floor_dbfs`, with every capture scaled by `scale`.
+///
+/// The floor is what moves between cases; the capture does not.
+fn noisy_cohort(scale: f64, floor_dbfs: f64) -> MeasurementBundle {
+    let mut bundle = with_flat_floor(floor_dbfs);
+    for position in &mut bundle.positions {
+        for channel in position.ir.samples.iter_mut() {
+            for sample in channel.iter_mut() {
+                *sample *= scale;
+            }
+        }
+    }
+    bundle
+}
+
 /// The two SNR rows at their boundaries. The soft row is a Warn; the hard row
 /// refuses, and its copy forbids the remedy a user reaches for first.
 ///
@@ -496,23 +606,10 @@ fn noise_floor_too_high_refuses() {
 /// thresholds without needing to hit them.
 #[test]
 fn snr_soft_warns_and_hard_refuses_at_the_boundary() {
-    const CAPTURE_DBFS: f64 = -20.0;
+    const CAPTURE_DBFS: f64 = SNR_CAPTURE_DBFS;
 
-    let probe = decide(&with_flat_floor(-160.0));
-    let probe_level = snr_band_rms(&probe, 0);
-    let scale = 10f64.powf((CAPTURE_DBFS - probe_level) / 20.0);
-
-    let at_floor = |floor_db: f64| {
-        let mut bundle = with_flat_floor(floor_db);
-        for position in &mut bundle.positions {
-            for channel in position.ir.samples.iter_mut() {
-                for sample in channel.iter_mut() {
-                    *sample *= scale;
-                }
-            }
-        }
-        decide(&bundle)
-    };
+    let scale = snr_capture_scale();
+    let at_floor = |floor_db: f64| decide(&noisy_cohort(scale, floor_db));
 
     let mut saw_soft = false;
     let mut saw_hard = false;
@@ -606,6 +703,76 @@ fn snr_band_rms(set: &paraeq_decide::DecisionSet, position: usize) -> f64 {
     };
     band_rms_db(&set.analysis.per_position_db[position], freqs, (lo, hi))
 }
+
+/// "Hard outranks soft", asserted as the precedence it is rather than as a
+/// by-product of a threshold.
+///
+/// The two rows are one `if` / `else if` over the same number: every SNR under
+/// the 15 dB hard gate is also under the 25 dB soft gate, so replacing the
+/// `else if` with a plain `if` emits BOTH rows for every noisy position and no
+/// threshold assertion notices. What the user sees then is one position
+/// reported twice, in two voices that contradict each other — "too much
+/// background noise to trust this", above "we used it as it is".
+///
+/// So this grades the SHAPE of the output: no soft row anywhere, and exactly one
+/// SNR row per position. The floor is 12 dB under the cohort, which is inside
+/// the hard band and therefore inside the soft one too — the overlap is what
+/// makes the precedence necessary and what makes this case a falsifier.
+///
+/// Since ruling R-A8 the rows read a band quantity, so the cohort is built by
+/// [`noisy_cohort`] rather than by setting `CaptureStats::rms_dbfs`: the SNR the
+/// rows grade is the analysed curve's band RMS minus the silence capture's, and
+/// a summary number no longer reaches them while the curves exist.
+#[test]
+fn the_hard_snr_row_outranks_the_soft_one_and_a_noisy_position_is_reported_once() {
+    let scale = snr_capture_scale();
+    let set = decide(&noisy_cohort(scale, SNR_CAPTURE_DBFS - 12.0));
+
+    let hard = diagnostics_with(&set, DiagnosticCode::LowSnrHard);
+    assert_eq!(
+        hard.len(),
+        5,
+        "precondition: every position in the cohort is under the hard gate; \
+         got {:?}",
+        set.diagnostics
+    );
+    assert!(
+        hard.iter()
+            .all(|d| d.value.is_some_and(|snr| snr < SNR_SOFT_DB)),
+        "precondition: and each is under the SOFT gate too, so the soft row's \
+         own condition is satisfied and only the precedence suppresses it; \
+         got {:?}",
+        hard.iter().map(|d| d.value).collect::<Vec<_>>()
+    );
+
+    assert!(
+        !has_code(&set, DiagnosticCode::LowSnrSoft),
+        "a position that tripped 15 dB has already tripped 25 and must not be \
+         reported twice: {:?}",
+        set.diagnostics
+    );
+
+    let mut reported: Vec<Option<usize>> = set
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(
+                d.code,
+                DiagnosticCode::LowSnrHard | DiagnosticCode::LowSnrSoft
+            )
+        })
+        .map(|d| d.position)
+        .collect();
+    reported.sort_unstable();
+    assert_eq!(
+        reported,
+        (0..5).map(Some).collect::<Vec<_>>(),
+        "exactly one SNR row per noisy position, naming the capture it is about"
+    );
+}
+
+/// The soft gate, spelled so the test above can say what it is under.
+const SNR_SOFT_DB: f64 = 25.0;
 
 /// § D-P, taken honestly: the soft row's copy says the position was used
 /// UNWEIGHTED, because nothing de-weights it.

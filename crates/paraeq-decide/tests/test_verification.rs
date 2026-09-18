@@ -753,6 +753,112 @@ fn a_capture_channel_count_mismatch_between_baseline_and_verification_refuses() 
     );
 }
 
+/// A short check capture is gated at ITS length, and so is the baseline it is
+/// differenced against.
+///
+/// The window is `min(decided right window, baseline post-peak, corrected
+/// post-peak)` — "one window for both curves", and the third term is the one
+/// nothing pinned. A check sweep can come back short for ordinary reasons: the
+/// user aborted a beat early, or the helper's own recording ended before the
+/// full 1000 ms the coupler path asks for.
+///
+/// **Two ways to get this wrong, and they fail differently.** Gating the
+/// baseline for 1000 ms and the check for 400 ms would difference a curve with
+/// a decade of resolution against one with less, and report the difference in
+/// WINDOW as a difference in the correction — the residual inflates and a
+/// correct correction is refused. Gating both for 1000 ms asks `apply_gate` for
+/// more samples than the check recording holds, which it refuses outright:
+/// `residual` returns `None` and the run refuses with "could not analyse what
+/// came back". Neither is a measurement, and a user sees the same thing both
+/// ways — auto mode declining a correction that was fine.
+///
+/// So the assertion is an EQUALITY against a control that cannot be gated any
+/// other way: truncate the baseline to the same post-peak length, and the three
+/// terms agree no matter which of them binds. Both are bare deltas past the
+/// peak, so the two baselines carry identical samples inside any window either
+/// one can support, and the two residuals must match bit for bit.
+#[test]
+fn a_short_check_capture_gates_both_curves_at_its_own_length() {
+    // 400 ms of post-peak data, against the coupler path's decided 1000 ms and
+    // the baseline's own ~1100 ms.
+    const KEEP_POST_PEAK_MS: f64 = 400.0;
+
+    let truncated = |truncate_baseline: bool| {
+        let mut bundle = verified_bundle(&VerifiedSpec::default());
+        let peak = bundle.positions[0].ir.peak;
+        let rate = f64::from(bundle.positions[0].ir.sample_rate);
+        let keep = peak + 1 + (KEEP_POST_PEAK_MS * rate / 1000.0).round() as usize;
+        for channel in bundle
+            .verification
+            .as_mut()
+            .expect("carried")
+            .ir
+            .samples
+            .iter_mut()
+        {
+            channel.truncate(keep);
+        }
+        if truncate_baseline {
+            for channel in bundle.positions[0].ir.samples.iter_mut() {
+                channel.truncate(keep);
+            }
+        }
+        bundle
+    };
+
+    let short_check = decide(&truncated(false));
+    let both_short = decide(&truncated(true));
+
+    // Preconditions: the decided window really is longer than what the check
+    // capture holds, and the baseline really is longer still — otherwise the
+    // third term never binds and the pair proves nothing.
+    assert_eq!(
+        short_check.decisions.right_window_ms.value, 1000.0,
+        "precondition: the coupler path's decided right window"
+    );
+    let baseline_post_peak_ms = {
+        let ir = &truncated(false).positions[0].ir;
+        (ir.samples[0].len() - ir.peak - 1) as f64 * 1000.0 / f64::from(ir.sample_rate)
+    };
+    assert!(
+        baseline_post_peak_ms > 1000.0,
+        "precondition: the baseline is the longest of the three, at \
+         {baseline_post_peak_ms:.1} ms"
+    );
+
+    assert!(
+        !has_code(&short_check, DiagnosticCode::VerificationResidual),
+        "a check capture shorter than the decided window is a shorter window, \
+         not an unanalysable pass: {:?}",
+        short_check.diagnostics
+    );
+    assert_eq!(
+        short_check.verdict,
+        Verdict::Proceed,
+        "{:?}",
+        short_check.diagnostics
+    );
+    assert_eq!(
+        short_check
+            .verification
+            .as_ref()
+            .expect("carried")
+            .residual_rms_db,
+        both_short
+            .verification
+            .as_ref()
+            .expect("carried")
+            .residual_rms_db,
+        "the same window over the same samples must give the same residual, \
+         whichever of the three terms is the one that bound it"
+    );
+    assert!(
+        graded_residual(&short_check) < SHAPE_TOLERANCE_DB,
+        "and it is still the residual of a correct engine: {}",
+        graded_residual(&short_check)
+    );
+}
+
 /// The gate is the WORST channel, never the mean. One clean ear and one 3 dB out
 /// must refuse; a mean-over-channels implementation would report 1.5 dB against
 /// a 2.0 dB gate and pass.

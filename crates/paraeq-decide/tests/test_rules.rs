@@ -27,8 +27,9 @@
 mod common;
 
 use common::{
-    authority_policy_for, minimal_bundle, shaped_bundle, synthetic_bundle, synthetic_targets,
-    target_curve, well_formed_bundle, with_override, SyntheticSpec, EVERY_CLASS,
+    authority_policy_for, cal_with_curve, minimal_bundle, shaped_bundle, sos_impulse,
+    synthetic_bundle, synthetic_targets, target_curve, well_formed_bundle, with_override,
+    SyntheticSpec, EVERY_CLASS,
 };
 use paraeq_decide::{
     decide, profile_for, AuthorityPreset, CalVariant, CorrectionForm, CouplingPath, Decisions,
@@ -451,12 +452,18 @@ fn low_corner_falls_back_to_the_scan_top_with_source_default() {
 // B7a's default was a flat 200.0 with `Source::Default`.
 // ===========================================================================
 
-/// A room bundle whose positions disagree around `centre_hz` by a spread wide
-/// enough to put σ(f) over 3 dB, and nowhere else.
+/// A room bundle whose five positions disagree around `centre_hz` — position
+/// `p` carries a peaking filter of `-spread_db + p·spread_db/2` — and agree
+/// everywhere else.
 ///
-/// `q` is what makes the disagreement broad or narrow, which is exactly the
-/// "stays ≥ for ≥ 1/3 octave" clause's subject.
-fn scattered_bundle(centre_hz: f64, q: f64) -> MeasurementBundle {
+/// **Two independent knobs, and the separation is the point.** `spread_db` sets
+/// how HIGH σ(f) climbs at the centre; `q` sets how WIDE the region where it is
+/// high turns out to be. The sustain clause ("stays ≥ 3 dB for ≥ 1/3 octave")
+/// grades the width alone, so a fixture meant to fail it must clear the HEIGHT
+/// gate first — otherwise the scan never reaches the clause and the test passes
+/// for the wrong reason, which is exactly what the Q=20/±6 dB fixture used to
+/// do (its σ peaked at 2.60 dB and never touched 3.0).
+fn scattered_bundle(centre_hz: f64, q: f64, spread_db: f64) -> MeasurementBundle {
     shaped_bundle(
         SyntheticSpec {
             cal: true,
@@ -467,10 +474,42 @@ fn scattered_bundle(centre_hz: f64, q: f64) -> MeasurementBundle {
             seed: 0x5EED_0003,
         },
         move |index| {
-            let gain = -6.0 + 3.0 * index as f64;
+            let gain = -spread_db + 0.5 * spread_db * index as f64;
             vec![biquad::peaking(centre_hz, gain, q, RATE)]
         },
     )
+}
+
+/// The highest σ(f) `decide()` published, and the widest contiguous run of bins
+/// at or above 3 dB, in octaves.
+///
+/// An oracle over the PUBLISHED σ curve — `Analysis::sigma_db` is the same
+/// array `transition_scan` read — so a test can say "this σ really does cross
+/// 3 dB, and the crossing really is too narrow to sustain" without asking the
+/// rule to confirm its own answer. The run is measured between the first and
+/// last bin at or above the threshold, which is how far the crossing can be
+/// SHOWN to hold on this grid.
+fn sigma_peak_and_widest_run_oct(set: &paraeq_decide::DecisionSet) -> (f64, f64, f64) {
+    let freqs = &set.analysis.freqs_hz;
+    let sigma = &set.analysis.sigma_db;
+    let peak = sigma.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let (mut start_hz, mut widest_oct) = (f64::NAN, 0.0f64);
+    let mut i = 0;
+    while i < sigma.len() {
+        if sigma[i] < 3.0 {
+            i += 1;
+            continue;
+        }
+        let first = i;
+        while i < sigma.len() && sigma[i] >= 3.0 {
+            i += 1;
+        }
+        let run_oct = (freqs[i - 1] / freqs[first]).log2();
+        if run_oct > widest_oct {
+            (start_hz, widest_oct) = (freqs[first], run_oct);
+        }
+    }
+    (peak, start_hz, widest_oct)
 }
 
 /// `transition_hz`: "Lowest `f` where `σ(f) ≥ 3.0 dB` and stays ≥ for ≥ 1/3
@@ -484,7 +523,7 @@ fn scattered_bundle(centre_hz: f64, q: f64) -> MeasurementBundle {
 fn transition_hz_is_the_sustained_three_db_crossing_and_falls_back_to_200() {
     // Broad: a Q=1 disagreement around 140 Hz keeps σ over 3 dB for about an
     // octave, so the crossing is real and the rule reports where it starts.
-    let broad = decide(&scattered_bundle(140.0, 1.0))
+    let broad = decide(&scattered_bundle(140.0, 1.0, 6.0))
         .decisions
         .transition_hz;
     assert_eq!(
@@ -501,9 +540,26 @@ fn transition_hz_is_the_sustained_three_db_crossing_and_falls_back_to_200() {
 
     // Narrow: a Q=20 disagreement is ~0.07 octave wide, well inside the 1/3
     // octave the clause requires, so it is scatter and not a transition.
-    let narrow = decide(&scattered_bundle(140.0, 20.0))
-        .decisions
-        .transition_hz;
+    //
+    // The ±9 dB spread is what makes this case grade the SUSTAIN clause rather
+    // than the threshold. At ±6 dB the same Q=20 scatter peaked at 2.60 dB, so
+    // σ never reached 3.0 anywhere and the scan fell back without ever
+    // consulting the clause — the fallback was right for the wrong reason, and
+    // `a_sigma_crossing_too_narrow_to_sustain_is_scatter_not_a_transition`
+    // below is the falsifier that found it.
+    let narrow_set = decide(&scattered_bundle(140.0, 20.0, 9.0));
+    let (narrow_peak, _, narrow_run_oct) = sigma_peak_and_widest_run_oct(&narrow_set);
+    assert!(
+        narrow_peak > 3.0,
+        "precondition: σ must CROSS 3 dB for this case to reach the sustain \
+         clause at all; it peaks at {narrow_peak:.3} dB"
+    );
+    assert!(
+        narrow_run_oct < 1.0 / 3.0,
+        "precondition: and the crossing must be too narrow to sustain; it holds \
+         for {narrow_run_oct:.4} octave"
+    );
+    let narrow = narrow_set.decisions.transition_hz;
     assert_eq!(narrow.value, 200.0);
     assert_eq!(narrow.source, Source::Default);
 
@@ -542,6 +598,84 @@ fn transition_hz_is_the_sustained_three_db_crossing_and_falls_back_to_200() {
             }
         )),
         "§ D-L: `room::transition_range` rides along as the cross-check"
+    );
+}
+
+/// The sustain clause on its own, with the HEIGHT of the crossing held fixed
+/// and only its WIDTH moved.
+///
+/// The rule is two conditions joined by an "and": σ(f) reaches 3 dB, **and** it
+/// stays there for a third of an octave. Every earlier fixture varied both at
+/// once, so deleting the second condition — `if sustained || true` — changed no
+/// test's answer: the narrow case fell back because its σ never reached 3 dB,
+/// which the first condition already handles.
+///
+/// Both bundles here scatter by the same ±12 dB, so both cross 3 dB by a wide
+/// margin (the assertions say so). The only thing Q moves is how long the
+/// crossing holds: at Q=12 it holds for about a sixth of an octave and at Q=4
+/// for about half of one. The rule must answer differently, and what it answers
+/// is the difference between "the room stops being correctable everywhere above
+/// here" and "one bin was noisy".
+///
+/// **Why the width matters to a user and not only to the scan.** `transition_hz`
+/// is what the Advanced drawer renders as "below {f_t} Hz your room's problems
+/// are the same everywhere you sit". Reporting a sixth of an octave of scatter
+/// as that frequency puts a sentence about the whole room behind a
+/// disagreement that is narrower than the ear's own resolution there.
+#[test]
+fn a_sigma_crossing_too_narrow_to_sustain_is_scatter_not_a_transition() {
+    // ~1/6 octave of crossing: over the 3 dB line, under the 1/3 octave rule.
+    let scatter = decide(&scattered_bundle(140.0, 12.0, 12.0));
+    let (scatter_peak, _, scatter_run_oct) = sigma_peak_and_widest_run_oct(&scatter);
+    assert!(
+        scatter_peak > 3.0,
+        "σ must clear the 3 dB threshold, or the sustain clause is never \
+         reached and this case proves nothing; it peaks at {scatter_peak:.3} dB"
+    );
+    assert!(
+        (0.125..1.0 / 3.0).contains(&scatter_run_oct),
+        "and it must hold for roughly a sixth of an octave — over a bin's width \
+         and under the rule's third — but it holds for {scatter_run_oct:.4}"
+    );
+    assert_eq!(
+        scatter.decisions.transition_hz.value, 200.0,
+        "a crossing that cannot be shown to stay is not a crossing this rule \
+         may report: σ peaked at {scatter_peak:.3} dB over {scatter_run_oct:.4} \
+         octave"
+    );
+    assert_eq!(
+        scatter.decisions.transition_hz.source,
+        Source::Default,
+        "and the fallback is labelled a fallback, never a measurement"
+    );
+
+    // The same ±12 dB disagreement, spread over ~1/2 octave by dropping Q.
+    let transition = decide(&scattered_bundle(140.0, 4.0, 12.0));
+    let (wide_peak, wide_start_hz, wide_run_oct) = sigma_peak_and_widest_run_oct(&transition);
+    assert!(
+        wide_peak > 3.0,
+        "the wide case crosses too — only the width changed; σ peaks at \
+         {wide_peak:.3} dB"
+    );
+    assert!(
+        wide_run_oct >= 1.0 / 3.0,
+        "the wide case must SATISFY the clause the narrow one fails, or the \
+         pair is not a controlled comparison; it holds for {wide_run_oct:.4} \
+         octave"
+    );
+    assert_eq!(
+        transition.decisions.transition_hz.source,
+        Source::Auto,
+        "a sustained crossing is a measurement"
+    );
+    // This σ has one contiguous crossing, so its lowest bin is the lowest
+    // frequency at which a sustained crossing can begin — the number the rule
+    // reports, read off the published curve rather than off the rule.
+    assert!(
+        (transition.decisions.transition_hz.value - wide_start_hz).abs() < EPS,
+        "the rule reports the crossing's own lowest bin: said {}, the σ curve \
+         crosses at {wide_start_hz}",
+        transition.decisions.transition_hz.value
     );
 }
 
@@ -1152,6 +1286,115 @@ fn preamp_is_minus_the_realized_cascade_peak_with_no_headroom() {
             );
         }
     }
+}
+
+/// One channel's bands. `PerChannel` is not indexable — the container exists so
+/// a channel index cannot be confused with a band index — so a test that is
+/// about ONE channel says which through `get`.
+fn channel_bands(plan: &paraeq_decide::CorrectionPlan, channel: usize) -> &[EQBand] {
+    plan.bands
+        .get(channel)
+        .map(Vec::as_slice)
+        .unwrap_or_else(|| panic!("the plan carries no channel {channel}"))
+}
+
+/// A bundle whose CHANNEL `c` has the magnitude response of `per_channel[c]`,
+/// the same at every position.
+///
+/// `common::shaped_bundle` and `common::shaped_positions` both vary the shape
+/// per POSITION and copy one response across the channels, which is the right
+/// axis for σ(f) and the wrong one for anything folded over channels: with
+/// identical channels a fold cannot be told apart from its own mirror image.
+/// The cal is flattened for the same reason `shaped_bundle` flattens it —
+/// compensation subtracts the cal, so a vendor curve would put a second shape
+/// on the analysed curve that this test did not ask for.
+fn per_channel_bundle(class: TransducerClass, per_channel: &[Vec<[f64; 6]>]) -> MeasurementBundle {
+    let mut bundle = synthetic_bundle(SyntheticSpec {
+        cal: true,
+        channels: per_channel.len(),
+        class,
+        positions: profile_for(class).positions_default,
+        sample_rate: RATE as u32,
+        seed: 0x5EED_0011,
+    });
+    bundle.cal = Some(cal_with_curve(vec![20.0, 20_000.0], vec![0.0, 0.0]));
+    for position in &mut bundle.positions {
+        let peak = position.ir.peak;
+        let len = position.ir.samples[0].len();
+        for (channel, sections) in position.ir.samples.iter_mut().zip(per_channel) {
+            *channel = sos_impulse(sections, peak, len);
+        }
+    }
+    bundle
+}
+
+/// The worst channel wins, with the two channels made to disagree.
+///
+/// `preamp_is_minus_the_realized_cascade_peak_with_no_headroom` re-runs
+/// `fold(0.0, f64::min)` and compares, so it cannot tell `min` from `max`: on
+/// every fixture it grades, both channels carry the same peak and both folds
+/// give the same answer. This one builds the disagreement — a dip on the left
+/// ear, a bump on the right — and compares against a number written out from
+/// the authority envelope rather than from the fold.
+///
+/// **What the fold protects.** The preamp is the headroom the corrected path
+/// gives back before the cascade runs. Taking the QUIETER channel's requirement
+/// would leave the boosted channel 5 dB into the ceiling, so the ear that
+/// needed the boost is the ear that clips — and a listener hears it as
+/// distortion on one side only, which reads as a broken headphone rather than a
+/// broken correction.
+#[test]
+fn the_preamp_is_the_worst_channel_not_the_quietest() {
+    // A 120 Hz dip on channel 0 and a 120 Hz bump on channel 1, both 8 dB, on
+    // the coupler path. The correction inverts each: channel 0 asks for a
+    // boost, channel 1 for a cut.
+    let dip = vec![biquad::peaking(120.0, -8.0, 1.5, RATE)];
+    let bump = vec![biquad::peaking(120.0, 8.0, 1.5, RATE)];
+    let set = decide(&per_channel_bundle(
+        TransducerClass::OverEar,
+        &[dip.clone(), bump.clone()],
+    ));
+    let plan = set.correction.as_ref().expect("a clean coupler cohort");
+
+    // The case is only a case if the two channels really do differ in sign.
+    assert!(
+        channel_bands(plan, 0).iter().any(|b| b.gain_db > 0.0),
+        "precondition: channel 0 must ask for a boost, got {:?}",
+        channel_bands(plan, 0)
+    );
+    assert!(
+        channel_bands(plan, 1).iter().all(|b| b.gain_db <= 0.0),
+        "precondition: channel 1 must be cut-only, got {:?}",
+        channel_bands(plan, 1)
+    );
+
+    // Channel 1's own requirement, pinned by a bundle that carries nothing
+    // else: a cut-only cascade never rises above 0 dB, so it needs exactly no
+    // headroom. This is the number the `max` fold would have answered with.
+    let cut_only = decide(&per_channel_bundle(
+        TransducerClass::OverEar,
+        &[bump.clone(), bump],
+    ));
+    assert_eq!(
+        cut_only.decisions.preamp_db.value,
+        0.0,
+        "the quiet side's own preamp: {:?}",
+        cut_only.correction.as_ref().map(|p| p.bands.clone())
+    );
+
+    // Channel 0's, written out rather than re-folded. `COUPLER_EXCURSION_DB` is
+    // 10 dB at and below 150 Hz and `DEFAULT_BOOST_RATIO` halves it for boosts,
+    // so +5.0 dB is the most the envelope licenses at 120 Hz — the fit asked
+    // for +8 and was clamped there. A cascade whose peak is +5.0 dB needs
+    // 5.0 dB of headroom.
+    const LICENSED_BOOST_DB: f64 = 5.0;
+    assert!(
+        (set.decisions.preamp_db.value + LICENSED_BOOST_DB).abs() < 0.01,
+        "the preamp must be the BOOSTED channel's −{LICENSED_BOOST_DB:.1} dB, \
+         not the cut-only channel's 0.0; it is {} with bands {:?}",
+        set.decisions.preamp_db.value,
+        plan.bands
+    );
 }
 
 /// A zero preamp renders as "0.0 dB", never "-0.0 dB".
