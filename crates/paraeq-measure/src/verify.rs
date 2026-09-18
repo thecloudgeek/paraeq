@@ -84,6 +84,13 @@
 //! helper block, plus `ABORT_RAMP_MS`, plus the engine's own reported latency,
 //! plus slack — and reported rather than asserted.
 //!
+//! That budget answers "when has the SOUND stopped?" and it is not the
+//! teardown ladder's deadline (R-B3). Rung 1a asks a different question —
+//! "when has the PROCESS gone?" — and a process must stop its device, destroy
+//! its IOProc and destroy its private aggregate first, none of which is a ramp.
+//! So rung 1a gets the budget plus [`HELPER_TEARDOWN_ALLOWANCE_MS`]; giving it
+//! the acoustic budget alone fired SIGTERM on effectively every abort.
+//!
 //! Mitigating fact, stated so nobody "tightens" the budget by hard-stopping:
 //! `L_verify ≤ L_measure` **always**, so exposure during those extra
 //! milliseconds is bounded below the Direct path's, which the level ladder
@@ -179,6 +186,19 @@ pub struct VerifyTiming {
     pub helper_done_ms: u64,
     /// How long to wait for the child's `ready` line.
     pub helper_ready_ms: u64,
+    /// How long the child gets to run its OWN teardown — ramp, stop the
+    /// device, destroy the IOProc and its private aggregate, emit its
+    /// terminating line, exit — on top of the acoustic ramp budget, before
+    /// rung 1b escalates to SIGTERM.
+    ///
+    /// R-B3: this is a SECOND number, not the acoustic budget. Rung 1a used to
+    /// be given `abort_acoustic_budget_ms` (~21 ms), which no child can do all
+    /// of the above inside — so SIGTERM fired on effectively every abort and
+    /// the child's whole allowance to destroy its aggregate collapsed to
+    /// [`Self::sigterm_deadline_ms`] before SIGKILL, producing
+    /// `RenderDeviceLeaked` on exactly the path the ladder exists to prevent.
+    /// Default [`HELPER_TEARDOWN_ALLOWANCE_MS`].
+    pub helper_teardown_allowance_ms: u64,
     /// How long SIGTERM gets before SIGKILL.
     pub sigterm_deadline_ms: u64,
     /// Poll period for the realtime activity witness.
@@ -198,6 +218,7 @@ impl Default for VerifyTiming {
             capture_tail_s: 0.5,
             helper_done_ms: 30_000,
             helper_ready_ms: 5_000,
+            helper_teardown_allowance_ms: HELPER_TEARDOWN_ALLOWANCE_MS,
             sigterm_deadline_ms: 250,
             tap_poll_ms: 10,
             window_a_ms: 1_000,
@@ -205,6 +226,19 @@ impl Default for VerifyTiming {
         }
     }
 }
+
+/// Rung 1a's allowance for the child's own teardown, on top of the acoustic
+/// ramp budget, in milliseconds.
+///
+/// **[NEEDS DATA].** 1500 ms is a generous interim, not a measurement: the
+/// real cost is `AudioDeviceStop` + `AudioDeviceDestroyIOProcID` +
+/// `AudioHardwareDestroyAggregateDevice` on the rig, which is what B16's
+/// `SIGTERM:` measurement sizes (priced under E8, which reports the rungs
+/// separately). Generous is the safe direction here: overshooting costs a
+/// slower abort on a child that has genuinely wedged, while undershooting
+/// SIGKILLs a healthy child mid-destroy and leaves its private aggregate
+/// wrapping the user's output device.
+pub const HELPER_TEARDOWN_ALLOWANCE_MS: u64 = 1_500;
 
 /// The sweep to re-level and play. The SAME shape the baseline used at this
 /// position — only the level differs, which is the whole of MS-19.
@@ -440,7 +474,12 @@ pub struct VerificationPass {
 
     // Runtime.
     child_exited: bool,
-    ramp_deadline_ms: u64,
+    /// Rung 1a's deadline: the acoustic ramp budget PLUS
+    /// [`VerifyTiming::helper_teardown_allowance_ms`]. Distinct from
+    /// [`VerifyOutcome::abort_acoustic_budget_ms`], which is what gets
+    /// reported — R-B3 is that these are two numbers answering two questions
+    /// ("when has the sound stopped?" and "when has the process gone?").
+    helper_exit_deadline_ms: u64,
     warnings: Vec<MeasurementDiagnostic>,
 
     // RAII, in teardown order. The lease is LAST.
@@ -492,7 +531,7 @@ impl VerificationPass {
             recomputed_preamp_db: 0.0,
             stream_rate_hz: 0.0,
             child_exited: false,
-            ramp_deadline_ms: 0,
+            helper_exit_deadline_ms: 0,
             warnings: Vec::new(),
             child: None,
             gain_pin: None,
@@ -908,7 +947,14 @@ impl VerificationPass {
             0.0
         };
         let slack = self.request.timing.abort_slack_ms;
-        self.ramp_deadline_ms = (ABORT_RAMP_MS + block_ms + slack).ceil() as u64;
+        // Two numbers, deliberately (R-B3). The acoustic budget answers "when
+        // has the sound stopped?" and is REPORTED. Rung 1a's deadline answers
+        // "when has the process gone?", and a process needs to destroy an
+        // IOProc and a private aggregate first — which is a HAL round trip,
+        // not a ramp.
+        let ramp_deadline_ms = (ABORT_RAMP_MS + block_ms + slack).ceil() as u64;
+        self.helper_exit_deadline_ms =
+            ramp_deadline_ms + self.request.timing.helper_teardown_allowance_ms;
         let abort_acoustic_budget_ms =
             block_ms + ABORT_RAMP_MS + self.engine.latency_ms().unwrap_or(0.0) + slack;
 
@@ -1440,7 +1486,7 @@ impl VerificationPass {
                     error: e.to_string(),
                 });
             }
-            if !await_exit(&mut *child, self.ramp_deadline_ms) {
+            if !await_exit(&mut *child, self.helper_exit_deadline_ms) {
                 // Rung 1b — SIGTERM. A SECOND ramp request, not a stop.
                 if let Err(e) = child.request_terminate() {
                     self.log.push(SessionEvent::SinkFault {

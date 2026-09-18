@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use paraeq_dsp::peq::{EQBand, FilterType, ParametricEQ};
 use paraeq_dsp::targets::TransducerClass;
@@ -488,6 +488,15 @@ struct ChildScript {
     /// separation matters: a single flag cannot express "silent and alive",
     /// which is exactly the state that used to read as a clean exit.
     wedged_silent: Arc<AtomicBool>,
+    /// A HEALTHY child's own teardown: it keeps talking and exits this long
+    /// after the ladder first probes it. That is the state R-B3 is about —
+    /// ramping, stopping the device and destroying a private aggregate takes
+    /// far longer than the ~21 ms acoustic ramp budget rung 1a used to be
+    /// given, and a mock that exits instantly can never show it.
+    exit_after: Arc<Mutex<Option<Duration>>>,
+    /// When the ladder first asked whether the child was alive; `exit_after`
+    /// is measured from here.
+    first_probe: Arc<Mutex<Option<Instant>>>,
     exit: Arc<Mutex<HelperExit>>,
     flow: Flow,
     journal: Journal,
@@ -506,6 +515,8 @@ impl ChildScript {
             lines: Arc::new(Mutex::new(Vec::new())),
             never_exits: Arc::new(AtomicBool::new(false)),
             wedged_silent: Arc::new(AtomicBool::new(false)),
+            exit_after: Arc::new(Mutex::new(None)),
+            first_probe: Arc::new(Mutex::new(None)),
             exit: Arc::new(Mutex::new(HelperExit {
                 code: Some(0),
                 signalled: false,
@@ -592,6 +603,14 @@ impl HelperProcess for MockChild {
         {
             return Ok(None);
         }
+        // A healthy child mid-teardown: alive, and not done yet.
+        if let Some(delay) = *lock(&self.script.exit_after) {
+            let mut first = lock(&self.script.first_probe);
+            let started = *first.get_or_insert_with(Instant::now);
+            if started.elapsed() < delay {
+                return Ok(None);
+            }
+        }
         let exit = *lock(&self.script.exit);
         self.reaped = Some(exit);
         Ok(Some(exit))
@@ -607,6 +626,15 @@ impl HelperProcess for MockChild {
         let mut lines = lock(&self.script.lines);
         if lines.is_empty() {
             drop(lines);
+            // A child still running its teardown still has a pipe. Reporting
+            // EOF here would end `await_exit` before its deadline and make the
+            // deadline untestable.
+            if lock(&self.script.exit_after).is_some() {
+                std::thread::sleep(Duration::from_millis(1));
+                return Ok(HelperLine::Line(
+                    r#"{"event":"progress","frames_emitted":1}"#.to_owned(),
+                ));
+            }
             if self.script.never_exits.load(Ordering::SeqCst) {
                 // A wedged child keeps talking. Sleep so the ladder's deadline
                 // is a real deadline rather than a spin.
@@ -765,6 +793,9 @@ fn fast_timing() -> VerifyTiming {
         capture_tail_s: 0.02,
         helper_done_ms: 2_000,
         helper_ready_ms: 2_000,
+        // Short, but still an order of magnitude above the ~17 ms acoustic
+        // ramp budget this rig computes — which is the whole of R-B3.
+        helper_teardown_allowance_ms: 200,
         sigterm_deadline_ms: 15,
         tap_poll_ms: 1,
         window_a_ms: 5,
@@ -1608,6 +1639,57 @@ fn a_clean_exit_that_left_its_render_device_behind_is_still_reported() {
     assert!(
         !lock(&rig.script.exit).signalled,
         "the child exited cleanly: the old signalled-based inference would have missed this"
+    );
+}
+
+/// R-B3. Rung 1a's deadline is the acoustic ramp budget PLUS a named teardown
+/// allowance, not the acoustic budget alone.
+///
+/// The acoustic budget is ~21 ms: one helper block plus the 5 ms ramp plus
+/// slack. No child can ramp, `AudioDeviceStop`, `AudioDeviceDestroyIOProcID`,
+/// `AudioHardwareDestroyAggregateDevice` and exit inside that, so SIGTERM fired
+/// on effectively every abort — and once it had, the child's entire allowance
+/// to destroy its private aggregate was the 250 ms before SIGKILL. A SIGKILLed
+/// child bypasses `Drop`, which leaves that aggregate wrapping the user's
+/// output device: `RenderDeviceLeaked`, on exactly the path the ladder exists
+/// to prevent.
+///
+/// This child takes 30 ms to tear down — comfortably past the old deadline,
+/// comfortably inside this rig's 200 ms allowance.
+#[test]
+fn a_child_that_exits_within_the_teardown_allowance_never_reaches_sigterm() {
+    let scratch = Scratch::new("teardown-allowance");
+    let rig = Rig::new("teardown-allowance", &scratch, boost_plan());
+    // The tap never wakes, so the pass refuses mid-run with a LIVE child and
+    // the ladder runs for real rather than short-circuiting on `child_exited`.
+    rig.flow.wake_at.store(u64::MAX, Ordering::SeqCst);
+    *lock(&rig.script.exit_after) = Some(Duration::from_millis(30));
+
+    let mut pass = rig.acknowledged();
+    let error = pass.run().unwrap_err();
+    assert_eq!(refusal_of(&error), D::TapSilentDuringVerification);
+
+    let calls = rig.journal.calls();
+    assert!(
+        calls.contains(&"helper.request_abort".to_owned()),
+        "the polite rung still runs: {calls:?}"
+    );
+    assert!(
+        !calls.contains(&"helper.request_terminate".to_owned()),
+        "a child that tore down inside its allowance must not be signalled: {calls:?}"
+    );
+    assert!(
+        !calls.contains(&"helper.kill".to_owned()),
+        "and certainly not killed: {calls:?}"
+    );
+    assert!(
+        !pass.log().events().iter().any(|e| matches!(
+            e,
+            SessionEvent::Warning {
+                diagnostic: D::HelperKilledAfterRampDeadline
+            }
+        )),
+        "nothing was killed, so nothing is reported killed"
     );
 }
 

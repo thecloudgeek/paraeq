@@ -112,7 +112,7 @@ pub use verify::{
     classify_exit, exit_diagnostic, expected_render_device_uid, ArmingFailure, HelperExitKind,
     HelperReady, SweepShape, VerificationPass, VerifyCaptureStats, VerifyError, VerifyOutcome,
     VerifyPhase, VerifyPlan, VerifyRequest, VerifySeam, VerifyTiming, VerifyTwoClockFit,
-    CAPTURE_FLOOR_DBFS, PREAMP_MATCH_TOLERANCE, VERIFY_MIN_SNR_DB,
+    CAPTURE_FLOOR_DBFS, HELPER_TEARDOWN_ALLOWANCE_MS, PREAMP_MATCH_TOLERANCE, VERIFY_MIN_SNR_DB,
 };
 
 /// Error type shared by this crate's entry points.
