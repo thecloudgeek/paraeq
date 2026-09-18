@@ -59,6 +59,7 @@ pub use paraeq_dsp::targets::TransducerClass;
 pub use profile::{
     profile_for, AuthorityKind, AveragingMode, CouplingPath, GatingMode, PathProfile, SmoothingMode,
 };
+use std::borrow::Cow;
 pub use verification::VERIFICATION_RESIDUAL_MULTIPLE;
 
 /// Decide everything, from one measurement.
@@ -259,16 +260,25 @@ struct Pass {
 /// moment an earlier one was dropped. The analysis is index-parallel to this
 /// SHORTENED list, which is why [`Analysis::per_position_db`] says so.
 ///
-/// `Clone` rather than a borrowed view: `MeasurementBundle` is the one value
-/// every rule reads, and threading a "which positions count" argument through
-/// twenty rules is exactly the second source of truth this design avoids. The
-/// empty case is free — `excluded` is empty on every bundle with no
-/// position-scoped refusal, which is all of them but two.
-fn without_positions(bundle: &MeasurementBundle, excluded: &[usize]) -> MeasurementBundle {
+/// A whole COPY rather than a borrowed view, when a position is actually
+/// dropped: `MeasurementBundle` is the one value every rule reads, and threading
+/// a "which positions count" argument through twenty rules is exactly the second
+/// source of truth this design avoids.
+///
+/// [`Cow`] rather than an unconditional `clone()`, because the no-drop case is
+/// every bundle but two and the copy is not cheap: a nine-position room bundle
+/// carries megabytes of inline impulse response, and cloning it to change
+/// nothing cost that on every `decide()` call. `Cow::Borrowed` makes the common
+/// path free; the deep copy happens only on the round that actually sheds a
+/// capture.
+fn without_positions<'a>(
+    bundle: &'a MeasurementBundle,
+    excluded: &[usize],
+) -> Cow<'a, MeasurementBundle> {
     if excluded.is_empty() {
-        return bundle.clone();
+        return Cow::Borrowed(bundle);
     }
-    MeasurementBundle {
+    Cow::Owned(MeasurementBundle {
         positions: bundle
             .positions
             .iter()
@@ -276,7 +286,7 @@ fn without_positions(bundle: &MeasurementBundle, excluded: &[usize]) -> Measurem
             .cloned()
             .collect(),
         ..bundle.clone()
-    }
+    })
 }
 
 /// Every stage, over one cohort. Extracted from [`decide`] so the drop loop can
