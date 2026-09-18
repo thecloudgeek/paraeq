@@ -526,3 +526,75 @@ fn the_default_layout_costs_two_point_two_seconds() {
     );
     assert_eq!(DEFAULT_MARKER_LAYOUT.markers(), 4);
 }
+
+#[test]
+fn the_shipped_layout_is_the_four_marker_bracket() {
+    // The four-marker guarantee, asserted where it MEANS something rather than
+    // only as a side effect of the 2.20 s overhead budget: a layout can keep
+    // its duration and lose its degrees of freedom (one marker per end plus a
+    // longer lead-in costs the same seconds), and the figure that vanishes is
+    // the residual jitter the credibility ladder is built on.
+    assert_eq!(
+        DEFAULT_MARKER_LAYOUT.markers_per_end, 2,
+        "two markers at EACH end is the shipped bracket"
+    );
+    assert_eq!(
+        DEFAULT_MARKER_LAYOUT.markers(),
+        4,
+        "so the train the product assembles has four members"
+    );
+
+    // And the same claim end to end, ON THE SHIPPED LAYOUT rather than on the
+    // tenth-scale stand-in the rest of this file runs: four markers recover a
+    // real residual figure and two cannot. Noise is added for the same reason
+    // as in `four_markers_give_a_nonzero_residual_figure_and_two_do_not` —
+    // without something to scatter the peak refinement, a small figure would
+    // prove nothing.
+    //
+    // The SWEEP is short (0.3 s, not the 5.5 s cap) because the sweep length
+    // is not what this test is about: `find_marker_train` is an O(N·M) naive
+    // correlation, and the shipped 7.70 s file costs about a minute of
+    // debug-build time while the bracket around a 0.3 s sweep costs about
+    // seven seconds. Everything the four-marker claim depends on — the shipped
+    // marker length, gaps, lead-in, tail and sample rate — is the real one, so
+    // the rate is NOT scaled down: the marker is a 2–8 kHz chirp and a tenth
+    // of 48 kHz would alias it.
+    let sweep = low_band_payload();
+    let mut degenerate = DEFAULT_MARKER_LAYOUT;
+    degenerate.markers_per_end = 1;
+
+    let mut figures = Vec::new();
+    for layout in [degenerate, DEFAULT_MARKER_LAYOUT] {
+        let (playback, _) = bracket(&sweep, &layout, peak(&sweep), RATE);
+        let mut capture = simulate_capture(&playback, 733, 120.0);
+        let noise = lcg_noise(capture.len(), 0.02, 20_260_918);
+        for (sample, noise) in capture.iter_mut().zip(noise) {
+            *sample += noise;
+        }
+        let measured = locate(&capture, &layout_marker(&layout, RATE), &layout, RATE)
+            .expect("the train is present at this SNR");
+        assert_eq!(
+            measured.len(),
+            layout.markers(),
+            "the whole train, not a subset"
+        );
+        let expected = expected_marker_positions(&layout, sweep.len(), RATE);
+        figures.push(
+            estimate_skew(&expected, &measured)
+                .expect("fit")
+                .residual_peak_samples,
+        );
+    }
+
+    assert!(
+        figures[0] < 1e-9,
+        "one marker per end reports {} samples of 'jitter', which is \
+         arithmetic, not measurement",
+        figures[0]
+    );
+    assert!(
+        figures[1] > 1e-3,
+        "the shipped layout must report a REAL figure, got {} samples",
+        figures[1]
+    );
+}

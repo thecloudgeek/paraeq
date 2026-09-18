@@ -165,7 +165,7 @@ fn a_hot_sweep_padded_with_silence_is_still_refused() {
 }
 
 #[test]
-fn the_backstop_refuses_exactly_at_the_parents_ceiling() {
+fn the_backstop_refuses_a_tenth_of_a_db_over_the_parents_ceiling_and_plays_a_tenth_under() {
     // Behavioural, and computed FROM the re-exported constant rather than from
     // a copy. Two locally-declared constants kept in step by hand would pass an
     // equality assertion right up to the moment someone forgot; a bound derived
@@ -179,6 +179,129 @@ fn the_backstop_refuses_exactly_at_the_parents_ceiling() {
     assert_eq!(refusal.code.code(), 6);
     assert!(refusal.message.contains("window"), "{}", refusal.message);
     check(&cool, RATE).expect("below the ceiling, so it plays");
+}
+
+/// The sum `max_window_rms_dbfs` folds, in the same order it folds it — so a
+/// buffer can be built to land on a chosen value of it. Written as a fold over
+/// the samples rather than `count × square` because f64 addition is not
+/// associative and the two answers differ in the last bits, which is the only
+/// part of the answer this file's boundary test is about.
+fn sum_of_squares(buf: &[f32]) -> f64 {
+    buf.iter().map(|&v| f64::from(v) * f64::from(v)).sum()
+}
+
+/// A buffer whose max-window mean square is EXACTLY `mean_square`, bit for bit
+/// — and so whose measured dBFS RMS is exactly what that mean square reads as.
+///
+/// [`square_at_dbfs_rms`] cannot do this and no amplitude can: one f32
+/// amplitude quantises the mean square to ~1.2e-7 relative, i.e. ±2.5e-7 dB,
+/// which is five orders of magnitude too coarse to sit ON a ceiling instead of
+/// near it. So all but the last few samples are the square wave, and those few
+/// are TRIMMED to carry the shortfall — each one is the square root of what is
+/// still missing, so the error falls by about 1e-7 per trimmed sample and two
+/// of them reach the f64 floor of the sum itself. They are at the end, where
+/// they cannot disturb the partial sums before them.
+///
+/// The length is a power of two so the `sum / len` inside the measurement is
+/// exact, which makes "the sum hit its target" and "the mean hit its target"
+/// the same statement; and it is under one window, so the file is measured
+/// whole and there is exactly one window to land.
+fn square_with_exact_mean_square(mean_square: f64) -> Vec<f32> {
+    const LEN: usize = 4096;
+    const TRIMMED: usize = 6;
+    let target_sum = mean_square * LEN as f64; // exact: LEN is a power of two
+    let base_len = LEN - TRIMMED;
+    // Rounded DOWN until the untrimmed part is under the target: a trimmed
+    // sample can only ADD, so an overshooting base could never be walked back.
+    let mut amplitude = (target_sum / base_len as f64).sqrt() as f32;
+    while sum_of_squares(&vec![amplitude; base_len]) > target_sum {
+        amplitude = f32::from_bits(amplitude.to_bits() - 1);
+    }
+    let mut buf: Vec<f32> = (0..LEN)
+        .map(|i| {
+            if i >= base_len {
+                0.0
+            } else if (i / 24) % 2 == 0 {
+                amplitude
+            } else {
+                -amplitude
+            }
+        })
+        .collect();
+    for slot in base_len..LEN {
+        let sum = sum_of_squares(&buf);
+        if sum == target_sum {
+            break;
+        }
+        let mut sample = (target_sum - sum).sqrt() as f32;
+        buf[slot] = sample;
+        // `as f32` rounds to nearest and can overshoot; step down until this
+        // slot is under the target again and let the next one make up the rest.
+        while sum_of_squares(&buf) > target_sum {
+            sample = f32::from_bits(sample.to_bits() - 1);
+            buf[slot] = sample;
+        }
+    }
+    buf
+}
+
+#[test]
+fn the_hottest_level_that_is_not_above_the_ceiling_still_plays() {
+    // The boundary itself, at the finest resolution the number has. The test
+    // above straddles the ceiling by a tenth of a dB, which pins that the
+    // comparison is in the right place but says nothing about which side of it
+    // a file sitting ON the ceiling falls.
+    //
+    // **The ceiling cannot be hit exactly, and that is arithmetic, not a gap
+    // in this test.** `max_window_rms_dbfs` answers `10 * mean_square.log10()`,
+    // and no f64 mean square makes that expression return exactly -3.0: the
+    // reachable values either side are -3.0000000000000004 and
+    // -2.9999999999999991, because one f64 step in the mean square moves the
+    // answer by about two f64 steps (checked by walking 4096 steps either way).
+    // So `loudest > ceiling` and `loudest >= ceiling` accept and refuse exactly
+    // the same files. What is pinned here is therefore the tightest statement
+    // that HAS a witness — the last level below the ceiling plays and the first
+    // level above it is refused — and a mutation run that flips that comparison
+    // is looking at an equivalent mutant, not at a missing test.
+    let target = 10f64.powf(ABSOLUTE_MAX_DBFS_RMS / 10.0);
+    let at_ceiling = square_with_exact_mean_square(target);
+    // Neither of the other two bounds can decide this file: every sample is
+    // finite, and a square's crest factor of 1 keeps the peak at its RMS.
+    assert!(at_ceiling.iter().all(|v| v.is_finite() && v.abs() <= 1.0));
+
+    let loudest = max_window_rms_dbfs(&at_ceiling, RATE);
+    // One step UP in the bit pattern of a negative f64 is one step DOWN in
+    // value, so this is the largest level that is still not above the ceiling.
+    assert_eq!(
+        loudest.to_bits(),
+        ABSOLUTE_MAX_DBFS_RMS.to_bits() + 1,
+        "the file must sit on the last f64 step below the ceiling rather than \
+         near it, got {loudest:.17} dBFS RMS"
+    );
+    assert!(
+        ABSOLUTE_MAX_DBFS_RMS - loudest < 1e-12,
+        "which is {} dB under the ceiling",
+        ABSOLUTE_MAX_DBFS_RMS - loudest
+    );
+    check(&at_ceiling, RATE).expect("at the ceiling is not ABOVE it, so it plays");
+
+    // And the very next level the type can express IS above the ceiling — by
+    // under 1e-12 dB — and is refused, by the WINDOWED bound rather than by
+    // the peak or the non-finite one.
+    let above = square_with_exact_mean_square(f64::from_bits(target.to_bits() + 1));
+    assert!(above.iter().all(|v| v.is_finite() && v.abs() <= 1.0));
+    let hotter = max_window_rms_dbfs(&above, RATE);
+    assert!(
+        hotter > ABSOLUTE_MAX_DBFS_RMS && hotter - ABSOLUTE_MAX_DBFS_RMS < 1e-12,
+        "one f64 step over the ceiling, got {hotter:.17} dBFS RMS"
+    );
+    let refusal = check(&above, RATE).expect_err("above the ceiling");
+    assert_eq!(refusal.code.code(), 6);
+    assert!(
+        refusal.message.contains("window"),
+        "the WINDOWED bound is what fired: {}",
+        refusal.message
+    );
 }
 
 #[test]

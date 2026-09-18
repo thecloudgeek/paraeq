@@ -17,7 +17,7 @@ mod common;
 use common::Case;
 use paraeq_dsp::authority::{
     authority_band_mask, build_authority, width_oct_for_q, AuthorityCurve, AuthorityPolicy, Clamp,
-    COUPLER_CUTOFF_HZ, DEFAULT_MIN_DIP_WIDTH_OCT,
+    COUPLER_CUTOFF_HZ, DEFAULT_BOOST_RATIO, DEFAULT_MIN_DIP_WIDTH_OCT, SIGMA_NONE_DB,
 };
 use paraeq_dsp::autofit::{
     auto_fit_parametric_eq, auto_fit_room, RoomFitPolicy, RoomFitReport, CEILING_SLOP_DB,
@@ -617,5 +617,142 @@ fn a_narrow_dip_is_never_filled() {
         wide.bands.iter().all(|b| b.gain_db > 0.0),
         "filling a dip is a boost: {:?}",
         wide.bands
+    );
+}
+
+// ────────────────────── the boost weight the ranking uses ────────────────────
+
+/// A flat-σ curve whose boosts are capped at `ratio` of its cuts.
+///
+/// σ = 0.5 is at or below `SIGMA_FULL_DB`, so the confidence weight is 1.0 and
+/// the two ceilings are the excursion envelope itself — 10 dB of cut and
+/// `ratio × 10` dB of boost anywhere below 150 Hz. That makes the ratio under
+/// test readable off the policy instead of being a property of the σ curve.
+fn curve_with_boost_ratio(ratio: f64) -> AuthorityCurve {
+    let grid = LogGrid::standard();
+    build_authority(
+        &grid,
+        &vec![0.5; grid.len()],
+        &AuthorityPolicy {
+            boost_ratio: ratio,
+            ..AuthorityPolicy::default()
+        },
+    )
+    .expect("valid inputs")
+}
+
+/// A measured peak of `peak_db` at 60 Hz and a measured dip of `dip_db` at
+/// 120 Hz, as the correction curve that answers them: the peak asks for a cut
+/// (negative) and the dip asks for a boost (positive).
+///
+/// An octave apart and 1/3 octave wide, which is seven Gaussian sigmas of
+/// separation — so each feature's own bin carries its own amplitude and the
+/// ranking under test is not measuring overlap. 1/3 octave also clears
+/// `DEFAULT_MIN_DIP_WIDTH_OCT`, so the narrow-dip veto is not what decides
+/// this; `a_narrow_dip_is_never_filled` owns that rule.
+fn a_peak_and_a_dip(peak_db: f64, dip_db: f64) -> Vec<f64> {
+    let grid = LogGrid::standard();
+    let peak = gaussian(&grid, nearest_bin_hz(&grid, 60.0), -peak_db, 1.0 / 3.0);
+    let dip = gaussian(&grid, nearest_bin_hz(&grid, 120.0), dip_db, 1.0 / 3.0);
+    peak.iter().zip(&dip).map(|(p, d)| p + d).collect()
+}
+
+#[test]
+fn a_curves_boost_weight_is_its_max_boost_over_its_max_cut() {
+    // The weight the greedy ranking applies to a boost is READ OFF the curve —
+    // `max_boost(f) / max_cut(f)` — rather than being a second copy of the
+    // policy's `boost_ratio`. This test pins the three cases that weight has,
+    // on the curve itself; the pick-order test below pins that the fit
+    // actually uses it.
+    let grid = LogGrid::standard();
+    let f = nearest_bin_hz(&grid, 60.0);
+
+    // Cut-only: no boost authority against 10 dB of cut is a weight of ZERO,
+    // which is what makes a cut-only curve rank its boosts last instead of
+    // first. `decide()` passes this ratio on the room auto path.
+    let cut_only = curve_with_boost_ratio(0.0);
+    assert_eq!(cut_only.at(f).max_boost_db, 0.0);
+    assert!(
+        (cut_only.at(f).max_cut_db - 10.0).abs() < 1e-12,
+        "the excursion envelope is 10 dB here, got {}",
+        cut_only.at(f).max_cut_db
+    );
+
+    // The shipped default, and the reason the pick-order test below uses
+    // ratios that are NOT 0.5: at the default the weight IS 0.5, so every
+    // fixture built on `AuthorityPolicy::default()` agrees with a hardcoded
+    // 0.5 and can never tell the two apart.
+    let default = curve_with_boost_ratio(DEFAULT_BOOST_RATIO);
+    let at = default.at(f);
+    assert!(
+        (at.max_boost_db / at.max_cut_db - 0.5).abs() < 1e-12,
+        "{} / {} is not the shipped 0.5",
+        at.max_boost_db,
+        at.max_cut_db
+    );
+
+    // No authority of either sign: σ at `SIGMA_NONE_DB` zeroes the confidence
+    // weight, so the ratio is 0/0. The curve reports both ceilings as zero and
+    // the fit places nothing — which is why the ratio's own 0/0 fallback is
+    // defensive rather than load-bearing: a bin with no cut authority has no
+    // boost authority either and is struck before it can be ranked.
+    let none = curve_at_sigma(SIGMA_NONE_DB);
+    assert_eq!(none.at(f).max_cut_db, 0.0);
+    assert_eq!(none.at(f).max_boost_db, 0.0);
+    let report = fit(&a_peak_and_a_dip(3.0, 8.0), &none, 4, 1.0, None);
+    assert!(
+        report.bands.is_empty(),
+        "a curve with no authority licenses no band: {:?}",
+        report.bands
+    );
+}
+
+#[test]
+fn the_pick_order_between_a_peak_and_a_dip_follows_the_curves_boost_ratio() {
+    // The asymmetric score is `-r` for a cut and `r × boost_ratio` for a
+    // boost, so which of a peak and a dip is corrected FIRST is decided by the
+    // curve's own ratio. Both halves are asserted, and each is chosen so that
+    // the weight has to be the curve's: a fit that used any fixed weight of
+    // 0.5 — the shipped default, and so the one a copy would most likely be —
+    // picks the other feature in both cases.
+    //
+    // A single band is fitted on purpose. The greedy loop corrects everything
+    // eventually; what the ratio decides is the ORDER, and with a budget of
+    // one the order is the whole answer.
+
+    // A 3 dB peak against an 8 dB dip, weighted at a quarter: the peak scores
+    // 3.0 and the dip 2.0, so the PEAK is corrected first. At a weight of 0.5
+    // the dip would score 4.0 and win.
+    let quarter = curve_with_boost_ratio(0.25);
+    let report = fit(&a_peak_and_a_dip(3.0, 8.0), &quarter, 1, 1.0, None);
+    assert_eq!(report.bands.len(), 1, "one band was budgeted: {report:?}");
+    assert!(
+        report.bands[0].gain_db < 0.0,
+        "a quarter weight ranks the 3 dB peak above the 8 dB dip, so the one \
+         band must be a CUT: {:?}",
+        report.bands[0]
+    );
+    assert!(
+        (report.bands[0].fc / 60.0).log2().abs() < 0.25,
+        "and it must sit on the peak at 60 Hz, got {} Hz",
+        report.bands[0].fc
+    );
+
+    // The same shape the other way: a 5 dB peak against an 8 dB dip, weighted
+    // at one, scores 5.0 against 8.0, so the DIP is filled first. At a weight
+    // of 0.5 the dip would score 4.0 and lose.
+    let whole = curve_with_boost_ratio(1.0);
+    let report = fit(&a_peak_and_a_dip(5.0, 8.0), &whole, 1, 1.0, None);
+    assert_eq!(report.bands.len(), 1, "one band was budgeted: {report:?}");
+    assert!(
+        report.bands[0].gain_db > 0.0,
+        "an unweighted curve ranks the 8 dB dip above the 5 dB peak, so the \
+         one band must be a BOOST: {:?}",
+        report.bands[0]
+    );
+    assert!(
+        (report.bands[0].fc / 120.0).log2().abs() < 0.25,
+        "and it must sit on the dip at 120 Hz, got {} Hz",
+        report.bands[0].fc
     );
 }
