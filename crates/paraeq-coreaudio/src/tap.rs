@@ -9,13 +9,16 @@ use objc2_core_audio::{
     kAudioAggregateDeviceIsPrivateKey, kAudioAggregateDeviceIsStackedKey,
     kAudioAggregateDeviceMainSubDeviceKey, kAudioAggregateDeviceNameKey,
     kAudioAggregateDeviceSubDeviceListKey, kAudioAggregateDeviceTapAutoStartKey,
-    kAudioAggregateDeviceTapListKey, kAudioAggregateDeviceUIDKey, kAudioSubDeviceUIDKey,
-    kAudioSubTapDriftCompensationKey, kAudioSubTapUIDKey, AudioHardwareCreateAggregateDevice,
-    AudioHardwareCreateProcessTap, AudioHardwareDestroyAggregateDevice,
-    AudioHardwareDestroyProcessTap, AudioObjectID, CATapDescription, CATapMuteBehavior,
+    kAudioAggregateDeviceTapListKey, kAudioAggregateDeviceUIDKey, kAudioSubDeviceInputChannelsKey,
+    kAudioSubDeviceUIDKey, kAudioSubTapDriftCompensationKey, kAudioSubTapUIDKey,
+    AudioHardwareCreateAggregateDevice, AudioHardwareCreateProcessTap,
+    AudioHardwareDestroyAggregateDevice, AudioHardwareDestroyProcessTap, AudioObjectID,
+    CATapDescription, CATapMuteBehavior,
 };
 use objc2_core_audio_types::AudioStreamBasicDescription;
-use objc2_core_foundation::{CFArray, CFBoolean, CFDictionary, CFRetained, CFString, CFType};
+use objc2_core_foundation::{
+    CFArray, CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType,
+};
 use objc2_foundation::{NSArray, NSNumber, NSString};
 
 use crate::error::{check, CaError};
@@ -54,10 +57,21 @@ pub fn create_tap(
 pub fn create_aggregate(out_uid: &CFString, tap_uuid: &NSString) -> Result<AudioObjectID, CaError> {
     let key = |c: &std::ffi::CStr| CFString::from_str(c.to_str().unwrap());
 
-    // sub-device entry: { uid: <output device UID> }
+    // sub-device entry: { channels-in: 0, uid: <output device UID> }.
+    // input-channels 0 excludes the physical output's own input streams
+    // (AirPods / USB-headset mics) from the aggregate: without it, mic
+    // buffers of undocumented position share the IOProc's input list with
+    // the tap stream, and running the IOProc counts as microphone access
+    // (spurious TCC mic prompt at engine start — the OnlyEQ gotcha).
     let sub_dev: CFRetained<CFDictionary<CFString, CFType>> = CFDictionary::from_slices(
-        &[&*key(kAudioSubDeviceUIDKey)],
-        &[out_uid.as_ref() as &CFType],
+        &[
+            &*key(kAudioSubDeviceInputChannelsKey),
+            &*key(kAudioSubDeviceUIDKey),
+        ],
+        &[
+            CFNumber::new_i32(0).as_ref() as &CFType, // CFNumber, NOT CFBoolean
+            out_uid.as_ref() as &CFType,
+        ],
     );
     // sub-tap entry: { uid: <CATapDescription UUID string>, drift: true }
     let tap_uid_cf = CFString::from_str(&tap_uuid.to_string());
@@ -120,6 +134,23 @@ pub struct TapSystem {
     pub format: AudioStreamBasicDescription,
     pub device: AudioObjectID,
     pub device_uid: String,
+    /// MS-6's witness (measurement-safety `MS-6`):
+    /// `translate_pid(getpid()) != 0` at create time, i.e. our own HAL process
+    /// object was found and handed to
+    /// [`CATapDescription::initStereoGlobalTapButExcludeProcesses`]. `false`
+    /// means the documented fail-open path fired (see [`TapSystem::create`]):
+    /// the exclusion list went out **empty**, ParaEQ's own audio IS tapped, and
+    /// a measurement sweep would run through an unvalidated topology — the
+    /// spec's refusal condition ("Refuse, do not adapt", spec § The Load-Bearing
+    /// Invariant, consequence 3).
+    ///
+    /// **Read this as weaker than it sounds.** The HAL exposes no read-back
+    /// property for a live tap's exclusion list — the list is given once, at
+    /// description construction, and never queried. So this field records only
+    /// that we looked up our own process object and passed it to the tap
+    /// description. It is NOT a confirmation that the HAL is excluding us. It
+    /// is a record of what we successfully asked for.
+    pub self_excluded: bool,
     /// Kept alive for the tap's lifetime (the HAL references its UUID).
     #[allow(dead_code)]
     desc: Retained<CATapDescription>,
@@ -143,7 +174,9 @@ impl TapSystem {
     /// Self-exclusion: if the HAL has no process object for our pid yet
     /// (`translate_pid` returns 0), sleep 200 ms and retry once; if still 0,
     /// proceed with an empty exclusion list and warn (feedback risk is
-    /// spike-documented, non-fatal).
+    /// spike-documented, non-fatal *here*). The outcome is kept in
+    /// [`TapSystem::self_excluded`]: non-fatal to playback, but MS-6's refusal
+    /// condition for a measurement sweep.
     pub fn create() -> Result<TapSystem, CaError> {
         let device = properties::default_output_device()?;
         let device_uid = properties::device_uid(device)?;
@@ -152,6 +185,9 @@ impl TapSystem {
 
         let own = own_process_object()?;
         let excluded = if own != 0 { vec![own] } else { vec![] };
+        // Derived from the list itself, not from `own`, so the witness cannot
+        // drift from what `create_tap` is actually handed below.
+        let self_excluded = !excluded.is_empty();
         if excluded.is_empty() {
             log::warn!(
                 "own process not in HAL registry after retry — no self-exclusion (watch for feedback)"
@@ -187,6 +223,7 @@ impl TapSystem {
             format,
             device,
             device_uid,
+            self_excluded,
             desc,
             torn_down: false,
         })

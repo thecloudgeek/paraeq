@@ -1,0 +1,26 @@
+{
+ "arrays": {
+  "x": {
+   "file": "poly_rational.x.f64",
+   "len": 4096,
+   "shape": [
+    4096
+   ]
+  },
+  "y": {
+   "file": "poly_rational.y.f64",
+   "len": 6144,
+   "shape": [
+    6144
+   ]
+  }
+ },
+ "params": {
+  "band_limit": 0.15,
+  "down": 2,
+  "n_samples": 4096,
+  "sample_rate": 48000,
+  "up": 3
+ },
+ "scalars": {}
+}

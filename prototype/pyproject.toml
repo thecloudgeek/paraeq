@@ -6,7 +6,12 @@ build-backend = "hatchling.build"
 name = "paraeq"
 version = "0.1.0"
 description = "Open-source headphone measurement and correction EQ"
-readme = "../README.md"
+# No `readme` field on purpose: the only README is the repo root's, and
+# hatchling >= 1.32 rejects a readme path outside the project directory
+# ("Readme path must be within the project directory: ../README.md"), which
+# broke `pip install -e ./prototype[...]` — the command CLAUDE.md documents and
+# the prototype-oracle CI job runs. This package is the internal numerical
+# oracle and is never published, so it has no long description to carry.
 license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
@@ -18,13 +23,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-gui = [
-    "PyQt6>=6.5",
-    "pyqtgraph>=0.13",
-]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
+]
+# Exact pins for the fixture generator ONLY (tools/generate_fixtures.py asserts
+# them at startup). The loose floors above stay for the prototype's own use.
+fixtures = [
+    "numpy==2.5.0",
+    "scipy==1.18.0",
+]
+gui = [
+    "PyQt6>=6.5",
+    "pyqtgraph>=0.13",
 ]
 
 [tool.pytest.ini_options]

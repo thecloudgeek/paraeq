@@ -1,0 +1,44 @@
+{
+ "arrays": {
+  "freqs": {
+   "file": "rms_average.freqs.f64",
+   "len": 957,
+   "shape": [
+    957
+   ]
+  },
+  "measurements": {
+   "file": "rms_average.measurements.f64",
+   "len": 4785,
+   "shape": [
+    5,
+    957
+   ]
+  },
+  "rms_db": {
+   "file": "rms_average.rms_db.f64",
+   "len": 957,
+   "shape": [
+    957
+   ]
+  },
+  "sigma_db": {
+   "file": "rms_average.sigma_db.f64",
+   "len": 957,
+   "shape": [
+    957
+   ]
+  }
+ },
+ "params": {
+  "axis_order": "position_bin",
+  "band_hz": [
+   200.0,
+   2000.0
+  ],
+  "ddof": 0,
+  "n_positions": 5,
+  "ppo": 96
+ },
+ "scalars": {}
+}

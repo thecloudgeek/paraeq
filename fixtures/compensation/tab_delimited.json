@@ -1,0 +1,22 @@
+{
+ "arrays": {
+  "freqs": {
+   "file": "tab_delimited.freqs.f64",
+   "len": 7,
+   "shape": [
+    7
+   ]
+  },
+  "gains": {
+   "file": "tab_delimited.gains.f64",
+   "len": 7,
+   "shape": [
+    7
+   ]
+  }
+ },
+ "params": {
+  "cal_file": "tab_delimited.cal.txt"
+ },
+ "scalars": {}
+}

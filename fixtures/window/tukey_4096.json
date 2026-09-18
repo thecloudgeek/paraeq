@@ -1,0 +1,19 @@
+{
+ "arrays": {
+  "window": {
+   "file": "tukey_4096.window.f64",
+   "len": 4096,
+   "shape": [
+    4096
+   ]
+  }
+ },
+ "params": {
+  "alpha": 0.25,
+  "kind": "tukey",
+  "n": 4096,
+  "scipy_window": "tukey",
+  "sym": true
+ },
+ "scalars": {}
+}

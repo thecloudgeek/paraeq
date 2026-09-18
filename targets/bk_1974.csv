@@ -1,0 +1,32 @@
+# name: B&K Room 1974
+# category: room
+# classes: Bookshelf, Floorstander
+# description: Henning Moller's 1974 'optimum' steady-state in-room curve for domestic listening rooms (B&K application note 17-197, Fig. 5). Broadly flat through bass and midrange, then a gentle roll-off above the ~400 Hz knee: -3.0 dB at 3 kHz, about -5.7 dB at 20 kHz (roughly -1 dB/octave asymptotic; ~-0.84 dB/oct fitted above 200 Hz). Digitized as a smooth-knee model (softplus in log-frequency, knee 400 Hz, width 0.8 oct) calibrated to the published -3.0 dB @ 3 kHz anchor.
+# source: Bruel & Kjaer application note 17-197 (Moller 1974, 47th AES Convention) / https://www.bksv.com/media/doc/17-197.pdf
+# frequency_hz,gain_db
+20,-0.03
+32,-0.05
+50,-0.08
+80,-0.15
+125,-0.24
+200,-0.41
+250,-0.51
+315,-0.64
+400,-0.80
+500,-0.97
+630,-1.18
+800,-1.41
+1000,-1.64
+1250,-1.90
+1600,-2.19
+2000,-2.47
+2500,-2.76
+3000,-3.00
+4000,-3.39
+5000,-3.70
+6300,-4.02
+8000,-4.35
+10000,-4.67
+12500,-4.99
+16000,-5.34
+20000,-5.66

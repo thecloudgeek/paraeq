@@ -1,0 +1,22 @@
+[package]
+name = "paraeq-decide"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+# Spec constraint (2026-07-15 decision-engine-design.md): paraeq-dsp ONLY.
+# No Tauri (kills daemon-readiness and fixture testing), no CoreAudio, no
+# paraeq-engine (would drag rtrb/arc-swap into a pure crate for one type).
+# decide() does no filesystem I/O, reads no clock, and draws no randomness.
+[dependencies]
+paraeq-dsp = { path = "../paraeq-dsp", features = ["serde"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# proptest is for the GENERATOR half only: synthesizing wire values (channel
+# widths, routing indices) so the serde shapes are exercised beyond the handful
+# of literals the contract tests spell. Dev-deps do not appear in
+# `cargo tree -e normal`, so the crate-boundary assertion is unaffected
+# (precedent: `crates/paraeq-measure/Cargo.toml`'s paraeq-decide dev-dep).
+[dev-dependencies]
+proptest = { workspace = true }

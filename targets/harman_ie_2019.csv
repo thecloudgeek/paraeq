@@ -1,5 +1,6 @@
 # name: Harman In-Ear 2019
 # category: in-ear
+# classes: InEar
 # description: Sean Olive's 2019 in-ear preference target. Bass-emphasized low end (+7 dB shelf below 200 Hz), gentle 3 kHz presence peak, attenuated treble above 8 kHz. Best fit for IEMs.
 # source: AutoEq @ commit 7ae0f56 / Harman in-ear 2019.csv
 # frequency_hz,gain_db

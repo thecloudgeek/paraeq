@@ -1,5 +1,6 @@
 # name: Diffuse Field
 # category: reference
+# classes: InEar, OverEar
 # description: Diffuse field reference based on B&K Type 5128 head-and-torso simulator. Academic neutral reference; flatter than Harman targets.
 # source: AutoEq @ commit 7ae0f56 / Diffuse field 5128.csv
 # frequency_hz,gain_db

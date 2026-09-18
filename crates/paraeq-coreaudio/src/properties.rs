@@ -8,13 +8,15 @@ use std::ptr::NonNull;
 
 use objc2_core_audio::{
     kAudioDevicePropertyBufferFrameSize, kAudioDevicePropertyDeviceUID,
-    kAudioDevicePropertyNominalSampleRate, kAudioHardwarePropertyDefaultOutputDevice,
-    kAudioHardwarePropertyTranslatePIDToProcessObject, kAudioObjectPropertyElementMain,
-    kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, kAudioTapPropertyFormat,
-    AudioObjectGetPropertyData, AudioObjectID, AudioObjectPropertyAddress,
-    AudioObjectSetPropertyData,
+    kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertyStreamConfiguration,
+    kAudioHardwarePropertyDefaultInputDevice, kAudioHardwarePropertyDefaultOutputDevice,
+    kAudioHardwarePropertyTranslatePIDToProcessObject, kAudioHardwarePropertyTranslateUIDToDevice,
+    kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal,
+    kAudioObjectPropertyScopeInput, kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject,
+    kAudioTapPropertyFormat, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize,
+    AudioObjectID, AudioObjectPropertyAddress, AudioObjectSetPropertyData,
 };
-use objc2_core_audio_types::AudioStreamBasicDescription;
+use objc2_core_audio_types::{AudioBuffer, AudioBufferList, AudioStreamBasicDescription};
 use objc2_core_foundation::{CFRetained, CFString};
 
 use crate::error::{check, CaError};
@@ -43,6 +45,25 @@ pub fn default_output_device() -> Result<AudioObjectID, CaError> {
         )
     };
     check(status, "get default output device")?;
+    Ok(dev)
+}
+
+pub fn default_input_device() -> Result<AudioObjectID, CaError> {
+    let mut dev: AudioObjectID = 0;
+    let mut size = size_of::<AudioObjectID>() as u32;
+    // SAFETY: address/size/out pointers reference live stack locals; the out
+    // buffer is exactly `size` bytes of plain-old-data (AudioObjectID = u32).
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            kAudioObjectSystemObject as u32,
+            (&addr(kAudioHardwarePropertyDefaultInputDevice)).into(),
+            0,
+            std::ptr::null(),
+            (&mut size).into(),
+            NonNull::from(&mut dev).cast::<c_void>(),
+        )
+    };
+    check(status, "get default input device")?;
     Ok(dev)
 }
 
@@ -115,6 +136,127 @@ pub fn translate_pid(pid: i32) -> Result<AudioObjectID, CaError> {
     Ok(obj)
 }
 
+/// Device UID -> AudioObjectID. Returns 0 (kAudioObjectUnknown) if no device
+/// has that UID — the `translate_pid` convention.
+pub fn translate_uid_to_device(uid: &str) -> Result<AudioObjectID, CaError> {
+    let mut dev: AudioObjectID = 0;
+    let mut size = size_of::<AudioObjectID>() as u32;
+    let cf = CFString::from_str(uid);
+    // The qualifier is the CFStringRef VALUE (one pointer slot), passed by
+    // address — the same shape translate_pid uses for its pid_t.
+    let cf_ref: *const CFString = &*cf;
+    // SAFETY: qualifier points at a live CFStringRef of the declared size
+    // (`cf` outlives the call); the out buffer is exactly `size` bytes of
+    // plain-old-data (AudioObjectID = u32).
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            kAudioObjectSystemObject as u32,
+            (&addr(kAudioHardwarePropertyTranslateUIDToDevice)).into(),
+            size_of::<*const CFString>() as u32,
+            (&raw const cf_ref).cast(),
+            (&mut size).into(),
+            NonNull::from(&mut dev).cast::<c_void>(),
+        )
+    };
+    check(status, "translate UID to device")?;
+    Ok(dev)
+}
+
+/// Total input channels across the device's input streams
+/// (kAudioDevicePropertyStreamConfiguration, input scope). 0 means the device
+/// captures nothing — it is not usable as a mic.
+pub fn input_stream_channel_count(dev: AudioObjectID) -> Result<u32, CaError> {
+    stream_channel_count(
+        dev,
+        kAudioObjectPropertyScopeInput,
+        "get input stream configuration",
+    )
+}
+
+/// Total output channels across the device's output streams
+/// (kAudioDevicePropertyStreamConfiguration, output scope). 0 means the device
+/// renders nothing — refuse rather than open an IOProc that writes into
+/// nowhere.
+///
+/// The twin of [`input_stream_channel_count`], and deliberately not a
+/// convenience: the verification helper echoes this count in its `ready` line
+/// and refuses a `--channel N` at or above it BEFORE it plays a sample. Reading
+/// the channel count off the first callback instead would arrive after `ready`
+/// has been emitted and after the parent has committed, i.e. after the decision
+/// it is supposed to inform.
+pub fn output_channel_count(dev: AudioObjectID) -> Result<u32, CaError> {
+    stream_channel_count(
+        dev,
+        kAudioObjectPropertyScopeOutput,
+        "get output stream configuration",
+    )
+}
+
+/// The shared walk of `kAudioDevicePropertyStreamConfiguration`'s
+/// `AudioBufferList`. The SELECTOR is the part that does not change between the
+/// two scopes, which is why one body serves both and why the output twin
+/// carries no new HAL risk.
+fn stream_channel_count(dev: AudioObjectID, scope: u32, ctx: &str) -> Result<u32, CaError> {
+    let address = AudioObjectPropertyAddress {
+        mSelector: kAudioDevicePropertyStreamConfiguration,
+        mScope: scope,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let mut size: u32 = 0;
+    // SAFETY: address/out pointers reference live stack locals.
+    let status = unsafe {
+        AudioObjectGetPropertyDataSize(
+            dev,
+            NonNull::from(&address),
+            0,
+            std::ptr::null(),
+            NonNull::from(&mut size),
+        )
+    };
+    check(status, &format!("{ctx} size"))?;
+    if (size as usize) < size_of::<AudioBufferList>() {
+        return Ok(0);
+    }
+    // 8-byte-aligned backing for the variable-length AudioBufferList (u32
+    // fields + a pointer per AudioBuffer).
+    let mut backing: Vec<u64> = vec![0; size as usize / 8 + 1];
+    let mut got = size;
+    // SAFETY: the out buffer is `backing`, which is at least `size` bytes,
+    // 8-byte aligned, and outlives the call.
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            dev,
+            (&address).into(),
+            0,
+            std::ptr::null(),
+            (&mut got).into(),
+            NonNull::new(backing.as_mut_ptr().cast::<c_void>()).expect("vec ptr"),
+        )
+    };
+    check(status, ctx)?;
+    let list = backing.as_ptr().cast::<AudioBufferList>();
+    // SAFETY: the HAL wrote a valid AudioBufferList into `backing`.
+    let declared = unsafe { (*list).mNumberBuffers } as usize;
+    // Trust-but-bound: never read past what the HAL actually wrote (`got`
+    // bytes, of which the first AudioBuffer is inside AudioBufferList).
+    let fitting =
+        (got as usize).saturating_sub(size_of::<AudioBufferList>()) / size_of::<AudioBuffer>() + 1;
+    let mut channels: u32 = 0;
+    for i in 0..declared.min(fitting) {
+        // SAFETY: i is within both the declared entry count and the bytes
+        // the HAL wrote; `&raw const` keeps the base pointer's provenance
+        // over the trailing entries (the ioproc::raw_buffer idiom).
+        let buf = unsafe {
+            (&raw const (*list).mBuffers)
+                .cast::<AudioBuffer>()
+                .add(i)
+                .read()
+        };
+        channels += buf.mNumberChannels;
+    }
+    Ok(channels)
+}
+
 pub fn tap_format(tap: AudioObjectID) -> Result<AudioStreamBasicDescription, CaError> {
     // AudioStreamBasicDescription has no Default impl in objc2-core-audio-types
     // 0.3.2; zero-init explicitly (all fields are plain integer/float, so this
@@ -180,4 +322,85 @@ pub fn set_buffer_frame_size(dev: AudioObjectID, frames: u32) -> Result<(), CaEr
         )
     };
     check(status, "set buffer frame size")
+}
+
+// ─────────────────── by-UID reads, for the verification seam ───────────────
+
+/// Is a device with this UID present in the HAL right now?
+///
+/// Composed from [`translate_uid_to_device`] rather than reading a new
+/// property: that function already answers "which object carries this UID", and
+/// its documented convention is that **0 (`kAudioObjectUnknown`) means no
+/// device has it**. So existence is a comparison, not a fourth FFI call, and
+/// this function adds no `unsafe` of its own.
+///
+/// An `Err` is a HAL failure, not an absence, and the caller must not collapse
+/// the two: the verification teardown asks this about the helper's private
+/// render aggregate, and an unanswerable read there has to be reported as a
+/// possible leaked device rather than as a clean teardown.
+pub fn device_exists(uid: &str) -> Result<bool, CaError> {
+    Ok(translate_uid_to_device(uid)? != 0)
+}
+
+/// The nominal sample rate of the device carrying this UID.
+///
+/// `Ok(None)` when no device has the UID — the same "0 means nobody" that
+/// [`translate_uid_to_device`] documents — and `Err` when the HAL refused a
+/// read it should have answered. The verification rate fence needs the
+/// distinction: the helper's render aggregate legitimately disappears between
+/// the capture ending and the fence running, and that is not a rate failure.
+pub fn nominal_sample_rate_for_uid(uid: &str) -> Result<Option<f64>, CaError> {
+    let dev = translate_uid_to_device(uid)?;
+    if dev == 0 {
+        return Ok(None);
+    }
+    nominal_sample_rate(dev).map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A UID no device can carry resolves to nobody, on any machine, without
+    /// opening anything. This is the one half of the by-UID pair that is
+    /// falsifiable without hardware: it proves the "0 means absent" convention
+    /// is actually applied rather than assumed, which is the whole of the
+    /// function's logic.
+    ///
+    /// On a CI box with no audio devices `translate_uid_to_device` may refuse
+    /// outright instead of answering 0. That is still not an existence claim,
+    /// so the assertion is "never `Ok(true)`".
+    #[test]
+    fn an_impossible_uid_is_never_reported_as_present() {
+        let answer = device_exists("com.paraeq.no-such-device.deadbeef");
+        assert_ne!(
+            answer.as_ref().ok().copied(),
+            Some(true),
+            "a UID nothing carries must not read as present: {answer:?}"
+        );
+        let rate = nominal_sample_rate_for_uid("com.paraeq.no-such-device.deadbeef");
+        assert_ne!(
+            rate.as_ref().ok().map(Option::is_some),
+            Some(true),
+            "a UID nothing carries has no rate: {rate:?}"
+        );
+    }
+
+    /// The real device, on real hardware. `#[ignore]`: CI has no audio devices,
+    /// and this asserts against whatever is actually plugged in.
+    #[test]
+    #[ignore = "requires a real default output device"]
+    fn the_default_output_exists_by_its_own_uid_and_reports_its_rate() {
+        let dev = default_output_device().expect("a default output device");
+        let uid = device_uid(dev).expect("its UID");
+        assert!(device_exists(&uid).expect("the by-UID lookup"));
+        let by_uid = nominal_sample_rate_for_uid(&uid)
+            .expect("the by-UID rate")
+            .expect("the device exists, so it has a rate");
+        let by_id = nominal_sample_rate(dev).expect("the by-id rate");
+        assert_eq!(
+            by_uid, by_id,
+            "the two spellings must read the same property off the same device"
+        );
+    }
 }

@@ -1,0 +1,24 @@
+{
+ "arrays": {
+  "decay_db": {
+   "file": "schroeder_decay.decay_db.f64",
+   "len": 8192,
+   "shape": [
+    8192
+   ]
+  },
+  "ir": {
+   "file": "schroeder_decay.ir.f64",
+   "len": 8192,
+   "shape": [
+    8192
+   ]
+  }
+ },
+ "params": {
+  "n": 8192,
+  "sample_rate": 48000,
+  "t60_s": 0.12
+ },
+ "scalars": {}
+}

@@ -4,9 +4,25 @@ edition.workspace = true
 license.workspace = true
 version.workspace = true
 
+[features]
+# Wire derives for the types that cross into paraeq-decide's serializable
+# bundle (TargetCurve, TransducerClass) and its CorrectionPlan (EQBand,
+# FilterType). Off by default so a consumer that has no wire opts out; three
+# crates opt in, each for a stated reason:
+#   - desktop/src-tauri — its AppState envelope, profile store and settings
+#     file all persist/IPC `EQBand` (wire format: snake_case).
+#   - paraeq-decide — `TargetCurve` / `TransducerClass` ride its bundle.
+#   - paraeq-engine — R1-6 put design INTENT on the wire, so
+#     `CorrectionConfig::Peq` carries `EQBand` for the daemon seam. That
+#     crate is realtime, but it only DERIVES the impls: nothing on the
+#     realtime lane (`shared.rs`) ever serializes, and nothing may.
+serde = ["dep:serde"]
+
 [dependencies]
 realfft = { workspace = true }
+regex = "1"
 rustfft = { workspace = true }
+serde = { workspace = true, optional = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

@@ -1,0 +1,731 @@
+// The EQ tab: the first audible corrected-audio path. Rust owns ALL state; this
+// component renders the AppState snapshot and turns every edit into a typed
+// command. It holds NO forked band/preamp state — numeric cells are uncontrolled
+// inputs keyed on the AppState band values (so a successful edit remounts them
+// from the new snapshot, and a rejected edit snaps back via an error nonce),
+// and the Type select / preamp / toolbar actions all commit immediately (the
+// prototype contract: no Apply button).
+//
+// Layout, top to bottom (prototype parity, manual_eq_editor.py): toolbar, band
+// table, preamp row, frequency plot (curve + one draggable handle per band),
+// status strip.
+//
+// Drag (Task 15): the plot and table are two views of the SAME Rust-owned
+// bands. During a pointer drag we hold ONE ephemeral fork (`draggingBands`, the
+// spec-sanctioned in-flight state) so handles + table update at frame rate;
+// engine application is throttled to ~10 Hz and finalized authoritatively on
+// pointer-up, after which the AppState snapshot is the sole truth again.
+
+import { useEffect, useRef, useState } from "react";
+import type { JSX, ReactNode } from "react";
+import { open, save } from "@tauri-apps/plugin-dialog";
+import { Info } from "lucide-react";
+
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import { FrequencyPlot } from "@/components/FrequencyPlot";
+import { AutoEqBrowser } from "@/dialogs/AutoEqBrowser";
+import {
+  eqAddBand,
+  eqExportAutoeq,
+  eqImportAutoeq,
+  eqRemoveBand,
+  eqResponse,
+  eqSetBands,
+  engineDisable,
+  engineEnable,
+  engineSetBypass,
+  engineSetPreampDb,
+  profilesSave,
+} from "@/ipc/commands";
+import type { AppState, EQBand, EngineState, FilterType } from "@/ipc/types";
+import { BAND_PALETTE, EQ_PLOT_RANGE, logspace, qWheelStep } from "@/plot/FreqPlotRenderer";
+import { clippedNotice, rateMismatchNotice } from "./statusStrip";
+import type { PlotHandle, Trace } from "@/plot/FreqPlotRenderer";
+
+// The plot's frequency grid (prototype parity: 512 log-spaced points 20..20k).
+const PLOT_FREQS = logspace(20, 20000, 512);
+
+// Filter-type options, in the prototype's exact order.
+const FILTER_TYPES: { label: string; value: FilterType }[] = [
+  { label: "Peaking", value: "peaking" },
+  { label: "Low Shelf", value: "low_shelf" },
+  { label: "High Shelf", value: "high_shelf" },
+  { label: "Notch", value: "notch" },
+];
+
+// Plain-language hints for the newcomer. Gentle-prescriptive: define the term,
+// then a light nudge on what to actually do. Explanation only — no state.
+function InfoTip({ term, children }: { term: string; children: ReactNode }): JSX.Element {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          aria-label={`What is ${term}?`}
+          className="ml-1 inline-flex align-middle text-muted-foreground/70 hover:text-foreground focus-visible:text-foreground focus-visible:outline-none"
+        >
+          <Info className="size-3.5" aria-hidden />
+        </button>
+      </TooltipTrigger>
+      <TooltipContent>{children}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+type NumField = "fc" | "gain_db" | "q";
+
+interface EqTabProps {
+  state: AppState;
+}
+
+export function EqTab({ state }: EqTabProps): JSX.Element {
+  const bands = state.eq.bands;
+  const engine = state.engine;
+
+  const [selected, setSelected] = useState<number | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  // Bumped on every rejected edit to force the offending uncontrolled input to
+  // remount from unchanged AppState (value "snaps back").
+  const [errNonce, setErrNonce] = useState(0);
+  const [traces, setTraces] = useState<Trace[]>([]);
+  const [saveOpen, setSaveOpen] = useState(false);
+  const [profileName, setProfileName] = useState("");
+  const [browseOpen, setBrowseOpen] = useState(false);
+  // The ONE sanctioned ephemeral fork: the in-flight band list while a plot
+  // handle is being dragged (null when not dragging). `dragBandsRef` mirrors it
+  // for synchronous reads inside the (non-React) drag handlers; `lastApplyRef`
+  // throttles engine writes during the drag.
+  const [draggingBands, setDraggingBands] = useState<EQBand[] | null>(null);
+  const dragBandsRef = useRef<EQBand[] | null>(null);
+  const lastApplyRef = useRef(0);
+
+  // What the table + handles render from: the in-flight fork during a drag,
+  // otherwise the authoritative AppState bands. The plot traces stay keyed on
+  // AppState (they refresh through the throttled commit round-trip — decision
+  // 12: curve math stays in Rust).
+  const displayBands = draggingBands ?? bands;
+  const handles: PlotHandle[] = displayBands.map((b, i) => ({
+    color: BAND_PALETTE[i % BAND_PALETTE.length],
+    db: b.gain_db,
+    f: b.fc,
+    id: i,
+  }));
+
+  const sampleRate = engine.stream?.sample_rate ?? 48000;
+  const bandsSig = JSON.stringify(bands);
+
+  // Recompute the plot curves whenever the bands or the live rate change. The
+  // Rust `eq_response` designs at the live stream rate (48k fallback); we pass
+  // the display grid and echo `sampleRate` into the deps so a rate flip redraws.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const resp = await eqResponse(PLOT_FREQS);
+        if (cancelled) return;
+        const next: Trace[] = [
+          { color: "#FFFFFF", dbs: resp.composite, freqs: PLOT_FREQS, width: 2.5 },
+          ...resp.per_band.map((dbs, i) => ({
+            color: BAND_PALETTE[i % BAND_PALETTE.length],
+            dash: [2, 3],
+            dbs,
+            freqs: PLOT_FREQS,
+            width: 1,
+          })),
+        ];
+        setTraces(next);
+      } catch {
+        // A response failure leaves the previous curve; band edits surface their
+        // own errors through the command path below.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bandsSig, sampleRate]);
+
+  const fail = (e: unknown) => {
+    setError(String(e));
+    setNotice(null);
+    setErrNonce((n) => n + 1);
+  };
+
+  const succeed = (msg?: string) => {
+    setError(null);
+    setNotice(msg ?? null);
+  };
+
+  // Commit one numeric cell: parse, build the full new band list from the
+  // current snapshot + this edit, and apply. Rust validates; a rejection snaps
+  // the input back and shows the Rust message.
+  const commitNum = async (i: number, field: NumField, raw: string) => {
+    const value = Number(raw);
+    if (raw.trim() === "" || !Number.isFinite(value)) {
+      fail(`band ${i}: ${field} must be a finite number`);
+      return;
+    }
+    const next: EQBand[] = bands.map((b, j) => (j === i ? { ...b, [field]: value } : b));
+    try {
+      await eqSetBands(next);
+      succeed();
+    } catch (e) {
+      fail(e);
+    }
+  };
+
+  const commitType = async (i: number, value: FilterType) => {
+    const next: EQBand[] = bands.map((b, j) =>
+      j === i ? { ...b, filter_type: value } : b,
+    );
+    try {
+      await eqSetBands(next);
+      succeed();
+    } catch (e) {
+      fail(e);
+    }
+  };
+
+  // Apply a band list to Rust. Shared by the drag/wheel gestures; the values
+  // they pass are pre-clamped to the plot range (well inside the eq.rs limits),
+  // so validation never rejects — a genuine failure still surfaces.
+  const applyBands = async (next: EQBand[]) => {
+    try {
+      await eqSetBands(next);
+    } catch (e) {
+      fail(e);
+    }
+  };
+
+  // Pointer drag of a band handle. The wrapper pre-clamps f/db to the plot
+  // range and rAF-throttles "move". We fork into `draggingBands` for frame-rate
+  // table + handle feedback, throttle the engine write to ~10 Hz, and do the
+  // authoritative set on "end" (then drop the fork — AppState is truth again).
+  const onHandleDrag = (
+    id: number,
+    f: number,
+    db: number,
+    phase: "move" | "end" | "start",
+  ) => {
+    if (phase === "start") {
+      const snap = bands.map((b) => ({ ...b }));
+      dragBandsRef.current = snap;
+      lastApplyRef.current = 0;
+      setDraggingBands(snap);
+      return;
+    }
+    const base = dragBandsRef.current ?? bands;
+    const next: EQBand[] = base.map((b, i) =>
+      i === id
+        ? { ...b, fc: Math.round(f * 100) / 100, gain_db: Math.round(db * 10) / 10 }
+        : b,
+    );
+    if (phase === "end") {
+      dragBandsRef.current = null;
+      setDraggingBands(null);
+      void applyBands(next);
+      return;
+    }
+    dragBandsRef.current = next;
+    setDraggingBands(next);
+    const now = performance.now();
+    if (now - lastApplyRef.current >= 100) {
+      lastApplyRef.current = now;
+      void applyBands(next);
+    }
+  };
+
+  // Wheel over a handle adjusts that band's Q multiplicatively (discrete → one
+  // commit per event). Honors an in-flight drag fork if one is live.
+  const onHandleWheel = (id: number, deltaY: number) => {
+    const base = dragBandsRef.current ?? bands;
+    const next: EQBand[] = base.map((b, i) =>
+      i === id ? { ...b, q: qWheelStep(b.q, deltaY) } : b,
+    );
+    if (dragBandsRef.current) {
+      dragBandsRef.current = next;
+      setDraggingBands(next);
+    }
+    void applyBands(next);
+  };
+
+  const commitPreamp = async (raw: string) => {
+    const value = Number(raw);
+    if (raw.trim() === "" || !Number.isFinite(value)) {
+      fail("preamp must be a finite number");
+      return;
+    }
+    try {
+      await engineSetPreampDb(value);
+      succeed();
+    } catch (e) {
+      fail(e);
+    }
+  };
+
+  const addBand = async () => {
+    try {
+      await eqAddBand();
+      succeed();
+    } catch (e) {
+      fail(e);
+    }
+  };
+
+  const removeBand = async () => {
+    try {
+      await eqRemoveBand(selected ?? undefined);
+      setSelected(null);
+      succeed();
+    } catch (e) {
+      fail(e);
+    }
+  };
+
+  const importPreset = async () => {
+    try {
+      const path = await open({
+        filters: [{ extensions: ["txt", "csv"], name: "AutoEQ preset" }],
+      });
+      if (typeof path !== "string") return; // cancelled (null) or multi-select
+      const r = await eqImportAutoeq(path);
+      succeed(
+        `Imported ${r.band_count} band${r.band_count === 1 ? "" : "s"}, ` +
+          `preamp ${r.preamp_db.toFixed(1)} dB${r.preamp_clamped ? " (clamped into range)" : ""}`,
+      );
+    } catch (e) {
+      fail(e);
+    }
+  };
+
+  const exportPreset = async () => {
+    try {
+      const path = await save({
+        defaultPath: "eq_preset.txt",
+        filters: [{ extensions: ["txt"], name: "AutoEQ preset" }],
+      });
+      if (typeof path !== "string") return; // cancelled
+      await eqExportAutoeq(path);
+      succeed(`Exported to ${path}`);
+    } catch (e) {
+      fail(e);
+    }
+  };
+
+  const saveProfile = async () => {
+    try {
+      await profilesSave(profileName);
+      setSaveOpen(false);
+      setProfileName("");
+      succeed(`Saved profile "${profileName.trim()}"`);
+    } catch (e) {
+      fail(e);
+    }
+  };
+
+  const toggleBypass = async () => {
+    try {
+      await engineSetBypass(!engine.bypass);
+      succeed();
+    } catch (e) {
+      fail(e);
+    }
+  };
+
+  const toggleEnabled = async (enable: boolean) => {
+    try {
+      await (enable ? engineEnable() : engineDisable());
+      succeed();
+    } catch (e) {
+      fail(e);
+    }
+  };
+
+  return (
+    // The column is clipped to the tab height (overflow-hidden + min-h-0), so the
+    // WINDOW never grows a scrollbar. The band table and the plot share the
+    // leftover space as flex regions; only the band table scrolls internally when
+    // it has more bands than fit. Everything else is shrink-0 (fixed height).
+    <div className="flex h-full min-h-0 flex-col gap-3 overflow-hidden p-2">
+      {/* Toolbar */}
+      <div className="flex shrink-0 flex-wrap items-center gap-2">
+        <Button size="sm" variant="secondary" onClick={addBand}>
+          Add Band
+        </Button>
+        <Button size="sm" variant="secondary" onClick={removeBand}>
+          Remove Band
+        </Button>
+        <div className="flex-1" />
+        <Button size="sm" variant="outline" onClick={() => setSaveOpen(true)}>
+          Save Profile…
+        </Button>
+        <Button size="sm" variant="outline" onClick={() => setBrowseOpen(true)}>
+          Browse AutoEQ DB…
+        </Button>
+        <Button size="sm" variant="outline" onClick={importPreset}>
+          Import AutoEQ…
+        </Button>
+        <Button size="sm" variant="outline" onClick={exportPreset}>
+          Export AutoEQ…
+        </Button>
+      </div>
+
+      {/* Inline error / notice banner */}
+      {error ? (
+        <div
+          role="alert"
+          className="flex shrink-0 items-start justify-between gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+        >
+          <span>{error}</span>
+          <button className="shrink-0 opacity-70 hover:opacity-100" onClick={() => setError(null)}>
+            ✕
+          </button>
+        </div>
+      ) : notice ? (
+        <div className="flex shrink-0 items-start justify-between gap-2 rounded-md border bg-muted px-3 py-2 text-sm text-muted-foreground">
+          <span>{notice}</span>
+          <button className="shrink-0 opacity-70 hover:opacity-100" onClick={() => setNotice(null)}>
+            ✕
+          </button>
+        </div>
+      ) : null}
+
+      {/* Band table — the "freq adjustment" section. A flex region (min-h-24 so
+          it can be constrained) that scrolls INTERNALLY once its bands overflow,
+          rather than growing the whole window. */}
+      <div className="min-h-24 flex-[2] overflow-y-auto rounded-md border">
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead>
+              Type
+              <InfoTip term="the filter Type">
+                The shape of the adjustment. <b>Peaking</b> nudges one region up or
+                down; <b>Low/High Shelf</b> lifts or drops everything below/above a
+                point; <b>Notch</b> cuts out a narrow spot. If you&rsquo;re unsure,
+                Peaking is the everyday choice.
+              </InfoTip>
+            </TableHead>
+            <TableHead>
+              Freq (Hz)
+              <InfoTip term="Frequency">
+                Which part of the sound you&rsquo;re adjusting. Low numbers are bass,
+                the middle is where voices and most instruments live, high numbers are
+                treble and &ldquo;air.&rdquo;
+              </InfoTip>
+            </TableHead>
+            <TableHead>
+              Gain (dB)
+              <InfoTip term="Gain">
+                How much to boost (+) or cut (&minus;) that region. A little goes a
+                long way &mdash; ±3 dB is already very audible. Prefer cutting over
+                boosting where you can.
+              </InfoTip>
+            </TableHead>
+            <TableHead>
+              Q
+              <InfoTip term="Q">
+                How wide or narrow the adjustment is. A <b>low</b> Q spreads it over a
+                broad range (gentle tone shaping); a <b>high</b> Q focuses it on a
+                narrow spot (surgical). Most tone tweaks want a low-to-medium Q
+                (around 0.7&ndash;2).
+              </InfoTip>
+            </TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {displayBands.length === 0 ? (
+            <TableRow>
+              <TableCell className="text-muted-foreground" colSpan={4}>
+                No bands — flat passthrough. Add a band to begin.
+              </TableCell>
+            </TableRow>
+          ) : (
+            displayBands.map((band, i) => {
+              const sig = `${band.filter_type}:${band.fc}:${band.gain_db}:${band.q}:${errNonce}`;
+              const isNotch = band.filter_type === "notch";
+              return (
+                <TableRow
+                  key={i}
+                  data-state={selected === i ? "selected" : undefined}
+                  className="cursor-pointer"
+                  onClick={() => setSelected(i)}
+                >
+                  <TableCell>
+                    <Select
+                      value={band.filter_type}
+                      onValueChange={(v) => void commitType(i, v as FilterType)}
+                    >
+                      <SelectTrigger size="sm" className="w-32">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {FILTER_TYPES.map((t) => (
+                          <SelectItem key={t.value} value={t.value}>
+                            {t.label}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </TableCell>
+                  <TableCell>
+                    <Input
+                      key={`fc:${sig}`}
+                      type="number"
+                      className="w-28"
+                      min={0}
+                      max={sampleRate / 2}
+                      step={1}
+                      defaultValue={band.fc.toFixed(1)}
+                      onBlur={(e) => void commitNum(i, "fc", e.currentTarget.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") e.currentTarget.blur();
+                      }}
+                    />
+                  </TableCell>
+                  <TableCell>
+                    <Input
+                      key={`gain:${sig}`}
+                      type="number"
+                      className="w-24"
+                      min={-30}
+                      max={30}
+                      step={0.5}
+                      title={
+                        isNotch
+                          ? "Notch filters ignore gain in the engine; the value is kept for parity."
+                          : undefined
+                      }
+                      defaultValue={band.gain_db.toFixed(1)}
+                      onBlur={(e) => void commitNum(i, "gain_db", e.currentTarget.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") e.currentTarget.blur();
+                      }}
+                    />
+                  </TableCell>
+                  <TableCell>
+                    <Input
+                      key={`q:${sig}`}
+                      type="number"
+                      className="w-24"
+                      min={0.1}
+                      max={100}
+                      step={0.1}
+                      defaultValue={band.q.toFixed(3)}
+                      onBlur={(e) => void commitNum(i, "q", e.currentTarget.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") e.currentTarget.blur();
+                      }}
+                    />
+                  </TableCell>
+                </TableRow>
+              );
+            })
+          )}
+        </TableBody>
+      </Table>
+      </div>
+
+      {/* Preamp row */}
+      <div className="flex shrink-0 items-center gap-2">
+        <label className="flex items-center text-sm font-medium" htmlFor="preamp">
+          Preamp (dB)
+          <InfoTip term="Preamp">
+            Turns the whole output down to leave room for boosts without distortion.
+            If a boosted band sounds crackly or harsh, lower this a little; otherwise
+            you can leave it alone.
+          </InfoTip>
+        </label>
+        <Input
+          id="preamp"
+          key={`preamp:${state.eq.preamp_db}:${errNonce}`}
+          type="number"
+          className="w-28"
+          min={-30}
+          max={10}
+          step={0.5}
+          defaultValue={state.eq.preamp_db.toFixed(1)}
+          onBlur={(e) => void commitPreamp(e.currentTarget.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") e.currentTarget.blur();
+          }}
+        />
+      </div>
+
+      {/* Frequency plot: curve + one draggable handle per band. Takes the larger
+          share of the flexible space (min-h-40 keeps it readable on a short
+          window); FrequencyPlot fills it via its own ResizeObserver. */}
+      <div className="min-h-40 flex-[3]">
+        <FrequencyPlot
+          handles={handles}
+          onHandleDrag={onHandleDrag}
+          onHandleWheel={onHandleWheel}
+          range={EQ_PLOT_RANGE}
+          traces={traces}
+          title={`${(sampleRate / 1000).toFixed(1)} kHz`}
+        />
+      </div>
+
+      {/* Plain-language legend: reads the plot AND teaches the two gestures. */}
+      <p className="shrink-0 text-xs text-muted-foreground">
+        Left is bass, right is treble; where the line rises your audio gets louder,
+        where it dips it gets quieter. Drag a dot to move that band; scroll on a dot
+        to make it wider or narrower (its Q).
+      </p>
+
+      {/* Status strip */}
+      <StatusStrip engine={engine} onToggleEnabled={toggleEnabled} onToggleBypass={toggleBypass} />
+
+      {/* Save Profile dialog */}
+      <Dialog open={saveOpen} onOpenChange={setSaveOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Save Profile</DialogTitle>
+          </DialogHeader>
+          <Input
+            autoFocus
+            placeholder="Profile name"
+            value={profileName}
+            onChange={(e) => setProfileName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void saveProfile();
+            }}
+          />
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setSaveOpen(false)}>
+              Cancel
+            </Button>
+            <Button onClick={saveProfile} disabled={profileName.trim() === ""}>
+              Save
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Browse AutoEQ DB dialog */}
+      <AutoEqBrowser open={browseOpen} onOpenChange={setBrowseOpen} onApplied={succeed} />
+    </div>
+  );
+}
+
+// The honest engine line + enable/bypass affordances. Kept in-file: it renders
+// purely from EngineState and delegates its two actions to the parent.
+function StatusStrip({
+  engine,
+  onToggleBypass,
+  onToggleEnabled,
+}: {
+  engine: EngineState;
+  onToggleBypass: () => void;
+  onToggleEnabled: (enable: boolean) => void;
+}): JSX.Element {
+  const { label, hint } = describeStatus(engine.status);
+  const rateNotice = rateMismatchNotice(engine.correction_rate_mismatch);
+  // R1-8's minimum viable surfacing until the Advanced drawer exists: the
+  // +-1.0 clamp engaged invisibly before this.
+  const clipNotice = clippedNotice(engine.clipped_samples, engine.auto_preamp_db);
+
+  const parts: string[] = [label];
+  if (engine.latency_ms != null) parts.push(`${engine.latency_ms.toFixed(1)} ms`);
+  if (engine.stream) {
+    parts.push(`${(engine.stream.sample_rate / 1000).toFixed(1)} kHz`);
+    parts.push(engine.stream.channels === 2 ? "stereo" : `${engine.stream.channels} ch`);
+  }
+  if (engine.frame_mismatch_blocks > 0) parts.push("degraded (frame mismatch)");
+  if (clipNotice) parts.push(clipNotice);
+  if (engine.bypass) parts.push("bypassed");
+
+  // A user-disabled engine, an auto-disable fail-open, or a hard failure all
+  // need an Enable (retry) — the engine contract's only way back on.
+  const kind = engine.status.kind;
+  const showEnable =
+    !engine.enabled || kind === "auto_disabled_no_input" || kind === "failed";
+
+  return (
+    <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-t pt-2 text-sm">
+      <span className="font-medium">Engine: {parts.join(" · ")}</span>
+      {/* R1-6: the engine failed OPEN and is running flat. Safe, but it must
+          never be silent -- an un-disclosed fail-open is the invisible
+          failure the hardening work exists to prevent. */}
+      {rateNotice ? <span className="font-medium text-destructive">{rateNotice}</span> : null}
+      {hint ? <span className="text-muted-foreground">{hint}</span> : null}
+      <div className="flex-1" />
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            size="xs"
+            variant={engine.bypass ? "default" : "outline"}
+            onClick={onToggleBypass}
+          >
+            {engine.bypass ? "Bypassed" : "Bypass"}
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>
+          Temporarily plays your audio with the EQ switched off, so you can hear the
+          before-and-after. It doesn&rsquo;t change any of your settings.
+        </TooltipContent>
+      </Tooltip>
+      {showEnable ? (
+        <Button size="xs" onClick={() => onToggleEnabled(true)}>
+          Enable
+        </Button>
+      ) : (
+        <Button size="xs" variant="outline" onClick={() => onToggleEnabled(false)}>
+          Disable
+        </Button>
+      )}
+    </div>
+  );
+}
+
+// Honest status label + optional user-facing hint, from the tagged EngineStatus.
+function describeStatus(status: EngineState["status"]): { hint: string | null; label: string } {
+  const permHint = "Check System Audio Recording permission, or play some audio.";
+  switch (status.kind) {
+    case "auto_disabled_no_input":
+      return { hint: permHint, label: "Auto-disabled (no input)" };
+    case "failed":
+      return { hint: null, label: `Failed: ${status.reason}` };
+    case "idle":
+      return { hint: null, label: "Idle" };
+    case "input_silent":
+      return { hint: null, label: "Input silent" };
+    case "no_input_detected":
+      return { hint: permHint, label: "No input detected" };
+    case "running":
+      return { hint: null, label: "Running" };
+    case "starting":
+      return { hint: null, label: "Starting…" };
+    case "stopped":
+      return { hint: null, label: "Stopped" };
+  }
+}

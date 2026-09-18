@@ -1,0 +1,13 @@
+error[E0451]: fields `kind`, `level`, `sample_rate_hz` and `samples` of struct `AssembledStimulus` are private
+  --> tests/ui/raw_vec_cannot_be_an_assembled_stimulus.rs:12:9
+   |
+11 |     let _ = AssembledStimulus {
+   |             ----------------- in this type
+12 |         kind: StimulusKind::Sweep,
+   |         ^^^^ private field
+13 |         level,
+   |         ^^^^^ private field
+14 |         sample_rate_hz: 48_000,
+   |         ^^^^^^^^^^^^^^ private field
+15 |         samples: vec![2.0; 48_000],
+   |         ^^^^^^^ private field

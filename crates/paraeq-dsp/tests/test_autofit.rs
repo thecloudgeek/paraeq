@@ -1,6 +1,34 @@
+//! Two entry points, two tiers.
+//!
+//! - [`greedy_fit_matches_oracle_bands`] is **Tier 1**: `auto_fit_parametric_eq`
+//!   against the golden fixture, byte-identical to the Python oracle.
+//! - Everything below it is **Tier 3** (analytic policy) for `auto_fit_room`'s
+//!   B4 additions — the residual-RMS stop, shelf emission and the
+//!   `min_gain_db` drop rule. No oracle exists and none is faked: what is
+//!   pinned is the spec's own sentences, each asserted as the behaviour it
+//!   buys (a band count against a curve with a known residual; the closed-form
+//!   half-gain width for the shelf).
+//!
+//! Spec: docs/specs/2026-07-15-decision-engine-design.md § Decision table,
+//! rows `max_filters`, `flatness_target_db` and `shelves`.
+
 mod common;
+
 use common::Case;
-use paraeq_dsp::autofit::auto_fit_parametric_eq;
+use paraeq_dsp::authority::{
+    authority_band_mask, build_authority, width_oct_for_q, AuthorityCurve, AuthorityPolicy, Clamp,
+    COUPLER_CUTOFF_HZ, DEFAULT_BOOST_RATIO, DEFAULT_MIN_DIP_WIDTH_OCT, SIGMA_NONE_DB,
+};
+use paraeq_dsp::autofit::{
+    auto_fit_parametric_eq, auto_fit_room, RoomFitPolicy, RoomFitReport, CEILING_SLOP_DB,
+    NO_AUTHORITY_CUT_LEAK_DB, SHELF_Q,
+};
+use paraeq_dsp::logf::LogGrid;
+use paraeq_dsp::peq::{EQBand, FilterType, ParametricEQ};
+use paraeq_dsp::PerChannel;
+use std::f64::consts::TAU;
+
+const SR: f64 = 48_000.0;
 
 #[test]
 fn greedy_fit_matches_oracle_bands() {
@@ -37,4 +65,694 @@ fn greedy_fit_matches_oracle_bands() {
             b.q
         );
     }
+}
+
+// ───────────────────────────────── helpers ───────────────────────────────────
+
+/// A flat-σ authority curve on the standard grid.
+fn curve_at_sigma(sigma: f64) -> AuthorityCurve {
+    let grid = LogGrid::standard();
+    let sigma_db = vec![sigma; grid.len()];
+    build_authority(&grid, &sigma_db, &AuthorityPolicy::default()).expect("valid inputs")
+}
+
+/// The grid bin nearest `f`, so a synthetic feature sits exactly on a sample
+/// point and the test is not measuring interpolation error.
+fn nearest_bin_hz(grid: &LogGrid, f: f64) -> f64 {
+    *grid
+        .freqs()
+        .iter()
+        .min_by(|a, b| (*a - f).abs().total_cmp(&(*b - f).abs()))
+        .expect("non-empty grid")
+}
+
+/// A Gaussian bump in log-frequency of amplitude `amp_db` centred on
+/// `centre_hz`, with `width_oct` measured at half amplitude — the same shape
+/// `tests/test_authority.rs` uses, so the width under test is exact by
+/// construction rather than a property of a biquad.
+fn gaussian(grid: &LogGrid, centre_hz: f64, amp_db: f64, width_oct: f64) -> Vec<f64> {
+    let s = width_oct / (2.0 * (2.0 * std::f64::consts::LN_2).sqrt());
+    grid.freqs()
+        .iter()
+        .map(|&f| {
+            let x = (f / centre_hz).log2() / s;
+            amp_db * (-0.5 * x * x).exp()
+        })
+        .collect()
+}
+
+fn fit(
+    correction: &[f64],
+    curve: &AuthorityCurve,
+    max_bands: usize,
+    min_gain_db: f64,
+    policy: Option<&RoomFitPolicy>,
+) -> RoomFitReport {
+    let grid = LogGrid::standard();
+    let per = PerChannel::new(vec![correction.to_vec()]).expect("one channel");
+    let out = auto_fit_room(&per, &grid, SR, curve, max_bands, min_gain_db, 0.0, policy)
+        .expect("valid fit inputs");
+    out.get(0).expect("one channel").clone()
+}
+
+/// What is left over the authority band after `bands` run, in dB RMS —
+/// re-derived here, in the test, from the realized cascade rather than from
+/// anything the fit reported about itself.
+fn residual_rms_over_band(
+    correction: &[f64],
+    bands: &[EQBand],
+    curve: &AuthorityCurve,
+    correction_range: (f64, f64),
+) -> f64 {
+    let grid = LogGrid::standard();
+    let realized = ParametricEQ {
+        bands: bands.to_vec(),
+        sample_rate: SR,
+    }
+    .frequency_response(grid.freqs());
+    let mask = authority_band_mask(grid.freqs(), curve, correction_range);
+    let mut sum_sq = 0.0;
+    let mut n = 0usize;
+    for ((c, r), in_band) in correction.iter().zip(&realized).zip(&mask) {
+        if *in_band {
+            let left = c - r;
+            sum_sq += left * left;
+            n += 1;
+        }
+    }
+    assert!(n > 0, "the authority band must not be empty in this test");
+    (sum_sq / n as f64).sqrt()
+}
+
+/// A coupler envelope — **exactly zero above 10 kHz** — must still emit bands
+/// below it.
+///
+/// The spec's own words for the envelope are "On the coupler path,
+/// `A_base(f) = 0` above 10 kHz", and that hard zero met a cascade ceiling
+/// checked with a float-equality slop of 1e-9. Every realizable IIR band has a
+/// non-zero magnitude at EVERY frequency — a 1.5 kHz peaking filter leaves
+/// about 9e-3 dB at 13 kHz — so `shrink_into_cascade` answered "does not fit"
+/// for every candidate, bisected each one down to a gain below `min_gain_db`,
+/// and `auto_fit_room` returned ZERO bands. Both coupler paths, every in-ear
+/// and over-ear measurement, no correction at all.
+///
+/// The envelope bounds the CORRECTION, and the tail of a filter placed
+/// elsewhere is not one: no band may be placed in the zero region, and this
+/// test asserts that too.
+#[test]
+fn a_coupler_envelope_that_is_zero_above_10_khz_still_fits_bands_below_it() {
+    let grid = LogGrid::standard();
+    let curve = build_authority(&grid, &vec![1.0; grid.len()], &AuthorityPolicy::coupler())
+        .expect("valid inputs");
+
+    // A 6 dB peak at 1.5 kHz, comfortably inside the region the envelope
+    // licenses 2 dB of cut in.
+    let centre = nearest_bin_hz(&grid, 1500.0);
+    let correction: Vec<f64> = gaussian(&grid, centre, -6.0, 0.5);
+    let policy = RoomFitPolicy {
+        correction_range: (20.0, 20_000.0),
+        flatness_target_db: 1.0,
+        shelves: false,
+    };
+    let report = fit(&correction, &curve, 10, 0.5, Some(&policy));
+
+    assert!(
+        !report.bands.is_empty(),
+        "a coupler fit emitted nothing; clamps were {:?}",
+        report.clamps
+    );
+    for band in &report.bands {
+        assert!(
+            band.fc < COUPLER_CUTOFF_HZ,
+            "no band may be PLACED where the envelope licenses nothing, got {band:?}"
+        );
+    }
+
+    // And the cascade still respects the zero region to the two tolerances the
+    // ceiling states — and the ASYMMETRY is the design: what survives there is
+    // a cut, which cannot damage a driver, fill a null or ring, while a boost
+    // stays held to `CEILING_SLOP_DB`.
+    let realized = ParametricEQ {
+        bands: report.bands.clone(),
+        sample_rate: SR,
+    }
+    .frequency_response(grid.freqs());
+    let zero_region: Vec<f64> = grid
+        .freqs()
+        .iter()
+        .zip(&realized)
+        .filter(|(f, _)| !curve.at(**f).licenses_correction())
+        .map(|(_, r)| *r)
+        .collect();
+    assert!(
+        !zero_region.is_empty(),
+        "the coupler envelope has a zero region"
+    );
+    let worst_cut = zero_region.iter().copied().fold(0.0f64, |a, r| a.max(-r));
+    let worst_boost = zero_region.iter().copied().fold(0.0f64, f64::max);
+    assert!(
+        worst_cut <= NO_AUTHORITY_CUT_LEAK_DB,
+        "the cascade cuts {worst_cut} dB inside the zero-envelope region"
+    );
+    assert!(
+        worst_boost <= CEILING_SLOP_DB,
+        "a BOOST in the zero region is what the envelope exists to forbid, got {worst_boost} dB"
+    );
+    assert!(
+        worst_cut > 0.0,
+        "non-vacuity: a real biquad DOES leave something there, which is the \
+         whole reason a float-equality ceiling could not be right"
+    );
+}
+
+/// A no-authority region forgives a leaked CUT and never a leaked BOOST.
+///
+/// The asymmetry is the whole design of `NO_AUTHORITY_CUT_LEAK_DB`: what the
+/// envelope guards against is the corrector DRIVING the system — excursion, a
+/// filled null, a resonance that rings longer than the problem it fixes — and
+/// every one of those is a boost. A dip immediately under the coupler cutoff
+/// asks for exactly the boost that must not leak.
+#[test]
+fn a_leaked_boost_is_never_forgiven_where_the_envelope_licenses_nothing() {
+    let grid = LogGrid::standard();
+    let curve = build_authority(&grid, &vec![1.0; grid.len()], &AuthorityPolicy::coupler())
+        .expect("valid inputs");
+    // A DIP just under the cutoff: the fit would answer it with a boost, and a
+    // boost's skirt reaches over the step.
+    let centre = nearest_bin_hz(&grid, 8000.0);
+    let correction: Vec<f64> = gaussian(&grid, centre, 6.0, 0.5);
+    let policy = RoomFitPolicy {
+        correction_range: (20.0, 20_000.0),
+        flatness_target_db: 1.0,
+        shelves: false,
+    };
+    let report = fit(&correction, &curve, 10, 0.5, Some(&policy));
+    let realized = ParametricEQ {
+        bands: report.bands.clone(),
+        sample_rate: SR,
+    }
+    .frequency_response(grid.freqs());
+    for (f, r) in grid.freqs().iter().zip(&realized) {
+        let at = curve.at(*f);
+        assert!(
+            *r <= at.max_boost_db + CEILING_SLOP_DB,
+            "cascade boosts {r} dB at {f} Hz against a ceiling of {}",
+            at.max_boost_db
+        );
+    }
+}
+
+// ──────────────────────── the residual-RMS stop (B4.1) ───────────────────────
+
+#[test]
+fn max_filters_stops_at_the_flatness_target_not_at_the_cap() {
+    // decision-engine-design.md § Decision table, `max_filters`, verbatim:
+    // "Greedy worst-first; stop when residual RMS over the authority band
+    // `< flatness_target_db` or the cap is hit."  Both halves are asserted:
+    // the target ends this fit, the cap ends the next one.
+    const CAP: usize = 10;
+    let grid = LogGrid::standard();
+    let curve = curve_at_sigma(0.5);
+    let range = (40.0, 250.0);
+    let policy = RoomFitPolicy {
+        correction_range: range,
+        flatness_target_db: 3.0,
+        shelves: false,
+    };
+
+    // Three measured peaks worth removing, plus a ±1.5 dB ripple across the
+    // whole grid. Every ripple lobe clears `min_gain_db`, so a fit with no
+    // target keeps chasing them to the cap; a fit with a 3 dB target must stop
+    // once the peaks are gone, because 1.5 dB of ripple is 1.06 dB RMS and
+    // already inside the target.
+    // The amplitudes are well inside the ±10 dB excursion envelope on purpose:
+    // a curve deeper than the ceiling stops being a test of the STOP and
+    // becomes a test of the cascade gate, which `test_authority.rs` owns.
+    let mut correction = vec![0.0; grid.len()];
+    for centre in [50.0, 100.0, 200.0] {
+        let peak = gaussian(&grid, nearest_bin_hz(&grid, centre), -5.0, 0.5);
+        for (c, p) in correction.iter_mut().zip(&peak) {
+            *c += p;
+        }
+    }
+    for (c, &f) in correction.iter_mut().zip(grid.freqs()) {
+        *c += 1.5 * (TAU * f.log2()).sin();
+    }
+
+    let stopped = fit(&correction, &curve, CAP, 1.0, Some(&policy));
+    let unstopped = fit(&correction, &curve, CAP, 1.0, None);
+
+    assert_eq!(
+        unstopped.bands.len(),
+        CAP,
+        "without a target the cap is what binds — otherwise this test cannot \
+         tell the stop from running out of candidates"
+    );
+    assert!(
+        !stopped.bands.is_empty(),
+        "the stop must not fire before any work is done"
+    );
+    assert!(
+        stopped.bands.len() < CAP,
+        "the target, not the cap, must end this fit: got {} bands",
+        stopped.bands.len()
+    );
+
+    let left = residual_rms_over_band(&correction, &stopped.bands, &curve, range);
+    assert!(
+        left < policy.flatness_target_db,
+        "and the target must actually be met: {left:.3} dB RMS over the band"
+    );
+
+    // One band earlier the target is NOT met — so the stop fired as soon as it
+    // could, rather than late. The greedy loop is a prefix, so refitting with
+    // one fewer band reproduces the same bands minus the last.
+    let one_short = fit(&correction, &curve, stopped.bands.len() - 1, 1.0, None);
+    let short_left = residual_rms_over_band(&correction, &one_short.bands, &curve, range);
+    assert!(
+        short_left >= policy.flatness_target_db,
+        "the fit used more bands than the target needed: {short_left:.3} dB \
+         RMS with {} bands",
+        one_short.bands.len()
+    );
+
+    // The other half of the sentence — "or the cap is hit" — on the same
+    // curve, with a budget too small to reach a coupler-tight 1 dB: the fit
+    // must spend every filter it has and hand back a residual that still
+    // misses the target, rather than stopping early or pretending it landed.
+    const TIGHT_CAP: usize = 5;
+    let tight = RoomFitPolicy {
+        correction_range: range,
+        flatness_target_db: 1.0,
+        shelves: false,
+    };
+    let capped = fit(&correction, &curve, TIGHT_CAP, 1.0, Some(&tight));
+    assert_eq!(
+        capped.bands.len(),
+        TIGHT_CAP,
+        "five filters cannot reach 1 dB here, so the cap must be what binds"
+    );
+    let capped_left = residual_rms_over_band(&correction, &capped.bands, &curve, range);
+    assert!(
+        capped_left >= tight.flatness_target_db,
+        "and it must stop there with the target unmet, got {capped_left:.3} dB"
+    );
+}
+
+// ─────────────────────── the min_gain_db drop rule (B4.3) ────────────────────
+
+#[test]
+fn bands_below_min_gain_db_are_dropped_and_reported() {
+    // decision-engine-design.md § Decision table, `max_filters`: "Drop any band
+    // with |gain| < flatness/2". `min_gain_db` IS that flatness/2 — the binding
+    // is `decide()`'s (tested in B7b); this owns the mechanism, and the point
+    // of `Clamp::BelowMinGain` is that the drop stops being silent.
+    let grid = LogGrid::standard();
+    let curve = curve_at_sigma(0.5);
+    let small_hz = nearest_bin_hz(&grid, 2000.0);
+    let big = gaussian(&grid, nearest_bin_hz(&grid, 60.0), -6.0, 1.0);
+    let small = gaussian(&grid, small_hz, -1.2, 1.0);
+    let correction: Vec<f64> = big.iter().zip(&small).map(|(b, s)| b + s).collect();
+
+    let min_gain_db = 1.5;
+    let report = fit(&correction, &curve, 4, min_gain_db, None);
+
+    assert!(
+        report.bands.len() < 4,
+        "the floor, not the cap, must end this fit: {:?}",
+        report.bands
+    );
+    assert!(
+        report.bands.iter().all(|b| b.gain_db.abs() >= min_gain_db),
+        "no band may be emitted below the floor: {:?}",
+        report.bands
+    );
+    assert!(
+        report
+            .bands
+            .iter()
+            .all(|b| (b.fc / small_hz).log2().abs() > 0.5),
+        "the 1.2 dB feature must be left alone, not corrected: {:?}",
+        report.bands
+    );
+
+    let dropped: Vec<&Clamp> = report
+        .clamps
+        .iter()
+        .filter(|c| matches!(c, Clamp::BelowMinGain { .. }))
+        .collect();
+    assert_eq!(
+        dropped.len(),
+        1,
+        "the drop must be reported exactly once, got {:?}",
+        report.clamps
+    );
+    let Clamp::BelowMinGain { fc, gain_db } = dropped[0] else {
+        unreachable!("filtered above")
+    };
+    assert!(
+        gain_db.abs() < min_gain_db && gain_db.abs() > 0.0,
+        "the report must carry what was found and left alone, got {gain_db} dB"
+    );
+    assert!(fc.is_finite() && *fc > 0.0, "and where it was: {fc} Hz");
+    assert_eq!(
+        report.dropped, 0,
+        "a band below the floor is a tuning outcome, NOT a stability drop"
+    );
+}
+
+// ────────────────────────── shelf emission (B4.2) ────────────────────────────
+
+#[test]
+fn a_broad_one_signed_end_excursion_becomes_a_shelf() {
+    // decision-engine-design.md § Decision table, `shelves`, verbatim: "Emit a
+    // shelf where a >=0.5-octave one-signed excursion exists at either end of
+    // `correction_range`; shelf Q clamped `[0.4, 0.7]`."
+    //
+    // A Gaussian centred on the low edge of the range falls to half its
+    // amplitude `width_oct / 2` octaves in — and half the gain is exactly
+    // where a shelf's corner sits — so a 1.5-octave bump presents a 0.75-octave
+    // one-signed excursion and a 0.5-octave bump presents 0.25.
+    let grid = LogGrid::standard();
+    let curve = curve_at_sigma(0.5);
+    let edge_hz = grid.freqs()[0];
+    let range = (edge_hz, 20_000.0);
+    let policy = RoomFitPolicy {
+        correction_range: range,
+        flatness_target_db: 0.5,
+        shelves: true,
+    };
+
+    let broad = gaussian(&grid, edge_hz, -6.0, 1.5);
+    let report = fit(&broad, &curve, 4, 1.0, Some(&policy));
+    let shelves: Vec<&EQBand> = report
+        .bands
+        .iter()
+        .filter(|b| matches!(b.filter_type, FilterType::LowShelf | FilterType::HighShelf))
+        .collect();
+    assert_eq!(
+        shelves.len(),
+        1,
+        "0.75 octaves of one-signed excursion is a shelf: {:?}",
+        report.bands
+    );
+    assert_eq!(shelves[0].filter_type, FilterType::LowShelf);
+    assert!(
+        shelves[0].gain_db < 0.0,
+        "a measured peak at the low end is a CUT shelf: {:?}",
+        shelves[0]
+    );
+    assert!(
+        SHELF_Q.contains(&shelves[0].q),
+        "shelf Q must be clamped into {SHELF_Q:?}, got {}",
+        shelves[0].q
+    );
+    assert!(
+        (shelves[0].fc / (edge_hz * 2f64.powf(0.75))).log2().abs() < 0.05,
+        "the corner is the half-gain point, {} Hz here, got {}",
+        edge_hz * 2f64.powf(0.75),
+        shelves[0].fc
+    );
+
+    let narrow = gaussian(&grid, edge_hz, -6.0, 0.5);
+    let report = fit(&narrow, &curve, 4, 1.0, Some(&policy));
+    assert!(
+        !report.bands.is_empty(),
+        "the feature must still be corrected, just not with a shelf"
+    );
+    assert!(
+        report
+            .bands
+            .iter()
+            .all(|b| b.filter_type == FilterType::Peaking),
+        "0.25 octaves is a bump, not a tilt: {:?}",
+        report.bands
+    );
+}
+
+#[test]
+fn shelves_are_not_emitted_when_the_decision_says_no() {
+    // `shelves` is a `Choice: true, false` the owner can turn off; the same
+    // curve that produced one above must produce none with the flag down —
+    // and must still be corrected, with peaking filters.
+    let grid = LogGrid::standard();
+    let curve = curve_at_sigma(0.5);
+    let edge_hz = grid.freqs()[0];
+    let policy = RoomFitPolicy {
+        correction_range: (edge_hz, 20_000.0),
+        flatness_target_db: 0.5,
+        shelves: false,
+    };
+    let broad = gaussian(&grid, edge_hz, -6.0, 1.5);
+    let report = fit(&broad, &curve, 4, 1.0, Some(&policy));
+    assert!(
+        !report.bands.is_empty(),
+        "turning shelves off must not turn the fit off"
+    );
+    assert!(
+        report
+            .bands
+            .iter()
+            .all(|b| b.filter_type == FilterType::Peaking),
+        "{:?}",
+        report.bands
+    );
+}
+
+#[test]
+fn auto_fit_room_refuses_a_malformed_fit_policy() {
+    // A stop that cannot be graded must refuse, not run silently forever:
+    // `authority_band_mask` returns an empty band for an inverted or
+    // non-finite range, and an empty band can never say "flat enough".
+    let grid = LogGrid::standard();
+    let curve = curve_at_sigma(1.0);
+    let flat = PerChannel::new(vec![vec![0.0; grid.len()]]).expect("one channel");
+    let bad = [
+        RoomFitPolicy {
+            correction_range: (1000.0, 40.0),
+            flatness_target_db: 3.0,
+            shelves: true,
+        },
+        RoomFitPolicy {
+            correction_range: (f64::NAN, 1000.0),
+            flatness_target_db: 3.0,
+            shelves: true,
+        },
+        RoomFitPolicy {
+            correction_range: (0.0, 1000.0),
+            flatness_target_db: 3.0,
+            shelves: true,
+        },
+        RoomFitPolicy {
+            correction_range: (40.0, 1000.0),
+            flatness_target_db: 0.0,
+            shelves: true,
+        },
+        RoomFitPolicy {
+            correction_range: (40.0, 1000.0),
+            flatness_target_db: f64::NAN,
+            shelves: true,
+        },
+    ];
+    for policy in bad {
+        assert!(
+            auto_fit_room(&flat, &grid, SR, &curve, 4, 1.0, 0.0, Some(&policy)).is_err(),
+            "{policy:?} must be refused"
+        );
+    }
+}
+
+// ───────────────────────────── the narrow-dip veto ───────────────────────────
+
+#[test]
+fn a_narrow_dip_is_never_filled() {
+    // The two widths under test, placed against the threshold in BOTH of the
+    // spellings the specs use: room-dsp states it as a width (1/6 octave,
+    // `DEFAULT_MIN_DIP_WIDTH_OCT`) and engine-hardening as a Q (>3 is narrow).
+    // `width_oct_for_q` is the exact conversion between them — the equality is
+    // pinned in `test_authority.rs`; what is pinned HERE is which rule the
+    // shipped fit actually obeys.
+    let narrow_oct = 1.0 / 12.0;
+    let wide_oct = 1.0 / 3.0;
+    let q_rule_oct = width_oct_for_q(3.0);
+    assert!(
+        narrow_oct < DEFAULT_MIN_DIP_WIDTH_OCT && wide_oct > DEFAULT_MIN_DIP_WIDTH_OCT,
+        "the two cases must straddle the shipped threshold of \
+         {DEFAULT_MIN_DIP_WIDTH_OCT:.4} octaves"
+    );
+    assert!(
+        wide_oct < q_rule_oct,
+        "the 1/3-octave case is the DISCRIMINATING one: Q>3 is anything under \
+         {q_rule_oct:.4} octaves, so engine-hardening's spelling would veto it \
+         while room-dsp's 1/6-octave spelling fills it. The shipped rule is \
+         the width, so it is filled."
+    );
+
+    let grid = LogGrid::standard();
+    let curve = curve_at_sigma(0.5);
+    let f0 = nearest_bin_hz(&grid, 60.0);
+
+    // Positive residual = a measured dip = something to FILL.
+    let narrow = fit(&gaussian(&grid, f0, 8.0, narrow_oct), &curve, 4, 1.0, None);
+    assert!(
+        narrow.bands.is_empty(),
+        "1/12 octave is destructive interference, not response: {:?}",
+        narrow.bands
+    );
+    assert!(
+        narrow
+            .clamps
+            .iter()
+            .any(|c| matches!(c, Clamp::DipRefused { .. })),
+        "and the refusal must say so: {:?}",
+        narrow.clamps
+    );
+
+    let wide = fit(&gaussian(&grid, f0, 8.0, wide_oct), &curve, 4, 1.0, None);
+    assert!(
+        !wide.bands.is_empty(),
+        "1/3 octave is response, and is filled"
+    );
+    assert!(
+        wide.bands.iter().all(|b| b.gain_db > 0.0),
+        "filling a dip is a boost: {:?}",
+        wide.bands
+    );
+}
+
+// ────────────────────── the boost weight the ranking uses ────────────────────
+
+/// A flat-σ curve whose boosts are capped at `ratio` of its cuts.
+///
+/// σ = 0.5 is at or below `SIGMA_FULL_DB`, so the confidence weight is 1.0 and
+/// the two ceilings are the excursion envelope itself — 10 dB of cut and
+/// `ratio × 10` dB of boost anywhere below 150 Hz. That makes the ratio under
+/// test readable off the policy instead of being a property of the σ curve.
+fn curve_with_boost_ratio(ratio: f64) -> AuthorityCurve {
+    let grid = LogGrid::standard();
+    build_authority(
+        &grid,
+        &vec![0.5; grid.len()],
+        &AuthorityPolicy {
+            boost_ratio: ratio,
+            ..AuthorityPolicy::default()
+        },
+    )
+    .expect("valid inputs")
+}
+
+/// A measured peak of `peak_db` at 60 Hz and a measured dip of `dip_db` at
+/// 120 Hz, as the correction curve that answers them: the peak asks for a cut
+/// (negative) and the dip asks for a boost (positive).
+///
+/// An octave apart and 1/3 octave wide, which is seven Gaussian sigmas of
+/// separation — so each feature's own bin carries its own amplitude and the
+/// ranking under test is not measuring overlap. 1/3 octave also clears
+/// `DEFAULT_MIN_DIP_WIDTH_OCT`, so the narrow-dip veto is not what decides
+/// this; `a_narrow_dip_is_never_filled` owns that rule.
+fn a_peak_and_a_dip(peak_db: f64, dip_db: f64) -> Vec<f64> {
+    let grid = LogGrid::standard();
+    let peak = gaussian(&grid, nearest_bin_hz(&grid, 60.0), -peak_db, 1.0 / 3.0);
+    let dip = gaussian(&grid, nearest_bin_hz(&grid, 120.0), dip_db, 1.0 / 3.0);
+    peak.iter().zip(&dip).map(|(p, d)| p + d).collect()
+}
+
+#[test]
+fn a_curves_boost_weight_is_its_max_boost_over_its_max_cut() {
+    // The weight the greedy ranking applies to a boost is READ OFF the curve —
+    // `max_boost(f) / max_cut(f)` — rather than being a second copy of the
+    // policy's `boost_ratio`. This test pins the three cases that weight has,
+    // on the curve itself; the pick-order test below pins that the fit
+    // actually uses it.
+    let grid = LogGrid::standard();
+    let f = nearest_bin_hz(&grid, 60.0);
+
+    // Cut-only: no boost authority against 10 dB of cut is a weight of ZERO,
+    // which is what makes a cut-only curve rank its boosts last instead of
+    // first. `decide()` passes this ratio on the room auto path.
+    let cut_only = curve_with_boost_ratio(0.0);
+    assert_eq!(cut_only.at(f).max_boost_db, 0.0);
+    assert!(
+        (cut_only.at(f).max_cut_db - 10.0).abs() < 1e-12,
+        "the excursion envelope is 10 dB here, got {}",
+        cut_only.at(f).max_cut_db
+    );
+
+    // The shipped default, and the reason the pick-order test below uses
+    // ratios that are NOT 0.5: at the default the weight IS 0.5, so every
+    // fixture built on `AuthorityPolicy::default()` agrees with a hardcoded
+    // 0.5 and can never tell the two apart.
+    let default = curve_with_boost_ratio(DEFAULT_BOOST_RATIO);
+    let at = default.at(f);
+    assert!(
+        (at.max_boost_db / at.max_cut_db - 0.5).abs() < 1e-12,
+        "{} / {} is not the shipped 0.5",
+        at.max_boost_db,
+        at.max_cut_db
+    );
+
+    // No authority of either sign: σ at `SIGMA_NONE_DB` zeroes the confidence
+    // weight, so the ratio is 0/0. The curve reports both ceilings as zero and
+    // the fit places nothing — which is why the ratio's own 0/0 fallback is
+    // defensive rather than load-bearing: a bin with no cut authority has no
+    // boost authority either and is struck before it can be ranked.
+    let none = curve_at_sigma(SIGMA_NONE_DB);
+    assert_eq!(none.at(f).max_cut_db, 0.0);
+    assert_eq!(none.at(f).max_boost_db, 0.0);
+    let report = fit(&a_peak_and_a_dip(3.0, 8.0), &none, 4, 1.0, None);
+    assert!(
+        report.bands.is_empty(),
+        "a curve with no authority licenses no band: {:?}",
+        report.bands
+    );
+}
+
+#[test]
+fn the_pick_order_between_a_peak_and_a_dip_follows_the_curves_boost_ratio() {
+    // The asymmetric score is `-r` for a cut and `r × boost_ratio` for a
+    // boost, so which of a peak and a dip is corrected FIRST is decided by the
+    // curve's own ratio. Both halves are asserted, and each is chosen so that
+    // the weight has to be the curve's: a fit that used any fixed weight of
+    // 0.5 — the shipped default, and so the one a copy would most likely be —
+    // picks the other feature in both cases.
+    //
+    // A single band is fitted on purpose. The greedy loop corrects everything
+    // eventually; what the ratio decides is the ORDER, and with a budget of
+    // one the order is the whole answer.
+
+    // A 3 dB peak against an 8 dB dip, weighted at a quarter: the peak scores
+    // 3.0 and the dip 2.0, so the PEAK is corrected first. At a weight of 0.5
+    // the dip would score 4.0 and win.
+    let quarter = curve_with_boost_ratio(0.25);
+    let report = fit(&a_peak_and_a_dip(3.0, 8.0), &quarter, 1, 1.0, None);
+    assert_eq!(report.bands.len(), 1, "one band was budgeted: {report:?}");
+    assert!(
+        report.bands[0].gain_db < 0.0,
+        "a quarter weight ranks the 3 dB peak above the 8 dB dip, so the one \
+         band must be a CUT: {:?}",
+        report.bands[0]
+    );
+    assert!(
+        (report.bands[0].fc / 60.0).log2().abs() < 0.25,
+        "and it must sit on the peak at 60 Hz, got {} Hz",
+        report.bands[0].fc
+    );
+
+    // The same shape the other way: a 5 dB peak against an 8 dB dip, weighted
+    // at one, scores 5.0 against 8.0, so the DIP is filled first. At a weight
+    // of 0.5 the dip would score 4.0 and lose.
+    let whole = curve_with_boost_ratio(1.0);
+    let report = fit(&a_peak_and_a_dip(5.0, 8.0), &whole, 1, 1.0, None);
+    assert_eq!(report.bands.len(), 1, "one band was budgeted: {report:?}");
+    assert!(
+        report.bands[0].gain_db > 0.0,
+        "an unweighted curve ranks the 8 dB dip above the 5 dB peak, so the \
+         one band must be a BOOST: {:?}",
+        report.bands[0]
+    );
+    assert!(
+        (report.bands[0].fc / 120.0).log2().abs() < 0.25,
+        "and it must sit on the dip at 120 Hz, got {} Hz",
+        report.bands[0].fc
+    );
 }

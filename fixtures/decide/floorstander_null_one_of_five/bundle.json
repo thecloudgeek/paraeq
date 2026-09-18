@@ -1,0 +1,346 @@
+{
+  "cal": {
+    "content": "\"Sens Factor =-1.4dB\", SERNO: 7005770\n20.000,-3.1300\n31.500,-1.8600\n50.000,-0.9400\n80.000,-0.4100\n125.000,-0.1200\n250.000,0.0400\n500.000,0.0000\n1000.000,0.0000\n2000.000,0.2100\n5000.000,0.6300\n10000.000,0.7500\n20000.000,-2.0800\n",
+    "curve": [
+      [
+        20.0,
+        31.5,
+        50.0,
+        80.0,
+        125.0,
+        250.0,
+        500.0,
+        1000.0,
+        2000.0,
+        5000.0,
+        10000.0,
+        20000.0
+      ],
+      [
+        -3.13,
+        -1.86,
+        -0.94,
+        -0.41,
+        -0.12,
+        0.04,
+        0.0,
+        0.0,
+        0.21,
+        0.63,
+        0.75,
+        -2.08
+      ]
+    ],
+    "gain_db": 18.0,
+    "sensitivity_db": -1.4,
+    "serial": "7005770",
+    "variant": "Plain"
+  },
+  "capture": {
+    "chain_sensitivity_spl_per_dbfs": 104.0,
+    "clock_adjusted": true,
+    "clock_skew_ppm": 9.8,
+    "input_present": true,
+    "input_rate": 48000,
+    "input_uid": "UMIK-1:7005770",
+    "output_rate": 48000,
+    "output_uid": "AppleUSBAudioEngine:Topping:D10s",
+    "self_excluded": true,
+    "sweep": {
+      "duration_s": 5.5,
+      "f_end_hz": 20000.0,
+      "f_start_hz": 20.0,
+      "level_dbfs": -18.0
+    },
+    "sweep_rate": 48000
+  },
+  "class": "Floorstander",
+  "noise_floor": {
+    "freqs_hz": [
+      20.0,
+      25.198,
+      31.748,
+      40.0,
+      50.397,
+      63.496,
+      80.0,
+      100.794,
+      126.992,
+      160.0,
+      201.587,
+      253.984,
+      320.0,
+      403.175,
+      507.968,
+      640.0,
+      806.349,
+      1015.937,
+      1280.0,
+      1612.699,
+      2031.873,
+      2560.0,
+      3225.398,
+      4063.747,
+      5120.0,
+      6450.796,
+      8127.493,
+      10240.0,
+      12901.592,
+      16254.987,
+      20000.0
+    ],
+    "rms_dbfs": [
+      -76.774
+    ],
+    "spectrum_db": [
+      [
+        -84.0,
+        -85.204,
+        -86.375,
+        -86.355,
+        -82.831,
+        -89.672,
+        -91.225,
+        -92.429,
+        -93.633,
+        -94.837,
+        -96.041,
+        -97.245,
+        -98.449,
+        -99.654,
+        -100.858,
+        -102.062,
+        -103.266,
+        -104.47,
+        -105.674,
+        -106.878,
+        -108.082,
+        -109.287,
+        -110.491,
+        -111.695,
+        -112.899,
+        -114.103,
+        -115.307,
+        -116.511,
+        -117.715,
+        -118.919,
+        -120.0
+      ]
+    ]
+  },
+  "overrides": {
+    "align_spl_band": null,
+    "authority": null,
+    "averaging": null,
+    "class": null,
+    "clock_adjust": null,
+    "correction_kind": null,
+    "correction_range": null,
+    "fdw_post_cycles": null,
+    "fdw_pre_cycles": null,
+    "flatness_target_db": null,
+    "left_window_ms": null,
+    "low_corner_hz": null,
+    "max_filters": null,
+    "positions_n": null,
+    "preamp_db": null,
+    "q_cap": null,
+    "right_window_ms": null,
+    "shelves": null,
+    "smoothing": null,
+    "target": null,
+    "transition_hz": null,
+    "window_type": null
+  },
+  "positions": [
+    {
+      "capture": {
+        "clipped_samples": 0,
+        "peak_dbfs": -8.4,
+        "rms_dbfs": -26.1
+      },
+      "captured_at_ms": 1752537600000,
+      "index": 0,
+      "ir": {
+        "peak": 4800,
+        "sample_rate": 48000,
+        "samples": [
+          {
+            "file": "ir/pos00_ch0.f64",
+            "len": 76800,
+            "shape": [
+              76800
+            ]
+          }
+        ]
+      },
+      "label": "Position 1 (primary seat)",
+      "routing": "Both"
+    },
+    {
+      "capture": {
+        "clipped_samples": 0,
+        "peak_dbfs": -8.4,
+        "rms_dbfs": -26.1
+      },
+      "captured_at_ms": 1752537645000,
+      "index": 1,
+      "ir": {
+        "peak": 4800,
+        "sample_rate": 48000,
+        "samples": [
+          {
+            "file": "ir/pos01_ch0.f64",
+            "len": 76800,
+            "shape": [
+              76800
+            ]
+          }
+        ]
+      },
+      "label": "Position 2 (primary seat, +30 cm left)",
+      "routing": "Both"
+    },
+    {
+      "capture": {
+        "clipped_samples": 0,
+        "peak_dbfs": -8.4,
+        "rms_dbfs": -26.1
+      },
+      "captured_at_ms": 1752537690000,
+      "index": 2,
+      "ir": {
+        "peak": 4800,
+        "sample_rate": 48000,
+        "samples": [
+          {
+            "file": "ir/pos02_ch0.f64",
+            "len": 76800,
+            "shape": [
+              76800
+            ]
+          }
+        ]
+      },
+      "label": "Position 3 (primary seat, +30 cm right)",
+      "routing": "Both"
+    },
+    {
+      "capture": {
+        "clipped_samples": 0,
+        "peak_dbfs": -8.4,
+        "rms_dbfs": -26.1
+      },
+      "captured_at_ms": 1752537735000,
+      "index": 3,
+      "ir": {
+        "peak": 4800,
+        "sample_rate": 48000,
+        "samples": [
+          {
+            "file": "ir/pos03_ch0.f64",
+            "len": 76800,
+            "shape": [
+              76800
+            ]
+          }
+        ]
+      },
+      "label": "Position 4 (primary seat, +30 cm forward)",
+      "routing": "Both"
+    },
+    {
+      "capture": {
+        "clipped_samples": 0,
+        "peak_dbfs": -8.4,
+        "rms_dbfs": -26.1
+      },
+      "captured_at_ms": 1752537780000,
+      "index": 4,
+      "ir": {
+        "peak": 4800,
+        "sample_rate": 48000,
+        "samples": [
+          {
+            "file": "ir/pos04_ch0.f64",
+            "len": 76800,
+            "shape": [
+              76800
+            ]
+          }
+        ]
+      },
+      "label": "Position 5 (primary seat, +30 cm back)",
+      "routing": "Both"
+    }
+  ],
+  "targets": [
+    {
+      "category": null,
+      "classes": [
+        "Bookshelf",
+        "Floorstander"
+      ],
+      "description": null,
+      "frequencies": [
+        20.0,
+        50.0,
+        125.0,
+        315.0,
+        800.0,
+        2000.0,
+        5000.0,
+        12500.0,
+        20000.0
+      ],
+      "gains_db": [
+        6.0,
+        5.2,
+        3.4,
+        1.4,
+        0.0,
+        -1.3,
+        -3.0,
+        -5.4,
+        -6.6
+      ],
+      "name": "bk_1974",
+      "source": null
+    },
+    {
+      "category": null,
+      "classes": [
+        "Bookshelf",
+        "Floorstander",
+        "InEar",
+        "OverEar"
+      ],
+      "description": null,
+      "frequencies": [
+        20.0,
+        50.0,
+        125.0,
+        315.0,
+        800.0,
+        2000.0,
+        5000.0,
+        12500.0,
+        20000.0
+      ],
+      "gains_db": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "name": "flat",
+      "source": null
+    }
+  ],
+  "verification": null
+}

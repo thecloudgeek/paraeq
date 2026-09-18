@@ -1,0 +1,11 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+  --> tests/ui/sweep_level_has_no_second_constructor.rs:11:20
+   |
+11 |     let _wrapped = SweepLevel(-3.01);
+   |                    ^^^^^^^^^^
+   |
+note: constructor is not visible here due to private fields
+  --> src/level.rs
+   |
+   | pub struct SweepLevel(f64);
+   |                       ^^^ private field

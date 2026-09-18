@@ -1,19 +1,48 @@
 #!/usr/bin/env python3
-"""Golden-fixture generator: dumps input->output pairs from the Python
-prototype (the numerical oracle) for the Rust port's parity tests.
+"""Golden-fixture generator for the Rust port's parity tests.
+
+Two tiers are written from here (docs/specs/2026-07-15-measurement-suite-design.md,
+"The four tiers"):
+
+  Tier 1 -- dumps input->output pairs from the Python prototype, the numerical
+    oracle for the ten modules ported from it. FROZEN: not regenerated for
+    measurement-suite work.
+  Tier 2 -- scipy/numpy-direct cases for new primitives that have a library
+    delegate. These import NOTHING from paraeq, on purpose: the fixture's
+    provenance is the library, not our own ported code, so the Rust module
+    cannot be graded against a transcription of itself. Marked `Tier 2` in each
+    gen_*() docstring.
+
+fixtures/decide/ is a fifth kind and is NOT one of them: owner-reviewed
+decision bundles, frozen once accepted, which this script neither writes nor
+removes. No prototype decision engine is ever written, so there is nothing here
+that could regenerate them -- see PRESERVED below for how they are protected.
 
 Run:  source .venv/bin/activate && python prototype/tools/generate_fixtures.py
 Deterministic: seeded RNG, no timestamps. Rerunning must be byte-identical.
+
+Toolchain pinned: numpy/scipy must match PINNED_VERSIONS (declared as the
+`fixtures` extra in prototype/pyproject.toml) or generation is refused —
+a drifted scipy/numpy could silently rewrite the goldens. Override with
+--allow-version-drift, which stamps "drift": true into fixtures/manifest.json.
+The manifest is a provenance record of what ran, never the pin.
 """
+import argparse
 import json
+import math
 import platform
 import shutil
+import sys
 from pathlib import Path
 
 import numpy as np
 import scipy
+from scipy.ndimage import gaussian_filter1d
+from scipy.signal import minimum_phase, resample_poly, sosfilt
+from scipy.signal.windows import blackmanharris, boxcar, hann, tukey
 
 from paraeq.correction.auto_fit import auto_fit_parametric_eq
+from paraeq.correction.autoeq_db import parse_parametric_eq
 from paraeq.correction.biquad import (
     biquad_frequency_response,
     biquad_high_shelf,
@@ -43,10 +72,38 @@ from paraeq.measurement.sweep import generate_inverse_sweep, generate_sweep
 
 ROOT = Path(__file__).resolve().parent.parent.parent  # repo root
 OUT = ROOT / "fixtures"
+# Must equal the `fixtures` extra in prototype/pyproject.toml — that extra is
+# the declaration, this dict is the enforcement, and fixtures/manifest.json is
+# only the record of what actually ran.
+PINNED_VERSIONS = {"numpy": "2.5.0", "scipy": "1.18.0"}
+# Children of fixtures/ this script must never write and never remove. Only
+# fixtures/decide/ qualifies: those bundles are owner-reviewed characterization
+# records, frozen once accepted, and no code here can reproduce them.
+PRESERVED = frozenset({"decide"})
 SR = 48000
 
 
+def wipe_generated_fixtures():
+    """Clear what this script owns, child by child, leaving PRESERVED alone.
+
+    Not shutil.rmtree(OUT): that recursively deleted fixtures/decide/ too, so
+    the regeneration command CLAUDE.md sanctions destroyed every owner-frozen
+    decision bundle in passing. The wipe is still total for everything else --
+    a renamed or deleted gen_*() case must not leave an orphan behind.
+    """
+    OUT.mkdir(parents=True, exist_ok=True)
+    for child in sorted(OUT.iterdir()):
+        if child.name in PRESERVED:
+            continue
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+
+
 def save_case(stage: str, name: str, params: dict, arrays: dict, scalars: dict | None = None):
+    # Before the mkdir, so a mis-named stage cannot even create the directory.
+    assert stage not in PRESERVED, f"{stage}/ is owner-frozen; no gen_*() may write it"
     d = OUT / stage
     d.mkdir(parents=True, exist_ok=True)
     case = {"params": params, "scalars": scalars or {}, "arrays": {}}
@@ -56,6 +113,28 @@ def save_case(stage: str, name: str, params: dict, arrays: dict, scalars: dict |
         (d / fname).write_bytes(arr.astype("<f8").tobytes())
         case["arrays"][key] = {"file": fname, "len": int(arr.size), "shape": list(arr.shape)}
     (d / f"{name}.json").write_text(json.dumps(case, indent=1, sort_keys=True) + "\n")
+
+
+def log_grid(f_min: float = 20.0, f_max: float = 20000.0, ppo: int = 96) -> np.ndarray:
+    """The logf.rs axis: f_i = f_min * 2^(i/ppo) for i in [0, N).
+
+    N = floor(ppo*log2(f_max/f_min)) + 1 -- the largest set of ppo-spaced points
+    that does not EXCEED f_max, so the top bin falls short by under one spacing.
+    Deliberate; see the room-DSP spec's logf.rs section before "fixing" it.
+
+    Two traps, both measured against this pinned toolchain rather than assumed:
+
+    - Not np.logspace. The spec's Tier-2 wording ("np.interp on np.logspace") is
+      loose: logspace's endpoint-based spacing is a DIFFERENT float sequence,
+      here by up to 2.5e-11 Hz -- above the 1e-12 bar these cases are compared
+      at. These are the query points LogGrid::standard() must reproduce, so the
+      formula is the contract and logspace would fail a correct implementation.
+    - The standard grid's top bin is 19897.0 Hz, not the 19910 Hz the spec's
+      prose states -- that figure is an arithmetic slip in the spec, not a
+      different grid. N = 957 and f[0] = 20.0 exactly, both as specified.
+    """
+    n = int(np.floor(ppo * np.log2(f_max / f_min))) + 1
+    return f_min * 2.0 ** (np.arange(n) / ppo)
 
 
 def gen_sweep():
@@ -106,6 +185,481 @@ def gen_compensation():
     save_case("compensation", "edge_hold", {},
               {"comp_freqs": comp_freqs, "comp_gains": comp_gains, "grid": grid,
                "mag_db": mag, "compensated": out})
+
+
+def gen_cal():
+    """Cal-file parse cases for REW's leading-numeric rule (Tier 2).
+
+    Constructive, and deliberately so: each file is RENDERED FROM the golden
+    curve, so no parser supplies its own expectation and neither half of the
+    rewrite grades its own homework. `single_header` and `tab_delimited` pin
+    the dropped-first-row bug the old quote-sniff + skiprows=2 parsers shared
+    -- under the old rule they load six rows, not seven. `two_header` and
+    `comma_delimited` are the invariance witnesses: the old rule got those
+    right, which is exactly why the bug survived.
+    """
+    freqs = np.array([20.0, 50.0, 100.0, 1000.0, 5000.0, 10000.0, 20000.0])
+    gains = np.array([0.5, 0.3, 0.0, -0.2, -0.5, -1.0, -2.0])
+    triples = "".join(f"{f:>10.4f} {g:>9.4f} {0.0:>9.4f}\n" for f, g in zip(freqs, gains))
+    cases = {
+        # ParaEQ CSV: # comment, comma-separated pairs.
+        "comma_delimited": "# ParaEQ compensation curve\n"
+                           + "".join(f"{f:.4f},{g:.4f}\n" for f, g in zip(freqs, gains)),
+        # UMIK-1 0-degree: ONE quoted header, 3-column whitespace rows.
+        "single_header": '"Sens Factor =-0.4210dB, SERNO: 7103798"\n' + triples,
+        # UMIK-1 as shipped: one header, tab-separated pairs.
+        "tab_delimited": '"Sens Factor =-0.4210dB, AGain =18dB, SERNO: 7103798"\n'
+                         + "".join(f"{f:.4f}\t{g:.4f}\n" for f, g in zip(freqs, gains)),
+        # miniDSP EARS: TWO quoted headers, * comments, 3-column rows.
+        "two_header": '"Sens Factor =-0.8dB, EARS Serial 999-9999, compensation RAW V1"\n'
+                      '"Use this file on the LEFT channel. Your sensitive side is RIGHT."\n'
+                      "*\n* Freq(Hz) SPL(dB) Phase(degrees)\n*\n" + triples,
+    }
+    for name, text in cases.items():
+        save_case("compensation", name, {"cal_file": f"{name}.cal.txt"},
+                  {"freqs": freqs, "gains": gains})
+        (OUT / "compensation" / f"{name}.cal.txt").write_text(text)
+
+
+def gen_gaussian_smoothing():
+    """scipy.ndimage.gaussian_filter1d on the log-f axis (Tier 2).
+
+    The reference for fr.rs's Alvarez-Mazorra recursion, which is by construction
+    an APPROXIMATION to a true Gaussian -- hence the spec's 1e-3 dB "published
+    accuracy" bar rather than a parity bar.
+
+    Boundary handling is deliberately lifted out of the comparison: the curve is
+    flat over its outer 200 bins, wider than 6*sigma at the widest sigma here, and
+    every sane extension -- scipy's reflect, mirror, nearest, and AM's own --
+    reproduces a constant identically. AM's boundary treatment differs from
+    scipy's and is not the claim under test; the kernel shape is. A case with
+    structure running into the edge would fail on the extension and read as a
+    kernel bug.
+
+    sigma is in BINS on the uniform octave axis, where constant sigma IS
+    constant-Q -- the coordinate trick fdw.rs shares. At 96 ppo: 2 bins = 1/48
+    oct, 8 = 1/12, 32 = 1/3, spanning what fr.rs's Variable profile drives. The
+    fraction->sigma mapping is fr.rs's own design decision and is NOT pinned here.
+    """
+    rng = np.random.default_rng(48)
+    freqs = log_grid()
+    flat = 200
+    interior = np.cumsum(rng.standard_normal(freqs.shape[0] - 2 * flat)) * 0.3
+    interior = np.clip(interior - interior.mean(), -12.0, 12.0)
+    mag_db = np.concatenate([np.full(flat, interior[0]), interior, np.full(flat, interior[-1])])
+    for sigma in (2.0, 8.0, 32.0):
+        save_case("fr", f"gaussian_sigma{int(sigma)}",
+                  {"flat_margin_bins": flat, "mode": "reflect", "ppo": 96,
+                   "sigma_bins": sigma, "truncate": 4.0},
+                  {"freqs": freqs, "mag_db": mag_db,
+                   "smoothed": gaussian_filter1d(mag_db, sigma, mode="reflect", truncate=4.0)})
+
+
+def gen_variable_smooth():
+    """fr.rs Variable smoothing: per-bin truncated sampled Gaussian (Tier 2).
+
+    The Variable profile cannot be a scipy.ndimage.gaussian_filter1d call -- its
+    sigma is per-bin (1/48 oct <100 Hz, 1/6 at 1 kHz, 1/3 >10 kHz, log-f
+    interpolated), which no single-sigma primitive expresses. So this is an
+    INDEPENDENT numpy re-implementation of the exact operation
+    `variable_gaussian_smooth` performs (truncate=4.0, normalized weights,
+    clamp-to-edge extension); a transcription bug in the Rust convolution -- wrong
+    fraction anchors, linear-vs-log interpolation, wrong normalization -- diverges
+    from this reference. The inner accumulation is a scalar loop mirroring the
+    Rust summation ORDER so parity holds to 1e-12, not just method accuracy.
+
+    GAUSSIAN_FWHM_PER_SIGMA and the fraction anchors are fr.rs's contract,
+    replicated here; the fixture freezes their product, so a change to either on
+    the Rust side must move the output to disagree.
+    """
+    ppo = 96
+    freqs = log_grid(ppo=ppo)
+    n = freqs.shape[0]
+    fwhm_per_sigma = 2.3548200450309493  # 2*sqrt(2 ln 2)
+
+    def variable_fraction(f):
+        frac_bass, frac_mid, frac_treble = 1.0 / 48.0, 1.0 / 6.0, 1.0 / 3.0
+        if f <= 100.0:
+            return frac_bass
+        if f <= 1000.0:
+            return frac_bass + (frac_mid - frac_bass) * math.log10(f / 100.0)
+        if f <= 10000.0:
+            return frac_mid + (frac_treble - frac_mid) * math.log10(f / 1000.0)
+        return frac_treble
+
+    # A structured input so mid-band bins carry gradient the smoothing acts on
+    # (a flat input would pass through every profile identically and pin nothing).
+    rng = np.random.default_rng(50)
+    mag_db = np.cumsum(rng.standard_normal(n)) * 0.25
+    mag_db = np.clip(mag_db - mag_db.mean(), -15.0, 15.0)
+
+    out = np.empty(n, dtype=np.float64)
+    for i, f in enumerate(freqs):
+        sigma = variable_fraction(f) / fwhm_per_sigma * ppo
+        radius = math.ceil(4.0 * sigma)
+        inv_two_sigma_sq = 1.0 / (2.0 * sigma * sigma)
+        num = 0.0
+        den = 0.0
+        for m in range(-radius, radius + 1):  # same order as the Rust loop
+            w = math.exp(-(m * m) * inv_two_sigma_sq)
+            j = min(max(i + m, 0), n - 1)
+            num += w * float(mag_db[j])
+            den += w
+        out[i] = num / den
+
+    save_case("fr", "variable_smooth",
+              {"fwhm_per_sigma": fwhm_per_sigma, "ppo": ppo, "truncate": 4.0},
+              {"freqs": freqs, "mag_db": mag_db, "smoothed": out})
+
+
+def gen_complex_spectrum():
+    """fr::complex_spectrum vs np.fft.rfft / np.fft.rfftfreq (Tier 2).
+
+    compute_frequency_response returns MAGNITUDE only; fdw::apply_fdw and
+    logf::resample_complex_to_log_grid both need the complex linear-axis
+    spectrum, so this is the case that pins the phase half as well.
+
+    The one trap, and the reason n_samples < n_fft here: np.fft.rfft zero-pads
+    UP TO n_fft, it never truncates. A 1024-sample IR into a 4096-point rfft is
+    what actually exercises realfft's padding; an n_samples == n_fft case would
+    pin the easy path and miss it.
+
+    Complex arrays are split into spectrum_re / spectrum_im because save_case
+    writes '<f8' only.
+    """
+    rng = np.random.default_rng(52)
+    n_fft = 4096
+    n_samples = 1024
+    ir = rng.standard_normal(n_samples) * np.exp(-np.arange(n_samples) / 180.0)
+    spec = np.fft.rfft(ir, n=n_fft)
+    save_case("fr", "complex_spectrum",
+              {"n_fft": n_fft, "n_samples": n_samples, "sample_rate": SR},
+              {"freqs": np.fft.rfftfreq(n_fft, d=1.0 / SR),
+               "ir": ir, "spectrum_im": spec.imag, "spectrum_re": spec.real})
+
+
+def gen_excess_group_delay():
+    """fr::excess_group_delay_s vs a scipy min-phase + numpy phase reference (Tier 2).
+
+    EGD = -d(phi_meas - phi_min)/d(omega): the measured group delay minus the
+    group delay of the minimum-phase reconstruction of the SAME magnitude. Ships
+    in v1 as Evidence only (decide's Analysis.excess_group_delay_s); it gates
+    nothing.
+
+    THE DISCRETIZATION IS THE CONTRACT, because the derivative is where a
+    transcription would hide. All three steps are pinned here and the Rust must
+    use the identical stencil:
+
+      1. np.unwrap BEFORE differencing, on each phase separately.
+      2. np.gradient against the omega COORDINATE ARRAY, not a scalar spacing.
+         omega = 2*pi*rfftfreq is not exactly uniform in float (16 distinct
+         diffs at n_fft=8192), so np.gradient takes its NON-UNIFORM branch:
+         second-order interior weights from the two local spacings, first-order
+         one-sided at both ends (edge_order=1). The uniform central-difference
+         stencil is close but not bit-identical.
+      3. On the uniform LINEAR rfft axis. Resampling onto a log grid happens
+         AFTER, in the caller, never inside the derivative.
+
+    The IR is a two-path h = d(t0) + 2*d(t0 + tau) with |g| = 2 > 1, so its
+    zeros sit OUTSIDE the unit circle and the response is genuinely
+    non-minimum-phase. The minimum-phase counterpart reflects them inward and is
+    exactly 2*d(0) + 1*d(240) -- reversed taps -- so the excess is a pure
+    all-pass whose group delay has mean exactly tau. tau = 240 samples at 48 kHz
+    = 5 ms; measured here: mean 4.9992 ms, range 1.671..14.675 ms, ripple period
+    1/tau = 200 Hz. That mean is the cross-check that this fixture is not itself
+    wrong, and it is what the Rust-side Tier-3 invariant asserts independently.
+
+    NO RNG. Seed 54 is reserved for this case by the build plan's seed ledger and
+    is deliberately left undrawn: the whole value of a two-tap IR is that its
+    excess delay has a closed form, and a random IR would have none. Constructing
+    an unused default_rng(54) only to discard it would be a lie about provenance.
+    """
+    n_fft = 8192
+    delay_samples = 240
+    ir = np.zeros(2048)
+    ir[0] = 1.0
+    ir[delay_samples] = 2.0
+    freqs = np.fft.rfftfreq(n_fft, d=1.0 / SR)
+    mp = minimum_phase(ir, method="homomorphic", n_fft=n_fft, half=False)
+    phase_meas = np.unwrap(np.angle(np.fft.rfft(ir, n=n_fft)))
+    phase_min = np.unwrap(np.angle(np.fft.rfft(mp, n=n_fft)))
+    omega = 2.0 * np.pi * freqs
+    save_case("fr", "excess_group_delay",
+              {"delay_samples": delay_samples, "g": 2.0, "half": False,
+               "n_fft": n_fft, "n_samples": int(ir.size), "sample_rate": SR},
+              {"egd_s": -np.gradient(phase_meas - phase_min, omega),
+               "freqs": freqs, "ir": ir})
+
+
+def gen_logf():
+    """resample_db_to_log_grid at Prefilter::None == np.interp (Tier 2).
+
+    np.interp is the entire contract at this setting: linear interpolation in f
+    (NOT in log f) from the linear FFT axis onto the log grid, carrying
+    np.interp's edge-hold outside the source range -- which a real n_fft axis
+    spanning 0..sr/2 never reaches, and which this case therefore does not
+    manufacture.
+
+    The AntiComb prefilter is NOT pinned here. It is Tier 3, asserted as the
+    aliasing DIFFERENCE it exists to remove, which is the only form of the claim
+    that means anything.
+    """
+    rng = np.random.default_rng(49)
+    n_fft = 16384
+    freqs_linear = np.arange(n_fft // 2 + 1) * (SR / n_fft)
+    mag_db = np.cumsum(rng.standard_normal(freqs_linear.shape[0])) * 0.08
+    mag_db = np.clip(mag_db - mag_db.mean(), -18.0, 18.0)
+    grid_freqs = log_grid()
+    save_case("logf", "resample_db",
+              {"f_max": 20000.0, "f_min": 20.0, "n_fft": n_fft, "ppo": 96,
+               "prefilter": "none", "sample_rate": SR},
+              {"freqs_linear": freqs_linear, "grid_freqs": grid_freqs, "mag_db": mag_db,
+               "resampled": np.interp(grid_freqs, freqs_linear, mag_db)})
+
+
+def gen_min_phase_spectrum():
+    """fir::minimum_phase_spectrum vs scipy.signal.minimum_phase(half=False) (Tier 2).
+
+    WHY half=False, stated here because getting it wrong is silent and
+    catastrophic. half=True returns a filter of HALF the order whose magnitude
+    response is sqrt(|H|) -- and therefore whose phase is HALF the minimum phase
+    of |H|. That is the call fir.rs:131 ports (the `* 0.5` on the log magnitude),
+    and it is correct THERE only because design_fir_correction squares its target
+    magnitude first, so the two halvings cancel. Reached for directly by an EGD
+    that wants phi_min(|H|), it would halve every excess-group-delay number:
+    wrong everywhere, plausible-looking, and invisible unless a test states the
+    factor of two. `half` was added in scipy 1.14.0; the pin here is 1.18.0.
+
+    h is mixed-phase on purpose (a random FIR convolved with a minimum-phase
+    pair), so the reconstruction genuinely has to move zeros rather than return
+    its input.
+
+    The saved spectrum is np.fft.rfft(mp, n_fft) of scipy's OWN returned taps --
+    which for half=False are h_minimum[:len(h)], i.e. already truncated to the
+    input order. The Rust mirrors that truncation rather than returning the
+    untruncated exp(FFT(windowed cepstrum)): at n_fft=4096 the two differ by up
+    to 1.3e-3 relative, so a function that skipped the truncation could not be
+    graded against this delegate at all.
+    """
+    rng = np.random.default_rng(53)
+    n_fft = 4096
+    h = np.convolve(rng.standard_normal(96), [1.0, 0.6, 0.25])   # mixed-phase on purpose
+    mp = minimum_phase(h, method="homomorphic", n_fft=n_fft, half=False)
+    spec = np.fft.rfft(mp, n=n_fft)
+    save_case("fir", "min_phase_spectrum",
+              {"half": False, "method": "homomorphic", "n_fft": n_fft,
+               "n_taps": int(h.size), "n_taps_out": int(mp.size)},
+              {"h": h, "min_phase_taps": mp,
+               "spectrum_im": spec.imag, "spectrum_re": spec.real})
+
+
+def gen_resample_poly():
+    """resample::resample_ratio vs scipy.signal.resample_poly, rational ratio (Tier 2).
+
+    The ONE Tier-2 case for a Tier-3 function. resample_ratio takes an arbitrary
+    real ratio and a sub-sample phase, for which no library is the authority --
+    but the RATIONAL-ratio, zero-phase special case is exactly what resample_poly
+    does, so for that case scipy is a real delegate rather than a transcription
+    of our own kernel.
+
+    What the delegate is authoritative about, and what it is not. Verified on
+    this pinned toolchain: resample_poly's output sample j is the input signal at
+    input time j*down/up, i.e. our index convention with frac_offset = 0 and no
+    residual filter delay -- that is the property the fixture pins, along with
+    the ratio itself and the kernel's broad shape. It is NOT authoritative to
+    many digits: resample_poly designs its FIR with firwin(..., ('kaiser', 5.0)),
+    whose passband ripples about 3e-3 on this signal, while a 32-tap kaiser-8.6
+    windowed sinc sits within 5e-5 of the exact band-limited answer. So the two
+    agree to scipy's accuracy, not to ours, and the Rust test's tolerances say so
+    out loud. A wrong convention, a reciprocal ratio or a broken kernel all miss
+    by orders of magnitude more.
+
+    The input is white noise brick-walled at 0.15 of the sample rate by an rfft
+    round trip and normalised to unit RMS. Band-limiting is not cosmetic: both
+    filters transition near Nyquist, so energy up there would grade the two
+    designs' transition bands against each other and nothing else. numpy's fft
+    is the only thing that touches the signal, so the case imports nothing from
+    paraeq.
+    """
+    rng = np.random.default_rng(56)
+    up, down, n, band_limit = 3, 2, 4096, 0.15
+    spectrum = np.fft.rfft(rng.standard_normal(n))
+    spectrum[np.fft.rfftfreq(n) > band_limit] = 0.0
+    x = np.fft.irfft(spectrum, n)
+    x = x / np.sqrt(np.mean(x**2))
+    save_case("resample", "poly_rational",
+              {"band_limit": band_limit, "down": down, "n_samples": n,
+               "sample_rate": SR, "up": up},
+              {"x": x, "y": resample_poly(x, up, down)})
+
+
+def gen_rms_average():
+    """Power/RMS spatial average and sigma(f) vs numpy (Tier 2).
+
+    The five curves are pre-aligned in the 200-2000 Hz band -- their band means
+    agree to float precision -- so align_spl is a no-op on them (offsets ~1e-15
+    dB) and the set reaches the type-gated estimators without moving this
+    reference off 1e-12. Removing the band offsets SHAPES THE INPUT; the expected
+    outputs are numpy's alone, which is what keeps the tier honest.
+
+    align_spl itself, and the pinned -30 dB-null numbers (dB-avg = -6.0 vs
+    power-avg = -0.97), are Tier 3: those assert the two estimators' divergence,
+    a claim about physics rather than about numpy.
+    """
+    rng = np.random.default_rng(50)
+    freqs = log_grid()
+    n_positions = 5
+    walk = np.cumsum(rng.standard_normal((n_positions, freqs.shape[0])), axis=1) * 0.15
+    meas = -0.9 * np.log2(freqs / freqs[0]) + np.clip(
+        walk - walk.mean(axis=1, keepdims=True), -12.0, 12.0)
+    band = (freqs >= 200.0) & (freqs <= 2000.0)
+    band_means = meas[:, band].mean(axis=1)
+    meas = meas - (band_means - band_means.mean())[:, None]
+    save_case("fr", "rms_average",
+              {"axis_order": "position_bin", "band_hz": [200.0, 2000.0], "ddof": 0,
+               "n_positions": n_positions, "ppo": 96},
+              {"freqs": freqs, "measurements": meas,
+               "rms_db": 10.0 * np.log10(np.mean(10.0 ** (meas / 10.0), axis=0)),
+               "sigma_db": np.std(meas, axis=0, ddof=0)})
+
+
+def gen_rms_average_weighted():
+    """Weighted power/RMS average and weighted sigma(f) vs numpy (Tier 2).
+
+    The de-weighting shape LowSnrSoft produces: one position fully de-weighted
+    (0.25) and one half-weighted (0.5). REUSES gen_rms_average's construction
+    verbatim -- same seed 50, same five pre-aligned curves -- and that reuse is
+    the point, not laziness: the Rust asserts that equal weights reproduce the
+    UNWEIGHTED fixture bit for bit, which is only a claim about the weighting if
+    both fixtures grade the same measurements. A fresh seed here would compare
+    two different data sets and pin nothing.
+
+    THE WEIGHTED-SIGMA CONVENTION HAS NO NUMPY DELEGATE. np.average takes
+    weights; np.std does not. So sigma is a STATED FORMULA, and saying so is the
+    honest form of the tier: RELIABILITY weights, ddof = 0, i.e.
+
+        mean_w = sum(w_i x_i) / sum(w_i)
+        sigma  = sqrt( sum(w_i (x_i - mean_w)^2) / sum(w_i) )
+
+    NOT frequency weights (which would use sum(w) - 1 in the denominator) and
+    not any of scipy's bias corrections. np.average carries both divisions here,
+    so the expression below is still numpy's arithmetic rather than a transcribed
+    loop -- but the CHOICE of denominator is ours and is pinned by this docstring.
+    """
+    rng = np.random.default_rng(50)
+    freqs = log_grid()
+    n_positions = 5
+    walk = np.cumsum(rng.standard_normal((n_positions, freqs.shape[0])), axis=1) * 0.15
+    meas = -0.9 * np.log2(freqs / freqs[0]) + np.clip(
+        walk - walk.mean(axis=1, keepdims=True), -12.0, 12.0)
+    band = (freqs >= 200.0) & (freqs <= 2000.0)
+    band_means = meas[:, band].mean(axis=1)
+    meas = meas - (band_means - band_means.mean())[:, None]
+    w = np.array([1.0, 0.25, 1.0, 0.5, 1.0])
+    power = 10.0 ** (meas / 10.0)
+    mean_w = np.average(meas, axis=0, weights=w)
+    save_case("fr", "rms_average_weighted",
+              {"axis_order": "position_bin", "band_hz": [200.0, 2000.0], "ddof": 0,
+               "n_positions": n_positions, "ppo": 96,
+               "weights_kind": "reliability_ddof0"},
+              {"freqs": freqs, "measurements": meas,
+               "rms_db": 10.0 * np.log10(np.average(power, axis=0, weights=w)),
+               "sigma_db": np.sqrt(np.average((meas - mean_w) ** 2, axis=0, weights=w)),
+               "weights": w})
+
+
+def gen_schroeder():
+    """Schroeder backward integration vs a numpy reverse cumsum (Tier 2).
+
+    E(t) = integral_t^inf h^2(tau) dtau, reported as 10*log10(E(t)/E(0)). E(0) is
+    the total energy and therefore the maximum, h^2 being non-negative -- so
+    normalizing to E[0] and to E.max() are the same operation here. Pinned as one
+    array so a reimplementation cannot quietly normalize to something else.
+
+    The IR is exponentially-decayed noise with a KNOWN T60 of 0.12 s: the envelope
+    is exp(-t*ln(1000)/T60), since -60 dB is a factor of 1e-3 in amplitude.
+    Recovering that T60 from a -5..-25 dB fit is Tier 3, analytic, in room.rs --
+    this case pins the integration and nothing else. The curve runs 0 -> -107.6 dB
+    and is finite throughout (no sample is exactly zero, so no log10(0)).
+    """
+    rng = np.random.default_rng(51)
+    n, t60_s = 8192, 0.12
+    ir = rng.standard_normal(n) * np.exp(-(np.arange(n) / SR) * np.log(1000.0) / t60_s)
+    energy = np.cumsum(ir[::-1] ** 2)[::-1]
+    save_case("room", "schroeder_decay", {"n": n, "sample_rate": SR, "t60_s": t60_s},
+              {"decay_db": 10.0 * np.log10(energy / energy[0]), "ir": ir})
+
+
+def gen_sosfilt_offline():
+    """peq::sosfilt vs scipy.signal.sosfilt, zero initial state (Tier 2).
+
+    THE SOS ARRAY IS HARDCODED AS PLAIN NUMBERS, and that is the whole design of
+    this case. The function under test takes an EXPLICITLY SUPPLIED sos array and
+    no `self`, exactly as scipy's does, so a fixture can actually reach it. Its
+    caller ParametricEQ::apply_offline derives its sections from
+    realized_sos(rate_hz) instead, so an arbitrary array could never be fed
+    through THAT door and a fixture hung there would have graded nothing.
+
+    Writing the rows as literals also keeps the provenance honest: importing
+    paraeq's biquad designers to build them would make this case a transcription
+    of our own coefficient math wearing a scipy label. What scipy is the
+    authority on here is the FILTERING -- cascaded direct-form-II-transposed,
+    zero initial state (zi=None) -- and nothing else. The rows happen to be a
+    peaking + low-shelf + high-shelf cascade at 48 kHz; all three are stable
+    (|a2| < 1 and |a1| < a2 + 1), which matters because an unstable row would
+    make the reference diverge rather than grade anything.
+
+    a0 is 1.0 in every row. scipy's sosfilt IGNORES column 3 and assumes it is
+    already normalized, so a row with a0 != 1 would silently mean something
+    different to scipy than to a reader; ours are pre-normalized the same way
+    biquad.rs emits them.
+    """
+    rng = np.random.default_rng(55)
+    sos = np.array([
+        [1.003828061497939, -1.9921367462290207, 0.9884793705421085,
+         1.0, -1.9921367462290207, 0.9923074320400475],
+        [0.9946744428395408, -1.9483203709749175, 0.9544749339210261,
+         1.0, -1.9480779310546488, 0.9493918166808356],
+        [1.2973147213531064, -1.4171921755757653, 0.5980851799190852,
+         1.0, -0.9334639352461903, 0.41167166094261687],
+    ])
+    x = rng.standard_normal(4096)
+    save_case("peq", "sosfilt_offline",
+              {"n_samples": int(x.size), "n_sections": int(sos.shape[0]),
+               "sample_rate": SR, "zi": "none"},
+              {"sos": sos, "x": x, "y": sosfilt(sos, x)})
+
+
+def gen_windows():
+    """scipy.signal.windows at sym=True, the convention window.rs adopts (Tier 2).
+
+    Both length parities: the sym denominator is n-1, which is where off-by-ones
+    live. Tukey rides its shipping alpha=0.25, which at n=9 degenerates to a
+    taper exactly one sample wide -- the endpoints alone, [0,1,1,1,1,1,1,1,0] --
+    the case a half-open taper loop gets wrong.
+
+    Compare on an ABSOLUTE tolerance. The spec's "1e-12" is not safe read as
+    relative: blackmanharris's 4-term cosine sum cancels to ~6e-5 at the edges,
+    so scipy's summation order and any reimplementation's diverge by up to
+    5.8e-13 RELATIVE at n=4096 while sitting at 1e-16 absolute (measured, not
+    assumed). Windows are bounded in [0, 1]; absolute is the meaningful measure.
+
+    Tukey's alpha=0 -> Rect and alpha=1 -> Hann identities are NOT pinned here.
+    They hold exactly in scipy (verified via np.array_equal) and the spec assigns
+    them to Tier 3; with Rect and Hann pinned below, a Rust identity assertion
+    implies them against scipy anyway, so a fixture would only duplicate it.
+    """
+    fns = {"blackmanharris": blackmanharris, "boxcar": boxcar, "hann": hann, "tukey": tukey}
+    for kind, scipy_window, kwargs in (
+        ("blackmanharris", "blackmanharris", {}),
+        ("hann", "hann", {}),
+        ("rect", "boxcar", {}),
+        ("tukey", "tukey", {"alpha": 0.25}),
+    ):
+        for n in (8, 9, 64, 4096):
+            save_case("window", f"{kind}_{n}",
+                      {"kind": kind, "n": n, "scipy_window": scipy_window, "sym": True, **kwargs},
+                      {"window": fns[scipy_window](n, sym=True, **kwargs)})
 
 
 def gen_targets():
@@ -193,6 +747,94 @@ def gen_peq_autofit():
                                   for b in fitted]})
 
 
+def gen_autoeq_parser():
+    # DELIBERATE layout exception: parser cases are pure text with no float
+    # arrays, so they do NOT use save_case()'s per-stage-dir + `.f64` convention
+    # (see save_case above). Instead one top-level list-of-cases file
+    # `fixtures/autoeq_parser.json` holds every case. Do not "fix" this to the
+    # save_case layout — the Rust parser test (test_autoeq_parse.rs) reads this
+    # flat file directly. Oracle: paraeq.correction.autoeq_db.parse_parametric_eq.
+    roundtrip_bands = [
+        EQBand("peaking", 105.3, 5.04, 1.201),
+        EQBand("high_shelf", 9000.0, -3.5, 0.707),
+    ]
+    roundtrip_input = ParametricEQ(roundtrip_bands, SR).export_autoeq_format()
+    # Fixed (deterministic) case order.
+    inputs = [
+        (
+            "standard_with_preamp",
+            "Preamp: -6.5 dB\n"
+            "Filter 1: ON PK Fc 105 Hz Gain 5.0 dB Q 1.20\n"
+            "Filter 2: ON LSC Fc 100 Hz Gain 3.0 dB Q 0.70\n"
+            "Filter 3: ON HSC Fc 10000 Hz Gain -2.5 dB Q 0.71\n"
+            "Filter 4: ON NO Fc 60 Hz Gain 0.0 dB Q 10.0",
+        ),
+        (
+            "no_preamp_line_defaults_zero",
+            "Filter 1: ON PK Fc 1000 Hz Gain 6.0 dB Q 1.0",
+        ),
+        (
+            "two_preamp_lines_last_wins",
+            "Preamp: -3.0 dB\n"
+            "Filter 1: ON PK Fc 1000 Hz Gain 6.0 dB Q 1.0\n"
+            "Preamp: -7.5 dB",
+        ),
+        (
+            "off_filter_skipped",
+            "Preamp: 0.0 dB\n"
+            "Filter 1: ON PK Fc 1000 Hz Gain 6.0 dB Q 1.0\n"
+            "Filter 2: OFF PK Fc 2000 Hz Gain 3.0 dB Q 2.0\n"
+            "Filter 3: ON PK Fc 3000 Hz Gain -2.0 dB Q 1.5",
+        ),
+        (
+            "unknown_code_falls_back_to_peaking",
+            "Filter 1: ON XYZ Fc 500 Hz Gain 2.0 dB Q 1.0",
+        ),
+        (
+            "legacy_ls_hs_aliases",
+            "Filter 1: ON LS Fc 100 Hz Gain 4.0 dB Q 0.70\n"
+            "Filter 2: ON HS Fc 8000 Hz Gain -3.0 dB Q 0.71",
+        ),
+        (
+            "lowercase_on_pk",
+            "filter 1: on pk fc 250 Hz gain -1.5 dB q 0.9",
+        ),
+        (
+            "junk_lines_interleaved",
+            "# ParametricEq generated by AutoEq\n"
+            "Preamp: -1.0 dB\n"
+            "\n"
+            "some random prose that should be ignored\n"
+            "Filter 1: ON PK Fc 440 Hz Gain 2.5 dB Q 1.0\n"
+            "==== garbage ====\n"
+            "Filter 2: ON PK Fc 880 Hz Gain -1.0 dB Q 2.0",
+        ),
+        (
+            "empty_string",
+            "",
+        ),
+        (
+            "roundtrip_from_export",
+            roundtrip_input,
+        ),
+    ]
+    cases = []
+    for name, text in inputs:
+        parsed = parse_parametric_eq(text)
+        cases.append({
+            "name": name,
+            "input": text,
+            "expected": {
+                "preamp_db": parsed.preamp_db,
+                "bands": [{"filter_type": b.filter_type, "fc": b.fc,
+                           "gain_db": b.gain_db, "q": b.q} for b in parsed.bands],
+            },
+        })
+    (OUT / "autoeq_parser.json").write_text(
+        json.dumps(cases, indent=1, sort_keys=True) + "\n"
+    )
+
+
 def gen_convolver():
     rng = np.random.default_rng(46)
     fir_l = rng.standard_normal(1024) * np.exp(-np.arange(1024) / 200.0)
@@ -218,27 +860,76 @@ def gen_iir():
               {"sos": sos, "input": blocks_in, "output": out})
 
 
+def check_pinned_versions(allow_drift: bool) -> bool:
+    """Refuse to touch fixtures/ under a drifted toolchain unless overridden.
+
+    Returns True when generation proceeds under drifted versions (the caller
+    must then stamp "drift": true into the manifest).
+    """
+    installed = {"numpy": np.__version__, "scipy": scipy.__version__}
+    drifted = sorted(name for name in PINNED_VERSIONS if installed[name] != PINNED_VERSIONS[name])
+    if not drifted:
+        return False
+    for name in drifted:
+        print(f"ERROR: {name} {installed[name]} != pinned {name}=={PINNED_VERSIONS[name]} "
+              "(prototype/pyproject.toml, `fixtures` extra)", file=sys.stderr)
+    if not allow_drift:
+        print("Refusing to regenerate: a drifted numpy/scipy could silently rewrite the "
+              "goldens. Install the pins (.venv/bin/pip install -e './prototype[fixtures]') "
+              "or rerun with --allow-version-drift to proceed anyway.", file=sys.stderr)
+        sys.exit(1)
+    print('WARNING: --allow-version-drift: generating anyway; stamping "drift": true '
+          "into fixtures/manifest.json", file=sys.stderr)
+    return True
+
+
 def main():
-    if OUT.exists():
-        shutil.rmtree(OUT)
-    OUT.mkdir()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--allow-version-drift", action="store_true",
+        help='generate despite numpy/scipy not matching the pins; stamps "drift": true '
+             "into fixtures/manifest.json")
+    args = parser.parse_args()
+    drift = check_pinned_versions(args.allow_version_drift)
+    wipe_generated_fixtures()
     gen_sweep()
     gen_deconvolution()
     gen_frequency_response()
+    gen_cal()
     gen_compensation()
     gen_targets()
     gen_fir()
     gen_biquad()
     gen_peq_autofit()
+    gen_autoeq_parser()
     gen_convolver()
     gen_iir()
-    (OUT / "manifest.json").write_text(json.dumps({
+    # Tier 2 -- scipy/numpy-direct, no paraeq import. Their Rust consumers land
+    # in stages 3-4; the fixtures come first, which is the point of the tier.
+    gen_complex_spectrum()
+    gen_excess_group_delay()
+    gen_gaussian_smoothing()
+    gen_logf()
+    gen_min_phase_spectrum()
+    gen_resample_poly()
+    gen_rms_average()
+    gen_rms_average_weighted()
+    gen_schroeder()
+    gen_sosfilt_offline()
+    gen_variable_smooth()
+    gen_windows()
+    manifest = {
         "dtype": "<f8",
         "numpy": np.__version__,
         "python": platform.python_version(),
         "scipy": scipy.__version__,
-    }, indent=1, sort_keys=True) + "\n")
-    n = sum(1 for _ in OUT.rglob("*"))
+    }
+    if drift:
+        manifest["drift"] = True
+    (OUT / "manifest.json").write_text(json.dumps(manifest, indent=1, sort_keys=True) + "\n")
+    # Count only what this run produced: the PRESERVED children were already
+    # there and were deliberately left untouched.
+    n = sum(1 for p in OUT.rglob("*") if p.relative_to(OUT).parts[0] not in PRESERVED)
     print(f"wrote {n} files under {OUT}")
 
 

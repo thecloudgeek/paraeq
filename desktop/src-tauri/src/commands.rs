@@ -1,0 +1,568 @@
+//! The `#[tauri::command]` surface, grouped by domain (`engine_*`, `eq_*`, and
+//! the `get_app_state` initial-fetch). Every mutating command ends by calling
+//! [`engine_bridge::publish_current`] so the UI reflects the change immediately
+//! -- the `data`-side change (bands, preamp, devices) is visible at once, and
+//! the engine-side change follows on the next forwarder snapshot.
+//!
+//! Validation here is USER-FACING FEEDBACK, not the enforcement wall: every
+//! band and preamp still passes [`eq::validate_bands`] / [`eq::validate_preamp`]
+//! at the live stream rate so a bad edit is rejected with a named reason, but
+//! since R1-6 the wall itself is `paraeq-engine`, which re-derives every band
+//! at whatever rate the stream is actually running (see `eq.rs`'s header).
+
+use crate::autoeq::{self, AutoEqClient, IndexEntry, ParsedPresetDto, ReqwestFetch};
+use crate::engine_bridge;
+use crate::eq::{self, ImportResult, ResponseData};
+use crate::profiles;
+use crate::setup::{self, ProbeVerdict};
+use crate::state::{AppShared, AppState, OutputDeviceInfo};
+use paraeq_dsp::peq::{EQBand, FilterType, ParametricEQ};
+use paraeq_engine::controller::EngineCommand;
+use tauri::Manager;
+
+/// Max search results returned to the browse dialog (the same model recurs
+/// under many sources/rigs; the dialog disambiguates but stays bounded).
+const AUTOEQ_SEARCH_CAP: usize = 200;
+
+/// Build a Tauri-free [`AutoEqClient`] pointed at `app_data_dir()/autoeq/`.
+/// This is the ONLY place that couples the client to Tauri (path resolution);
+/// the client itself holds no Tauri types.
+fn autoeq_client(app: &tauri::AppHandle) -> Result<AutoEqClient<ReqwestFetch>, String> {
+    let cache_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("autoeq");
+    Ok(AutoEqClient::new(
+        ReqwestFetch::new()?,
+        cache_dir,
+        None,
+        None,
+    ))
+}
+
+/// The live stream sample rate, or the 48 kHz fallback when no stream is up.
+///
+/// Since R1-6 this is PROVENANCE plus the rate a band edit is checked against
+/// for the user's benefit -- it is no longer the rate coefficients are designed
+/// at. The engine designs at the rate its own stream reports, so the 48 kHz
+/// no-stream fallback is harmless: a correction stamped `design_rate = 48000`
+/// while nothing was playing still installs correctly on a 44.1 kHz stream.
+fn live_rate(shared: &AppShared) -> f64 {
+    engine_bridge::current_engine_state(shared)
+        .stream
+        .map(|s| s.sample_rate)
+        .unwrap_or(48_000.0)
+}
+
+/// The shared apply path for every band edit (set/add/remove): validate at the
+/// live rate (user feedback), send the correction intent (or `ClearCorrection`
+/// when empty), store the bands, then publish. `bands` is the FULL new band
+/// set.
+fn apply_bands(app: &tauri::AppHandle, bands: Vec<EQBand>) -> Result<(), String> {
+    let shared = app.state::<AppShared>();
+    let rate = live_rate(&shared);
+    eq::validate_bands(&bands, rate)?;
+    match eq::design_correction(&bands, rate) {
+        Some(cfg) => engine_bridge::send_cmd(&shared, EngineCommand::SetCorrection(cfg)),
+        None => engine_bridge::send_cmd(&shared, EngineCommand::ClearCorrection),
+    }
+    {
+        let mut data = shared.data.lock().unwrap();
+        data.bands = bands;
+    }
+    engine_bridge::publish_current(app);
+    Ok(())
+}
+
+/// Serve the initial UI state (events emitted before `listen` are lost, so the
+/// UI fetches this once on mount). Composes `data` + the current engine
+/// snapshot.
+#[tauri::command]
+pub fn get_app_state(app: tauri::AppHandle) -> Result<AppState, String> {
+    let shared = app.state::<AppShared>();
+    let engine = engine_bridge::current_engine_state(&shared);
+    let verification = shared.verify.lock().unwrap().state();
+    let data = shared.data.lock().unwrap();
+    Ok(data.app_state(&engine, verification))
+}
+
+/// Enable the EQ (records persisted intent -- survives fail-open across
+/// launches).
+#[tauri::command]
+pub fn engine_enable(app: tauri::AppHandle) -> Result<(), String> {
+    let shared = app.state::<AppShared>();
+    engine_bridge::send_cmd(&shared, EngineCommand::Enable);
+    shared.data.lock().unwrap().engine_enabled = true;
+    engine_bridge::publish_current(&app);
+    Ok(())
+}
+
+/// Disable the EQ (full teardown: session stopped, tap destroyed, device
+/// unmuted). Records persisted intent.
+#[tauri::command]
+pub fn engine_disable(app: tauri::AppHandle) -> Result<(), String> {
+    let shared = app.state::<AppShared>();
+    engine_bridge::send_cmd(&shared, EngineCommand::Disable);
+    shared.data.lock().unwrap().engine_enabled = false;
+    engine_bridge::publish_current(&app);
+    Ok(())
+}
+
+/// Toggle A/B bypass (correction retained; chain passes through when bypassed).
+#[tauri::command]
+pub fn engine_set_bypass(app: tauri::AppHandle, bypass: bool) -> Result<(), String> {
+    let shared = app.state::<AppShared>();
+    engine_bridge::send_cmd(&shared, EngineCommand::SetBypass(bypass));
+    engine_bridge::publish_current(&app);
+    Ok(())
+}
+
+/// Set the preamp trim (dB). Validated into the accepted range before it
+/// reaches the (unclamped) engine gain command.
+#[tauri::command]
+pub fn engine_set_preamp_db(app: tauri::AppHandle, db: f64) -> Result<(), String> {
+    eq::validate_preamp(db)?;
+    let shared = app.state::<AppShared>();
+    engine_bridge::send_cmd(&shared, EngineCommand::SetGainDb(db as f32));
+    shared.data.lock().unwrap().preamp_db = db;
+    engine_bridge::publish_current(&app);
+    Ok(())
+}
+
+/// Set the system default output device. The engine's own
+/// `DefaultOutputChanged` listener drives the rebuild -- no engine command is
+/// sent from here.
+#[tauri::command]
+pub fn engine_set_default_output(app: tauri::AppHandle, uid: String) -> Result<(), String> {
+    paraeq_coreaudio::devices::set_default_output_device(&uid).map_err(|e| e.to_string())?;
+    let shared = app.state::<AppShared>();
+    shared.data.lock().unwrap().default_output_uid = Some(uid);
+    engine_bridge::publish_current(&app);
+    Ok(())
+}
+
+/// Re-enumerate output devices, refresh the cached list, publish, and return
+/// it.
+#[tauri::command]
+pub fn engine_list_outputs(app: tauri::AppHandle) -> Result<Vec<OutputDeviceInfo>, String> {
+    let list: Vec<OutputDeviceInfo> = paraeq_coreaudio::devices::list_output_devices()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|d| OutputDeviceInfo {
+            name: d.name,
+            uid: d.uid,
+        })
+        .collect();
+    let shared = app.state::<AppShared>();
+    shared.data.lock().unwrap().devices = list.clone();
+    engine_bridge::publish_current(&app);
+    Ok(list)
+}
+
+/// THE apply path (prototype contract: every edit applies immediately, no Apply
+/// button). Replaces the entire band set.
+#[tauri::command]
+pub fn eq_set_bands(app: tauri::AppHandle, bands: Vec<EQBand>) -> Result<(), String> {
+    apply_bands(&app, bands)
+}
+
+/// Append a default peaking band, then apply.
+#[tauri::command]
+pub fn eq_add_band(app: tauri::AppHandle) -> Result<(), String> {
+    let shared = app.state::<AppShared>();
+    let mut bands = shared.data.lock().unwrap().bands.clone();
+    bands.push(EQBand {
+        filter_type: FilterType::Peaking,
+        fc: 1000.0,
+        gain_db: 0.0,
+        q: 1.41,
+    });
+    apply_bands(&app, bands)
+}
+
+/// Remove the band at `index`, or the LAST band when `None` (prototype parity:
+/// remove-with-no-selection deletes the last row). A no-op on an empty set.
+#[tauri::command]
+pub fn eq_remove_band(app: tauri::AppHandle, index: Option<usize>) -> Result<(), String> {
+    let shared = app.state::<AppShared>();
+    let mut bands = shared.data.lock().unwrap().bands.clone();
+    if bands.is_empty() {
+        return Ok(());
+    }
+    let idx = match index {
+        Some(i) => i,
+        None => bands.len() - 1,
+    };
+    if idx >= bands.len() {
+        return Err(format!(
+            "band index {idx} out of range (have {} bands)",
+            bands.len()
+        ));
+    }
+    bands.remove(idx);
+    apply_bands(&app, bands)
+}
+
+/// The magnitude response the plot draws, over the caller's frequency grid, at
+/// the live stream rate (48 kHz fallback).
+#[tauri::command]
+pub fn eq_response(app: tauri::AppHandle, freqs: Vec<f64>) -> Result<ResponseData, String> {
+    let shared = app.state::<AppShared>();
+    let rate = live_rate(&shared);
+    let bands = shared.data.lock().unwrap().bands.clone();
+    Ok(eq::response(&bands, &freqs, rate))
+}
+
+/// Export the current bands + computed preamp to an AutoEQ ParametricEq text
+/// file. The path comes from the native save dialog (capability-safe). Format
+/// is the DSP-owned `export_autoeq_format_with_preamp` — the CASCADE-DERIVED
+/// preamp (R1-1), i.e. the same number `build_correction` applies in the
+/// engine, not the oracle's `0.0` literal (`export_autoeq_format`) and no
+/// longer the user's manual trim (`export_autoeq_format_with_preamp_db`,
+/// which is still the right call for a caller-supplied number). The sample
+/// rate matters: `preamp_db()` evaluates the realized cascade at it.
+#[tauri::command]
+pub fn eq_export_autoeq(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    let shared = app.state::<AppShared>();
+    let bands = {
+        let data = shared.data.lock().unwrap();
+        data.bands.clone()
+    };
+    let rate = live_rate(&shared);
+    // R1-1 (spec `R1-1 § Tests`): the exported preamp is the COMPUTED one -- the same
+    // `ParametricEQ::preamp_db()` the engine hands `build_correction`, so the
+    // text names the number the engine is applying (`EngineState`'s
+    // `auto_preamp_db`). It is deliberately NOT `data.preamp_db`, the user's
+    // manual trim: that number rides `gain_bits`, applies on both chain paths
+    // including bypass, and says nothing about the headroom this band set's
+    // boosts need. Other people's EQ software gets the same protection ParaEQ
+    // gives itself, which is the whole point of the item.
+    let text = ParametricEQ {
+        bands,
+        sample_rate: rate,
+    }
+    .export_autoeq_format_with_preamp();
+    std::fs::write(&path, text).map_err(|e| format!("failed to write {path}: {e}"))
+}
+
+/// Import an AutoEQ ParametricEq text file (path from the native open dialog).
+/// Zero filter lines is an error carrying the prototype's exact message. Else
+/// the bands REPLACE the current set through the validating apply path, and the
+/// file's preamp -- clamped into the accepted range -- is applied through the
+/// preamp path. Bands are applied first, so an invalid band set errors before
+/// the preamp is touched (no partial apply). Returns the [`ImportResult`] so the
+/// UI can report the band count and whether the preamp was clamped.
+///
+/// # The file's preamp COMPOSES with R1-1's auto-preamp -- `OPEN [OWNER]`
+///
+/// The parsed `Preamp:` line goes to `SetGainDb`, i.e. the user's trim on
+/// `gain_bits`, which applies on both chain paths. Since R1-1 the engine also
+/// derives its OWN preamp from the very bands `apply_bands` just installed and
+/// applies it on the corrected path, and AutoEq's `ParametricEq.txt`
+/// convention makes a file's preamp exactly `-max_gain` of its own bands
+/// (engine-hardening `R1-1 §2`) -- the same quantity. So importing a boosting
+/// preset attenuates roughly twice: measured -6.8 (file) + -6.78 (engine) =
+/// -13.58 dB on the corrected path. ParaEQ's own export re-imported doubles by
+/// construction, because R1-1 made `eq_export_autoeq` write the
+/// cascade-derived number.
+///
+/// This is left as-is on purpose, not overlooked. Whether a file's `Preamp:`
+/// line is the user's trim or a headroom number the engine should re-derive is
+/// a product call with a `settings.json` migration behind it, and Phase A
+/// froze `EqState.preamp_db`'s meaning and persistence. It fails quiet, never
+/// loud, and the number is reported on import and editable in one field. See
+/// `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md` D-24 and
+/// `crates/paraeq-dsp/DIVERGENCES.md` #19. `desktop/ui/src/dialogs/
+/// AutoEqBrowser.tsx` and [`profiles_activate`] share the behaviour.
+#[tauri::command]
+pub fn eq_import_autoeq(app: tauri::AppHandle, path: String) -> Result<ImportResult, String> {
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("failed to read {path}: {e}"))?;
+    let (bands, result) = eq::prepare_import(&text)?;
+    // Bands first: apply_bands validates at the live rate and returns Err
+    // WITHOUT mutating anything, so an invalid file never applies a partial
+    // (preamp-only) change.
+    apply_bands(&app, bands)?;
+    let shared = app.state::<AppShared>();
+    engine_bridge::send_cmd(&shared, EngineCommand::SetGainDb(result.preamp_db as f32));
+    shared.data.lock().unwrap().preamp_db = result.preamp_db;
+    engine_bridge::publish_current(&app);
+    Ok(result)
+}
+
+/// Save the current bands + preamp as a named profile, refresh the cached
+/// profile list, mark it active, then publish. Rejects an empty/whitespace-only
+/// name (would slugify to a useless filename).
+#[tauri::command]
+pub fn profiles_save(app: tauri::AppHandle, name: String) -> Result<(), String> {
+    if name.trim().is_empty() {
+        return Err("profile name must not be empty".to_string());
+    }
+    let shared = app.state::<AppShared>();
+    let (bands, preamp_db) = {
+        let data = shared.data.lock().unwrap();
+        (data.bands.clone(), data.preamp_db)
+    };
+    let profile = profiles::Profile {
+        bands,
+        name: name.clone(),
+        preamp_db,
+    };
+    profiles::save_profile(&shared.profiles_dir, &profile).map_err(|e| e.to_string())?;
+    {
+        let mut data = shared.data.lock().unwrap();
+        data.profiles = profiles::list_profiles(&shared.profiles_dir);
+        data.active_profile = Some(name);
+    }
+    engine_bridge::publish_current(&app);
+    Ok(())
+}
+
+/// Activate a saved profile: load it, apply its bands through EXACTLY the
+/// `eq_set_bands` path (validate at the live rate, then `SetCorrection`/
+/// `ClearCorrection`) and its preamp through the `engine_set_preamp_db` path,
+/// mark it active, then publish once. Errors if no profile matches `name`.
+///
+/// As in `apply_bands`, the live rate is provenance + user feedback: the
+/// engine re-derives the profile's bands at the stream's own rate.
+///
+/// A profile saved from an AutoEq import carries that file's preamp in
+/// `Profile.preamp_db`, so replaying it composes with R1-1's auto-preamp the
+/// same way [`eq_import_autoeq`] does -- see its `OPEN [OWNER]` note.
+#[tauri::command]
+pub fn profiles_activate(app: tauri::AppHandle, name: String) -> Result<(), String> {
+    let shared = app.state::<AppShared>();
+    let profile = profiles::load_profile(&shared.profiles_dir, &name)
+        .ok_or_else(|| format!("no profile named {name:?}"))?;
+    let rate = live_rate(&shared);
+    eq::validate_bands(&profile.bands, rate)?;
+    eq::validate_preamp(profile.preamp_db)?;
+    match eq::design_correction(&profile.bands, rate) {
+        Some(cfg) => engine_bridge::send_cmd(&shared, EngineCommand::SetCorrection(cfg)),
+        None => engine_bridge::send_cmd(&shared, EngineCommand::ClearCorrection),
+    }
+    engine_bridge::send_cmd(&shared, EngineCommand::SetGainDb(profile.preamp_db as f32));
+    {
+        let mut data = shared.data.lock().unwrap();
+        data.bands = profile.bands;
+        data.preamp_db = profile.preamp_db;
+        data.active_profile = Some(name);
+    }
+    engine_bridge::publish_current(&app);
+    Ok(())
+}
+
+/// The cached list of saved profile display names (populated at startup from
+/// disk and refreshed on every save).
+#[tauri::command]
+pub fn profiles_list(app: tauri::AppHandle) -> Result<Vec<String>, String> {
+    let shared = app.state::<AppShared>();
+    let profiles = shared.data.lock().unwrap().profiles.clone();
+    Ok(profiles)
+}
+
+// --- AutoEq DB (async: network must not block a sync command) --------------
+//
+// The AutoEq index is NOT kept in `AppShared`; each command re-reads it from
+// the on-disk cache via `sync_index(false)` (a zero-fetch cache hit once
+// synced). This keeps `AppShared` free of AutoEq state and the client
+// stateless per call, at the cost of one small cache read per browse action --
+// negligible for a user-driven dialog.
+
+/// Sync the model index (cache-first; `force` refetches). Returns the entry
+/// count for the dialog's "N models" affordance.
+#[tauri::command]
+pub async fn autoeq_sync_index(app: tauri::AppHandle, force: bool) -> Result<usize, String> {
+    let client = autoeq_client(&app)?;
+    Ok(client.sync_index(force).await?.len())
+}
+
+/// Case-insensitive substring search on model name over the synced index
+/// (prototype parity), returning full entries (so the dialog can disambiguate
+/// duplicates) capped at [`AUTOEQ_SEARCH_CAP`].
+#[tauri::command]
+pub async fn autoeq_search(
+    app: tauri::AppHandle,
+    query: String,
+) -> Result<Vec<IndexEntry>, String> {
+    let client = autoeq_client(&app)?;
+    let entries = client.sync_index(false).await?;
+    Ok(AutoEqClient::<ReqwestFetch>::search(&entries, &query)
+        .into_iter()
+        .take(AUTOEQ_SEARCH_CAP)
+        .cloned()
+        .collect())
+}
+
+/// Fetch + parse a preset, keyed by the entry `path` (resolved against the
+/// synced index; unknown paths error). Fetch/parse ONLY -- applying the bands
+/// and preamp is the UI's explicit second step (Task 16). A preset with no
+/// parametric filters is an error.
+#[tauri::command]
+pub async fn autoeq_fetch_preset(
+    app: tauri::AppHandle,
+    path: String,
+) -> Result<ParsedPresetDto, String> {
+    let client = autoeq_client(&app)?;
+    let entry = client
+        .sync_index(false)
+        .await?
+        .into_iter()
+        .find(|e| e.path == path)
+        .ok_or_else(|| format!("no AutoEq entry for path {path:?}"))?;
+    let text = client.fetch_preset(&entry).await?;
+    let parsed = autoeq::parse_preset(&text);
+    if parsed.bands.is_empty() {
+        return Err("Preset contains no parametric EQ filters".to_string());
+    }
+    Ok(parsed)
+}
+
+// --- Setup wizard + chime probe -------------------------------------------
+//
+// The probe verifies audio CAPTURE (tap + TCC grant), which is otherwise
+// unobservable: a missing grant is indistinguishable from silence. See
+// `setup.rs` for the full rationale and the never-orphan-a-child safety story.
+
+/// Start the deterministic chime probe: ensure the engine is enabled (so a tap
+/// engages) and spawn the looping `afplay` helper. Enabling here is idempotent
+/// and also clears any fail-open latch, so a fresh "Enable EQ" click and a
+/// "Re-test" both funnel through the same path. `ProbeState::start` is itself
+/// idempotent (it stops any prior probe first), so repeated calls never stack
+/// helper loops.
+#[tauri::command]
+pub fn setup_probe_start(app: tauri::AppHandle) -> Result<(), String> {
+    let shared = app.state::<AppShared>();
+    engine_bridge::send_cmd(&shared, EngineCommand::Enable);
+    shared.data.lock().unwrap().engine_enabled = true;
+    shared.probe.start();
+    engine_bridge::publish_current(&app);
+    Ok(())
+}
+
+/// Stop the chime probe: kill any live `afplay` child and join the loop thread.
+/// Safe to call when no probe is running.
+#[tauri::command]
+pub fn setup_probe_stop(app: tauri::AppHandle) -> Result<(), String> {
+    let shared = app.state::<AppShared>();
+    shared.probe.stop();
+    Ok(())
+}
+
+/// Compute the probe verdict from the LIVE engine status plus the client's
+/// `elapsed_ms` since the probe started. The timing logic lives in Rust
+/// ([`setup::probe_verdict`], unit-tested) so the wizard renders from a single
+/// source of truth rather than re-implementing the 10 s window in TS.
+#[tauri::command]
+pub fn setup_probe_verdict(app: tauri::AppHandle, elapsed_ms: u64) -> ProbeVerdict {
+    let shared = app.state::<AppShared>();
+    let status = engine_bridge::current_engine_state(&shared).status;
+    setup::probe_verdict(
+        &status,
+        std::time::Duration::from_millis(elapsed_ms),
+        setup::PROBE_TIMEOUT,
+    )
+}
+
+/// Open System Settings at the Screen & System Audio Recording pane so the user
+/// can grant the permission a process tap needs.
+#[tauri::command]
+pub fn setup_open_privacy_settings() -> Result<(), String> {
+    std::process::Command::new("open")
+        .arg(setup::PRIVACY_URL)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("failed to open privacy settings: {e}"))
+}
+
+/// Mark setup complete (persisted) and stop the probe, recording the user's
+/// ACTUAL terminal choice via `enable` -- decoupled from the probe's *temporary*
+/// enable ([`setup_probe_start`] flips `engine_enabled` on the instant the
+/// diagnostic runs, before any grant is verified):
+///
+/// - `enable == true` -- the user opted in (a verified-`Running` probe, then
+///   Finish). `engine_enabled` persists `true`, so the next launch auto-enables;
+///   this holds even if the engine later fails open, because the persisted
+///   intent is the user's, not the tap's (decision 1). No engine command is
+///   sent -- the probe already engaged it.
+/// - `enable == false` -- the user skipped / declined without a successful
+///   enable. Any temporary enable the probe left on is reverted with `Disable`
+///   (full teardown: session stopped, tap destroyed, device unmuted) and
+///   `engine_enabled` persists `false`, so future launches do NOT re-engage the
+///   tap and mute audio for ~15 s while the grant is still missing.
+///
+/// Stopping the probe here guarantees the wizard never leaves an `afplay` helper
+/// running. Lock discipline: the `data` guard is dropped before the `Disable`
+/// send and before `publish_current` -- no lock spans a send or emit.
+#[tauri::command]
+pub fn setup_complete(app: tauri::AppHandle, enable: bool) -> Result<(), String> {
+    let shared = app.state::<AppShared>();
+    shared.probe.stop();
+    let must_disable = { shared.data.lock().unwrap().complete_setup(enable) };
+    if must_disable {
+        engine_bridge::send_cmd(&shared, EngineCommand::Disable);
+    }
+    engine_bridge::publish_current(&app);
+    Ok(())
+}
+
+// --- Verification ---------------------------------------------------------
+//
+// Four commands, and the split between them is MS-18's. `verify_arm` runs every
+// gate that can refuse before a process exists and reports the device and the
+// projected SPL; `verify_run` takes the acknowledgement of exactly those two
+// facts and is the ONLY door to a sweep. Collapsing them into one command would
+// make the acknowledgement a parameter of the thing it is supposed to gate.
+
+/// Arm a verification pass: gates 1-6, the level, and the SNR budget.
+///
+/// **No process is spawned and no sample is emitted.** What comes back is the
+/// MS-18 acknowledgement's content -- the output device's name and the SPL the
+/// sweep will project at the mic -- for the UI to show and the user to confirm.
+#[tauri::command]
+pub fn verify_arm(
+    app: tauri::AppHandle,
+    request: crate::verify::VerifyArmRequest,
+) -> Result<crate::verify::VerifyArmed, String> {
+    crate::verify::arm(&app, request)
+}
+
+/// Record the MS-18 acknowledgement and run the pass.
+///
+/// `acknowledgedSplDb` is the number the user was actually shown. The pass
+/// refuses a stale one rather than trusting the caller: an acknowledgement of a
+/// different level authorizes nothing.
+///
+/// Returns as soon as the worker is started. The outcome arrives on the
+/// `app-state` event, because the run plays a multi-second sweep and then runs
+/// a matched filter over the capture -- a command that did that inline would
+/// freeze the window for the whole of it.
+#[tauri::command]
+pub fn verify_run(
+    app: tauri::AppHandle,
+    device_name: String,
+    acknowledged_spl_db: f64,
+) -> Result<(), String> {
+    crate::verify::run(&app, device_name, acknowledged_spl_db)
+}
+
+/// Abort whatever is armed or running.
+///
+/// Wired to Esc, to the panel's own control, and to app exit. The helper is
+/// asked to RAMP, never hard-stopped -- a hard stop is itself a full-scale
+/// click -- and the full MS-14 restore sequence runs whichever path gets here.
+#[tauri::command]
+pub fn verify_abort(app: tauri::AppHandle) -> Result<(), String> {
+    crate::verify::abort(&app)
+}
+
+/// The verification slot, for a UI that mounted after the last event.
+///
+/// The same value `AppState::verification` carries; this exists for the same
+/// reason `get_app_state` does -- events emitted before `listen` are lost.
+#[tauri::command]
+pub fn verify_report(app: tauri::AppHandle) -> Result<crate::state::VerifyState, String> {
+    let shared = app.state::<AppShared>();
+    let report = shared.verify.lock().unwrap().state();
+    Ok(report)
+}

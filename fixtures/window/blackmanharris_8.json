@@ -1,0 +1,18 @@
+{
+ "arrays": {
+  "window": {
+   "file": "blackmanharris_8.window.f64",
+   "len": 8,
+   "shape": [
+    8
+   ]
+  }
+ },
+ "params": {
+  "kind": "blackmanharris",
+  "n": 8,
+  "scipy_window": "blackmanharris",
+  "sym": true
+ },
+ "scalars": {}
+}

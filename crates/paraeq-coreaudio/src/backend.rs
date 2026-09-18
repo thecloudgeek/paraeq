@@ -5,11 +5,12 @@
 //!
 //! Realtime discipline: everything the IOProc closure needs (de/interleave
 //! scratch, the [`RtProcessor`]) is preallocated/moved in at `start`; the
-//! per-callback work is layout resolve + deinterleave + `process_block` +
-//! interleave — no allocation, no locks, no logging. HAL-supplied values
-//! are never trusted: mismatched or oversized frame counts zero the output
-//! (silence) and record the skip via `RtProcessor::note_skipped_block`
-//! (which keeps the callback counter honest) instead of panicking.
+//! per-callback work is layout resolve + deinterleave (with the non-finite
+//! capture guard fused in) + `process_block` + interleave — no allocation,
+//! no locks, no logging. HAL-supplied values are never trusted: mismatched
+//! or oversized frame counts zero the output (silence) and record the skip
+//! via `RtProcessor::note_skipped_block` (which keeps the callback counter
+//! honest) instead of panicking.
 //!
 //! Teardown: [`TapBackend::stop`] encodes the FULL invariant order in one
 //! place — `AudioDeviceStop` → `AudioDeviceDestroyIOProcID` (both inside
@@ -19,7 +20,9 @@
 //! bare `Drop` respect the same order as a backup.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
 
 use objc2_core_audio::{
     kAudioDevicePropertyDeviceIsAlive, kAudioDevicePropertyNominalSampleRate,
@@ -49,6 +52,100 @@ impl From<CaError> for EngineError {
 /// `skipped_blocks`), never allocated for.
 const MIN_SCRATCH_FRAMES: usize = 4096;
 
+/// One channel of the deinterleave copy with the capture-boundary guard
+/// fused in: finite samples copy bit-exact; non-finite samples (NaN/+-inf)
+/// are written as 0.0 and counted. `f32::clamp` propagates NaN, so the
+/// chain's downstream clamps are not sanitizers, and ONE NaN reaching a
+/// DF2T biquad poisons its state for the processor's lifetime -- taps
+/// deliver f32, the format class that can encode it. Extracts `dst.len()`
+/// frames of lane `channel` from the interleaved `data` (`stride` = the
+/// buffer's channel count). Returns the sanitized count; the caller reports
+/// it through an atomic ([`RtProcessor::note_invalid_samples`]) -- never a
+/// log. Realtime-safe: no allocation, no locks, no logging.
+pub fn deinterleave_sanitize_channel(
+    data: &[f32],
+    stride: usize,
+    channel: usize,
+    dst: &mut [f32],
+) -> u64 {
+    let mut invalid = 0;
+    for (i, d) in dst.iter_mut().enumerate() {
+        let v = data[i * stride + channel];
+        if v.is_finite() {
+            *d = v;
+        } else {
+            invalid += 1;
+            *d = 0.0;
+        }
+    }
+    invalid
+}
+
+/// MS-6's witness (measurement-safety `MS-6`) as a
+/// cloneable handle: a live read-back of whether the backend's current tap
+/// excludes ParaEQ's own process.
+///
+/// Why a shared cell and not a field read off `EngineState`: once a
+/// [`TapBackend`] is handed to `EngineHandle::spawn` it lives inside the
+/// controller thread and nothing outside can reach its [`TapSystem`]. A caller
+/// takes a clone *before* that move (see [`TapBackend::exclusion_witness`]) and
+/// keeps reading the same cell afterwards. `paraeq-measure` requires exactly
+/// that: [`TapStatus`](paraeq_measure::TapStatus) "reports the tap's *current*
+/// state, not the state at construction; the session polls it at every gate
+/// that precedes emission" (`crates/paraeq-measure/src/seam.rs:96-98`). An
+/// `EngineState` snapshot is published at most once per controller tick and is
+/// additionally filtered by `effectively_equal` — up to a quarter second stale
+/// on a safety gate.
+///
+/// **`false` whenever no tap is live** — before start, after stop, during a
+/// device-change rebuild, and on a failed start. The invariant is not being
+/// witnessed then, and a tap can come up on the very next controller tick, so
+/// reporting `true` would be a claim about a topology that is not there.
+///
+/// Inherits the honest limit of [`TapSystem::self_excluded`]: the HAL has no
+/// read-back for a tap's exclusion list, so this witnesses that we looked up
+/// our own process object and passed it to the tap description — strictly
+/// weaker than "the HAL is excluding us".
+///
+/// **This is the ONLY production `TapStatus`, and the realtime-activity witness
+/// deliberately lives somewhere else.** A natural-looking extension is to hang
+/// "is audio actually flowing through the tap?" off this same trait, since both
+/// facts are about the tap. It does not fit: `ExclusionWitness` is one
+/// `Arc<AtomicBool>` with no path to `RtShared`'s per-block counters, so the
+/// activity fact would need a second implementor beside this one — two seams
+/// reporting about one tap, free to disagree, which is exactly the defect
+/// `self_excluded` was moved onto a live witness to avoid. The activity witness
+/// is therefore a CONTROLLER fact, on
+/// `paraeq_measure::EngineFacts::tap_activity`, and this trait keeps its single
+/// method and its single production impl.
+#[derive(Clone, Debug, Default)]
+pub struct ExclusionWitness(Arc<AtomicBool>);
+
+impl ExclusionWitness {
+    /// Publish the live tap's self-exclusion. [`TapBackend`] calls this at the
+    /// two points that change the answer: once the [`TapSystem`] is up, and
+    /// with `false` after teardown.
+    ///
+    /// Public because the witness's authority never came from this method being
+    /// private — [`TapStatus`](paraeq_measure::TapStatus) is a public trait any
+    /// caller can implement, so a session is only as honest as the handle the
+    /// wiring hands it. What makes *this* witness trustworthy is that it is the
+    /// backend's own cell, obtained from [`TapBackend::exclusion_witness`].
+    ///
+    /// The contract that keeps it trustworthy: **`TapBackend` is the only
+    /// writer.** Anything else that writes here is lying to the MS-6 gate about
+    /// a live audio topology, with a full-level stimulus armed.
+    pub fn set(&self, self_excluded: bool) {
+        self.0.store(self_excluded, Ordering::Release);
+    }
+}
+
+impl paraeq_measure::TapStatus for ExclusionWitness {
+    fn self_excluded(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 /// Production tap backend. One instance drives at most one live
 /// tap/aggregate/IOProc set at a time; the engine controller starts/stops
 /// it (including one stop+start renegotiation cycle when the reported
@@ -59,8 +156,13 @@ const MIN_SCRATCH_FRAMES: usize = 4096;
 /// destroy IOProc), then `system` (destroy aggregate → destroy tap). Rust
 /// drops fields in declaration order, so even a bare `Drop` — without
 /// [`stop`](AudioBackend::stop) — tears down in the validated sequence.
+/// `exclusion` is deliberately declared FIRST, ahead of that ordered tail: it
+/// owns no HAL object, so dropping it early cannot disturb the sequence, and
+/// keeping it out of the tail stops a later reader from mistaking it for a
+/// teardown step.
 #[derive(Default)]
 pub struct TapBackend {
+    exclusion: ExclusionWitness,
     listeners: Vec<PropertyListener>,
     events: Option<Receiver<ListenerEvent>>,
     /// Mapped-but-unreturned events (the per-poll dedup buffer).
@@ -74,6 +176,16 @@ impl TapBackend {
         TapBackend::default()
     }
 
+    /// Take a clone of this backend's MS-6 witness.
+    ///
+    /// Call it **before** the backend is moved into `EngineHandle::spawn` —
+    /// after that move the backend is owned by the controller thread and
+    /// unreachable. The returned handle tracks the backend's start/stop for as
+    /// long as the backend lives, and reads `false` once it does not.
+    pub fn exclusion_witness(&self) -> ExclusionWitness {
+        self.exclusion.clone()
+    }
+
     /// The 8-step start, with partial state stashed in `self` as it is
     /// created so the caller's cleanup (`stop`) can unwind any prefix.
     fn start_inner(
@@ -84,6 +196,10 @@ impl TapBackend {
         // 1. Tap + private aggregate (spike-validated composition).
         self.system = Some(TapSystem::create()?);
         let system = self.system.as_ref().expect("just stored");
+        // MS-6: publish the live tap's self-exclusion as soon as there is a
+        // tap. Any later failure in this function unwinds through `stop`,
+        // which clears it again.
+        self.exclusion.set(system.self_excluded);
         let aggregate = system.aggregate;
         let device = system.device;
         let device_uid = system.device_uid.clone();
@@ -118,16 +234,11 @@ impl TapBackend {
         // 4. The realtime closure. REALTIME LANE: no allocation, no locks,
         // no logging, and NEVER a panic on HAL-supplied values.
         //
-        // KNOWN LIMITATION — input-stream identification: the deinterleave
-        // below assumes the tap's stream(s) are the only (or first) buffers
-        // in the aggregate's input list. A default output device that ALSO
-        // exposes input streams (AirPods, USB headsets with mics) may
-        // contribute mic buffers whose position in the input buffer list is
-        // undocumented; if such a buffer preceded the tap stream, mic
-        // samples would be treated as tap input. Validation needed: an
-        // owner hardware test with a mic-capable default output (see the
-        // manual checklist in docs/CONTEXT.md). No stream-identification
-        // heuristic is attempted until that test says one is needed.
+        // Input-stream identity: the aggregate composes its sub-device with
+        // kAudioSubDeviceInputChannelsKey: 0 (tap.rs::create_aggregate), so
+        // the input buffer list below carries the tap's stream(s) only — a
+        // mic-capable default output (AirPods, USB headset) contributes no
+        // mic buffers and no stream-identification logic is needed.
         let mut processor = processor;
         let cb: IoCallback = Box::new(move |mut block: IoBlock<'_>| {
             // Zero ALL output buffers first (spike order, main.rs:56-60):
@@ -142,6 +253,7 @@ impl TapBackend {
             let mut frames: usize = 0;
             let mut first = true;
             let mut filled = 0usize; // input channels deinterleaved so far
+            let mut invalid = 0u64; // non-finite input samples zeroed
             for (data, buf_channels) in block.input.buffers() {
                 let bc = buf_channels.max(1);
                 let f = data.len() / bc;
@@ -170,10 +282,7 @@ impl TapBackend {
                     if ch >= channels {
                         break;
                     }
-                    let dst = &mut in_scratch[ch][..f];
-                    for (i, d) in dst.iter_mut().enumerate() {
-                        *d = data[i * bc + c];
-                    }
+                    invalid += deinterleave_sanitize_channel(data, bc, c, &mut in_scratch[ch][..f]);
                 }
                 filled += bc;
             }
@@ -182,6 +291,10 @@ impl TapBackend {
             for ch_scratch in in_scratch.iter_mut().skip(filled) {
                 ch_scratch[..frames].fill(0.0);
             }
+            // Report zeroed non-finite input samples (relaxed atomic add,
+            // no-op at 0). The warn! stays OFF the realtime thread: the
+            // controller tick reads the counter and logs the delta.
+            processor.note_invalid_samples(invalid);
 
             // Input views from StreamInfo.channels (matching the chain's
             // build parameter after renegotiation): a stack array sliced to
@@ -329,6 +442,12 @@ impl AudioBackend for TapBackend {
             Some(mut system) => system.teardown(),
             None => Vec::new(),
         };
+        // MS-6: no tap, nothing witnessed. After the teardown, so the witness
+        // never reads `false` while a tap is still up. This is also the
+        // failed-start unwind path (`start` calls `stop` on error) and the
+        // first half of a device-change rebuild.
+        self.exclusion.set(false);
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -357,6 +476,15 @@ impl AudioBackend for TapBackend {
             }
         }
         self.pending.pop_front()
+    }
+
+    /// The engine's half of the MS-6 witness, forwarding the same cell
+    /// [`TapStatus`](paraeq_measure::TapStatus) reads. One source of truth:
+    /// `EngineState.self_excluded` and a live measurement session can never
+    /// disagree about the same tap, they only differ in staleness (the
+    /// snapshot is published at most once per controller tick).
+    fn self_excluded(&self) -> bool {
+        paraeq_measure::TapStatus::self_excluded(&self.exclusion)
     }
 }
 

@@ -1,0 +1,31 @@
+{
+ "arrays": {
+  "freqs": {
+   "file": "variable_smooth.freqs.f64",
+   "len": 957,
+   "shape": [
+    957
+   ]
+  },
+  "mag_db": {
+   "file": "variable_smooth.mag_db.f64",
+   "len": 957,
+   "shape": [
+    957
+   ]
+  },
+  "smoothed": {
+   "file": "variable_smooth.smoothed.f64",
+   "len": 957,
+   "shape": [
+    957
+   ]
+  }
+ },
+ "params": {
+  "fwhm_per_sigma": 2.3548200450309493,
+  "ppo": 96,
+  "truncate": 4.0
+ },
+ "scalars": {}
+}

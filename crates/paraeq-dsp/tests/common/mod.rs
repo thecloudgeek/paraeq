@@ -71,6 +71,12 @@ impl Case {
         }
     }
 
+    /// Path to a non-array file shipped alongside a case — e.g. a cal file
+    /// the parser under test must read verbatim, byte for byte.
+    pub fn file(&self, name: &str) -> PathBuf {
+        self.dir.join(name)
+    }
+
     pub fn param_f64(&self, key: &str) -> f64 {
         self.json["params"][key]
             .as_f64()

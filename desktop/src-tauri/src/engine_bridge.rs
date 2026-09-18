@@ -1,0 +1,368 @@
+//! The bridge between the Tauri app and the `paraeq-engine` controller:
+//! spawning the engine honoring persisted state, the single snapshot
+//! forwarder thread, and the `publish` choke point that emits `app-state` and
+//! persists the durable settings subset.
+//!
+//! Safety-critical wiring lives here (never-leave-muted + no-NaN + lock
+//! discipline). Two rules the whole module upholds:
+//!   1. NEVER hold the [`AppShared::data`] lock across an `EngineHandle::send`
+//!      or a Tauri `emit` -- lock, copy what is needed, drop the guard, THEN
+//!      send/emit.
+//!   2. NEVER send bands from a USER EDIT that were not
+//!      [`eq::validate_bands`]-validated, so the user gets a named reason
+//!      instead of a silently dropped band. Since R1-6 this is feedback, not
+//!      the safety wall: `paraeq-engine` re-derives every band at the LIVE
+//!      stream rate at install time and drops (or, if nothing survives,
+//!      refuses) anything at or above the new Nyquist, so no NaN/Inf
+//!      coefficient can reach the realtime chain by any route. The
+//!      forwarder's own re-send deliberately does NOT gate on it (D-10) --
+//!      there is no user at the keyboard to read a message, and refusing the
+//!      whole set there removed the entire EQ over one band above the new
+//!      Nyquist.
+
+use crate::eq;
+use crate::settings::{self, Settings};
+use crate::state::{AppShared, OutputDeviceInfo};
+use paraeq_coreaudio::backend::{ExclusionWitness, TapBackend};
+use paraeq_coreaudio::devices;
+use paraeq_engine::controller::{EngineCommand, EngineConfig, EngineHandle, EngineState};
+use paraeq_engine::status::EngineStatus;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::Arc;
+use std::time::Duration;
+use tauri::{Emitter, Manager};
+
+/// How long the forwarder blocks on the snapshot channel before looping to
+/// re-check for disconnection.
+const RECV_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Spawn the engine controller with a real Core Audio [`TapBackend`], honoring
+/// persisted state: the tap engages on spawn ONLY when the user has both
+/// completed setup and left the EQ enabled. Called ONCE from `.setup`, AFTER
+/// [`settings::load`] -- never spawn before reading persisted state, or the tap
+/// mutes system audio pre-wizard until fail-open.
+///
+/// Returns the MS-6 [`ExclusionWitness`] alongside the handle. THIS IS THE ONLY
+/// PLACE it can be taken: `EngineHandle::spawn` moves the backend into the
+/// controller thread, after which nothing outside that thread can reach its
+/// `TapSystem`. So the backend is constructed into a binding, the witness is
+/// cloned off it, and only then is it moved. The measurement runtime reads that
+/// clone directly (`paraeq_measure::TapStatus`) rather than
+/// `EngineState.self_excluded`, which is the same fact up to a controller tick
+/// stale -- too stale for a gate that arms a full-level stimulus.
+pub fn spawn_engine(settings: &Settings) -> (EngineHandle, ExclusionWitness) {
+    let backend = TapBackend::new();
+    let exclusion_witness = backend.exclusion_witness();
+    let handle = EngineHandle::spawn(
+        backend,
+        EngineConfig {
+            enabled: settings.engine_enabled && settings.setup_complete,
+            ..EngineConfig::default()
+        },
+    );
+    (handle, exclusion_witness)
+}
+
+/// THE choke point every command and the forwarder call after a mutation:
+/// compose [`AppState`](crate::state::AppState) from `AppShared::data` plus the
+/// given engine snapshot, persist the durable `Settings` subset if it changed
+/// since the last write, and emit the `app-state` event. The data guard is
+/// dropped before any disk I/O or emit; no lock is held across the emit.
+pub fn publish(app: &tauri::AppHandle, engine: &EngineState) {
+    let shared = app.state::<AppShared>();
+    // Read the verification slot BEFORE taking the data lock, and release it
+    // immediately: the verify worker publishes from its own thread while
+    // holding nothing, and nesting the two locks in opposite orders anywhere
+    // would be a deadlock.
+    let verification = shared.verify.lock().unwrap().state();
+    let (app_state, durable) = {
+        let data = shared.data.lock().unwrap();
+        (data.app_state(engine, verification), data.to_settings())
+    };
+    // Persist only when the durable subset actually changed. Compare against the
+    // in-memory mirror of what is on disk (`AppShared::persisted`, seeded from
+    // the file at setup) instead of re-reading settings.json -- the forwarder
+    // publishes on every input_peak change during playback (tens/sec), and none
+    // of those engine-only deltas (status, peak, latency) touch the durable
+    // subset, so this keeps engine ticks off the disk entirely, reads included.
+    //
+    // The `persisted` mutex is held across the compare AND the save so the
+    // check-and-write is atomic and the mirror only advances on a *successful*
+    // write (a failed save leaves it stale so the next publish retries, matching
+    // the old re-read-from-disk semantics). It is acquired after the `data`
+    // guard is dropped and released before the emit below -- the data/engine
+    // lock is never held here, and no lock spans the emit.
+    {
+        let mut persisted = shared.persisted.lock().unwrap();
+        if *persisted != durable {
+            match settings::save(&shared.settings_path, &durable) {
+                Ok(()) => *persisted = durable,
+                Err(e) => log::warn!("failed to persist settings: {e}"),
+            }
+        }
+    }
+    // Sync the tray (toggle text, bypass checkmark, tooltip, profile submenu)
+    // BEFORE the emit consumes `app_state`. sync_tray only schedules the
+    // main-thread mutation, so it never blocks the emit.
+    crate::tray::sync_tray(app, &app_state);
+    if let Err(e) = app.emit("app-state", app_state) {
+        log::warn!("failed to emit app-state: {e}");
+    }
+}
+
+/// Log a room transition that came from the FALLBACK rather than from the
+/// measurement -- the third of the three places the 200 Hz constant must be
+/// labelled a fallback.
+///
+/// The spec's sentence is unambiguous about where: "**it must be labelled a
+/// fallback in the code, the UI, and the log, never a rule**". Code and UI are
+/// the decision engine's (a named constant and a rationale string); the LOG is
+/// this crate's, because `paraeq-decide` may not perform I/O inside `decide()`
+/// at all -- its determinism test forbids it -- so a crate that cannot log
+/// cannot discharge a logging requirement.
+///
+/// The line carries the word "fallback" literally. That is not stylistic: it is
+/// what makes the requirement greppable in a user's log when someone asks why a
+/// correction transitions where it does, and it is what
+/// `a_fallback_transition_logs_the_word_fallback` asserts.
+///
+/// `Source::Auto` and `Source::UserOverride` log NOTHING. A line on every run
+/// would train the reader to skip it, and then the one run that mattered looks
+/// like all the others.
+pub fn log_transition_source(decisions: &paraeq_decide::decisions::Decisions) {
+    if let Some(line) = transition_fallback_line(
+        decisions.transition_hz.source,
+        decisions.transition_hz.value,
+    ) {
+        log::info!("{line}");
+    }
+}
+
+/// The line itself, rendered rather than logged, so the requirement is
+/// assertable without a `Decisions` and without a log capture.
+///
+/// `None` for `Source::Auto` and `Source::UserOverride`: a line on every run
+/// would train the reader to skip it, and then the one run that mattered looks
+/// like all the others.
+pub fn transition_fallback_line(
+    source: paraeq_decide::decision::Source,
+    value_hz: f64,
+) -> Option<String> {
+    use paraeq_decide::decision::Source;
+    if source != Source::Default {
+        return None;
+    }
+    Some(format!(
+        "room transition {value_hz} Hz is a fallback, not a measurement: the evidence was \
+         absent or inconclusive, so the path profile default was used"
+    ))
+}
+
+/// Compose the engine half of the snapshot from the live handle, or a disabled
+/// `Stopped` default if the handle is somehow absent (e.g. after teardown).
+pub fn current_engine_state(shared: &AppShared) -> EngineState {
+    let guard = shared.engine.lock().unwrap();
+    match guard.as_ref() {
+        Some(handle) => (*handle.state()).clone(),
+        None => stopped_state(),
+    }
+}
+
+/// Send a command to the engine, no-op if the handle has been torn down. Holds
+/// only the engine-handle lock (never the data lock) across the fire-and-forget
+/// send.
+pub fn send_cmd(shared: &AppShared, cmd: EngineCommand) {
+    let guard = shared.engine.lock().unwrap();
+    if let Some(handle) = guard.as_ref() {
+        handle.send(cmd);
+    }
+}
+
+/// Convenience: compose the current engine snapshot and [`publish`].
+pub fn publish_current(app: &tauri::AppHandle) {
+    let shared = app.state::<AppShared>();
+    let engine = current_engine_state(&shared);
+    publish(app, &engine);
+}
+
+/// The dedicated forwarder thread. Owns `rx` (the subscriber receiver, created
+/// BEFORE the handle was stored so no early snapshot is missed) and reconciles
+/// each published snapshot:
+///
+/// 1. On an engine-published redesign refusal (or the first stream), hand the
+///    band set over WHOLE as a fresh `SetCorrection` -- the R1-6 fallback
+///    path. It never re-validates and never clears: the engine drops only the
+///    bands that are illegal at the live rate (D-10). A bare rate change does
+///    NOT come through here any more, because the engine re-derives a `Peq`
+///    correction at the new rate itself. The refusal is answered on its EDGE,
+///    which is what [`eq::ResendState`] is carried for.
+/// 2. On a device change, refresh the selectable device list.
+/// 3. Publish the snapshot (emit + persist).
+///
+/// `handle.state()` is always the reconciliation source; channel pushes are
+/// lossy change-notifications.
+pub fn start_forwarder(app: tauri::AppHandle, rx: Receiver<Arc<EngineState>>) {
+    std::thread::Builder::new()
+        .name("paraeq-forwarder".into())
+        .spawn(move || {
+            // Since R1-6 this is bookkeeping, not the redesign trigger:
+            // "have we seen a stream yet", plus the refused rate we have
+            // already supplied design intent for. See `eq::ResendState`.
+            let mut resend = eq::ResendState::default();
+            let mut last_device_uid: Option<String> = None;
+            loop {
+                match rx.recv_timeout(RECV_TIMEOUT) {
+                    Ok(snapshot) => {
+                        let shared = app.state::<AppShared>();
+
+                        // 1. Redesign re-send: the engine refused the config
+                        //    it holds, or this is the first stream we have
+                        //    seen. The set goes over WHOLE -- the engine
+                        //    drops only the bands that are illegal at the
+                        //    live rate (D-10); clearing here used to lose
+                        //    the user's entire EQ, unrecoverably. Once per
+                        //    refusal, not once per snapshot: the flag latches
+                        //    and this loop runs at the publish rate. See
+                        //    `eq::resend_command`.
+                        let bands = { shared.data.lock().unwrap().bands.clone() };
+                        if let Some(cmd) = eq::resend_command(&mut resend, &snapshot, &bands) {
+                            send_cmd(&shared, cmd);
+                        }
+
+                        // 2. Device change -> refresh the selectable list.
+                        let device_uid = snapshot.stream.as_ref().map(|s| s.device_uid.clone());
+                        if device_uid != last_device_uid {
+                            if device_uid.is_some() {
+                                match devices::list_output_devices() {
+                                    Ok(list) => {
+                                        let infos = to_device_info(list);
+                                        shared.data.lock().unwrap().devices = infos;
+                                    }
+                                    Err(e) => {
+                                        log::warn!("output device enumeration failed: {e}")
+                                    }
+                                }
+                            }
+                            last_device_uid = device_uid;
+                        }
+
+                        // 3. Publish (emits app-state, persists the durable
+                        //    subset, and syncs the tray inside publish()).
+                        publish(&app, &snapshot);
+                    }
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        })
+        .expect("spawn paraeq-forwarder thread");
+}
+
+/// Project the coreaudio (serde-free) device list into the UI wire struct.
+fn to_device_info(list: Vec<devices::OutputDevice>) -> Vec<OutputDeviceInfo> {
+    list.into_iter()
+        .map(|d| OutputDeviceInfo {
+            name: d.name,
+            uid: d.uid,
+        })
+        .collect()
+}
+
+/// A disabled, stopped snapshot -- the fallback when the engine handle is
+/// absent (only after Exit teardown has taken it).
+fn stopped_state() -> EngineState {
+    EngineState {
+        auto_preamp_db: None,
+        bands_dropped: 0,
+        bypass: false,
+        clipped_samples: 0,
+        correction: None,
+        correction_rate_mismatch: None,
+        enabled: false,
+        frame_mismatch_blocks: 0,
+        gain_db: 0.0,
+        input_peak: 0.0,
+        input_peak_session: 0.0,
+        invalid_samples: 0,
+        latency_ms: None,
+        output_peak: 0.0,
+        // No chain, so no installed cascade to describe -- the same
+        // session-scoped rule `auto_preamp_db: None` above follows.
+        sections_substituted: 0,
+        // No handle, so no tap, so nothing is witnessed. Paired with
+        // `stream: None` this reads as "the engine is not running", never as
+        // the fail-open path having fired.
+        self_excluded: false,
+        status: EngineStatus::Stopped,
+        stream: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paraeq_decide::decision::Source;
+
+    /// The wizard spec's fallback sentence names three places the 200 Hz
+    /// constant must be labelled a fallback: "**in the code, the UI, and the
+    /// log, never a rule**". This is the LOG, and it lives here because
+    /// `paraeq-decide` may not perform I/O inside `decide()` at all -- a crate
+    /// that cannot log cannot discharge a logging requirement.
+    ///
+    /// The literal word is the assertion. It is what makes the requirement
+    /// greppable in a user's log when someone asks why a correction transitions
+    /// where it does.
+    #[test]
+    fn a_fallback_transition_logs_the_word_fallback() {
+        let line = transition_fallback_line(Source::Default, 200.0)
+            .expect("a defaulted transition must produce a line");
+        assert!(
+            line.contains("fallback"),
+            "the line must carry the literal word: {line}"
+        );
+        assert!(
+            line.contains("200"),
+            "and the value it fell back to: {line}"
+        );
+        assert!(
+            !line.contains("rule"),
+            "'never a rule' is the spec's own wording about this sentence: {line}"
+        );
+    }
+
+    /// A measured transition logs NOTHING, and neither does one the user set.
+    /// A line on every run would train the reader to skip it, and then the one
+    /// run that mattered looks like all the others.
+    #[test]
+    fn a_measured_or_overridden_transition_logs_nothing() {
+        assert_eq!(transition_fallback_line(Source::Auto, 143.0), None);
+        assert_eq!(transition_fallback_line(Source::UserOverride, 180.0), None);
+    }
+
+    /// The wrapper must actually LOG the rendered line. Without this, the
+    /// renderer above could keep passing while nothing reached a log file --
+    /// which is the requirement, not the string.
+    ///
+    /// A source grep rather than a log capture: `log` has no per-test capture
+    /// and installing a global logger from one test races every other test in
+    /// the binary.
+    #[test]
+    fn the_transition_log_leg_is_wired_to_log_info() {
+        let src = include_str!("engine_bridge.rs");
+        let body = src
+            .split_once("pub fn log_transition_source")
+            .expect("the log leg")
+            .1
+            .split_once("/// The line itself")
+            .expect("the renderer that follows")
+            .0;
+        assert!(
+            body.contains("transition_fallback_line"),
+            "the leg must render through the tested function: {body}"
+        );
+        assert!(
+            body.contains("log::info!"),
+            "and it must emit at info, beside this module's other log calls: {body}"
+        );
+    }
+}

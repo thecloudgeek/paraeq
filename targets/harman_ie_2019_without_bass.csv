@@ -1,5 +1,6 @@
 # name: Harman In-Ear 2019 (No Bass Shelf)
 # category: in-ear
+# classes: InEar
 # description: Harman 2019 in-ear with the +7 dB sub-bass shelf removed. Preferred by treble-sensitive listeners and as a 'neutral IEM' reference target.
 # source: AutoEq @ commit 7ae0f56 / Harman in-ear 2019 without bass.csv
 # frequency_hz,gain_db

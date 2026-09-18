@@ -6,6 +6,7 @@ pub mod chain;
 pub mod controller;
 pub mod convolver;
 pub mod iir;
+pub mod preamp;
 pub mod shared;
 pub mod status;
 

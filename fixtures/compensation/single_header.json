@@ -1,0 +1,22 @@
+{
+ "arrays": {
+  "freqs": {
+   "file": "single_header.freqs.f64",
+   "len": 7,
+   "shape": [
+    7
+   ]
+  },
+  "gains": {
+   "file": "single_header.gains.f64",
+   "len": 7,
+   "shape": [
+    7
+   ]
+  }
+ },
+ "params": {
+  "cal_file": "single_header.cal.txt"
+ },
+ "scalars": {}
+}

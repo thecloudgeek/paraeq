@@ -1,13 +1,24 @@
 //! Synthetic-block tests for the realtime chain:
 //! bypass? -> correction -> trim gain -> safety clamp(+-1.0).
 
-use paraeq_engine::chain::{build_fir, build_iir, ChainOutcome, RealtimeChain};
+use std::f64::consts::PI;
+
+use paraeq_dsp::biquad;
+use paraeq_dsp::biquad::peaking;
+use paraeq_engine::chain::{
+    build_fir, build_iir, ChainOutcome, Correction, CorrectionKind, RealtimeChain,
+};
 use paraeq_engine::convolver::OverlapAddConvolver;
 use paraeq_engine::iir::IIRProcessor;
+use proptest::prelude::*;
 
 const BLOCK: usize = 64;
+/// The identity section `build_iir` substitutes for an unstable row.
+const IDENTITY: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
 /// A stable, stateful biquad section (a1 = -0.5, a2 = 0.25).
 const SOS: [f64; 6] = [0.2, 0.3, 0.1, 1.0, -0.5, 0.25];
+/// A hand-unstable section: a2 > 1 puts a pole outside the unit circle.
+const UNSTABLE_SOS: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 1.01];
 
 /// Deterministic non-trivial test signal.
 fn sig(block: usize, ch: usize, i: usize) -> f32 {
@@ -76,7 +87,7 @@ fn no_correction_is_identity_with_gain_and_clamp() {
 #[test]
 fn iir_path_matches_direct_processor_across_blocks() {
     let mut chain = RealtimeChain::new(2, BLOCK);
-    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK)));
+    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK, 1.0).0));
 
     let mut direct = IIRProcessor::new();
     direct.set_sos(0, vec![SOS]);
@@ -88,6 +99,10 @@ fn iir_path_matches_direct_processor_across_blocks() {
         let (out, outcome) = chain_process(&mut chain, &input, false, gain);
         assert!(outcome.corrected);
         assert!(!outcome.frame_mismatch);
+        assert_eq!(
+            outcome.nonfinite_outputs, 0,
+            "clean audio must not trip the output guard"
+        );
 
         // Hand-driven reference with the chain's exact casts.
         let in64: Vec<Vec<f64>> = input
@@ -115,7 +130,12 @@ fn iir_path_matches_direct_processor_across_blocks() {
 fn fir_path_matches_direct_convolver() {
     let fir = vec![0.5f64, 0.25, -0.125];
     let mut chain = RealtimeChain::new(2, BLOCK);
-    chain.set_correction(Some(build_fir(vec![fir.clone(), fir.clone()], 2, BLOCK)));
+    chain.set_correction(Some(build_fir(
+        vec![fir.clone(), fir.clone()],
+        2,
+        BLOCK,
+        1.0,
+    )));
 
     let mut direct = OverlapAddConvolver::new(vec![fir.clone(), fir], BLOCK);
 
@@ -125,6 +145,10 @@ fn fir_path_matches_direct_convolver() {
         let (out, outcome) = chain_process(&mut chain, &input, false, gain);
         assert!(outcome.corrected);
         assert!(!outcome.frame_mismatch);
+        assert_eq!(
+            outcome.nonfinite_outputs, 0,
+            "clean audio must not trip the output guard"
+        );
 
         let in64: Vec<Vec<f64>> = input
             .iter()
@@ -150,7 +174,7 @@ fn fir_path_matches_direct_convolver() {
 #[test]
 fn bypass_passes_through_and_edge_resets_state() {
     let mut chain = RealtimeChain::new(2, BLOCK);
-    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK)));
+    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK, 1.0).0));
     let gain = 0.5f32;
 
     // Block 0: loud, correction active -- builds internal filter state.
@@ -204,7 +228,7 @@ fn mono_iir_config_broadcasts_to_both_channels() {
     // ONE SOS set on a 2-channel chain: the last (only) set is broadcast,
     // so both channels are corrected identically.
     let mut chain = RealtimeChain::new(2, BLOCK);
-    chain.set_correction(Some(build_iir(vec![vec![SOS]], 2, BLOCK)));
+    chain.set_correction(Some(build_iir(vec![vec![SOS]], 2, BLOCK, 1.0).0));
 
     let mut direct = IIRProcessor::new();
     direct.set_sos(0, vec![SOS]);
@@ -239,7 +263,7 @@ fn mono_iir_config_broadcasts_to_both_channels() {
 #[test]
 fn fir_frame_mismatch_passes_through() {
     let mut chain = RealtimeChain::new(2, BLOCK);
-    chain.set_correction(Some(build_fir(vec![vec![0.5f64, 0.25]], 2, BLOCK)));
+    chain.set_correction(Some(build_fir(vec![vec![0.5f64, 0.25]], 2, BLOCK, 1.0)));
 
     // The convolver requires exactly BLOCK frames; half a block must NOT
     // panic -- pass through with gain + clamp instead.
@@ -260,7 +284,12 @@ fn frame_mismatch_resets_correction_state() {
     let fir = vec![0.5f64, 0.25, -0.125];
     let gain = 1.0f32;
     let mut chain = RealtimeChain::new(2, BLOCK);
-    chain.set_correction(Some(build_fir(vec![fir.clone(), fir.clone()], 2, BLOCK)));
+    chain.set_correction(Some(build_fir(
+        vec![fir.clone(), fir.clone()],
+        2,
+        BLOCK,
+        1.0,
+    )));
 
     // Block 0: conforming -- builds overlap state in the convolver.
     let (_, outcome) = chain_process(&mut chain, &make_block(0, 2, BLOCK), false, gain);
@@ -302,10 +331,511 @@ fn frame_mismatch_resets_correction_state() {
     }
 }
 
+// --- swap state transplant (spec R1-7a: click-free coefficient swaps) ---
+
+/// Phase-continuous 100 Hz sine at 48 kHz. 0.1 amplitude keeps the +12 dB
+/// Q=10 correction's output well inside the safety clamp.
+fn sine100(start_sample: usize, frames: usize, channels: usize) -> Vec<Vec<f32>> {
+    (0..channels)
+        .map(|_| {
+            (start_sample..start_sample + frames)
+                .map(|n| ((n as f64 * 2.0 * PI * 100.0 / 48000.0).sin() * 0.1) as f32)
+                .collect()
+        })
+        .collect()
+}
+
+fn max_first_diff(y: &[f32]) -> f32 {
+    y.windows(2)
+        .map(|w| (w[1] - w[0]).abs())
+        .fold(0.0, f32::max)
+}
+
+#[test]
+fn identical_coefficient_swap_is_bit_exact_noop() {
+    // The spec's sharpest test: swapping to identical coefficients at a
+    // block boundary must be sample-for-sample identical to never swapping.
+    let sos = peaking(100.0, 12.0, 10.0, 48000.0);
+    let mut swapped = RealtimeChain::new(2, BLOCK);
+    swapped.set_correction(Some(build_iir(vec![vec![sos]], 2, BLOCK, 1.0).0));
+    let mut unswapped = RealtimeChain::new(2, BLOCK);
+    unswapped.set_correction(Some(build_iir(vec![vec![sos]], 2, BLOCK, 1.0).0));
+    for b in 0..64 {
+        if b == 32 {
+            swapped.set_correction(Some(build_iir(vec![vec![sos]], 2, BLOCK, 1.0).0));
+        }
+        let input = sine100(b * BLOCK, BLOCK, 2);
+        let (out_s, outcome) = chain_process(&mut swapped, &input, false, 1.0);
+        assert!(outcome.corrected);
+        let (out_u, _) = chain_process(&mut unswapped, &input, false, 1.0);
+        for ch in 0..2 {
+            for i in 0..BLOCK {
+                assert_eq!(
+                    out_s[ch][i].to_bits(),
+                    out_u[ch][i].to_bits(),
+                    "block {b} ch {ch} sample {i}: a no-op swap must be a no-op"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn gain_only_swap_with_transplant_has_no_step() {
+    // Gain-only coefficient change (+12 dB -> +11 dB, Q=10 @ 100 Hz): with
+    // the transplant, the max first-difference across the swap boundary
+    // stays within 1.1x the surrounding steady state's (spec bound). The
+    // zero-state control below shows the same swap WITHOUT state is a
+    // click, so the bound is discriminating.
+    const WARM: usize = 96; // ~4 decay constants of the Q=10 resonance
+    const TAIL: usize = 32;
+    let sos_a = peaking(100.0, 12.0, 10.0, 48000.0);
+    let sos_b = peaking(100.0, 11.0, 10.0, 48000.0);
+
+    let mut chain = RealtimeChain::new(2, BLOCK);
+    chain.set_correction(Some(build_iir(vec![vec![sos_a]], 2, BLOCK, 1.0).0));
+    let mut y = Vec::new();
+    for b in 0..WARM {
+        let input = sine100(b * BLOCK, BLOCK, 2);
+        let (out, _) = chain_process(&mut chain, &input, false, 1.0);
+        y.extend_from_slice(&out[0]);
+    }
+    chain.set_correction(Some(build_iir(vec![vec![sos_b]], 2, BLOCK, 1.0).0));
+
+    // Zero-state control: the same continuation through a fresh chain --
+    // exactly what every swap sounded like before the transplant existed.
+    let mut fresh = RealtimeChain::new(2, BLOCK);
+    fresh.set_correction(Some(build_iir(vec![vec![sos_b]], 2, BLOCK, 1.0).0));
+    let mut y_zero_state = y.clone();
+    for b in WARM..WARM + TAIL {
+        let input = sine100(b * BLOCK, BLOCK, 2);
+        let (out, _) = chain_process(&mut chain, &input, false, 1.0);
+        y.extend_from_slice(&out[0]);
+        let (out_f, _) = chain_process(&mut fresh, &input, false, 1.0);
+        y_zero_state.extend_from_slice(&out_f[0]);
+    }
+
+    let boundary = WARM * BLOCK;
+    let steady = max_first_diff(&y[boundary - 16 * BLOCK..boundary]);
+    let across = max_first_diff(&y[boundary - 1..boundary + 4 * BLOCK]);
+    assert!(
+        across <= 1.1 * steady,
+        "transplanted swap stepped: boundary diff {across} > 1.1 x steady {steady}"
+    );
+    let across_zero = max_first_diff(&y_zero_state[boundary - 1..boundary + 4 * BLOCK]);
+    assert!(
+        across_zero > 1.1 * steady,
+        "zero-state control shows no click ({across_zero} <= 1.1 x {steady}); the bound is not discriminating"
+    );
+}
+
+#[test]
+fn a_swap_to_a_weaker_preamp_starts_from_clean_state() {
+    // R1-1 x R1-7a. The transplant carries the outgoing cascade's
+    // UN-PREAMPED delay lines, and the INCOMING `preamp_lin` is what
+    // multiplies them on the first block. When the incoming correction has
+    // less headroom (a larger `preamp_lin`), that tail no longer fits under
+    // the +-1.0 clamp, so the transplant is skipped and the incoming
+    // correction starts clean. The opposite direction -- an incoming preamp
+    // with MORE headroom -- still transplants, because its tail can only get
+    // quieter. `test_meters.rs::a_swap_that_weakens_the_preamp_does_not_clip`
+    // is the audible half of the same rule.
+    const WARM: usize = 8;
+    let sos = peaking(100.0, 12.0, 10.0, 48000.0);
+    // The preamps `build_correction` computes for a +12 dB band and for the
+    // same band dragged flat. Identical COEFFICIENTS on both sides, so the
+    // state transplant is the only thing that can make two chains differ.
+    let strong = 10f64.powf(-12.0 / 20.0) as f32;
+    let weak = 1.0f32;
+
+    let warmed = |preamp: f32| {
+        let mut chain = RealtimeChain::new(2, BLOCK);
+        chain.set_correction(Some(build_iir(vec![vec![sos]], 2, BLOCK, preamp).0));
+        for b in 0..WARM {
+            chain_process(&mut chain, &sine100(b * BLOCK, BLOCK, 2), false, 1.0);
+        }
+        chain
+    };
+    let fresh_next_block = |preamp: f32| {
+        let mut chain = RealtimeChain::new(2, BLOCK);
+        chain.set_correction(Some(build_iir(vec![vec![sos]], 2, BLOCK, preamp).0));
+        chain_process(&mut chain, &sine100(WARM * BLOCK, BLOCK, 2), false, 1.0).0
+    };
+
+    // Weakening (12 dB of headroom -> none): no transplant, so the block
+    // after the swap is bit-identical to a chain that never ran.
+    let mut chain = warmed(strong);
+    chain.set_correction(Some(build_iir(vec![vec![sos]], 2, BLOCK, weak).0));
+    let (after, _) = chain_process(&mut chain, &sine100(WARM * BLOCK, BLOCK, 2), false, 1.0);
+    let clean = fresh_next_block(weak);
+    for ch in 0..2 {
+        for i in 0..BLOCK {
+            assert_eq!(
+                after[ch][i].to_bits(),
+                clean[ch][i].to_bits(),
+                "ch {ch} sample {i}: a preamp-weakening swap must not transplant state"
+            );
+        }
+    }
+
+    // Strengthening (no headroom -> 12 dB): R1-7a still applies, so the same
+    // block must NOT match a chain that never ran.
+    let mut chain = warmed(weak);
+    chain.set_correction(Some(build_iir(vec![vec![sos]], 2, BLOCK, strong).0));
+    let (after, _) = chain_process(&mut chain, &sine100(WARM * BLOCK, BLOCK, 2), false, 1.0);
+    let clean = fresh_next_block(strong);
+    let carried = (0..BLOCK).any(|i| after[0][i].to_bits() != clean[0][i].to_bits());
+    assert!(
+        carried,
+        "a swap to MORE headroom lost R1-7a's transplant; the skip is too broad"
+    );
+}
+
+#[test]
+fn iir_to_fir_swap_is_safe_noop() {
+    // Cross-kind swap: no state can carry over (a FIR overlap tail cannot
+    // be transplanted). Must not panic; the FIR behaves exactly as fresh.
+    let mut chain = RealtimeChain::new(2, BLOCK);
+    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK, 1.0).0));
+    for b in 0..2 {
+        chain_process(&mut chain, &make_block(b, 2, BLOCK), false, 1.0);
+    }
+    let fir = vec![0.5f64, 0.25, -0.125];
+    chain.set_correction(Some(build_fir(
+        vec![fir.clone(), fir.clone()],
+        2,
+        BLOCK,
+        1.0,
+    )));
+
+    let mut direct = OverlapAddConvolver::new(vec![fir.clone(), fir], BLOCK);
+    for b in 2..4 {
+        let input = make_block(b, 2, BLOCK);
+        let (out, outcome) = chain_process(&mut chain, &input, false, 1.0);
+        assert!(outcome.corrected);
+        let in64: Vec<Vec<f64>> = input
+            .iter()
+            .map(|v| v.iter().map(|&s| s as f64).collect())
+            .collect();
+        let views: Vec<&[f64]> = in64.iter().map(|v| v.as_slice()).collect();
+        let mut out64 = vec![vec![0.0f64; BLOCK]; 2];
+        direct.process(&views, &mut out64);
+        for ch in 0..2 {
+            for i in 0..BLOCK {
+                let expected = downcast_gain_clamp(out64[ch][i], 1.0);
+                assert_eq!(
+                    out[ch][i].to_bits(),
+                    expected.to_bits(),
+                    "block {b} ch {ch} sample {i}: FIR after cross-kind swap not fresh"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn fir_to_iir_swap_starts_fresh() {
+    // Cross-kind swap the other way: the incoming IIR must start from zero
+    // state (fresh), not from anything scavenged off the FIR.
+    let fir = vec![0.5f64, 0.25, -0.125];
+    let mut chain = RealtimeChain::new(2, BLOCK);
+    chain.set_correction(Some(build_fir(vec![fir.clone(), fir], 2, BLOCK, 1.0)));
+    for b in 0..2 {
+        chain_process(&mut chain, &make_block(b, 2, BLOCK), false, 1.0);
+    }
+    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK, 1.0).0));
+
+    let mut fresh = IIRProcessor::new();
+    fresh.set_sos(0, vec![SOS]);
+    fresh.set_sos(1, vec![SOS]);
+    for b in 2..4 {
+        let input = make_block(b, 2, BLOCK);
+        let (out, outcome) = chain_process(&mut chain, &input, false, 1.0);
+        assert!(outcome.corrected);
+        let in64: Vec<Vec<f64>> = input
+            .iter()
+            .map(|v| v.iter().map(|&s| s as f64).collect())
+            .collect();
+        let views: Vec<&[f64]> = in64.iter().map(|v| v.as_slice()).collect();
+        let mut out64 = vec![vec![0.0f64; BLOCK]; 2];
+        fresh.process(&views, &mut out64);
+        for ch in 0..2 {
+            for i in 0..BLOCK {
+                let expected = downcast_gain_clamp(out64[ch][i], 1.0);
+                assert_eq!(
+                    out[ch][i].to_bits(),
+                    expected.to_bits(),
+                    "block {b} ch {ch} sample {i}: IIR after cross-kind swap not fresh"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn extra_sos_sets_do_not_defeat_the_transplant() {
+    // A config carrying MORE SOS sets than the stream has channels is
+    // accepted (build_iir sizes channels.max(sets), extra slots never
+    // process), so its slot count is broadcast-inflated: 3 sets on a
+    // stereo stream build a 3-slot processor. The transplant gate keys on
+    // the stream width, not slot counts — an identical-coefficient
+    // 3-set -> 2-set swap must stay a bit-exact no-op, not a zero-state
+    // click (regression: slot-count equality misread this as a
+    // channel-count change).
+    let sos = peaking(100.0, 12.0, 10.0, 48000.0);
+    let mut swapped = RealtimeChain::new(2, BLOCK);
+    swapped.set_correction(Some(
+        build_iir(vec![vec![sos], vec![sos], vec![sos]], 2, BLOCK, 1.0).0,
+    ));
+    let mut unswapped = RealtimeChain::new(2, BLOCK);
+    unswapped.set_correction(Some(
+        build_iir(vec![vec![sos], vec![sos], vec![sos]], 2, BLOCK, 1.0).0,
+    ));
+    for b in 0..64 {
+        if b == 32 {
+            swapped.set_correction(Some(build_iir(vec![vec![sos], vec![sos]], 2, BLOCK, 1.0).0));
+        }
+        let input = sine100(b * BLOCK, BLOCK, 2);
+        let (out_s, outcome) = chain_process(&mut swapped, &input, false, 1.0);
+        assert!(outcome.corrected);
+        let (out_u, _) = chain_process(&mut unswapped, &input, false, 1.0);
+        for ch in 0..2 {
+            for i in 0..BLOCK {
+                assert_eq!(
+                    out_s[ch][i].to_bits(),
+                    out_u[ch][i].to_bits(),
+                    "block {b} ch {ch} sample {i}: set-count artifact defeated the transplant"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn channel_count_change_swap_starts_fresh() {
+    // Stereo correction -> mono-built correction: the transplant is a
+    // no-op across a channel-count change (spec R1-7a), so the incoming
+    // processor behaves exactly as fresh and nothing panics.
+    let mut chain = RealtimeChain::new(2, BLOCK);
+    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK, 1.0).0));
+    for b in 0..2 {
+        chain_process(&mut chain, &make_block(b, 2, BLOCK), false, 1.0);
+    }
+    chain.set_correction(Some(build_iir(vec![vec![SOS]], 1, BLOCK, 1.0).0));
+
+    let mut fresh = IIRProcessor::new();
+    fresh.set_sos(0, vec![SOS]);
+    for b in 2..4 {
+        let input = make_block(b, 2, BLOCK);
+        let (out, outcome) = chain_process(&mut chain, &input, false, 1.0);
+        assert!(outcome.corrected);
+        let in64: Vec<f64> = input[0].iter().map(|&s| f64::from(s)).collect();
+        let mut out64 = vec![vec![0.0f64; BLOCK]];
+        fresh.process(&[&in64], &mut out64);
+        for i in 0..BLOCK {
+            let expected = downcast_gain_clamp(out64[0][i], 1.0);
+            assert_eq!(
+                out[0][i].to_bits(),
+                expected.to_bits(),
+                "block {b} ch 0 sample {i}: transplant crossed a channel-count change"
+            );
+            // The mono processor has no ch1 state: pass-through (the f64
+            // round-trip is exact, gain 1.0, well inside the clamp).
+            assert_eq!(
+                out[1][i].to_bits(),
+                input[1][i].to_bits(),
+                "block {b} ch 1 sample {i}: expected pass-through"
+            );
+        }
+    }
+}
+
+#[test]
+fn nan_input_zeroes_poisoned_output_and_self_heals() {
+    let mut chain = RealtimeChain::new(2, BLOCK);
+    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK, 1.0).0));
+
+    let mut direct = IIRProcessor::new();
+    direct.set_sos(0, vec![SOS]);
+    direct.set_sos(1, vec![SOS]);
+    let gain = 1.0f32;
+
+    // Block 0: clean -- builds real filter state.
+    let input = make_block(0, 2, BLOCK);
+    let (_, outcome) = chain_process(&mut chain, &input, false, gain);
+    assert!(outcome.corrected);
+    assert_eq!(outcome.nonfinite_outputs, 0);
+    let in64: Vec<Vec<f64>> = input
+        .iter()
+        .map(|v| v.iter().map(|&s| s as f64).collect())
+        .collect();
+    let views: Vec<&[f64]> = in64.iter().map(|v| v.as_slice()).collect();
+    let mut out64 = vec![vec![0.0f64; BLOCK]; 2];
+    direct.process(&views, &mut out64);
+
+    // Block 1: one NaN mid-block on ch 0. The DF2T section is poisoned
+    // from that sample on; the output backstop must zero exactly the
+    // poisoned tail, leave every finite sample bit-identical, and reset
+    // the correction state.
+    const NAN_AT: usize = 10;
+    let mut input = make_block(1, 2, BLOCK);
+    input[0][NAN_AT] = f32::NAN;
+    let (out, outcome) = chain_process(&mut chain, &input, false, gain);
+    assert!(outcome.corrected);
+    assert_eq!(
+        outcome.nonfinite_outputs as usize,
+        BLOCK - NAN_AT,
+        "exactly the poisoned tail is sanitized"
+    );
+    for ch in &out {
+        for &s in ch {
+            assert!(s.is_finite(), "output must never carry non-finite samples");
+        }
+    }
+    let in64: Vec<Vec<f64>> = input
+        .iter()
+        .map(|v| v.iter().map(|&s| s as f64).collect())
+        .collect();
+    let views: Vec<&[f64]> = in64.iter().map(|v| v.as_slice()).collect();
+    let mut out64 = vec![vec![0.0f64; BLOCK]; 2];
+    direct.process(&views, &mut out64);
+    for i in 0..BLOCK {
+        if i < NAN_AT {
+            let expected = downcast_gain_clamp(out64[0][i], gain);
+            assert_eq!(
+                out[0][i].to_bits(),
+                expected.to_bits(),
+                "ch 0 sample {i}: pre-NaN samples must be bit-identical"
+            );
+        } else {
+            assert_eq!(out[0][i].to_bits(), 0.0f32.to_bits(), "ch 0 sample {i}");
+        }
+        // The clean channel is untouched bit-for-bit.
+        let expected = downcast_gain_clamp(out64[1][i], gain);
+        assert_eq!(out[1][i].to_bits(), expected.to_bits(), "ch 1 sample {i}");
+    }
+
+    // Block 2: clean again -- the backstop's reset self-heals within one
+    // block, so output equals a FRESH processor fed only this block
+    // (without the reset, the DF2T state would stay NaN forever).
+    let input = make_block(2, 2, BLOCK);
+    let (out, outcome) = chain_process(&mut chain, &input, false, gain);
+    assert!(outcome.corrected);
+    assert_eq!(outcome.nonfinite_outputs, 0);
+    let mut fresh = IIRProcessor::new();
+    fresh.set_sos(0, vec![SOS]);
+    fresh.set_sos(1, vec![SOS]);
+    let in64: Vec<Vec<f64>> = input
+        .iter()
+        .map(|v| v.iter().map(|&s| s as f64).collect())
+        .collect();
+    let views: Vec<&[f64]> = in64.iter().map(|v| v.as_slice()).collect();
+    let mut out64 = vec![vec![0.0f64; BLOCK]; 2];
+    fresh.process(&views, &mut out64);
+    for ch in 0..2 {
+        for i in 0..BLOCK {
+            let expected = downcast_gain_clamp(out64[ch][i], gain);
+            assert_eq!(
+                out[ch][i].to_bits(),
+                expected.to_bits(),
+                "ch {ch} sample {i}: state not healed after NaN block"
+            );
+        }
+    }
+}
+
+#[test]
+fn inf_input_on_pass_through_clamps_to_unity() {
+    // No correction installed: the pass-through path's clamp already
+    // handles +-inf correctly (f32::clamp only fails to sanitize NaN) --
+    // pinned so it cannot regress.
+    let mut chain = RealtimeChain::new(2, BLOCK);
+    let mut input = vec![vec![0.25f32; BLOCK]; 2];
+    input[0][3] = f32::INFINITY;
+    input[1][7] = f32::NEG_INFINITY;
+    let (out, outcome) = chain_process(&mut chain, &input, false, 1.0);
+    assert!(!outcome.corrected);
+    assert_eq!(
+        outcome.nonfinite_outputs, 0,
+        "the output guard lives on the corrected path only"
+    );
+    assert_eq!(out[0][3], 1.0, "+inf clamps to exactly +1.0");
+    assert_eq!(out[1][7], -1.0, "-inf clamps to exactly -1.0");
+    assert_eq!(out[0][0], 0.25);
+    assert_eq!(out[1][0], 0.25);
+}
+
+#[test]
+fn nonfinite_correction_output_fires_backstop_and_resets() {
+    // Fabricated unstable SOS (pole at 10 -- bypasses the design-side
+    // guard in-test): the output overflows f32 range within one block.
+    // The backstop must keep the block finite and reset the filter so an
+    // identical next block repeats identically instead of compounding.
+    // Constructed directly rather than via build_iir, whose stability
+    // funnel (R1-3) would substitute identity and defeat the test.
+    const UNSTABLE: [f64; 6] = [1.0, 0.0, 0.0, 1.0, -10.0, 0.0];
+    let mut chain = RealtimeChain::new(1, BLOCK);
+    let mut unstable = IIRProcessor::new();
+    unstable.set_sos(0, vec![UNSTABLE]);
+    chain.set_correction(Some(Correction {
+        kind: CorrectionKind::Iir(unstable),
+        preamp_lin: 1.0,
+    }));
+
+    let input = vec![vec![0.9f32; BLOCK]];
+    let (out0, outcome0) = chain_process(&mut chain, &input, false, 1.0);
+    assert!(outcome0.corrected);
+    assert!(
+        outcome0.nonfinite_outputs > 0,
+        "a divergent filter must trip the backstop"
+    );
+    for &s in &out0[0] {
+        assert!(s.is_finite(), "output must never carry non-finite samples");
+    }
+
+    // ORDER IS LOAD-BEARING, and this is what pins it. `chain.rs`'s fused
+    // pre-clamp scan runs the R1-2 `is_finite` backstop FIRST, so a sanitized
+    // sample is reported exactly once -- as `nonfinite_outputs` -- and never a
+    // second time as a clip or a peak. Hoisting the meter scan above the
+    // backstop leaves every other assertion in this file green while:
+    //   * `peak_out` becomes +inf, which `RtProcessor::process_block` then
+    //     LATCHES for the life of the session (`peak_out.max(decay *
+    //     peak_out())`, and `decay * inf == inf`), publishing a non-finite
+    //     `EngineState::output_peak` against a non-nullable TS `number`; and
+    //   * every zeroed sample is counted a second time in `clipped`, the
+    //     counter that is R1-1's falsifier (spec `§ Scope and Sequencing 3`).
+    //
+    // NOT `clipped == 0`: this divergent filter legitimately clips for the
+    // samples between |y| > 1.0 and the f32 overflow, and those are real
+    // clips. The invariant is that a sanitized sample is not ALSO one of them,
+    // i.e. no sample is reported twice.
+    assert!(
+        outcome0.peak_out.is_finite(),
+        "a zeroed non-finite sample must not reach peak_out (got {})",
+        outcome0.peak_out
+    );
+    let samples = (input.len() * BLOCK) as u32;
+    assert!(
+        outcome0.clipped + outcome0.nonfinite_outputs <= samples,
+        "each sample is reported at most once: {} clipped + {} sanitized > {samples} samples \
+         (the backstop must run BEFORE the meter scan)",
+        outcome0.clipped,
+        outcome0.nonfinite_outputs
+    );
+
+    // Same block again, post-reset: bit-identical output (state healed,
+    // not left saturated at inf).
+    let (out1, outcome1) = chain_process(&mut chain, &input, false, 1.0);
+    assert_eq!(outcome1.nonfinite_outputs, outcome0.nonfinite_outputs);
+    for (i, (a, b)) in out0[0].iter().zip(out1[0].iter()).enumerate() {
+        assert_eq!(a.to_bits(), b.to_bits(), "sample {i}: reset did not heal");
+    }
+}
+
 #[test]
 fn oversized_frames_pass_through_for_any_correction() {
     let mut chain = RealtimeChain::new(2, BLOCK);
-    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK)));
+    chain.set_correction(Some(build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK, 1.0).0));
 
     // 2x block_size exceeds the preallocated scratch; must NOT panic (the
     // HAL occasionally resizes) -- pass through with gain + clamp.
@@ -317,6 +847,151 @@ fn oversized_frames_pass_through_for_any_correction() {
         assert_eq!(ch.len(), 2 * BLOCK);
         for &s in ch {
             assert_eq!(s, 1.0, "0.9 * 2.0 clamps to 1.0");
+        }
+    }
+}
+
+#[test]
+fn stable_sections_install_without_substitution() {
+    let (_, substituted) = build_iir(vec![vec![SOS], vec![SOS]], 2, BLOCK, 1.0);
+    assert_eq!(substituted, 0);
+}
+
+/// An injected unstable section is installed as identity: audio passes
+/// through that section unchanged (bit-exact through the f64 round trip)
+/// instead of exploding.
+#[test]
+fn unstable_section_is_substituted_and_passes_audio_unchanged() {
+    let (correction, substituted) = build_iir(vec![vec![UNSTABLE_SOS]], 2, BLOCK, 1.0);
+    assert_eq!(substituted, 1);
+    let mut chain = RealtimeChain::new(2, BLOCK);
+    chain.set_correction(Some(correction));
+
+    for b in 0..3 {
+        let input = make_block(b, 2, BLOCK);
+        let (out, outcome) = chain_process(&mut chain, &input, false, 1.0);
+        assert!(outcome.corrected);
+        for ch in 0..2 {
+            for i in 0..BLOCK {
+                assert_eq!(
+                    out[ch][i].to_bits(),
+                    input[ch][i].to_bits(),
+                    "block {b} ch {ch} sample {i}: identity must pass through"
+                );
+            }
+        }
+    }
+}
+
+/// A mixed cascade keeps its stable rows: only the unstable row becomes
+/// identity, so the output equals a direct processor running the stable
+/// row alone.
+#[test]
+fn mixed_cascade_substitutes_only_the_unstable_row() {
+    let (correction, substituted) = build_iir(vec![vec![SOS, UNSTABLE_SOS]], 2, BLOCK, 1.0);
+    assert_eq!(substituted, 1);
+    let mut chain = RealtimeChain::new(2, BLOCK);
+    chain.set_correction(Some(correction));
+
+    let mut direct = IIRProcessor::new();
+    direct.set_sos(0, vec![SOS]);
+    direct.set_sos(1, vec![SOS]);
+
+    let gain = 0.8f32;
+    for b in 0..3 {
+        let input = make_block(b, 2, BLOCK);
+        let (out, outcome) = chain_process(&mut chain, &input, false, gain);
+        assert!(outcome.corrected);
+
+        let in64: Vec<Vec<f64>> = input
+            .iter()
+            .map(|v| v.iter().map(|&s| s as f64).collect())
+            .collect();
+        let views: Vec<&[f64]> = in64.iter().map(|v| v.as_slice()).collect();
+        let mut out64 = vec![vec![0.0f64; BLOCK]; 2];
+        direct.process(&views, &mut out64);
+
+        for ch in 0..2 {
+            for i in 0..BLOCK {
+                let expected = downcast_gain_clamp(out64[ch][i], gain);
+                assert_eq!(
+                    out[ch][i].to_bits(),
+                    expected.to_bits(),
+                    "block {b} ch {ch} sample {i}: unstable row must act as identity"
+                );
+            }
+        }
+    }
+}
+
+/// q = 0 designs NaN coefficients (dsp-level test: test_props.rs); the
+/// build_iir funnel must catch them: identity installed, count == 1 (the
+/// bad INPUT row counts once, not once per broadcast channel).
+#[test]
+fn q_zero_design_is_substituted_and_counted_once() {
+    let sos = biquad::peaking(1000.0, 6.0, 0.0, 48000.0);
+    let (correction, substituted) = build_iir(vec![vec![sos]], 2, BLOCK, 1.0);
+    assert_eq!(substituted, 1);
+    match &correction.kind {
+        CorrectionKind::Iir(p) => {
+            for ch in 0..2 {
+                assert_eq!(p.sos(ch), Some(&[IDENTITY][..]), "channel {ch}");
+            }
+        }
+        CorrectionKind::Fir(_) => panic!("expected an Iir correction"),
+    }
+}
+
+/// fc at and above Nyquist: substituted and counted.
+#[test]
+fn nyquist_and_supra_nyquist_designs_are_substituted() {
+    // fc == sr/2 exactly: w0 = pi, alpha ~ 0 -- the poles land ON the unit
+    // circle in f64 and the strict Jury form rejects them.
+    let at_nyquist = biquad::peaking(24000.0, 6.0, 1.0, 48000.0);
+    let (_, substituted) = build_iir(vec![vec![at_nyquist]], 1, BLOCK, 1.0);
+    assert_eq!(substituted, 1, "fc == sr/2 must be substituted");
+
+    // fc > sr/2: finite but aliased math; this design has a pole outside
+    // the unit circle.
+    let above_nyquist = biquad::peaking(30000.0, 6.0, 1.0, 48000.0);
+    let (_, substituted) = build_iir(vec![vec![above_nyquist]], 1, BLOCK, 1.0);
+    assert_eq!(substituted, 1, "fc > sr/2 must be substituted");
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Hostile box (spec R1-3): far outside the parameter range the dsp
+    /// stability props pin, `build_iir` never panics and never installs a
+    /// section failing the STRICT Jury form -- bad rows surface only as
+    /// the substitution count.
+    #[test]
+    fn hostile_box_never_installs_unstable_sections(
+        fc in 0.0f64..1e6,
+        gain in -60.0f64..60.0,
+        q in 1e-6f64..1e6,
+        sr in prop_oneof![Just(44100.0f64), Just(48000.0f64), Just(96000.0f64)],
+    ) {
+        let designed = vec![
+            biquad::peaking(fc, gain, q, sr),
+            biquad::low_shelf(fc, gain, q, sr),
+            biquad::high_shelf(fc, gain, q, sr),
+            biquad::notch(fc, q, sr),
+        ];
+        let unstable = designed.iter().filter(|sos| !biquad::is_stable(sos)).count();
+        let (correction, substituted) = build_iir(vec![designed], 2, 32, 1.0);
+        prop_assert_eq!(substituted, unstable);
+        match &correction.kind {
+            CorrectionKind::Iir(p) => {
+                for ch in 0..2 {
+                    let sos = p.sos(ch).expect("broadcast installs every channel");
+                    prop_assert_eq!(sos.len(), 4);
+                    for row in sos {
+                        prop_assert!(biquad::is_stable(row), "installed unstable row {:?}", row);
+                    }
+                }
+            }
+            CorrectionKind::Fir(_) => prop_assert!(false, "expected an Iir correction"),
         }
     }
 }

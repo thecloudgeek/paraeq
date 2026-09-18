@@ -69,7 +69,7 @@ Phase 2 has begun — see docs/specs/2026-07-02-rust-port-design.md (process-tap
 
 **Built-in Target Curves (`targets/`):** flat.csv, harman_ie_2019.csv, harman_ie_2019_without_bass.csv, harman_oe_2018.csv, harman_oe_2018_without_bass.csv, diffuse_field.csv. High-resolution data sourced from AutoEQ (MIT licensed) at commit `7ae0f56` (full SHA `7ae0f56d53074872b028649617a22bbb4232feb7`). Each CSV carries `# name:`, `# category:`, `# description:`, `# source:` metadata headers; the loader (`paraeq/correction/target_curves.py`) populates these on the `TargetCurve` dataclass.
 
-**Testing:** 128 tests, all passing, ~1.7s runtime. Includes 3 end-to-end integration tests covering measurement → FIR pipeline, measurement → PEQ pipeline, and profile save/load round-trip; 8 tests covering the metadata-headered target curve loader; 6 tests for the interactive-editor library functions (`build_anchor_target` deviation model + `match_closest_target`); and 10 tests for the AutoEq database module (`parse_index`, `parse_parametric_eq` with preamp + shelf aliases, and `AutoEQClient` cache-hit/miss + both filename casings, all with networking mocked via a patched `_http_get`). GUI layers (`app/`) are manual-smoke only (no display in CI).
+**Testing:** `pytest prototype/tests` — all passing, a couple of seconds. No total count recorded here on purpose: the count that used to sit here went stale (it read "128" against an actual 131) and the command prints the real number anyway. Includes 3 end-to-end integration tests covering measurement → FIR pipeline, measurement → PEQ pipeline, and profile save/load round-trip; 8 tests covering the metadata-headered target curve loader; 6 tests for the interactive-editor library functions (`build_anchor_target` deviation model + `match_closest_target`); and 10 tests for the AutoEq database module (`parse_index`, `parse_parametric_eq` with preamp + shelf aliases, and `AutoEQClient` cache-hit/miss + both filename casings, all with networking mocked via a patched `_http_get`). GUI layers (`app/`) are manual-smoke only (no display in CI).
 
 ### Notable Implementation Decisions
 
@@ -104,20 +104,141 @@ These items were specified in the design but not in the executed implementation 
 
 ### Phase 2 (in progress)
 
-In progress. Spec: docs/specs/2026-07-02-rust-port-design.md. Foundation plan: docs/plans/2026-07-02-rust-port-foundation.md. Repo restructured (Python → prototype/), fixtures committed, workspace + desktop scaffold + CI live. Tap spike findings: docs/spikes/2026-07-tap-spike.md. Stage 2 (DSP core) complete (merged 2026-07-06): all pure-DSP modules golden-matched in crates/paraeq-dsp + engine processors in crates/paraeq-engine (see crates/paraeq-dsp/DIVERGENCES.md; fixture oracle pin = scipy 1.18.0 per fixtures/manifest.json). Stage 3 (production tap engine) complete (2026-07-11): `TapBackend` in crates/paraeq-coreaudio behind the engine's `AudioBackend` seam; `EngineController` with a command API + serialized `EngineState` snapshots (arc-swap + subscribe channel); rebuild-on-change driven by CoreAudio property listeners; fail-safe teardown (stop IOProc → destroy aggregate → destroy tap) on every exit path, including catch_unwind+abort in the FFI trampolines. Plan: docs/plans/2026-07-06-rust-port-tap-engine.md — all five stage-2 review carry-forwards landed there too (unified processor output contracts, shelf/notch stability proptests, dsp input-wiring validation, silence watchdog, and the spike's unsafe patterns are now enforced-against in code, not just documented). The engine now fails open (2026-07-12): `NoInputDetected` persisting past `fail_open_after_ms` (default 15 s) triggers the same path as Disable — tap destroyed, un-EQ'd audio restored — publishing `AutoDisabledNoInput`, with retries only via an explicit `Enable` (post-`Running` states `Idle`/`InputSilent` never fail open — pausing music must never disable the EQ). Next: stage 4 — Tauri shell + EQ tab.
+In progress. Spec: docs/specs/2026-07-02-rust-port-design.md. Foundation plan: docs/plans/2026-07-02-rust-port-foundation.md. Repo restructured (Python → prototype/), fixtures committed, workspace + desktop scaffold + CI live. Tap spike findings: docs/spikes/2026-07-tap-spike.md. Stage 2 (DSP core) complete (merged 2026-07-06): all pure-DSP modules golden-matched in crates/paraeq-dsp + engine processors in crates/paraeq-engine (see crates/paraeq-dsp/DIVERGENCES.md; fixture oracle pinned to numpy 2.5.0 + scipy 1.18.0 by prototype/pyproject.toml's `fixtures` extra, enforced by generate_fixtures.py — fixtures/manifest.json only records what ran). Stage 3 (production tap engine) complete (2026-07-11): `TapBackend` in crates/paraeq-coreaudio behind the engine's `AudioBackend` seam; `EngineController` with a command API + serialized `EngineState` snapshots (arc-swap + subscribe channel); rebuild-on-change driven by CoreAudio property listeners; fail-safe teardown (stop IOProc → destroy aggregate → destroy tap) on every exit path, including catch_unwind+abort in the FFI trampolines. Plan: docs/plans/2026-07-06-rust-port-tap-engine.md — all five stage-2 review carry-forwards landed there too (unified processor output contracts, shelf/notch stability proptests, dsp input-wiring validation, silence watchdog, and the spike's unsafe patterns are now enforced-against in code, not just documented). The engine now fails open (2026-07-12): `NoInputDetected` persisting past `fail_open_after_ms` (default 15 s) triggers the same path as Disable — tap destroyed, un-EQ'd audio restored — publishing `AutoDisabledNoInput`, with retries only via an explicit `Enable` (post-`Running` states `Idle`/`InputSilent` never fail open — pausing music must never disable the EQ). Stage 4 (Tauri shell + EQ tab) complete (2026-07-14, implementation + CI-green; AWAITS owner ears-on acceptance before promotion to main — see below): the desktop app (`desktop/src-tauri`) is tray-resident with `tauri-plugin-single-instance` registered first, Regular activation policy (dock icon stays), close-to-hide, and a wizard-gated launch flow so the engine never spawns enabled before the user grants TCC and completes setup. The EQ tab is end-to-end: validated bands (Task 6 consts — `GAIN_LIMIT_DB=30`, `PREAMP_MIN_DB=-30`, `PREAMP_MAX_DB=10`, `Q_MIN=0.1`, `Q_MAX=100` — are the single source of truth; UI clamps mirror them exactly) flow to `SetCorrection`. **Stage-3 carry-forward CLOSED — but in the ENGINE, not the forwarder (updated in Phase A; R1-6, D-10, D-12).** As shipped in stage 4 it was the desktop forwarder that re-validated bands at the new rate and issued `ClearCorrection` on failure. R1-6 moved the whole mechanism inside `paraeq-engine`: `CorrectionConfig::Peq` carries design INTENT and `build_correction(.., stream_rate)` re-derives every band's coefficients at the LIVE rate on every rebuild, dropping only the bands at or above the new Nyquist and refusing (flat pass-through, `EngineState::correction_rate_mismatch` published) only when nothing survives. The desktop designs no SOS at all now, and `eq::resend_decision` is reduced to a fallback for two cases the engine cannot handle alone — a published refusal and the first-ever stream — which `eq::resend_command` answers on the refusal's EDGE, handing the set over whole. It can never clear one: that is the behaviour D-10 ruled against, because a whole-set clear lost the user's entire EQ over a single band above the new Nyquist and, by clearing the flag too, made the loss permanent. Also shipped: AutoEQ import/export plus a seam-mocked DB client (Task 9), a minimal JSON profile store with tray-menu switching (Task 8), and a hand-rolled two-layer-canvas `FrequencyPlot` (drag + wheel, log-frequency grid) since no third-party plot library met the wizard/EQ-tab needs. `Rust owns all state; the UI renders it` end to end: mutations go through typed `invoke` commands in `desktop/src-tauri/src/commands.rs`, and state reaches the UI only via the `app-state` event / `get_app_state`.
 
 **Stage-3 findings and open items (2026-07-11):**
 - Watchdog semantics: `Running` is gated on the first nonzero input block, never on start returning; ~5 s engage tolerance, then `NoInputDetected` — the "check System Audio Recording permission or play some audio" hint, because TCC silent-failure is indistinguishable from silence. `InputSilent` and `Idle` are informational states, never failures.
 - **Hardware finding:** the tap aggregate's IOProc only cycles while the system renders audio — 0 cb/s idle, ~94 cb/s during playback. A frozen callback counter is normal idling (status `Idle`), NOT engine death; rebuilds trigger only on device events (default-output change, device death, format change).
 - Latency (measured, release build, 48 kHz BuiltInSpeakerDevice): 512 frames = 62.3 ms, 256 = 51.6 ms, 128 = 46.3 ms — a ~41 ms fixed tap-path floor. The spec's original 20–30 ms budget (since revised to the measured numbers) is NOT reachable by buffer sizing alone; the measured number is exposed honestly in `EngineState.latency_ms` (SoundSource-style, per the spike obligation). CPU is negligible (IIR ≈0%; 4096-tap min-phase FIR 0.2–0.4%).
 - Dev-loop caveat: unsigned CLI binaries never get the TCC prompt — grant manually (System Settings → Privacy & Security → Screen & System Audio Recording → add the terminal, then fully relaunch it). The dev terminal used for this stage currently runs in silent-zeros mode.
-- **Outstanding manual owner checklist** (needs a TCC-granted, ears-on session): music audibly EQ'd via `cargo run -p paraeq-coreaudio --example tap_engine`; native volume keys + HUD while processing; `--bypass-every` A/B is clean; Ctrl-C restores audio; `kill -9` restores audio; EQ'd audio stays correct (no mic bleed into the tap input) with a mic-capable default output (AirPods / USB headset) — `TapBackend`'s input-stream identification assumes the tap buffers come first (KNOWN LIMITATION doc in `backend.rs`).
+- **Outstanding manual owner checklist** (needs a TCC-granted, ears-on session): music audibly EQ'd via `cargo run -p paraeq-coreaudio --example tap_engine`; native volume keys + HUD while processing; `--bypass-every` A/B is clean; Ctrl-C restores audio; `kill -9` restores audio; with a mic-capable default output (AirPods / USB headset): EQ'd audio stays correct (no mic bleed into the tap input — the aggregate composes its sub-device with `kAudioSubDeviceInputChannelsKey: 0`, `tap.rs::create_aggregate`; hardware test `aggregate_input_carries_only_tap_channels`) AND, on a fresh TCC state (`tccutil reset` first), exactly ONE prompt appears — System Audio Recording — with NO microphone prompt.
 - **Stage-4 carry-forward:** on a sample-rate change the engine republishes state but cannot redesign SOS/FIR coefficients — stage 4 must re-send corrections on rate change. Also: the setup wizard should verify capture with a deterministic probe — play a chime via a helper child process (ParaEQ's own audio is excluded from its tap by design; the hardware tests' `afplay` helper in `crates/paraeq-coreaudio/tests/test_hardware.rs` is the reference) instead of waiting on ambient audio, so `NoInputDetected`/fail-open cleanly distinguishes a missing TCC grant from "nothing playing".
+
+**Deliberate divergences from a literal reading of the spec (recorded for the stage-5 planner):**
+- **Preamp round-trip:** the persisted `settings.json` preamp is a hand-editable file, so `lib.rs` setup clamps it into `[PREAMP_MIN_DB, PREAMP_MAX_DB]` (warning on clamp) and explicitly re-sends `SetGainDb` at startup — the forwarder's first-stream trigger only carries bands, so without this explicit resend the engine would silently run at 0 dB while the UI displayed the persisted value.
+- **Live-rate curve:** the EQ tab's read-only response curve is computed against the engine's *current* sample rate (not a fixed reference rate), so it stays visually accurate across a rate change even though the underlying SOS coefficients are being redesigned server-side. (Updated in Phase A: since R1-6 the redesign is the ENGINE's — `build_correction` at the live `stream_rate` — not `eq::resend_decision`'s.)
+- **Loud-band validation:** no path can push an over-limit band or preamp value into the engine. (Updated in Phase A: D-13 moved the band rules themselves into `paraeq_engine::controller::{validate_band, validate_band_at}`, and the engine's `validate_correction` pre-screen now runs them on EVERY `SetCorrection`, the daemon seam included — a stronger guarantee than the stage-4 enumeration of desktop entry points, which is why the forwarder's own re-send deliberately no longer validates (D-10). `eq::validate_bands` is retained desktop-side purely for the indexed, user-facing message on an EDIT, at the two command call sites; the Task 6 constants are still the single source of truth, now owned by the engine.)
+- **`Q_MIN` subnormal-reject:** `Q_MIN=0.1` validation rejects subnormal/near-zero Q values outright rather than clamping, since a subnormal Q produces a numerically unstable biquad rather than merely an extreme-but-valid one.
+
+**Single-processor contract (decision 26, for the stage-5 planner):** the engine holds exactly one correction slot; the last-applied correction wins. Stage 4 only ever writes PEQ-derived IIR (SOS) into that slot, but the command surface (`SetCorrection`/`ClearCorrection`) is generic — stage 5's live min-phase FIR preview takes the *same* slot via the *same* commands, not a parallel path.
+
+**Deferrals (stated, not dropped):**
+- Spectrum `Channel` + analyzer ring buffer → **stage 6**.
+- Profiles tab UI, WAV impulse storage, and the target editor (anchors + deviation model) → **stage 5**, building on Task 8's store format and Task 9's AutoEQ client (target-side reuse).
+- **Mid-run TCC revocation prompt → post-parity.** TCC grant/revocation state is undetectable at the CoreAudio API level (`status.rs:4-12`); once `Running`, a revocation is indistinguishable from the user simply pausing playback — the engine degrades to `InputSilent`/`Idle`, which deliberately never fails open (auto-disabling on every pause would be a worse failure mode than a rare missed revocation). What ships instead: the pre-start `no_input_detected` hint and the setup wizard's guidance panel (Task 17), plus honest state in the status strip (Task 14). A dedicated revocation prompt needs an OS signal that does not exist today; recorded here so no future session "discovers" this gap and re-litigates it.
+- Accessory mode / template tray icon / autostart / updater / code signing / CSP hardening → **post-parity** (ship-stage concerns, out of scope for functional parity with the prototype).
+
+**Mic-capable default outputs (AirPods, USB headsets) — code fix landed, owner verification outstanding:** the tap aggregate composes its sub-device with `kAudioSubDeviceInputChannelsKey: 0` (`tap.rs::create_aggregate`), so the input buffer list carries only the tap's streams and no stream-identification heuristic is needed (`backend.rs:151-155`; hardware test `aggregate_input_carries_only_tap_channels`). That closed the stage-3 KNOWN LIMITATION in `backend.rs`, which the rescope stack deleted along with it. What remains is the owner's ears-on check (EQ applies cleanly to music, no mic bleed/feedback) plus the fresh-TCC single-prompt check. Stage 4's 12-point acceptance checklist (below) is where those and the remaining stage-3 ears-on items (audible EQ, volume keys + HUD, bypass A/B, Ctrl-C/`kill -9` recovery) finally get exercised in the real app rather than the tap-spike CLI.
+
+**Status (as of the stage-4 branch): implementation-complete and CI-green (fmt/clippy/workspace tests/oracle pytest/frontend build+vitest all pass in this headless session). The 12-point checklist (real hardware + TCC grant + human ears) AWAITS the owner's ears-on acceptance pass before promotion to main** — see the task report / PR description for the full checklist text.
+
+Next: stage 5 — Target editor + profiles (tab UI, WAV impulse storage, target math wiring).
+
+**Integration merge (2026-09-16).** `feature/rust-port-tauri-shell` was merged **as-is** into the rescope stack on `feature/integration` (merge parents: rescope tip `c180658` + shell tip `2752c44`, base `179cd34`). Nothing above was reverted: the desktop app, its Tauri commands and the shell's DSP additions land whole, and the rescope stack's measurement crates (`paraeq-decide`, `paraeq-measure`, room DSP, authority, level ladder, CoreAudio volume + measure aggregate) land whole beside them. Conflict resolutions that changed behavior are recorded in the merge commit and in `crates/paraeq-dsp/DIVERGENCES.md` (#15/#16): `paraeq-dsp`'s `serde` stays an OPTIONAL feature that `desktop/src-tauri`, `paraeq-decide` and — since R1-6 put `EQBand` inside `CorrectionConfig::Peq` — `paraeq-engine` opt into, `FilterType` keeps the UI's snake_case wire format, and the desktop's AutoEQ export moved off the argument-free, fixture-pinned, oracle-parity `export_autoeq_format()` onto an additive variant. (That export was repointed again in Phase A: R1-1 moved it to `export_autoeq_format_with_preamp`, the CASCADE-DERIVED number, per engine-hardening `:117`. `export_autoeq_format_with_preamp_db` — the caller-supplied variant — now has no production caller.) **The `EngineState`/`CorrectionConfig` shape freeze** that the rescope plan's branch strategy imposed while the shell branch was outstanding **is lifted on this branch** — the shell's shapes are now in the trunk of the stack, so changing them is an ordinary change. Still open: the owner's ears-on 12-point acceptance run (above), which gates promotion of this branch to `main`. Rescope staging continues per `docs/plans/2026-07-16-rescope-implementation.md`.
+
+**Hardware checklist addition (2026-09-16), from engine-hardening R1-6.** Add to
+the outstanding manual owner checklist above: **with a +12 dB 1 kHz band live,
+change the device's sample rate in Audio MIDI Setup, sweep the analyzer, and
+confirm the band is still centred at 1 kHz — not 919 Hz.** 44.1 vs 48 kHz is a
+1.088× ratio, so a stale-coefficient install detunes every filter by ~8% and a
+1 kHz band lands at 919 Hz. This is the only check that can falsify R1-6's
+rate-independence claim end to end — the synthetic `paraeq-engine` tests pin the
+refusal and the published `correction_rate_mismatch` flag, but nothing headless
+can hear the detune. Record the result next to the 12-point acceptance run. See
+`docs/specs/2026-07-15-engine-hardening-design.md` R1-6 and
+`docs/decisions/2026-09-16-post-merge-and-stage6-calls.md`.
+
+**Stage-6 rig session — the B0 spike and the B16 verification tests (added
+2026-09-18).** Add to the outstanding manual owner checklist above. These are
+the checks that cannot be made headlessly: they need real devices, the
+microphone TCC grant, and in two places a human watching the screen. Nothing
+here runs in CI (every test is `#[ignore]`d and the spike is an `examples/`
+binary). Run them in this order, in one sitting, from a TCC-granted terminal:
+
+```bash
+# 0. Name the measurement mic, then build both binaries in the SAME profile.
+#    Every rig test and the spike read PARAEQ_MIC_UID and fall back to the
+#    system default input SILENTLY when it is unset -- and a run captured
+#    through the laptop's own microphone looks like a measurement and is not
+#    one. Either export the UID or make the measurement mic the default input.
+#    `cargo test -p paraeq-coreaudio` does NOT build the helper:
+#    paraeq-stimulus depends on paraeq-coreaudio, not the other way round, so
+#    it is not in that package's dependency graph.
+export PARAEQ_MIC_UID=<uid>
+cargo build --release -p paraeq-stimulus
+cargo build --release -p paraeq-coreaudio --examples
+
+# 1. B0, the spike — three questions, one sitting. Select AirPods or a USB
+#    headset as the default output and run `tccutil reset Microphone` first,
+#    or the mic-prompt question cannot be answered. Read the `PROBE ...:` lines.
+cargo run --release -p paraeq-coreaudio --example hal_render_probe -- --bare
+cargo run --release -p paraeq-coreaudio --example hal_render_probe -- --wrapped
+cargo run --release -p paraeq-coreaudio --example hal_render_probe -- --coexist
+
+# 2. B16, the hardware verification tests. One at a time, in this order.
+#    `--release` because the matched filter is O(N*M); `--test-threads 1`
+#    because two taps on one output device is not the topology under test.
+cargo test -p paraeq-coreaudio --release --test test_measure_hardware -- \
+    --ignored --nocapture --test-threads 1 <one test name>
+```
+
+Test order, and what each one is for:
+
+1. `tap_and_measurement_aggregates_coexist_on_one_output_device` — the engine's
+   tap aggregate and the MS-22 measurement aggregate up at once on one default
+   output. **Owner question E6**; on a failure, **E12** picks the fallback.
+   Nothing downstream is meaningful if this fails.
+2. `muted_when_tapped_really_mutes_the_helper` (HW-2) — one number: the 1 kHz
+   tone minus the 300 Hz reference at the microphone, against a designed −18 dB
+   cut. Near 0 dB means the tap did not mute the helper's raw path, which is a
+   safety miss (up to +6 dB over the solve), not a measurement miss.
+3. `helper_audio_really_is_corrected` — **the premise of the whole feature**:
+   the same stimulus played by the helper twice, bypassed and corrected,
+   differing by the designed correction. A HAL fact, not a computation.
+4. `the_render_aggregate_round_trips_across_a_real_helper_run`,
+   `the_render_aggregate_does_not_survive_a_killed_helper`,
+   `the_sigterm_rung_ramps_the_child_and_its_cost_is_recorded` — the private
+   render aggregate's lifecycle across a real child process, including SIGKILL.
+   The SIGTERM test prints that rung's millisecond cost, which **owner question
+   E8** (the acceptable abort budget) needs priced separately.
+5. `the_verification_gates_arm_on_a_genuinely_quiet_machine` — the one-minute
+   experiment behind the ruling that the wizard's "Engine is `Running`" cannot
+   be read literally: the verification pre-roll requires silence, and the
+   watchdog only says `Running` while audio is flowing. If this fails, the gate
+   order downstream is re-derived from here.
+6. `the_full_verification_pass_runs_end_to_end_on_the_rig` — the whole loop
+   through the real seams. Prints the residual, the two-clock fit and the
+   computed `abort_acoustic_budget_ms` rather than asserting them; the
+   acceptance bounds are the owner's (**E8**, **E11**).
+
+What to read: every test writes labelled lines to stderr (`COEXIST:`, `HW-2:`,
+`CORRECTED:`, `ROUNDTRIP:`, `KILLED:`, `SIGTERM:`, `ARMED:`, `PASS:`), and the
+spike writes one `PROBE <question>: PASS|FAIL|OBSERVE` line per question with
+the fallback for each FAIL recorded in the example's own doc comment. Paste
+both into the PR body. The single `OBSERVE` line is the microphone-permission
+question, which no API can answer.
+
+**Post-merge and Stage-6 calls (2026-09-16).** The post-merge queue and Stage 6
+carried ~49 unresolved shape/value questions across the six 2026-07-15 specs.
+They are ruled in `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md`,
+which also reproduces the **thirty-one items escalated to the owner**: E1–E7
+from 2026-09-16 (the verification residual threshold; in-session TCC-failure
+detection; MMM scope and sequencing; the MMM level-safety row; MS-17's
+chain-sensitivity envelope; the tap-aggregate/measure-aggregate coexistence
+spike; and the `fixtures/decide/` freeze sign-off), plus **E2-bis and E8–E31**
+raised while Stage 6 was built — among them E19 (the helper's dependency rule,
+which cannot be honoured as a `cargo tree` property), E17 (the wizard's
+"`Running`" gate), E18/E20 (the two sanctioned non-CoreAudio `unsafe` blocks)
+and E31 (the AutoEq import preamp double-count). **E16 is withdrawn and its
+number retired.** The same record now carries §"Rulings from the Stage-6
+review" — the thirteen R-A/R-B rows the review's fix lanes implement. The
+losing spec text each ruling supersedes was corrected in the same commit. Read
+that record before reopening any decision in those specs.
 
 ## How to Pick Up the Work
 
 1. Read this document, `CLAUDE.md`, the Rust-port spec at `docs/specs/2026-07-02-rust-port-design.md`, and (for Phase-1 history) the original design at `docs/specs/2026-04-22-paraeq-design.md`.
-2. Continue the Rust port: next stage per the spec's port order (stage 4: Tauri shell + EQ tab — stage-4 carry-forward noted above).
+2. Continue the Rust port: next stage per the spec's port order (stage 5: Target editor + profiles — see the stage-4 completion entry above for what it builds on). The live staging is the rescope plan's (`docs/plans/2026-07-16-rescope-implementation.md`), whose 2026-07-15 specs partially supersede that port order; **Stage 6 is built on `feature/pb-int`** (worktree `.worktrees/pb-int`, forked from `feature/integration`), and that is the branch to fork from for Stage-6 work. `main` is untouched pending the owner's ears-on run.
 3. Use the brainstorming → writing-plans → subagent-driven-development workflow for substantial new work. Smaller fixes can be done directly.
 4. Each major change should follow TDD where possible (DSP changes definitely; GUI changes by manual smoke test since no display in CI).
 

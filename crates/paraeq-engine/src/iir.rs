@@ -24,6 +24,41 @@ impl IIRProcessor {
         self.channels[channel] = Some(ChannelState { sos, zi });
     }
 
+    /// Number of channel slots configured via [`set_sos`](Self::set_sos).
+    pub fn channels(&self) -> usize {
+        self.channels.len()
+    }
+
+    /// Transplant per-channel delay state from `old` -- the outgoing
+    /// processor on a coefficient swap -- so this cascade continues where
+    /// the old one left off instead of restarting from zero (an audible
+    /// step on every band edit otherwise; spec R1-7a). Per channel:
+    /// sections beyond the old cascade's length are zeroed; state beyond
+    /// the new cascade's length is discarded. Realtime-safe: bounded
+    /// copies into `zi` already sized by [`set_sos`](Self::set_sos), no
+    /// allocation.
+    pub fn adopt_state_from(&mut self, old: &IIRProcessor) {
+        for (new_ch, old_ch) in self.channels.iter_mut().zip(old.channels.iter()) {
+            let (Some(new_state), Some(old_state)) = (new_ch.as_mut(), old_ch.as_ref()) else {
+                continue;
+            };
+            let carried = new_state.zi.len().min(old_state.zi.len());
+            new_state.zi[..carried].copy_from_slice(&old_state.zi[..carried]);
+            for z in &mut new_state.zi[carried..] {
+                *z = [0.0; 2];
+            }
+        }
+    }
+
+    /// The SOS rows installed for `channel`, if any. Control-plane
+    /// introspection (tests, telemetry); never called on the realtime path.
+    pub fn sos(&self, channel: usize) -> Option<&[[f64; 6]]> {
+        self.channels
+            .get(channel)
+            .and_then(Option::as_ref)
+            .map(|state| state.sos.as_slice())
+    }
+
     /// Filter one block per channel in place, with persistent per-channel state.
     ///
     /// Each `input[ch]` is filtered by the cascaded-biquad state for that
