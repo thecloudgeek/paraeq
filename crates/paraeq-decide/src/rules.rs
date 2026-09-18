@@ -50,7 +50,8 @@
 use crate::analysis::{fdw_post_ceiling, realized_preamp_db, AnalysisProducts, Geometry};
 use crate::bundle::{CalVariant, MeasurementBundle};
 use crate::decision::{
-    Decision, Domain, Evidence, EvidenceLabel, Invalidation, Rationale, Source, Unit,
+    ClampIntoDomain, Decision, Domain, Evidence, EvidenceLabel, Invalidation, Rationale, Source,
+    Unit,
 };
 use crate::decisions::{
     AuthorityPreset, CorrectionForm, Decisions, QCapPolicy, TargetChoice, WindowType,
@@ -226,20 +227,25 @@ fn with_evidence<T>(mut d: Decision<T>, evidence: Vec<Evidence>) -> Decision<T> 
 /// idempotence property mechanical rather than disciplinary: overriding to the
 /// value auto already chose reaches exactly one field.
 ///
-/// **NOT IMPLEMENTED HERE: § D-N, the out-of-domain override.** The ruling is
-/// "clamp into the domain, set `source: UserOverride` with the clamped value,
-/// and emit `DiagnosticCode::OverrideOutOfDomain` at `Severity::Warn`, naming
-/// the decision and both numbers", and the code exists
-/// (`DiagnosticCode::OverrideOutOfDomain = 25`). It is not here because
-/// clamping is per-type — a band clamps element-wise, a `Choice` has no nearest
-/// legal value at all — and because it is flagged `OPEN [DESIGN]` rather than
-/// settled. Whoever lands it lands it HERE, in this function, and pins it with
-/// a test that an out-of-domain override arrives clamped and warned rather than
-/// obeyed. Until then an override is taken as given.
-fn resolve<T: Clone>(mut d: Decision<T>, over: Option<&T>) -> Decision<T> {
+/// **§ D-N lands here, and only here** (ruling R-A6). An override that arrives
+/// outside its decision's `Domain` is CLAMPED into it — never obeyed, never
+/// ignored. `decide()` has no `Result`, so those were the only two
+/// alternatives, and silently ignoring the user's intent recreates the "second,
+/// lying source of truth about what the app did" this design exists to prevent.
+///
+/// Clamping is per type, which is why it is a trait rather than an `if` here: a
+/// scalar clamps to its range's ends, a band clamps PER EDGE (the pair compares
+/// per edge, so clamping it as a tuple would leave one edge outside), and a
+/// `Choice` has no nearest legal value at all — "halfway between `Hann` and
+/// `Rect`" is not a window — so it falls back to the value this rule decided.
+/// See [`ClampIntoDomain`].
+///
+/// The diagnostic half is `refusal::override_out_of_domain`, which reports the
+/// number that was USED so the drawer's margin display is real.
+fn resolve<T: ClampIntoDomain>(mut d: Decision<T>, over: Option<&T>) -> Decision<T> {
     if let Some(value) = over {
+        d.value = value.clone().clamp_into_domain(&d.domain, &d.value);
         d.source = Source::UserOverride;
-        d.value = value.clone();
     }
     d
 }

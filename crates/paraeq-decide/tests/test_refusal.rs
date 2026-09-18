@@ -759,9 +759,12 @@ fn an_ears_cal_variant_warns_that_a_target_is_already_baked_in() {
 // The override row
 // ---------------------------------------------------------------------------
 
-/// D-N: an override outside its decision's `Domain` is surfaced rather than
-/// silently obeyed or silently dropped, and it names the decision and the
-/// range it missed.
+/// D-N: an override outside its decision's `Domain` is CLAMPED into it and the
+/// row says so, naming the decision, the number asked for and the number used.
+///
+/// Ruling R-A6 moved `Diagnostic::value` from the requested number to the
+/// clamped one: the drawer's margin display is about what the run did, and the
+/// requested number is already in the sentence.
 #[test]
 fn an_override_outside_its_domain_warns_and_names_both_numbers() {
     let mut bundle = clean();
@@ -769,10 +772,20 @@ fn an_override_outside_its_domain_warns_and_names_both_numbers() {
     let set = decide(&bundle);
     let diagnostic = only_diagnostic(&set, DiagnosticCode::OverrideOutOfDomain);
     assert_eq!(diagnostic.severity, Severity::Warn);
-    assert_eq!(diagnostic.value, Some(1000.0));
+    assert_eq!(
+        diagnostic.value,
+        Some(400.0),
+        "the row carries the number that was USED, not the one that was asked for"
+    );
+    assert_eq!(set.decisions.transition_hz.value, 400.0);
     assert!(diagnostic.remedy.contains("transition_hz"));
     assert!(diagnostic.remedy.contains("1000"));
     assert!(diagnostic.remedy.contains("400"));
+    assert!(
+        !diagnostic.remedy.contains("We used it as asked"),
+        "{}",
+        diagnostic.remedy
+    );
     assert_eq!(set.verdict, Verdict::ProceedWithWarnings);
 
     let mut inside = clean();
@@ -783,11 +796,15 @@ fn an_override_outside_its_domain_warns_and_names_both_numbers() {
     ));
 
     // A `Choice` domain answers the same question: `Gaussian` is representable
-    // on the merged smoothing type and is not on the decision table's list.
+    // on the merged smoothing type and is not on the decision table's list. It
+    // has no nearest legal value, so the fallback is the rule's own.
     let mut off_list = clean();
     off_list.overrides.smoothing = Some(paraeq_decide::SmoothingMode::Gaussian { fraction: 0.5 });
-    assert!(has_code(
-        &decide(&off_list),
-        DiagnosticCode::OverrideOutOfDomain
-    ));
+    let off = decide(&off_list);
+    assert!(has_code(&off, DiagnosticCode::OverrideOutOfDomain));
+    assert_eq!(
+        off.decisions.smoothing.value,
+        decide(&clean()).decisions.smoothing.value,
+        "an illegal Choice falls back to what the rule decided"
+    );
 }

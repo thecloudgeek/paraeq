@@ -3,6 +3,8 @@
 //! invalidation tier an override triggers. Every parameter a competitor asks
 //! or hardcodes is one of these.
 
+use crate::decisions::{AuthorityPreset, CorrectionForm, TargetChoice, WindowType};
+use crate::profile::{AveragingMode, SmoothingMode};
 use paraeq_dsp::authority::QCapPolicy;
 use paraeq_dsp::targets::TransducerClass;
 use serde::{Deserialize, Serialize};
@@ -153,6 +155,106 @@ impl<T: InRange + PartialEq> Domain<T> {
         }
     }
 }
+
+/// § D-N's half of an out-of-domain override: bring the requested value INSIDE
+/// the domain rather than obeying it or ignoring it.
+///
+/// `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md` § D-N, verbatim:
+/// "**Clamp into the domain, set `source: UserOverride` with the clamped value,
+/// and emit `DiagnosticCode::OverrideOutOfDomain` at `Severity::Warn`**, naming
+/// the decision and both numbers." `decide()` has no `Result`, so the only two
+/// candidates were clamp-and-warn and ignore-and-keep-Auto, and silently
+/// ignoring the user's intent recreates exactly the "second, lying source of
+/// truth about what the app did" this design exists to prevent.
+///
+/// **The default is the `Choice` rule, because a `Choice` has no nearest legal
+/// value.** "Halfway between `Hann` and `Rect`" is not a window, so an illegal
+/// choice falls back to the value the RULE decided — never to an invented
+/// member of the list, and never to the first one, which would be
+/// alphabetical-order-as-policy. Scalars, bands and counts override this with a
+/// real clamp; see the impls below.
+///
+/// `source` stays `UserOverride` either way: the value moved and the intent did
+/// not, and the row the refusal table emits is what tells the user which is
+/// which.
+pub trait ClampIntoDomain: Clone + InRange + PartialEq + Sized {
+    fn clamp_into_domain(self, domain: &Domain<Self>, rule_value: &Self) -> Self {
+        if domain.contains(&self) {
+            self
+        } else {
+            rule_value.clone()
+        }
+    }
+}
+
+/// A scalar clamps to the `Range`'s own ends.
+///
+/// A non-finite request falls back to the rule's value rather than clamping:
+/// `f64::clamp` propagates NaN, so clamping one would leave the decision
+/// carrying a NaN that `serde_json` then writes as `null`.
+impl ClampIntoDomain for f64 {
+    fn clamp_into_domain(self, domain: &Domain<Self>, rule_value: &Self) -> Self {
+        match domain {
+            Domain::Range { max, min, .. } if self.is_finite() && min <= max => {
+                self.clamp(*min, *max)
+            }
+            _ if domain.contains(&self) => self,
+            _ => *rule_value,
+        }
+    }
+}
+
+/// A count clamps to the `Range`'s own ends.
+impl ClampIntoDomain for usize {
+    fn clamp_into_domain(self, domain: &Domain<Self>, rule_value: &Self) -> Self {
+        match domain {
+            Domain::Range { max, min, .. } if min <= max => self.clamp(*min, *max),
+            _ if domain.contains(&self) => self,
+            _ => *rule_value,
+        }
+    }
+}
+
+/// A band clamps **per edge**, for the same reason [`InRange`] compares per
+/// edge: a band is two independent numbers, and clamping the pair as a tuple
+/// would leave one edge outside the domain whenever the other settled the
+/// comparison first.
+impl ClampIntoDomain for (f64, f64) {
+    fn clamp_into_domain(self, domain: &Domain<Self>, rule_value: &Self) -> Self {
+        match domain {
+            Domain::Range { max, min, .. } => (
+                self.0.clamp_into_domain(
+                    &Domain::Range {
+                        max: max.0,
+                        min: min.0,
+                        step: None,
+                    },
+                    &rule_value.0,
+                ),
+                self.1.clamp_into_domain(
+                    &Domain::Range {
+                        max: max.1,
+                        min: min.1,
+                        step: None,
+                    },
+                    &rule_value.1,
+                ),
+            ),
+            _ if domain.contains(&self) => self,
+            _ => *rule_value,
+        }
+    }
+}
+
+impl ClampIntoDomain for AuthorityPreset {}
+impl ClampIntoDomain for CorrectionForm {}
+impl ClampIntoDomain for QCapPolicy {}
+impl ClampIntoDomain for SmoothingMode {}
+impl ClampIntoDomain for TargetChoice {}
+impl ClampIntoDomain for TransducerClass {}
+impl ClampIntoDomain for WindowType {}
+impl ClampIntoDomain for bool {}
+impl ClampIntoDomain for AveragingMode {}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Source {

@@ -22,7 +22,7 @@ use common::{
     assert_every_value_in_domain, assert_refusal_is_consistent, minimal_bundle, synthetic_bundle,
     well_formed_bundle, with_override, SyntheticSpec, EVERY_CLASS,
 };
-use paraeq_decide::{decide, Source, TransducerClass};
+use paraeq_decide::{decide, DiagnosticCode, Domain, Severity, Source, TransducerClass, Verdict};
 
 /// The cheapest, fastest-failing guard on "no clock, no RNG, no I/O". A
 /// `decide()` that read any of the three would disagree with itself here.
@@ -69,6 +69,130 @@ fn every_decision_value_is_inside_its_domain() {
         let set = decide(&well_formed_bundle(class));
         assert_every_value_in_domain(&set.decisions, class);
     }
+}
+
+/// Every out-of-domain override the drawer can write, clamped and in-domain.
+///
+/// Ruling R-A6 makes § D-N's clamp real, so the domain invariant now has to
+/// hold under OVERRIDES as well as under the rules — which is the case that
+/// matters, because the rules produce their own values and the drawer does not.
+///
+/// The values below are each outside their decision's own domain in the
+/// direction the drawer can actually reach: a slider dragged past its end, a
+/// band with one edge off the grid, a `Choice` written by hand. `positions_n`
+/// is excluded for the reason the table excludes it everywhere — the rule
+/// ECHOES the accepted count and a `TooFewPositions` refusal is about that
+/// number — but the OVERRIDE of it is still clamped, which is what this test
+/// asserts for it.
+#[test]
+fn every_decision_value_is_inside_its_domain_under_overrides_too() {
+    let out_of_domain: &[(&str, serde_json::Value)] = &[
+        ("align_spl_band", serde_json::json!([10.0, 99_999.0])),
+        ("correction_range", serde_json::json!([0.5, 99_999.0])),
+        ("fdw_post_cycles", serde_json::json!(999.0)),
+        ("fdw_pre_cycles", serde_json::json!(0.25)),
+        ("flatness_target_db", serde_json::json!(50.0)),
+        ("left_window_ms", serde_json::json!(-5.0)),
+        ("max_filters", serde_json::json!(500)),
+        ("positions_n", serde_json::json!(9_999)),
+        ("right_window_ms", serde_json::json!(5.0)),
+        ("transition_hz", serde_json::json!(20_000.0)),
+        ("window_type", serde_json::json!({ "Tukey": 0.99 })),
+    ];
+
+    for class in EVERY_CLASS {
+        let bundle = well_formed_bundle(class);
+        for (id, value) in out_of_domain {
+            let set = decide(&with_override(&bundle, id, value.clone()));
+            assert_every_value_in_domain(&set.decisions, class);
+            let view = set
+                .decisions
+                .iter()
+                .find(|v| v.id == *id)
+                .expect("every id names a decision");
+            assert_eq!(
+                view.source,
+                Source::UserOverride,
+                "{class:?}/{id}: the clamp must not un-record the user's intent"
+            );
+            assert_ne!(
+                view.value, *value,
+                "{class:?}/{id}: an out-of-domain override was taken as given"
+            );
+            assert!(
+                set.diagnostics.iter().any(
+                    |d| d.code == DiagnosticCode::OverrideOutOfDomain && d.remedy.contains(*id)
+                ),
+                "{class:?}/{id}: clamped without saying so; diagnostics {:?}",
+                set.diagnostics
+            );
+        }
+    }
+}
+
+/// § D-N, end to end and on one decision, with the numbers spelled out.
+///
+/// Ruling R-A6. Before it, `resolve` took an override verbatim and the row's
+/// remedy said "We used it as asked" — which was true, and was the bug: the
+/// domain invariant the spec ranks above the golden bundles was false for any
+/// out-of-domain override, and the user was told the app had done something it
+/// must not do.
+#[test]
+fn an_out_of_domain_override_arrives_clamped_and_warned() {
+    let bundle = well_formed_bundle(TransducerClass::Bookshelf);
+    let auto = decide(&bundle);
+    let ceiling = match auto.decisions.fdw_post_cycles.domain {
+        Domain::Range { max, .. } => max,
+        ref other => panic!("fdw_post_cycles is a Range, got {other:?}"),
+    };
+
+    let set = decide(&with_override(
+        &bundle,
+        "fdw_post_cycles",
+        serde_json::json!(999.0),
+    ));
+    let decided = &set.decisions.fdw_post_cycles;
+    assert_eq!(
+        decided.value, ceiling,
+        "clamped to the domain's own ceiling"
+    );
+    assert_eq!(decided.source, Source::UserOverride);
+
+    let warning = set
+        .diagnostics
+        .iter()
+        .find(|d| d.code == DiagnosticCode::OverrideOutOfDomain)
+        .expect("§ D-N emits the row");
+    assert_eq!(warning.severity, Severity::Warn);
+    assert_eq!(
+        warning.value,
+        Some(ceiling),
+        "the row reports the number that was USED, so the drawer's margin is real"
+    );
+    assert!(warning.remedy.contains("999"), "{}", warning.remedy);
+    assert!(
+        !warning.remedy.contains("We used it as asked"),
+        "the copy must not claim the override was obeyed: {}",
+        warning.remedy
+    );
+    assert_eq!(
+        set.verdict,
+        Verdict::ProceedWithWarnings,
+        "a clamped override is a warning, never a refusal"
+    );
+
+    // A Choice cannot be clamped toward anything, so it falls back to the
+    // rule's own value — never to an invented member of the list.
+    let choice = decide(&with_override(
+        &bundle,
+        "window_type",
+        serde_json::json!({ "Tukey": 0.99 }),
+    ));
+    assert_eq!(
+        choice.decisions.window_type.value, auto.decisions.window_type.value,
+        "an illegal Choice falls back to what the rule decided"
+    );
+    assert_eq!(choice.decisions.window_type.source, Source::UserOverride);
 }
 
 /// "`None` iff `verdict == Refuse`" — an installable correction and a refusal

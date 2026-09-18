@@ -956,56 +956,56 @@ fn override_out_of_domain(bundle: &MeasurementBundle, decisions: &Decisions) -> 
         "fdw_post_cycles",
         over.fdw_post_cycles.as_ref(),
         &decisions.fdw_post_cycles,
-        over.fdw_post_cycles,
+        Some(decisions.fdw_post_cycles.value),
     );
     row(
         &mut out,
         "fdw_pre_cycles",
         over.fdw_pre_cycles.as_ref(),
         &decisions.fdw_pre_cycles,
-        over.fdw_pre_cycles,
+        Some(decisions.fdw_pre_cycles.value),
     );
     row(
         &mut out,
         "flatness_target_db",
         over.flatness_target_db.as_ref(),
         &decisions.flatness_target_db,
-        over.flatness_target_db,
+        Some(decisions.flatness_target_db.value),
     );
     row(
         &mut out,
         "left_window_ms",
         over.left_window_ms.as_ref(),
         &decisions.left_window_ms,
-        over.left_window_ms,
+        Some(decisions.left_window_ms.value),
     );
     row(
         &mut out,
         "low_corner_hz",
         over.low_corner_hz.as_ref(),
         &decisions.low_corner_hz,
-        over.low_corner_hz,
+        Some(decisions.low_corner_hz.value),
     );
     row(
         &mut out,
         "max_filters",
         over.max_filters.as_ref(),
         &decisions.max_filters,
-        over.max_filters.map(|v| v as f64),
+        Some(decisions.max_filters.value as f64),
     );
     row(
         &mut out,
         "positions_n",
         over.positions_n.as_ref(),
         &decisions.positions_n,
-        over.positions_n.map(|v| v as f64),
+        Some(decisions.positions_n.value as f64),
     );
     row(
         &mut out,
         "preamp_db",
         over.preamp_db.as_ref(),
         &decisions.preamp_db,
-        over.preamp_db,
+        Some(decisions.preamp_db.value),
     );
     row(
         &mut out,
@@ -1019,7 +1019,7 @@ fn override_out_of_domain(bundle: &MeasurementBundle, decisions: &Decisions) -> 
         "right_window_ms",
         over.right_window_ms.as_ref(),
         &decisions.right_window_ms,
-        over.right_window_ms,
+        Some(decisions.right_window_ms.value),
     );
     row(
         &mut out,
@@ -1047,7 +1047,7 @@ fn override_out_of_domain(bundle: &MeasurementBundle, decisions: &Decisions) -> 
         "transition_hz",
         over.transition_hz.as_ref(),
         &decisions.transition_hz,
-        over.transition_hz,
+        Some(decisions.transition_hz.value),
     );
     row(
         &mut out,
@@ -1059,9 +1059,17 @@ fn override_out_of_domain(bundle: &MeasurementBundle, decisions: &Decisions) -> 
     out
 }
 
-/// One decision's out-of-domain check. `value` is the requested number where the
-/// decision has one; a band or an enum has none, and inventing a stand-in would
-/// put a number in the drawer's margin display that means nothing.
+/// One decision's out-of-domain check. `value` is the CLAMPED number where the
+/// decision has one — the number that was actually used — so the drawer's
+/// margin display means something; a band or an enum has none, and inventing a
+/// stand-in would put a number there that means nothing.
+///
+/// **Ruling R-A6 moved both the number and the sentence.** Until § D-N's clamp
+/// landed in `rules::resolve` the override WAS taken as given, `value` carried
+/// the requested number and the remedy said "We used it as asked" — all three
+/// consistent, and all three describing behaviour the ruling forbids. The
+/// remedy now names what was asked for AND what was used, which are two
+/// different numbers exactly when this row fires.
 fn row<T>(
     out: &mut Vec<Diagnostic>,
     id: &str,
@@ -1077,12 +1085,14 @@ fn row<T>(
     }
     let asked = render(requested);
     let legal = describe(&decided.domain);
+    let used = render(&decided.value);
     out.push(Diagnostic {
         code: DiagnosticCode::OverrideOutOfDomain,
         position: None,
         remedy: format!(
             "The Advanced drawer set {id} to {asked}, which is outside what this measurement \
-             supports ({legal}). We used it as asked; pick a value inside that range instead."
+             supports ({legal}). We used {used} instead — the closest value this measurement \
+             supports."
         ),
         severity: Severity::Warn,
         value,

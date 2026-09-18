@@ -499,8 +499,18 @@ fn residual_outside_the_authority_band_does_not_refuse() {
 /// plot it, never gate on it."
 #[test]
 fn residual_vs_target_is_reported_but_never_gates() {
+    // A DEEP, WIDE cut, not the 4 dB one the other tests use: the point of the
+    // second half below is that `residual_vs_target` sits past the gate and is
+    // still not compared to it, and `flatness_target_db`'s domain floor is 0.5
+    // (gate 1.0) — so the number that has to clear the gate is this one, and it
+    // has to be made to.
     let bundle = verified_bundle(&VerifiedSpec {
-        bands: vec![cut_4db()],
+        bands: vec![vec![EQBand {
+            filter_type: FilterType::Peaking,
+            fc: 500.0,
+            gain_db: -12.0,
+            q: 0.5,
+        }]],
         ..VerifiedSpec::default()
     });
     let set = decide(&bundle);
@@ -535,10 +545,21 @@ fn residual_vs_target_is_reported_but_never_gates() {
     // And it does not gate even when it is well past the threshold: tightening
     // the flatness target moves the GATE and therefore the prediction residual's
     // verdict, never this one.
+    //
+    // 0.5 is the BOTTOM of `flatness_target_db`'s own domain, not an arbitrary
+    // small number: since ruling R-A6 an out-of-domain override is clamped, so
+    // asking for 0.2 would silently be answered with 0.5 anyway and the test
+    // would be asserting against a number it did not choose.
     let mut tightened = bundle.clone();
-    tightened.overrides.flatness_target_db = Some(0.2);
+    tightened.overrides.flatness_target_db = Some(0.5);
     let tight = decide(&tightened);
-    assert!(vs_target.1 > tight.verification.as_ref().expect("carried").gate_db);
+    let tight_gate = tight.verification.as_ref().expect("carried").gate_db;
+    assert_eq!(tight_gate, 2.0 * 0.5, "the gate followed the override down");
+    assert!(
+        vs_target.1 > tight_gate,
+        "vs_target {} against the tightened gate {tight_gate}",
+        vs_target.1
+    );
     assert!(!has_code(&tight, DiagnosticCode::VerificationResidual));
 }
 
