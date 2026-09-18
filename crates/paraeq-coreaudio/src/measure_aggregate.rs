@@ -756,9 +756,9 @@ pub struct StimulusOutput {
     capacity: usize,
     /// A paced [`paraeq_measure::StimulusSink::emit`] gave up on a device that
     /// stopped consuming. It is the ONE state in which `stop`'s drain must be
-    /// skipped: waiting [`STALL_SECONDS`] again for a ring that is provably
-    /// not moving only delays the teardown, and the teardown is what restores
-    /// the pre-measurement volume.
+    /// skipped entirely: the ring is provably not moving, so even the short
+    /// [`STOP_DRAIN_MAX_MS`] would be spent for nothing, and what it delays is
+    /// the teardown that restores the pre-measurement volume.
     device_stalled: bool,
     format: StreamFormat,
     inner: Arc<StimulusInner>,
@@ -830,9 +830,9 @@ impl paraeq_measure::StimulusSink for StimulusOutput {
             if written >= block.len() {
                 break;
             }
-            // A stall is remembered, not just reported: `stop` must not wait
-            // out a second STALL_SECONDS on a ring that is provably not
-            // moving (see `device_stalled`).
+            // A stall is remembered, not just reported: `stop` must not spend
+            // even its short drain on a ring that is provably not moving (see
+            // `device_stalled`).
             if let Err(e) = stall.observe(written != before) {
                 self.device_stalled = true;
                 return Err(e);
@@ -872,26 +872,35 @@ impl paraeq_measure::StimulusSink for StimulusOutput {
     /// silences anything the drain could not place — a device that stalled
     /// inside this very wait — so no sample at level can reach the DAC after
     /// the session lets go.
+    ///
+    /// **The drain has its own bound, [`STOP_DRAIN_MAX_MS`], not
+    /// [`STALL_SECONDS`].** `stop` runs ahead of the volume restore on every
+    /// abort and on panic unwind, so its wait is how long the user can be left
+    /// at measurement volume; a device that dies between the ramp emit and
+    /// this call keeps `is_abandoned()` false and would otherwise hold that
+    /// for two seconds. Past the bound the queue is silenced and teardown
+    /// continues — a partial ramp beats a system left loud.
     fn stop(&mut self) -> Result<(), MeasureError> {
         self.stopped = true;
         if !self.device_stalled {
-            let mut stall = StallGuard::new(&self.format);
-            let mut previous = self.queued_frames();
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_millis(STOP_DRAIN_MAX_MS);
+            let sleep = block_sleep(&self.format);
             while self.queued_frames() > 0 {
                 // The consumer is gone, so nothing will ever take these.
                 if self.producer.is_abandoned() {
                     break;
                 }
-                let now = self.queued_frames();
-                if stall.observe(now < previous).is_err() {
+                if std::time::Instant::now() >= deadline {
                     log::error!(
-                        "stimulus stop: the output device stopped consuming with {now} frames of \
-                         the abort ramp still queued; flushing them so teardown can restore the \
-                         pre-measurement volume"
+                        "stimulus stop: the output device did not take the last {} frames of the \
+                         abort ramp within {STOP_DRAIN_MAX_MS} ms; flushing them so teardown can \
+                         restore the pre-measurement volume",
+                        self.queued_frames()
                     );
                     break;
                 }
-                previous = now;
+                std::thread::sleep(sleep);
             }
         }
         self.inner.flush.store(true, Ordering::Relaxed);
@@ -910,6 +919,48 @@ impl paraeq_measure::StimulusSink for StimulusOutput {
 /// is defined as this bound. `pub const` on the associated const would have
 /// leaked the private type.
 pub const STALL_SECONDS: f64 = 2.0;
+
+/// How long a `stop` may spend draining what is already queued before it
+/// flushes the rest and tears down anyway, milliseconds.
+///
+/// **A SECOND bound, deliberately, and much smaller than [`STALL_SECONDS`].**
+/// The two answer different questions. `emit`/`write` asks "is this device
+/// still taking audio at all?", and a slow-but-alive device deserves the full
+/// two seconds. `stop` asks "will the last block land *before the teardown
+/// ladder runs out of patience*?", and there the clock belongs to somebody
+/// else:
+///
+/// - In the helper CHILD, the parent's rung 1a gives the whole teardown
+///   `ramp budget + HELPER_TEARDOWN_ALLOWANCE_MS` (~21 ms + 1500 ms), then
+///   SIGTERM, then `sigterm_deadline_ms` (250 ms) before SIGKILL — about
+///   1771 ms from the abort. A drain bounded by `STALL_SECONDS` outlives that:
+///   a device that stops consuming AFTER the last paced write (device death in
+///   the ~11 ms between the ramp write and `stop`) leaves ≤ 1 block queued
+///   with `is_abandoned()` still false, because the consumer lives inside the
+///   IOProc box until `io.stop()`. The child would then sit in the drain for
+///   2000 ms and be SIGKILLed mid-drain, leaking the private render aggregate
+///   onto the user's output device — the exact outcome the drain exists to
+///   prevent. The drain must also leave room for what follows it:
+///   `AudioDeviceStop` + `AudioDeviceDestroyIOProcID` +
+///   `AudioHardwareDestroyAggregateDevice`.
+/// - In-process, `stop` precedes the volume restore on every abort
+///   (`OutputDeviceChanged`, `MicDisconnected`) and on panic unwind, so its
+///   bound is how long the user can be left at measurement volume.
+///
+/// 250 ms is sized off what a SUCCESSFUL write guarantees rather than off the
+/// ring: the pacing loop returns only once the queue is back within one block,
+/// so a healthy device needs ONE block period — 10.7 ms at the production
+/// 512-frame/48 kHz geometry — and 250 ms is ~23 of those. It stays ≥ 2 block
+/// periods out to a 4096-frame block, and it is 1/6th of
+/// `HELPER_TEARDOWN_ALLOWANCE_MS`, which leaves the HAL teardown calls the
+/// rest. Past it the queue is flushed to silence and teardown continues: **a
+/// partial ramp beats a leaked device.**
+///
+/// This is a ceiling on elapsed time, not a stall count — a device dribbling
+/// one frame per poll would reset a progress-based bound forever, and the
+/// ladder does not care why the drain is slow. The loop can overshoot it by at
+/// most one `block_sleep` (≤ 50 ms), which the numbers above absorb.
+pub const STOP_DRAIN_MAX_MS: u64 = 250;
 
 /// Bounds how long [`StimulusOutput::emit`] will wait on a device that has
 /// stopped consuming.
@@ -1276,6 +1327,32 @@ mod tests {
         vec![0.0f32; 8]
     }
 
+    /// Block sizes the stop-path proofs run at, all at 48 kHz.
+    ///
+    /// 8 frames alone was not enough: `block_sleep` clamps to its 100 µs floor
+    /// there (8/48 kHz/4 = 41.7 µs), so the poll arithmetic that actually runs
+    /// in production — 512 frames is 2.67 ms a poll, 128 frames is 667 µs —
+    /// was never exercised on a real ring, and neither was the product
+    /// geometry these paths are sized against.
+    const STOP_DRAIN_GEOMETRIES: [usize; 3] = [8, 128, 512];
+
+    /// Slack over [`STOP_DRAIN_MAX_MS`] for the drain-bound assertions: the
+    /// loop can overshoot by one `block_sleep` (≤ 50 ms) and a loaded test
+    /// machine adds scheduler jitter. Still far below the 2 s the drain used
+    /// to take, which is the failure being pinned.
+    const STOP_DRAIN_SLACK_MS: u64 = 500;
+
+    /// One block of stimulus still at level, then the abort ramp — what
+    /// `emit`'s pacing loop leaves in the ring when `ramp_down` hands over the
+    /// padded 5 ms envelope.
+    fn residual_then_ramp(frames: usize) -> (Vec<f32>, Vec<f32>) {
+        let residual = vec![0.9f32; frames];
+        let ramp = (0..frames)
+            .map(|i| 0.8 * (1.0 - i as f32 / frames as f32))
+            .collect();
+        (residual, ramp)
+    }
+
     #[test]
     fn the_stimulus_is_pulled_once_per_frame_not_once_per_sample() {
         // The DGR Labs layout gotcha, as a rate bug: a stereo stream can arrive
@@ -1505,83 +1582,150 @@ mod tests {
         // last chunk that block IS the padded 5 ms envelope. Arming the flush
         // there dropped the whole ramp, so the last sample the device rendered
         // was one at level — the full-scale click the fade exists to prevent.
+        //
+        // Run at every geometry in STOP_DRAIN_GEOMETRIES: at 8 frames
+        // `block_sleep` sits on its 100 µs floor, so the poll arithmetic the
+        // production 512-frame block actually uses was otherwise unproven.
         use paraeq_measure::StimulusSink as _;
 
-        const FRAMES: usize = 8;
-        let format = StreamFormat {
-            channels: 1,
-            frames_per_block: FRAMES,
-            sample_rate_hz: 48_000.0,
-        };
-        let capacity = FRAMES * 8;
-        let (producer, consumer) = RingBuffer::<f32>::new(capacity);
-        let inner = Arc::new(StimulusInner::default());
-        let mut path = StimulusPath {
-            consumer,
-            inner: Arc::clone(&inner),
-            routing: StimulusRouting::Both,
-        };
-        let mut sink = StimulusOutput {
-            capacity,
-            device_stalled: false,
-            format: format.clone(),
-            inner: Arc::clone(&inner),
-            producer,
-            stopped: false,
-        };
+        for frames in STOP_DRAIN_GEOMETRIES {
+            let format = StreamFormat {
+                channels: 1,
+                frames_per_block: frames,
+                sample_rate_hz: 48_000.0,
+            };
+            let capacity = frames * 8;
+            let (producer, consumer) = RingBuffer::<f32>::new(capacity);
+            let inner = Arc::new(StimulusInner::default());
+            let mut path = StimulusPath {
+                consumer,
+                inner: Arc::clone(&inner),
+                routing: StimulusRouting::Both,
+            };
+            let mut sink = StimulusOutput {
+                capacity,
+                device_stalled: false,
+                format,
+                inner: Arc::clone(&inner),
+                producer,
+                stopped: false,
+            };
 
-        // What the pacing loop leaves behind: a block still at level, then the
-        // ramp.
-        let residual = [0.9f32; FRAMES];
-        let ramp: Vec<f32> = (0..FRAMES)
-            .map(|i| 0.8 * (1.0 - i as f32 / FRAMES as f32))
-            .collect();
-        for &v in residual.iter().chain(ramp.iter()) {
-            sink.producer.push(v).expect("the ring is deep enough");
-        }
-
-        // The device, on its own thread, one mono block at a time.
-        let halt = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let device_halt = Arc::clone(&halt);
-        let device = std::thread::spawn(move || {
-            let mut played: Vec<f32> = Vec::new();
-            while !device_halt.load(Ordering::Relaxed) {
-                let mut storage = [0.0f32; FRAMES];
-                let mut list = AudioBufferList {
-                    mNumberBuffers: 1,
-                    mBuffers: [buffer_over(&mut storage, 1)],
-                };
-                {
-                    // SAFETY: one buffer over live, aligned, exclusively-owned
-                    // f32 storage that outlives the view.
-                    let mut view = unsafe { BufferListMut::new(NonNull::from(&mut list)) };
-                    path.fill(&mut view);
-                }
-                played.extend_from_slice(&storage);
-                std::thread::sleep(std::time::Duration::from_micros(100));
+            // What the pacing loop leaves behind: a block still at level, then
+            // the ramp.
+            let (residual, ramp) = residual_then_ramp(frames);
+            for &v in residual.iter().chain(ramp.iter()) {
+                sink.producer.push(v).expect("the ring is deep enough");
             }
-            played
-        });
 
-        sink.stop().expect("stop never fails");
+            // The device, on its own thread, one mono block at a time.
+            let halt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let device_halt = Arc::clone(&halt);
+            let device = std::thread::spawn(move || {
+                let mut played: Vec<f32> = Vec::new();
+                while !device_halt.load(Ordering::Relaxed) {
+                    let mut storage = vec![0.0f32; frames];
+                    let mut list = AudioBufferList {
+                        mNumberBuffers: 1,
+                        mBuffers: [buffer_over(&mut storage, 1)],
+                    };
+                    {
+                        // SAFETY: one buffer over live, aligned,
+                        // exclusively-owned f32 storage that outlives the view.
+                        let mut view = unsafe { BufferListMut::new(NonNull::from(&mut list)) };
+                        path.fill(&mut view);
+                    }
+                    played.extend_from_slice(&storage);
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                }
+                played
+            });
 
-        // A few more cycles, so a flush that DID drop samples would show up as
-        // silence where the ramp should be.
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        halt.store(true, Ordering::Relaxed);
-        let played = device.join().expect("the device thread finishes");
+            sink.stop().expect("stop never fails");
 
-        assert_eq!(
-            inner.flushed.load(Ordering::Relaxed),
-            0,
-            "nothing queued was discarded"
-        );
-        let rendered: Vec<f32> = played.into_iter().filter(|v| *v != 0.0).collect();
-        let expected: Vec<f32> = residual.iter().chain(ramp.iter()).copied().collect();
-        assert_eq!(
-            rendered, expected,
-            "every queued sample reached the device, in order, ending on the ramp"
-        );
+            // A few more cycles, so a flush that DID drop samples would show up
+            // as silence where the ramp should be.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            halt.store(true, Ordering::Relaxed);
+            let played = device.join().expect("the device thread finishes");
+
+            assert_eq!(
+                inner.flushed.load(Ordering::Relaxed),
+                0,
+                "nothing queued was discarded at {frames} frames"
+            );
+            let rendered: Vec<f32> = played.into_iter().filter(|v| *v != 0.0).collect();
+            let expected: Vec<f32> = residual.iter().chain(ramp.iter()).copied().collect();
+            assert_eq!(
+                rendered, expected,
+                "every queued sample reached the device at {frames} frames, in order, ending on \
+                 the ramp"
+            );
+        }
+    }
+
+    #[test]
+    fn stop_gives_up_on_a_device_that_died_after_the_last_emit() {
+        // The in-process half of the drain bound. `stop` runs AHEAD of the
+        // volume restore on every abort (OutputDeviceChanged, MicDisconnected)
+        // and on panic unwind, so whatever it waits is how long the user is
+        // left at measurement volume. A device that dies after the last paced
+        // emit never set `device_stalled`, and `is_abandoned()` is false while
+        // the IOProc still owns the consumer — so before the bound this held
+        // the system loud for the full STALL_SECONDS.
+        use paraeq_measure::StimulusSink as _;
+
+        for frames in STOP_DRAIN_GEOMETRIES {
+            let format = StreamFormat {
+                channels: 1,
+                frames_per_block: frames,
+                sample_rate_hz: 48_000.0,
+            };
+            let capacity = frames * 8;
+            let (producer, consumer) = RingBuffer::<f32>::new(capacity);
+            let inner = Arc::new(StimulusInner::default());
+            // Held, never filled: the device is dead, but its consumer is not
+            // dropped, so the ring cannot report the wait as hopeless.
+            let path = StimulusPath {
+                consumer,
+                inner: Arc::clone(&inner),
+                routing: StimulusRouting::Both,
+            };
+            let mut sink = StimulusOutput {
+                capacity,
+                device_stalled: false,
+                format,
+                inner: Arc::clone(&inner),
+                producer,
+                stopped: false,
+            };
+
+            let (residual, ramp) = residual_then_ramp(frames);
+            for &v in residual.iter().chain(ramp.iter()) {
+                sink.producer.push(v).expect("the ring is deep enough");
+            }
+
+            let started = std::time::Instant::now();
+            sink.stop().expect("stop never fails");
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed < std::time::Duration::from_millis(STOP_DRAIN_MAX_MS + STOP_DRAIN_SLACK_MS),
+                "the drain must give up inside its own bound at {frames} frames, not the \
+                 {STALL_SECONDS:.1} s emit bound; took {elapsed:?}"
+            );
+            assert!(
+                elapsed >= std::time::Duration::from_millis(STOP_DRAIN_MAX_MS / 2),
+                "the drain still WAITS for the device at {frames} frames — the fix is a shorter \
+                 bound, not a skipped drain; took {elapsed:?}"
+            );
+            assert!(
+                inner.flush.load(Ordering::Relaxed),
+                "teardown continues at {frames} frames: what could not be placed is armed for \
+                 the flush, so the volume restore is not held behind audio at level"
+            );
+            drop(path);
+        }
     }
 
     #[test]

@@ -72,10 +72,16 @@ pub struct StreamFormat {
 ///   has accepted, because `emit` returns while up to one block is still
 ///   queued and after the MS-14 ramp that block IS the ramp — dropping it
 ///   makes the last sample the device rendered one at level, which is the
-///   full-scale click the ramp exists to prevent. The wait is bounded (a
-///   device that has stopped consuming is not waited out forever), and what
-///   cannot be placed is silenced rather than played at level. The system must
-///   never be left at measurement volume.
+///   full-scale click the ramp exists to prevent. **The wait is bounded by a
+///   few hundred milliseconds — a far SHORTER budget than `emit`'s own stall
+///   bound**, because `stop` precedes the volume restore on every abort and on
+///   panic unwind, and because the cross-process implementation runs it under a
+///   parent that SIGKILLs the child about 1.8 s after the abort. Sized off what
+///   a successful `emit` guarantees: the queue is within one block, so a
+///   healthy device finishes in one block period. Past the bound, what cannot
+///   be placed is silenced rather than played at level — a partial ramp beats a
+///   system left loud or a device left leaked. The system must never be left at
+///   measurement volume.
 pub trait StimulusSink: Send {
     fn format(&self) -> StreamFormat;
 
@@ -203,8 +209,15 @@ pub trait VolumeControl: Send {
 ///   — "by the time a caller reaches it the ramp has already played" — was
 ///   false: `write` returns while up to one block is still queued, and after
 ///   `ramp_out` that block is the ramp, so a `stop` that dropped it left the
-///   device's last rendered sample at level. The wait is bounded, and what
-///   cannot be placed is silenced rather than played at level.
+///   device's last rendered sample at level. **The wait is bounded by a few
+///   hundred milliseconds, and the bound is a ladder deadline rather than a
+///   device-health one**: this sink's implementation lives in the helper child,
+///   whose parent escalates to SIGTERM at the ramp budget plus
+///   [`HELPER_TEARDOWN_ALLOWANCE_MS`](crate::verify::HELPER_TEARDOWN_ALLOWANCE_MS)
+///   and then SIGKILLs it, so a drain that ran to `write`'s own stall bound
+///   would be killed mid-drain and leave the render device behind. Past the
+///   bound, what cannot be placed is silenced rather than played at level: a
+///   partial ramp beats a leaked device.
 /// - Neither `ramp_out` nor `stop` returns a `Result`. Both run on the teardown
 ///   ladder, on every exit path including panic, and a rung that could fail
 ///   into a `?` is a rung that can abort the ladder before the render device is
