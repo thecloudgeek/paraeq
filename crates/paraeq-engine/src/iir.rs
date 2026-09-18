@@ -100,9 +100,7 @@ impl IIRProcessor {
 
     pub fn reset(&mut self) {
         for ch in self.channels.iter_mut().flatten() {
-            for z in &mut ch.zi {
-                *z = [0.0; 2];
-            }
+            ch.zi.fill([0.0; 2]);
         }
     }
 }

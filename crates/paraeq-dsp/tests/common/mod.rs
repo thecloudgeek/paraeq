@@ -50,8 +50,10 @@ impl Case {
         let len = meta["len"].as_u64().unwrap() as usize;
         assert_eq!(bytes.len(), len * 8, "byte length mismatch for '{key}'");
         bytes
-            .chunks_exact(8)
-            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| f64::from_le_bytes(*c))
             .collect()
     }
 
