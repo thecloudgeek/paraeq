@@ -5,6 +5,13 @@
 
 #![allow(dead_code)]
 
+/// The seeded author of every input under `fixtures/decide/`. Separate from the
+/// synthetic helpers below because those are throwaway values for type-contract
+/// tests, while these are committed, digested and owner-reviewed.
+pub mod generator;
+/// The `fixtures/decide/` loader, sidecar hydrator, freeze digest and bless.
+pub mod golden;
+
 use paraeq_decide::{
     Analysis, AuthorityCurve, AuthorityPreset, AveragingMode, CalFile, CalVariant, CapturePlan,
     CaptureRouting, CaptureStats, CorrectionForm, CorrectionPlan, Decision, DecisionSet, Decisions,

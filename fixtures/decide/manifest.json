@@ -1,0 +1,332 @@
+{
+  "algorithm": "fnv1a64",
+  "cases": {
+    "bookshelf_clean_room": {
+      "bundle.json": {
+        "bytes": 8671,
+        "fnv1a64": "0xe8ad6488ad78bf9f"
+      },
+      "ir/pos00_ch0.f64": {
+        "bytes": 614400,
+        "fnv1a64": "0x345c349cc2b4d324"
+      },
+      "ir/pos01_ch0.f64": {
+        "bytes": 614400,
+        "fnv1a64": "0x464d1d46c25bd991"
+      },
+      "ir/pos02_ch0.f64": {
+        "bytes": 614400,
+        "fnv1a64": "0x5736f773e2a89942"
+      },
+      "ir/pos03_ch0.f64": {
+        "bytes": 614400,
+        "fnv1a64": "0x798daaf60e51d8d4"
+      },
+      "ir/pos04_ch0.f64": {
+        "bytes": 614400,
+        "fnv1a64": "0x08c3bfba1d91435e"
+      },
+      "ir/pos05_ch0.f64": {
+        "bytes": 614400,
+        "fnv1a64": "0xdb24ba20c102f680"
+      },
+      "ir/pos06_ch0.f64": {
+        "bytes": 614400,
+        "fnv1a64": "0x6138e2777f752c40"
+      },
+      "ir/pos07_ch0.f64": {
+        "bytes": 614400,
+        "fnv1a64": "0x704b66630dfe542d"
+      },
+      "ir/pos08_ch0.f64": {
+        "bytes": 614400,
+        "fnv1a64": "0xfe91b803831820ae"
+      },
+      "notes.md": {
+        "bytes": 1334,
+        "fnv1a64": "0xf6838985946c5414"
+      }
+    },
+    "floorstander_null_one_of_five": {
+      "bundle.json": {
+        "bytes": 6639,
+        "fnv1a64": "0x3b2a81beaf5e3e83"
+      },
+      "ir/pos00_ch0.f64": {
+        "bytes": 614400,
+        "fnv1a64": "0x3d192349e800a593"
+      },
+      "ir/pos01_ch0.f64": {
+        "bytes": 614400,
+        "fnv1a64": "0x12ba218d74de2725"
+      },
+      "ir/pos02_ch0.f64": {
+        "bytes": 614400,
+        "fnv1a64": "0x56e5d2e628b3ef13"
+      },
+      "ir/pos03_ch0.f64": {
+        "bytes": 614400,
+        "fnv1a64": "0x1bc8ed2c03b19d7c"
+      },
+      "ir/pos04_ch0.f64": {
+        "bytes": 614400,
+        "fnv1a64": "0x48403b98f2ca687f"
+      },
+      "notes.md": {
+        "bytes": 1427,
+        "fnv1a64": "0xcb67ccc472b838e6"
+      }
+    },
+    "in_ear_clean_coupler": {
+      "bundle.json": {
+        "bytes": 8764,
+        "fnv1a64": "0xd767a31cce094f1e"
+      },
+      "ir/pos00_ch0.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0x6a8f0e9765f9a59d"
+      },
+      "ir/pos00_ch1.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0x16f22777671df6a1"
+      },
+      "ir/pos01_ch0.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0x2421b81551b1b558"
+      },
+      "ir/pos01_ch1.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0x9f6f3a21758ccaab"
+      },
+      "ir/pos02_ch0.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0x3a6f54456ebc04c5"
+      },
+      "ir/pos02_ch1.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0xdbc010221f739de4"
+      },
+      "ir/pos03_ch0.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0xd50abf227e86e2ff"
+      },
+      "ir/pos03_ch1.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0x5f12f918d59e2344"
+      },
+      "ir/pos04_ch0.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0xa3009130e6690b1d"
+      },
+      "ir/pos04_ch1.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0x9829b367134c7e3f"
+      },
+      "notes.md": {
+        "bytes": 1522,
+        "fnv1a64": "0xe1ac8b847332a76f"
+      }
+    },
+    "over_ear_ears_heq_cal": {
+      "bundle.json": {
+        "bytes": 8294,
+        "fnv1a64": "0xf68602004d7542e7"
+      },
+      "ir/pos00_ch0.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0x237d1fd7d5944a61"
+      },
+      "ir/pos00_ch1.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0x15a1d93128047b44"
+      },
+      "ir/pos01_ch0.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0x9f453aa1c96242ab"
+      },
+      "ir/pos01_ch1.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0x0e4519fd0eb9c22e"
+      },
+      "ir/pos02_ch0.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0x8f8123bff514f2c2"
+      },
+      "ir/pos02_ch1.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0x98add58f512c3289"
+      },
+      "ir/pos03_ch0.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0xd24412d0d3397e26"
+      },
+      "ir/pos03_ch1.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0x559bc203f1a83b98"
+      },
+      "ir/pos04_ch0.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0x8029a33f64eb4468"
+      },
+      "ir/pos04_ch1.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0x57ce65b06f1f1e93"
+      },
+      "notes.md": {
+        "bytes": 1436,
+        "fnv1a64": "0x2f00de04c48c6167"
+      }
+    },
+    "over_ear_lost_seal_reseat": {
+      "bundle.json": {
+        "bytes": 10976,
+        "fnv1a64": "0x94c3ae8c9f70aa40"
+      },
+      "ir/pos00_ch0.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0xfa5b78fd88bed203"
+      },
+      "ir/pos00_ch1.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0x28c9ee615787504e"
+      },
+      "ir/pos01_ch0.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0x6943cca41b828f3a"
+      },
+      "ir/pos01_ch1.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0x34c35041b7e24d0c"
+      },
+      "ir/pos02_ch0.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0xe8c90c6083c40f99"
+      },
+      "ir/pos02_ch1.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0xddc93c013711fdd2"
+      },
+      "ir/pos03_ch0.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0x4a506fbeee4c377c"
+      },
+      "ir/pos03_ch1.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0x1204602789a2c16d"
+      },
+      "ir/pos04_ch0.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0xb232553f445721e1"
+      },
+      "ir/pos04_ch1.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0xffea935ab8e96dfe"
+      },
+      "ir/verify_ch0.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0x2be5d0654c75a5d9"
+      },
+      "ir/verify_ch1.f64": {
+        "bytes": 134400,
+        "fnv1a64": "0x161539478e66f060"
+      },
+      "notes.md": {
+        "bytes": 3236,
+        "fnv1a64": "0x1a05ea5243783169"
+      }
+    },
+    "room_cal_neighbour_outlier": {
+      "bundle.json": {
+        "bytes": 6831,
+        "fnv1a64": "0x1358f99b9c919f44"
+      },
+      "ir/pos00_ch0.f64": {
+        "bytes": 614400,
+        "fnv1a64": "0xc13940f241fcd35f"
+      },
+      "ir/pos01_ch0.f64": {
+        "bytes": 614400,
+        "fnv1a64": "0xce77338b1d025760"
+      },
+      "ir/pos02_ch0.f64": {
+        "bytes": 614400,
+        "fnv1a64": "0xbcc8b5db1c46e96a"
+      },
+      "ir/pos03_ch0.f64": {
+        "bytes": 614400,
+        "fnv1a64": "0x6289d13c5a8a5e04"
+      },
+      "ir/pos04_ch0.f64": {
+        "bytes": 614400,
+        "fnv1a64": "0x9fd522b1334d65b9"
+      },
+      "notes.md": {
+        "bytes": 1682,
+        "fnv1a64": "0x92fbc81e70a9fdca"
+      }
+    },
+    "room_clipped_position": {
+      "bundle.json": {
+        "bytes": 6642,
+        "fnv1a64": "0x70c73f50d309d6b1"
+      },
+      "ir/pos00_ch0.f64": {
+        "bytes": 614400,
+        "fnv1a64": "0x2209d22483bafc8d"
+      },
+      "ir/pos01_ch0.f64": {
+        "bytes": 614400,
+        "fnv1a64": "0xca883188a9e80ab5"
+      },
+      "ir/pos02_ch0.f64": {
+        "bytes": 614400,
+        "fnv1a64": "0x709707f4cdb37faf"
+      },
+      "ir/pos03_ch0.f64": {
+        "bytes": 614400,
+        "fnv1a64": "0x127e22c41f039ea7"
+      },
+      "ir/pos04_ch0.f64": {
+        "bytes": 614400,
+        "fnv1a64": "0xad38396bccfb52a0"
+      },
+      "notes.md": {
+        "bytes": 1723,
+        "fnv1a64": "0x6f1efdc5a6fc9d7b"
+      }
+    },
+    "room_noisy_snr_boundary": {
+      "bundle.json": {
+        "bytes": 6621,
+        "fnv1a64": "0x3c48841ef6e67a1c"
+      },
+      "ir/pos00_ch0.f64": {
+        "bytes": 614400,
+        "fnv1a64": "0xd025961a7e8aefb7"
+      },
+      "ir/pos01_ch0.f64": {
+        "bytes": 614400,
+        "fnv1a64": "0x3639b0001a1966ee"
+      },
+      "ir/pos02_ch0.f64": {
+        "bytes": 614400,
+        "fnv1a64": "0x4b5d1fe27c6d215f"
+      },
+      "ir/pos03_ch0.f64": {
+        "bytes": 614400,
+        "fnv1a64": "0xd46c30feebca4426"
+      },
+      "ir/pos04_ch0.f64": {
+        "bytes": 614400,
+        "fnv1a64": "0x20bd8bef36487b5d"
+      },
+      "notes.md": {
+        "bytes": 1850,
+        "fnv1a64": "0x38a5ce3a008bd732"
+      }
+    }
+  },
+  "frozen_at": null,
+  "reviewed_by": null,
+  "schema_version": 1
+}
