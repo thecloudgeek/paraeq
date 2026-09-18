@@ -20,10 +20,12 @@
 //! **Two strings are NOT quotations, and both are flagged where they are
 //! written:** [`clock_adjust`] has no row in the decision table at all (the
 //! decision comes from the 2026-07-21 record's §Q6 drawer toggle, which
-//! specifies the control and not the copy), and [`transition_hz`] renders the
-//! table's derived-case wording for every source — B17 owns the
-//! `Source::Default` fallback variant and the slot for it is marked in that
-//! function.
+//! specifies the control and not the copy), and
+//! [`transition_hz_fallback`] is B17's — the decision table writes one
+//! sentence for `transition_hz` and it is written for a MEASUREMENT, so the
+//! no-crossing case needed a second string that claims nothing
+//! (`docs/specs/2026-07-15-wizard-design.md:566`). [`transition_hz`] itself is
+//! still the table's, character for character.
 
 use crate::decision::{Rationale, RationaleKey};
 use paraeq_dsp::targets::TransducerClass;
@@ -304,13 +306,12 @@ pub(crate) fn target_room_parametric(tilt_db_per_oct: f64) -> Rationale {
 
 /// `transition_hz`, the DERIVED case: the σ-crossing scan found a crossing.
 ///
-/// **B17's slot.** The table's sentence is written for a measurement ("Below
-/// {f_t:.0} Hz your room's problems are the same everywhere you sit"), and read
-/// against the 200 Hz fallback it is a claim about a measurement that was never
-/// made. B17 adds a SECOND function here — the `Source::Default` variant — and
-/// [`crate::rules`] selects between the two on the decision's source. Nothing
-/// else in that item touches this file: the fallback constant is
-/// `paraeq_dsp::room`'s and the log line is the desktop boundary's.
+/// The table's sentence is written for a measurement, which is why it has a
+/// sibling: read against the 200 Hz fallback, "Below {f_t:.0} Hz your room's
+/// problems are the same everywhere you sit" is a claim about a measurement
+/// that was never made. [`crate::rules`] renders this one only when
+/// [`crate::rules`]'s σ-crossing scan returned a crossing, and
+/// [`transition_hz_fallback`] otherwise.
 pub(crate) fn transition_hz(transition_hz: f64) -> Rationale {
     rationale(
         RationaleKey::TransitionHz,
@@ -318,6 +319,38 @@ pub(crate) fn transition_hz(transition_hz: f64) -> Rationale {
             "Below {transition_hz:.0} Hz your room's problems are the same \
              everywhere you sit, so we fix them. Above that they change with \
              every head movement."
+        ),
+    )
+}
+
+/// `transition_hz`, the FALLBACK case: the σ-crossing scan found nothing.
+///
+/// **NOT a quotation — the decision table has one sentence for this row and it
+/// is the derived one.** `docs/specs/2026-07-15-wizard-design.md:566` is why a
+/// second string exists: if excess-group-delay masking slips to v1.1, "the
+/// 200 Hz *fallback constant* is what ships — and it must be labelled a
+/// fallback in the code, the UI, and the log, never a rule". The rationale IS
+/// the UI ("Rendered here, in Rust. The UI is a text field, not an author"), so
+/// the UI leg of that MUST is this function. The copy therefore makes NO
+/// measurement claim: it says the measurement could not be made, names the
+/// number it assumed instead, and calls it a fallback.
+///
+/// **Selected on the ANALYSIS FACT, never on [`crate::decision::Source`].**
+/// Source would be the obvious selector and it would fork the crate's
+/// idempotence invariant — overriding a decision to the value auto already
+/// chose must move `source` and nothing else, so copy that reads `source`
+/// changes under an override that changed nothing. The scan's own `None` is an
+/// input, not an output, and no override can reach it; a user who pins this row
+/// to 200.0 on an unmeasurable room still gets this sentence, because it is
+/// still true.
+pub(crate) fn transition_hz_fallback(transition_hz: f64) -> Rationale {
+    rationale(
+        RationaleKey::TransitionHz,
+        format!(
+            "We couldn't measure where your room stops being the same \
+             everywhere you sit, so we used the usual {transition_hz:.0} Hz as \
+             a fallback. That's an assumption, not something we found in your \
+             room."
         ),
     )
 }

@@ -228,10 +228,41 @@ pub fn schroeder_frequency(t60_s: f64, volume_m3: f64) -> f64 {
     2000.0 * (t60_s / volume_m3).sqrt()
 }
 
+/// The transition fallback: the number the product reports when the
+/// measurement cannot support a derived one.
+///
+/// **It is a FALLBACK, NOT A RULE.** `docs/specs/2026-07-15-wizard-design.md:566`
+/// — if excess-group-delay masking slips to v1.1, "the 200 Hz *fallback
+/// constant* is what ships — and it must be labelled a fallback in the code,
+/// the UI, and the log, never a rule" — and `wizard-design.md:491`: "the
+/// ~200 Hz figure appears only as a *fallback constant* when the measurement
+/// cannot support a derived one". The reasoning it must never be mistaken for
+/// is refuted in `docs/specs/2026-07-15-room-dsp-design.md`, "Why authority is
+/// confidence-derived, not threshold-derived": "The tempting rule is 'full
+/// authority below 200 Hz, none above.' **It is unsafe**". Authority comes from
+/// σ(f) and nothing else — see the module header.
+///
+/// Used by [`transition_range`]'s fallback arm, which also sets
+/// [`TransitionSource::Fallback`], and by `paraeq-decide`'s `transition_hz`
+/// rule, whose own no-crossing arm sets `Source::Default` and renders the
+/// fallback rationale. The sites must carry the same number and the same
+/// label, which is why the number has a name: a second bare literal elsewhere
+/// is a second policy nobody agreed to.
+///
+/// Test tier: none — it is a named literal, not a function. Stated because a
+/// silent omission reads as an oversight. What IS tested is the naming itself
+/// (`tests/test_room.rs`).
+pub const TRANSITION_FALLBACK_HZ: f64 = 200.0;
+
 /// `0.5·f_s … 2·f_s` around the Schroeder frequency, or the fallback
-/// (100–400 Hz around 200 Hz) when T60 or volume is unknown. Non-finite or
-/// non-positive inputs count as unknown: a NaN range would be strictly worse
-/// than the honest fallback.
+/// ([`TRANSITION_FALLBACK_HZ`], halved and doubled: 100–400 Hz around 200 Hz)
+/// when T60 or volume is unknown. Non-finite or non-positive inputs count as
+/// unknown: a NaN range would be strictly worse than the honest fallback.
+///
+/// The fallback arm spells no number of its own — all three edges are the named
+/// constant — so "this is a fallback, not a rule" is true by construction rather
+/// than by coincidence, and [`TransitionSource::Fallback`] says the same thing
+/// in the type for a caller that reads provenance instead of prose.
 pub fn transition_range(t60_s: Option<f64>, volume_m3: Option<f64>) -> TransitionRange {
     match (t60_s, volume_m3) {
         (Some(t60), Some(vol)) if t60.is_finite() && t60 > 0.0 && vol.is_finite() && vol > 0.0 => {
@@ -247,9 +278,9 @@ pub fn transition_range(t60_s: Option<f64>, volume_m3: Option<f64>) -> Transitio
             }
         }
         _ => TransitionRange {
-            low_hz: 100.0,
-            center_hz: 200.0,
-            high_hz: 400.0,
+            low_hz: 0.5 * TRANSITION_FALLBACK_HZ,
+            center_hz: TRANSITION_FALLBACK_HZ,
+            high_hz: 2.0 * TRANSITION_FALLBACK_HZ,
             source: TransitionSource::Fallback,
         },
     }
