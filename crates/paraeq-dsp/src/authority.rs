@@ -648,9 +648,10 @@ impl AuthorityAt {
     /// Whether the envelope licenses ANY correction here, of either sign.
     ///
     /// The band predicate, named. It is the second half of
-    /// [`authority_band_mask`]'s definition — "`{ f : authority.at(f).max_boost_db
-    /// > 0 || max_cut_db > 0 }`" — and it exists as a method because a second
-    /// caller needs the per-frequency question without a range:
+    /// [`authority_band_mask`]'s definition — the spec's
+    /// `{ f : authority.at(f).max_boost_db > 0 || max_cut_db > 0 }` — and it
+    /// exists as a method because a second caller needs the per-frequency
+    /// question without a range:
     /// `autofit::cut_limit_db` has to tell "a region we declined to correct"
     /// apart from "a region whose ceiling happens to be low", and re-spelling
     /// the disjunction there would be the second copy
