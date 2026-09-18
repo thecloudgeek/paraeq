@@ -9,6 +9,7 @@ use paraeq_dsp::{
     gating::ImpulseResponse,
     room::{
         estimate_t60, schroeder_decay_db, schroeder_frequency, transition_range, TransitionSource,
+        TRANSITION_FALLBACK_HZ,
     },
 };
 
@@ -233,5 +234,93 @@ fn unknown_inputs_fall_back_to_200_hz_center() {
         assert_eq!(r.center_hz, 200.0);
         assert_eq!(r.high_hz, 400.0);
         assert_eq!(r.source, TransitionSource::Fallback);
+    }
+}
+
+// ------------------------------------------------ The 200 Hz fallback --
+
+/// The whole file, as text, for the two naming assertions below.
+///
+/// The scan stops at an inline `#[cfg(test)]` module if one is ever added: a
+/// test module is entitled to spell whatever literal it is asserting, and the
+/// claim here is about the SHIPPING code. There is no such module today, so
+/// today this is the whole file.
+fn room_rs_source_lines() -> Vec<String> {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/room.rs"))
+        .expect("room.rs is readable");
+    src.lines()
+        .take_while(|line| !line.trim_start().starts_with("#[cfg(test)]"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// `docs/specs/2026-07-15-wizard-design.md:566`: if excess-group-delay masking
+/// slips to v1.1, "the 200 Hz **fallback constant** is what ships — and it must
+/// be labelled a fallback in the code, the UI, and the log, never a rule". This
+/// is the CODE leg — the number has a NAME, and the name is the only place the
+/// number is spelled.
+///
+/// **The exclusion is stated, because the constant itself has to spell its
+/// value.** Exactly one line may match `200.0` and that line must be the
+/// definition; a named constant spells its number once. `100.0` and `400.0` get
+/// no exclusion at all — they are `0.5 *` and `2.0 *` the constant, so a bare
+/// one of either would be an unlinked literal by definition.
+#[test]
+fn the_transition_fallback_constant_is_named_and_used_at_every_site() {
+    let code = room_rs_source_lines();
+
+    let spelled: Vec<&String> = code.iter().filter(|line| line.contains("200.0")).collect();
+    assert_eq!(
+        spelled.len(),
+        1,
+        "`200.0` belongs on the constant's definition line and nowhere else; found {spelled:?}"
+    );
+    assert!(
+        spelled[0].contains("pub const TRANSITION_FALLBACK_HZ"),
+        "the one `200.0` in room.rs is not the constant's definition: {:?}",
+        spelled[0]
+    );
+    for bare in ["100.0", "400.0"] {
+        assert!(
+            !code.iter().any(|line| line.contains(bare)),
+            "`{bare}` is half/double the named constant, not a literal of its own"
+        );
+    }
+
+    // The falsifier for a rename that changes behaviour: unchanged numbers,
+    // named source.
+    assert_eq!(TRANSITION_FALLBACK_HZ, 200.0);
+    let r = transition_range(None, None);
+    assert_eq!(r.low_hz, 100.0);
+    assert_eq!(r.center_hz, 200.0);
+    assert_eq!(r.high_hz, 400.0);
+    assert_eq!(r.source, TransitionSource::Fallback);
+}
+
+/// The doc comment is half the requirement: `wizard-design.md:566` legislates
+/// against the number being read as a rule, and the only thing that stops a
+/// later tidy-up trimming the doc to "the transition frequency" is a test that
+/// reads it.
+#[test]
+fn the_transition_fallback_doc_says_fallback_and_not_rule() {
+    let code = room_rs_source_lines();
+    let at = code
+        .iter()
+        .position(|line| line.contains("pub const TRANSITION_FALLBACK_HZ"))
+        .expect("room.rs defines the constant");
+    let doc = code[..at]
+        .iter()
+        .rev()
+        .take_while(|line| line.trim_start().starts_with("///"))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
+
+    for required in ["fallback", "never a rule", "wizard-design.md:566"] {
+        assert!(
+            doc.contains(required),
+            "the constant's doc no longer says {required:?}:\n{doc}"
+        );
     }
 }

@@ -65,7 +65,7 @@ use paraeq_dsp::gating::{
 };
 use paraeq_dsp::logf::{resample_db_to_log_grid, LogGrid, Prefilter};
 use paraeq_dsp::peq::EQBand;
-use paraeq_dsp::room::transition_range;
+use paraeq_dsp::room::{transition_range, TRANSITION_FALLBACK_HZ};
 use paraeq_dsp::targets::{
     build_room_target, compute_correction, match_closest_target, RoomTargetSpec, TransducerClass,
 };
@@ -116,16 +116,14 @@ const SIGMA_SUSTAIN_OCT: f64 = 1.0 / 3.0;
 /// practice always the fallback one.
 const TRANSITION_CLAMP_HZ: (f64, f64) = (80.0, 400.0);
 
-/// `transition_hz`: "No crossing ⇒ 200.0, `source: Default`".
-///
-/// **A FALLBACK, not a rule.** The wizard spec is explicit that if
-/// excess-group-delay masking slips, "the 200 Hz **fallback constant** is what
-/// ships — and it must be labelled a fallback in the code, the UI, and the log,
-/// never a rule". [`Source::Default`] is the machine-readable half of that
-/// label and this constant's name is the human half. B17 moves the number to
-/// `paraeq_dsp::room::TRANSITION_FALLBACK_HZ` so the two sites that spell it
-/// share one name, and adds the rationale variant that says so in words.
-const TRANSITION_FALLBACK_HZ: f64 = 200.0;
+// `transition_hz`: "No crossing ⇒ 200.0, `source: Default`" — and the number
+// itself is `paraeq_dsp::room::TRANSITION_FALLBACK_HZ`, imported above rather
+// than re-declared here, so `decide()` and `room::transition_range` cannot
+// drift apart. **A FALLBACK, not a rule** (`wizard-design.md:566`); the
+// constant's own doc carries that ruling. `Source::Default` is the
+// machine-readable half of the label, `rationale::transition_hz_fallback` is
+// the half a user reads, and one `log::info!` at the desktop boundary (B14) is
+// the third. The requirement is discharged only when all three land.
 
 /// Phase 1 — every decision the ANALYSIS stage reads, plus the two echoes and
 /// the clock toggle. Eleven of the twenty-two.
@@ -583,6 +581,17 @@ pub(crate) fn design_decisions(
     let transition_value = crossing
         .map(|f| f.clamp(TRANSITION_CLAMP_HZ.0, TRANSITION_CLAMP_HZ.1))
         .unwrap_or(TRANSITION_FALLBACK_HZ);
+    // The copy is chosen by the SCAN, not by the decision's source and not by
+    // its value: the table's sentence is written for a measurement, and
+    // rendering it over the fallback would claim a transition nobody measured
+    // (`wizard-design.md:566`). `source` would be the obvious selector and it
+    // would fork idempotence — an override to the value auto already chose must
+    // move `source` and nothing else — while `crossing` is an analysis fact no
+    // override can reach.
+    let copy = match crossing {
+        None => rationale::transition_hz_fallback(transition_value),
+        Some(_) => rationale::transition_hz(transition_value),
+    };
     let mut transition = decision(
         transition_value,
         Domain::Range {
@@ -590,9 +599,7 @@ pub(crate) fn design_decisions(
             min: TRANSITION_CLAMP_HZ.0,
             step: None,
         },
-        // B17 renders the `Source::Default` arm differently; see
-        // `rationale::transition_hz`.
-        rationale::transition_hz(transition_value),
+        copy,
         Invalidation::Reanalyze,
     );
     if crossing.is_some() {
