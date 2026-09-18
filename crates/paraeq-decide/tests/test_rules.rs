@@ -286,7 +286,7 @@ fn the_path_table_rows_echo_the_profile() {
 fn rolled_off_bundle(shelf_hz: f64) -> MeasurementBundle {
     shaped_bundle(
         SyntheticSpec {
-            cal: false,
+            cal: true,
             channels: 1,
             class: TransducerClass::Bookshelf,
             positions: 5,
@@ -345,7 +345,7 @@ fn an_isolated_dip_moves_the_low_corner_only_when_it_breaks_the_ten_db_run() {
     let dipped = |depth_db: f64| {
         shaped_bundle(
             SyntheticSpec {
-                cal: false,
+                cal: true,
                 channels: 1,
                 class: TransducerClass::Bookshelf,
                 positions: 5,
@@ -385,7 +385,7 @@ fn an_isolated_dip_moves_the_low_corner_only_when_it_breaks_the_ten_db_run() {
 fn scattered_bundle(centre_hz: f64, q: f64) -> MeasurementBundle {
     shaped_bundle(
         SyntheticSpec {
-            cal: false,
+            cal: true,
             channels: 1,
             class: TransducerClass::Bookshelf,
             positions: 5,
@@ -436,7 +436,7 @@ fn transition_hz_is_the_sustained_three_db_crossing_and_falls_back_to_200() {
     // None: identical positions, σ ≈ 0 everywhere.
     let flat = shaped_bundle(
         SyntheticSpec {
-            cal: false,
+            cal: true,
             channels: 1,
             class: TransducerClass::Bookshelf,
             positions: 5,
@@ -537,7 +537,7 @@ fn transition_hz_is_never_an_authority_input() {
 fn correction_range_low_takes_the_resolution_limit_and_the_snr_floor() {
     let mut bundle = shaped_bundle(
         SyntheticSpec {
-            cal: false,
+            cal: true,
             channels: 1,
             class: TransducerClass::Bookshelf,
             positions: 5,
@@ -584,7 +584,7 @@ fn correction_range_low_takes_the_resolution_limit_and_the_snr_floor() {
 #[test]
 fn correction_range_high_stops_at_the_last_target_crossing() {
     let spec = SyntheticSpec {
-        cal: false,
+        cal: true,
         channels: 1,
         class: TransducerClass::OverEar,
         positions: 5,
@@ -756,7 +756,7 @@ fn a_coupler_match_stays_inside_the_class_filtered_set() {
 fn lumpy_bundle(class: TransducerClass) -> MeasurementBundle {
     shaped_bundle(
         SyntheticSpec {
-            cal: false,
+            cal: true,
             channels: 2,
             class,
             positions: profile_for(class).positions_default,
@@ -1112,7 +1112,7 @@ fn moved(before: &Decisions, after: &Decisions) -> Vec<&'static str> {
 fn cascading_bundle() -> MeasurementBundle {
     shaped_bundle(
         SyntheticSpec {
-            cal: false,
+            cal: true,
             channels: 1,
             class: TransducerClass::Bookshelf,
             positions: 5,

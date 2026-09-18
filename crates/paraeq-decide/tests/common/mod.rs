@@ -818,11 +818,29 @@ pub fn assert_refusal_is_consistent(set: &DecisionSet) {
 /// between positions is the one `shape` introduces, so σ(f) is a quantity the
 /// test chose rather than a property of a random tail. An empty cascade is the
 /// identity, which gives every position the same flat response and σ ≈ 0.
+///
+/// **The cal is FLAT here, where [`synthetic_bundle`]'s is a vendor curve.**
+/// Both are well-formed files; the difference is what a shaped bundle promises.
+/// Compensation SUBTRACTS the cal from the measured magnitude, so a vendor
+/// curve would put a second shape on the analysed curve that no test asked for
+/// and that the closed form above would not predict. Zero at every point
+/// subtracts exactly zero (`m - 0.0 == m`), so the analysed curve is the
+/// cascade's magnitude response and nothing else.
+///
+/// It is a flat FILE rather than `spec.cal = false`, because a bundle carrying
+/// no cal is a refusal — `DiagnosticCode::CalMissing`, `Severity::Refuse` — and
+/// a refused bundle carries `correction: None`, so a rule test written against
+/// one can assert nothing about the filters the rule emitted. A mic whose
+/// calibration file reads 0.00 dB everywhere is a capture the shipped product
+/// accepts; a mic with no calibration file at all is one it turns away.
 pub fn shaped_bundle(
     spec: SyntheticSpec,
     shape: impl Fn(usize) -> Vec<[f64; 6]>,
 ) -> MeasurementBundle {
     let mut bundle = synthetic_bundle(spec);
+    if bundle.cal.is_some() {
+        bundle.cal = Some(cal_with_curve(vec![20.0, 20_000.0], vec![0.0, 0.0]));
+    }
     for position in &mut bundle.positions {
         let sos = shape(position.index);
         let peak = position.ir.peak;
