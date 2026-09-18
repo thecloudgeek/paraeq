@@ -99,8 +99,9 @@ def _redirect_out(monkeypatch, tmp_path):
 def _plant_decide_bundle(out):
     """Stand in for an owner-frozen decision bundle.
 
-    The committed tree has no fixtures/decide/ yet -- the bundles arrive with
-    the decision engine -- so the protection is tested against a planted one.
+    The planted bundle stands in for a case that is NOT in the committed
+    fixtures/decide/ set, so the test proves the protection for any bundle
+    the owner freezes later, not only the eight that ship today.
     Same shape as the real thing: <case>/{bundle,expected}.json.
     """
     bundle = out / "decide" / "flat_headphone"
@@ -138,11 +139,18 @@ def test_regeneration_does_not_delete_the_decide_bundles(monkeypatch, tmp_path):
 def test_save_case_refuses_to_write_into_decide(monkeypatch, tmp_path):
     """No gen_*() can reach the decide bundles even by naming the stage."""
     out = _redirect_out(monkeypatch, tmp_path)
+    # The committed tree now carries the real fixtures/decide/ cases (they
+    # arrived with the decision engine), so "the directory does not exist" is
+    # no longer the property. The property is that the refused call wrote
+    # nothing: the tree under decide/ is unchanged file for file.
+    before = sorted(str(p.relative_to(out)) for p in (out / "decide").rglob("*"))
 
     with pytest.raises(AssertionError):
         gen.save_case("decide", "smuggled", {}, {"values": np.zeros(4)})
 
-    assert not (out / "decide").exists()
+    after = sorted(str(p.relative_to(out)) for p in (out / "decide").rglob("*"))
+    assert after == before
+    assert not list((out / "decide").rglob("smuggled*"))
 
 
 @requires_pinned_toolchain
