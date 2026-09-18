@@ -74,12 +74,44 @@ impl TapStatus for MockTap {
 /// Records every emitted block; optionally trips an [`AbortHandle`] *during*
 /// the n-th emit call, the way a real trigger (Esc, SPL metering, a device
 /// listener) fires while audio is flowing.
-#[derive(Clone, Default)]
+///
+/// **It has a REAL queue, one block deep**, because the sink it stands for
+/// does: `emit` is paced only to "within about one block of caught up", so a
+/// block the session has emitted is not yet a block the device has rendered.
+/// The old mock appended straight to a `Vec`, which made it structurally
+/// incapable of losing anything — and that is precisely why R-B1's defect (a
+/// `stop` that dropped the queue dropped the whole MS-14 ramp) passed every
+/// test here while clicking on real hardware.
+#[derive(Clone)]
 struct MockSink {
     blocks: Arc<Mutex<Vec<Vec<f64>>>>,
+    /// R-B1's contract: `stop` lets everything already queued render. False
+    /// models the OLD sink, which dropped it.
+    drain_on_stop: Arc<AtomicBool>,
+    /// Accepted samples `stop` discarded instead of rendering.
+    dropped: Arc<Mutex<usize>>,
     fail_stop: Arc<AtomicBool>,
     journal: Journal,
+    /// Accepted but not yet taken by the device.
+    queued: Arc<Mutex<Vec<f64>>>,
+    /// Every sample the DEVICE actually rendered, in order.
+    rendered: Arc<Mutex<Vec<f64>>>,
     trip: Arc<Mutex<Option<(usize, AbortHandle, AbortReason)>>>,
+}
+
+impl Default for MockSink {
+    fn default() -> Self {
+        Self {
+            blocks: Arc::default(),
+            drain_on_stop: Arc::new(AtomicBool::new(true)),
+            dropped: Arc::default(),
+            fail_stop: Arc::default(),
+            journal: Journal::default(),
+            queued: Arc::default(),
+            rendered: Arc::default(),
+            trip: Arc::default(),
+        }
+    }
 }
 
 impl MockSink {
@@ -94,6 +126,11 @@ impl MockSink {
         *lock(&self.trip) = Some((nth, handle, reason));
     }
 
+    /// Keep the pre-R-B1 contract: drop whatever is still queued at `stop`.
+    fn drop_queue_at_stop(&self) {
+        self.drain_on_stop.store(false, Ordering::SeqCst);
+    }
+
     /// Make `stop` return `Err` — the teardown must collect the fault and still
     /// run the volume restore behind it (the `TapSystem` never-mask posture).
     fn fail_stop(&self) {
@@ -104,8 +141,17 @@ impl MockSink {
         lock(&self.blocks).clone()
     }
 
+    fn dropped(&self) -> usize {
+        *lock(&self.dropped)
+    }
+
     fn emit_calls(&self) -> usize {
         lock(&self.blocks).len()
+    }
+
+    /// Every sample the device rendered, flat and in order.
+    fn rendered(&self) -> Vec<f64> {
+        lock(&self.rendered).clone()
     }
 }
 
@@ -128,6 +174,15 @@ impl StimulusSink for MockSink {
         blocks.push(block.to_vec());
         let n = blocks.len();
         drop(blocks);
+        // Pace: the device takes everything but the last block, which is all
+        // the seam's pacing contract promises.
+        let mut queued = lock(&self.queued);
+        queued.extend_from_slice(block);
+        let keep = BLOCK.min(queued.len());
+        let take = queued.len() - keep;
+        let taken: Vec<f64> = queued.drain(..take).collect();
+        drop(queued);
+        lock(&self.rendered).extend(taken);
         if let Some((nth, handle, reason)) = lock(&self.trip).clone() {
             if n == nth {
                 handle.trigger(reason);
@@ -138,6 +193,12 @@ impl StimulusSink for MockSink {
 
     fn stop(&mut self) -> Result<(), MeasureError> {
         self.journal.record("stop");
+        let queued: Vec<f64> = lock(&self.queued).drain(..).collect();
+        if self.drain_on_stop.load(Ordering::SeqCst) {
+            lock(&self.rendered).extend(queued);
+        } else {
+            *lock(&self.dropped) += queued.len();
+        }
         if self.fail_stop.load(Ordering::SeqCst) {
             return Err(MeasureError::Sink("injected stop failure".to_owned()));
         }
@@ -650,6 +711,23 @@ fn ms14_abort_ramps_to_zero_then_restores_in_order() {
         }
     }
 
+    // R-B1: handed to the sink is not enough — every ramp sample must reach
+    // the DEVICE. `teardown` calls `stop` immediately after the last ramp
+    // block, and the sink is paced, so a stop that dropped its queue would
+    // drop the whole ramp.
+    assert_eq!(sink.dropped(), 0, "no accepted sample was discarded");
+    let rendered = sink.rendered();
+    assert_eq!(
+        rendered.len(),
+        3 * BLOCK,
+        "every accepted sample reached the device"
+    );
+    assert_eq!(
+        &rendered[2 * BLOCK..],
+        ramp.as_slice(),
+        "and the last thing it rendered was the ramp, ending at 0.0"
+    );
+
     // The restore sequence, in order, exactly once: stop, then volume.
     assert_eq!(
         journal.calls(),
@@ -664,6 +742,40 @@ fn ms14_abort_ramps_to_zero_then_restores_in_order() {
         Some(&SessionEvent::Terminated {
             diagnostic: Some(D::UserAborted)
         })
+    );
+}
+
+/// The defect R-B1 fixes, kept as a live witness rather than a paragraph.
+///
+/// A paced sink returns from `emit` with up to one block still in flight, and
+/// after `ramp_down`'s last chunk that block IS the padded 5 ms envelope. A
+/// `stop` that discards it — which is what arming the realtime flush before
+/// the ring drained did — leaves the DEVICE's last rendered sample at level.
+/// "A hard stop is itself a full-scale click", on every abort.
+#[test]
+fn a_sink_that_drops_its_queue_at_stop_loses_the_whole_abort_ramp() {
+    let journal = Journal::default();
+    let sink = MockSink::with_journal(journal.clone());
+    sink.drop_queue_at_stop();
+    let volume = MockVolume::new(PRE_VOLUME, journal.clone());
+    let mut session = acknowledged_session(sink.clone(), MockTap::new(true), volume);
+    sink.trip_on_call(2, session.abort_handle(), AbortReason::UserRequest);
+
+    let level = session.emit_level().expect("level installed");
+    let stim = assemble_sweep(0.25, 48_000, 20.0, 20_000.0, level).expect("stimulus assembles");
+    session.sweep(&stim).expect("an abort is an outcome");
+
+    assert_eq!(
+        sink.blocks().len(),
+        3,
+        "the ramp block was handed over as usual"
+    );
+    assert_eq!(sink.dropped(), BLOCK, "and then discarded entire");
+    let rendered = sink.rendered();
+    assert_eq!(rendered.len(), 2 * BLOCK, "only the audio AT LEVEL played");
+    assert!(
+        rendered[BLOCK..].iter().any(|v| v.abs() > 1e-6),
+        "the device's last rendered block is the un-faded sweep, which is the click"
     );
 }
 

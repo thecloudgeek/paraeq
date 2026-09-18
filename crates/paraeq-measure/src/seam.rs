@@ -67,9 +67,15 @@ pub struct StreamFormat {
 ///   seconds of already-queued full-level audio.
 /// - `stop` runs the sink's full teardown and MUST be idempotent — every exit
 ///   path, including panic unwinding, runs it, and it precedes the volume
-///   restore in the abort sequence. `stop` must not click: it drops any
-///   still-queued audio rather than flushing it at level. The system must never
-///   be left at measurement volume.
+///   restore in the abort sequence. **`stop` means: let everything already
+///   queued render, then silence, then stop** (R-B1). It may not drop audio it
+///   has accepted, because `emit` returns while up to one block is still
+///   queued and after the MS-14 ramp that block IS the ramp — dropping it
+///   makes the last sample the device rendered one at level, which is the
+///   full-scale click the ramp exists to prevent. The wait is bounded (a
+///   device that has stopped consuming is not waited out forever), and what
+///   cannot be placed is silenced rather than played at level. The system must
+///   never be left at measurement volume.
 pub trait StimulusSink: Send {
     fn format(&self) -> StreamFormat;
 
@@ -184,9 +190,13 @@ pub trait VolumeControl: Send {
 ///   click" — and never a re-render of the stimulus. The envelope itself is
 ///   [`abort_envelope`](crate::ramp::abort_envelope), so the in-process abort
 ///   and the cross-process abort are one shape with one test.
-/// - `stop` is idempotent and must not click: it drops still-queued audio
-///   rather than flushing it at level. By the time a caller reaches it the
-///   ramp has already played, so there is nothing left at level to drop.
+/// - `stop` is idempotent and means **let everything already queued render,
+///   then silence, then stop** (R-B1). The premise this contract used to state
+///   — "by the time a caller reaches it the ramp has already played" — was
+///   false: `write` returns while up to one block is still queued, and after
+///   `ramp_out` that block is the ramp, so a `stop` that dropped it left the
+///   device's last rendered sample at level. The wait is bounded, and what
+///   cannot be placed is silenced rather than played at level.
 /// - Neither `ramp_out` nor `stop` returns a `Result`. Both run on the teardown
 ///   ladder, on every exit path including panic, and a rung that could fail
 ///   into a `?` is a rung that can abort the ladder before the render device is

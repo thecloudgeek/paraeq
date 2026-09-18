@@ -394,6 +394,12 @@ pub struct DeviceRenderer {
     io: Option<IoProcHandle>,
     aggregate: Option<RenderAggregate>,
     capacity: usize,
+    /// A paced [`RenderSink::write`] gave up on a device that stopped
+    /// consuming. It is the ONE state in which [`stop_ring`]'s drain must be
+    /// skipped: waiting [`STALL_SECONDS`] again for a ring that is provably
+    /// not moving only delays the teardown, and the teardown is what destroys
+    /// the private render aggregate.
+    device_stalled: bool,
     /// The PHYSICAL output device's UID — the route the parent taps.
     device_uid: String,
     format: StreamFormat,
@@ -527,6 +533,7 @@ impl DeviceRenderer {
             io: Some(io),
             aggregate: Some(aggregate),
             capacity,
+            device_stalled: false,
             device_uid,
             format: StreamFormat {
                 channels,
@@ -570,7 +577,7 @@ impl DeviceRenderer {
     }
 
     pub fn queued_frames(&self) -> usize {
-        self.capacity - self.producer.slots()
+        queued(&self.producer, self.capacity)
     }
 
     /// The AGGREGATE's UID, `com.paraeq.render.<pid>`.
@@ -586,19 +593,23 @@ impl DeviceRenderer {
     }
 
     /// The full teardown in invariant order; idempotent; errors collected.
-    /// Listeners first (nothing should queue events for a system being torn
-    /// down), then the IOProc (stop → destroy), then the aggregate.
+    /// The RING first (R-B1: everything already accepted is rendered before
+    /// the flush is armed — see [`stop_ring`]), then the listeners (nothing
+    /// should queue events for a system being torn down), then the IOProc
+    /// (stop → destroy), then the aggregate.
     fn stop_inner(&mut self) -> Vec<CaError> {
         if self.torn_down {
             return Vec::new();
         }
         self.torn_down = true;
         self.stopped = true;
-        // Drop whatever is queued rather than playing it out at level. By the
-        // time a caller reaches here the ramp has played, so there is nothing
-        // left at level to drop — and if there is, dropping it is still the
-        // lesser click.
-        self.inner.flush.store(true, Ordering::Relaxed);
+        stop_ring(
+            &mut self.producer,
+            &self.inner,
+            self.capacity,
+            &self.format,
+            !self.device_stalled,
+        );
         self.listeners.clear();
         self.events = None;
         if let Some(mut io) = self.io.take() {
@@ -628,8 +639,16 @@ impl RenderSink for DeviceRenderer {
         self.inner.ramping.store(true, Ordering::Relaxed);
     }
 
-    /// Full teardown; idempotent. Drops queued audio rather than flushing it at
-    /// level, then stops the IOProc and destroys the render aggregate.
+    /// Full teardown; idempotent. **Lets everything already queued render,
+    /// then silence, then stops** — R-B1 — and only then stops the IOProc and
+    /// destroys the render aggregate.
+    ///
+    /// The old order armed the flush first, which on a 512-frame block at
+    /// 48 kHz discarded the whole 240-sample abort ramp unplayed: the pacing
+    /// loop in [`RenderSink::write`] returns with up to one block still
+    /// queued, and after a ramp write that block IS the ramp. The last sample
+    /// the device rendered was then one at level — "a hard stop is itself a
+    /// full-scale click" (measurement-safety § Abort Guards), on every abort.
     ///
     /// Returns nothing on purpose: this runs on every exit path including
     /// panic, and a rung that could fail into a `?` is a rung that can abort
@@ -682,7 +701,13 @@ impl RenderSink for DeviceRenderer {
             if written >= block.len() {
                 break;
             }
-            stall.observe(written != before)?;
+            // A stall is remembered, not just reported: `stop` must not wait
+            // out a second STALL_SECONDS on a ring that is provably not
+            // moving (see `device_stalled`).
+            if let Err(e) = stall.observe(written != before) {
+                self.device_stalled = true;
+                return Err(e);
+            }
         }
         // Pace: hold until the device is within about one block of caught up.
         let block_frames = self.format.frames_per_block.max(1);
@@ -695,7 +720,10 @@ impl RenderSink for DeviceRenderer {
                 ));
             }
             let now = self.queued_frames();
-            stall.observe(now < previous)?;
+            if let Err(e) = stall.observe(now < previous) {
+                self.device_stalled = true;
+                return Err(e);
+            }
             previous = now;
         }
         Ok(())
@@ -711,6 +739,62 @@ impl Drop for DeviceRenderer {
             log::error!("render drop: {err}");
         }
     }
+}
+
+/// Frames the device has not consumed yet.
+fn queued(producer: &Producer<f32>, capacity: usize) -> usize {
+    capacity - producer.slots()
+}
+
+/// The RING half of [`DeviceRenderer::stop_inner`]: **pace to empty, then arm
+/// the flush.** Free rather than a method so it is exercisable with no HAL —
+/// the defect it fixes is entirely a ring-ordering one, and a test that needed
+/// an audio device could not have caught it.
+///
+/// R-B1. `write`'s pacing loop returns while up to one block is still queued,
+/// so after `Player::abort_from` has written the 5 ms raised cosine that block
+/// is the ramp. Arming the flush there makes the next realtime fill pop the
+/// ring into a counter and output silence, so **the last sample the device
+/// rendered is one at level** — exactly the full-scale click
+/// measurement-safety § Abort Guards says the ramp exists to prevent. The same
+/// wait also plays out the tail of the MS-4 fade-out on the clean
+/// end-of-file path, which the old order discarded ~20 dB down.
+///
+/// `drain` is false only for a device that already stopped consuming (see
+/// [`DeviceRenderer::device_stalled`]): there the wait cannot succeed and
+/// would only delay destroying the private render aggregate.
+///
+/// The flush is still armed afterwards, and it is not redundant: it is what
+/// silences anything the drain could not place — a device that stalled inside
+/// this very wait, or a ring the producer refilled — so no sample at level can
+/// reach the DAC after the IOProc is stopped.
+pub(crate) fn stop_ring(
+    producer: &mut Producer<f32>,
+    inner: &RenderInner,
+    capacity: usize,
+    format: &StreamFormat,
+    drain: bool,
+) {
+    if drain {
+        let mut stall = StallBound::new(format);
+        let mut previous = queued(producer, capacity);
+        while queued(producer, capacity) > 0 {
+            // The consumer is gone, so nothing will ever take these samples.
+            if producer.is_abandoned() {
+                break;
+            }
+            let now = queued(producer, capacity);
+            if stall.observe(now < previous).is_err() {
+                log::error!(
+                    "render stop: the device stopped consuming with {now} frames of the abort \
+                     ramp still queued; flushing them so teardown can destroy the render device"
+                );
+                break;
+            }
+            previous = now;
+        }
+    }
+    inner.flush.store(true, Ordering::Relaxed);
 }
 
 /// Destroy a partially-built aggregate and wrap the error that caused it. The
@@ -782,4 +866,159 @@ fn block_sleep(format: &StreamFormat) -> std::time::Duration {
     };
     let seconds = format.frames_per_block.max(1) as f64 / rate / 4.0;
     std::time::Duration::from_secs_f64(seconds.clamp(1e-4, 0.05))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::c_void;
+    use std::ptr::NonNull;
+    use std::time::Duration;
+
+    use objc2_core_audio_types::{AudioBuffer, AudioBufferList};
+
+    use super::*;
+    use crate::ioproc::BufferListMut;
+
+    const FRAMES: usize = 8;
+    const RATE: f64 = 48_000.0;
+
+    fn test_format() -> StreamFormat {
+        StreamFormat {
+            channels: 1,
+            frames_per_block: FRAMES,
+            sample_rate_hz: RATE,
+        }
+    }
+
+    /// Drive [`RenderFill`] the way the IOProc would — one mono block at a
+    /// time — and record every sample the device actually rendered, until
+    /// `stop` is set. No HAL: the block is a hand-built `AudioBufferList` over
+    /// live storage, the `tests/test_buffers.rs` technique.
+    fn spawn_device(
+        mut fill: RenderFill,
+        stop: Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<Vec<f32>> {
+        std::thread::spawn(move || {
+            let mut rendered: Vec<f32> = Vec::new();
+            while !stop.load(Ordering::Relaxed) {
+                let mut storage = [0.0f32; FRAMES];
+                let mut list = AudioBufferList {
+                    mNumberBuffers: 1,
+                    mBuffers: [AudioBuffer {
+                        mNumberChannels: 1,
+                        mDataByteSize: (FRAMES * 4) as u32,
+                        mData: storage.as_mut_ptr().cast::<c_void>(),
+                    }],
+                };
+                {
+                    // SAFETY: `list` holds exactly one buffer over `storage`,
+                    // which is live, aligned, exclusively owned by this thread
+                    // and outlives the view; the view is dropped before
+                    // `storage` is read below.
+                    let mut view = unsafe { BufferListMut::new(NonNull::from(&mut list)) };
+                    fill.fill(&mut view);
+                }
+                rendered.extend_from_slice(&storage);
+                std::thread::sleep(Duration::from_micros(100));
+            }
+            rendered
+        })
+    }
+
+    /// One block of stimulus still at level, then the abort ramp — exactly
+    /// what `write`'s pacing loop leaves in the ring when `Player::abort_from`
+    /// hands over the 5 ms raised cosine.
+    fn residual_then_ramp() -> (Vec<f32>, Vec<f32>) {
+        let residual = vec![0.9f32; FRAMES];
+        let ramp = (0..FRAMES)
+            .map(|i| 0.8 * (1.0 - i as f32 / FRAMES as f32))
+            .collect();
+        (residual, ramp)
+    }
+
+    #[test]
+    fn stop_renders_every_queued_ramp_sample_before_it_arms_the_flush() {
+        // R-B1, the whole of it. Arming the flush while the ramp is still
+        // queued drains it into a counter and outputs silence, so the last
+        // sample the DEVICE rendered is one at level: "a hard stop is itself a
+        // full-scale click", on every abort.
+        let capacity = FRAMES * 8;
+        let (mut producer, consumer) = RingBuffer::<f32>::new(capacity);
+        let inner = Arc::new(RenderInner::default());
+        let fill = RenderFill::new(consumer, Arc::clone(&inner), StimulusRouting::Both);
+
+        let (residual, ramp) = residual_then_ramp();
+        for &v in residual.iter().chain(ramp.iter()) {
+            producer.push(v).expect("the ring is deep enough");
+        }
+
+        let halt = Arc::new(AtomicBool::new(false));
+        let device = spawn_device(fill, Arc::clone(&halt));
+
+        stop_ring(&mut producer, &inner, capacity, &test_format(), true);
+
+        // A few more cycles, so a flush that DID drop samples would show up as
+        // silence where the ramp should be.
+        std::thread::sleep(Duration::from_millis(20));
+        halt.store(true, Ordering::Relaxed);
+        let rendered = device.join().expect("the device thread finishes");
+
+        assert_eq!(
+            inner.flushed.load(Ordering::Relaxed),
+            0,
+            "nothing queued was discarded"
+        );
+        let played: Vec<f32> = rendered.into_iter().filter(|v| *v != 0.0).collect();
+        let expected: Vec<f32> = residual.iter().chain(ramp.iter()).copied().collect();
+        assert_eq!(
+            played, expected,
+            "every queued sample reached the device, in order, ending on the ramp"
+        );
+    }
+
+    #[test]
+    fn a_device_that_stopped_consuming_is_flushed_rather_than_waited_on() {
+        // The one case the drain must NOT take: a device that already made
+        // `write` give up cannot take these frames, and waiting another
+        // STALL_SECONDS only delays destroying the private render aggregate.
+        // This is also the shape of the OLD behaviour — and it shows what it
+        // cost: every queued ramp sample is counted flushed, never rendered.
+        let capacity = FRAMES * 8;
+        let (mut producer, consumer) = RingBuffer::<f32>::new(capacity);
+        let inner = Arc::new(RenderInner::default());
+        let mut fill = RenderFill::new(consumer, Arc::clone(&inner), StimulusRouting::Both);
+
+        let (residual, ramp) = residual_then_ramp();
+        for &v in residual.iter().chain(ramp.iter()) {
+            producer.push(v).expect("the ring is deep enough");
+        }
+
+        stop_ring(&mut producer, &inner, capacity, &test_format(), false);
+
+        let mut storage = [7.0f32; FRAMES];
+        let mut list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [AudioBuffer {
+                mNumberChannels: 1,
+                mDataByteSize: (FRAMES * 4) as u32,
+                mData: storage.as_mut_ptr().cast::<c_void>(),
+            }],
+        };
+        {
+            // SAFETY: one buffer over live, aligned, exclusively-owned storage
+            // that outlives the view.
+            let mut view = unsafe { BufferListMut::new(NonNull::from(&mut list)) };
+            fill.fill(&mut view);
+        }
+
+        assert_eq!(
+            inner.flushed.load(Ordering::Relaxed),
+            (residual.len() + ramp.len()) as u64,
+            "the undrainable queue is dropped, not played out at level"
+        );
+        assert!(
+            storage.iter().all(|&s| s == 7.0),
+            "the flush branch writes nothing; the callback's own zero-fill owns the buffer"
+        );
+    }
 }

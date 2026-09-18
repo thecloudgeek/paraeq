@@ -183,9 +183,12 @@ pub struct StimulusCounters {
     /// empty. Nonzero mid-sweep means the emitter fell behind the device and
     /// the stimulus has gaps — the measurement is not trustworthy.
     pub underrun_frames: u64,
-    /// Stimulus samples discarded by [`StimulusOutput::stop`]'s flush. These
-    /// are intentional: `stop` drops queued audio rather than flushing it at
-    /// level, which is what keeps it from clicking.
+    /// Stimulus samples discarded by [`StimulusOutput::stop`]'s flush.
+    ///
+    /// Zero on a healthy teardown since R-B1: `stop` paces the ring to empty
+    /// first, so the abort ramp is rendered rather than dropped. A NONZERO
+    /// count now means the device stopped consuming with audio still queued —
+    /// worth reading, not routine.
     pub flushed_samples: u64,
 }
 
@@ -390,6 +393,7 @@ impl MicCapture {
             sample_rate_hz,
             stimulus: Some(StimulusOutput {
                 capacity: ring_capacity,
+                device_stalled: false,
                 format: StreamFormat {
                     channels: 1,
                     frames_per_block,
@@ -697,9 +701,11 @@ impl StimulusPath {
     /// them would play it twice into the same acoustic path at unknown
     /// relative gain.
     fn fill(&mut self, output: &mut crate::ioproc::BufferListMut<'_>) {
-        // `stop` flushes rather than fading: the session ramps the stimulus to
-        // zero BEFORE tearing down (MS-14), so by the time this fires there is
-        // nothing left at level to click.
+        // The flush is the LAST resort, not the normal path: R-B1 makes `stop`
+        // pace the ring to empty first, so by the time this fires the ramp has
+        // genuinely been rendered and an empty ring is what it finds. It still
+        // exists for the device that stalled inside that wait — silence beats
+        // whatever is left at level once the IOProc is about to go.
         if self.inner.flush.swap(false, Ordering::Relaxed) {
             let mut flushed = 0u64;
             while self.consumer.pop().is_ok() {
@@ -748,6 +754,12 @@ impl StimulusPath {
 /// the aggregate outputting silence.
 pub struct StimulusOutput {
     capacity: usize,
+    /// A paced [`paraeq_measure::StimulusSink::emit`] gave up on a device that
+    /// stopped consuming. It is the ONE state in which `stop`'s drain must be
+    /// skipped: waiting [`STALL_SECONDS`] again for a ring that is provably
+    /// not moving only delays the teardown, and the teardown is what restores
+    /// the pre-measurement volume.
+    device_stalled: bool,
     format: StreamFormat,
     inner: Arc<StimulusInner>,
     producer: Producer<f32>,
@@ -818,7 +830,13 @@ impl paraeq_measure::StimulusSink for StimulusOutput {
             if written >= block.len() {
                 break;
             }
-            stall.observe(written != before)?;
+            // A stall is remembered, not just reported: `stop` must not wait
+            // out a second STALL_SECONDS on a ring that is provably not
+            // moving (see `device_stalled`).
+            if let Err(e) = stall.observe(written != before) {
+                self.device_stalled = true;
+                return Err(e);
+            }
         }
         // Pace: hold until the device is within about one block of caught up.
         let mut stall = StallGuard::new(&self.format);
@@ -830,20 +848,52 @@ impl paraeq_measure::StimulusSink for StimulusOutput {
                 ));
             }
             let now = self.queued_frames();
-            stall.observe(now < previous)?;
+            if let Err(e) = stall.observe(now < previous) {
+                self.device_stalled = true;
+                return Err(e);
+            }
             previous = now;
         }
         Ok(())
     }
 
-    /// Idempotent teardown. Arms the realtime flush so queued audio is
-    /// **dropped, not played out at level**, and refuses further emission.
+    /// Idempotent teardown: **let everything already queued render, then
+    /// silence, then stop** — R-B1 — and refuse further emission.
     ///
-    /// The stimulus is already at zero when a session calls this — `sweep`
-    /// ramps before terminating (MS-14) and every other caller has nothing
-    /// playing — so dropping the queue cannot click.
+    /// The pacing loop in `emit` returns while up to one block is still
+    /// queued, and after `MeasurementSession::ramp_down`'s last chunk that
+    /// block IS the ramp — a 512-frame block at 48 kHz is exactly the padded
+    /// 5 ms envelope. Arming the flush there dropped the whole ramp unplayed,
+    /// so the last sample the device rendered was one at level: "a hard stop
+    /// is itself a full-scale click" (measurement-safety § Abort Guards), on
+    /// every abort.
+    ///
+    /// The flush is still armed afterwards, and it is not redundant: it
+    /// silences anything the drain could not place — a device that stalled
+    /// inside this very wait — so no sample at level can reach the DAC after
+    /// the session lets go.
     fn stop(&mut self) -> Result<(), MeasureError> {
         self.stopped = true;
+        if !self.device_stalled {
+            let mut stall = StallGuard::new(&self.format);
+            let mut previous = self.queued_frames();
+            while self.queued_frames() > 0 {
+                // The consumer is gone, so nothing will ever take these.
+                if self.producer.is_abandoned() {
+                    break;
+                }
+                let now = self.queued_frames();
+                if stall.observe(now < previous).is_err() {
+                    log::error!(
+                        "stimulus stop: the output device stopped consuming with {now} frames of \
+                         the abort ramp still queued; flushing them so teardown can restore the \
+                         pre-measurement volume"
+                    );
+                    break;
+                }
+                previous = now;
+            }
+        }
         self.inner.flush.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -1417,8 +1467,11 @@ mod tests {
 
     #[test]
     fn a_flush_drops_queued_audio_and_outputs_silence() {
-        // `stop` must not flush the queue at level — that is the click the
-        // whole fade design exists to prevent.
+        // The flush's own behaviour, in isolation: whatever it finds is
+        // dropped and the output is silence. Since R-B1 it is the LAST resort
+        // rather than the normal path — `stop` paces the ring to empty first
+        // (see `stop_renders_every_queued_ramp_sample_before_it_arms_the_flush`),
+        // and this is what happens to a queue that could not be placed.
         let (mut cb, mut tx, inner) = stimulus_cb(StimulusRouting::Both);
         for _ in 0..8 {
             tx.push(0.9f32).expect("room");
@@ -1442,6 +1495,92 @@ mod tests {
         assert!(
             !inner.flush.load(Ordering::Relaxed),
             "the flush is one-shot; a later block plays normally again"
+        );
+    }
+
+    #[test]
+    fn stop_renders_every_queued_ramp_sample_before_it_arms_the_flush() {
+        // R-B1, the in-process half. `emit`'s pacing loop returns with up to
+        // one block still queued, and after `MeasurementSession::ramp_down`'s
+        // last chunk that block IS the padded 5 ms envelope. Arming the flush
+        // there dropped the whole ramp, so the last sample the device rendered
+        // was one at level — the full-scale click the fade exists to prevent.
+        use paraeq_measure::StimulusSink as _;
+
+        const FRAMES: usize = 8;
+        let format = StreamFormat {
+            channels: 1,
+            frames_per_block: FRAMES,
+            sample_rate_hz: 48_000.0,
+        };
+        let capacity = FRAMES * 8;
+        let (producer, consumer) = RingBuffer::<f32>::new(capacity);
+        let inner = Arc::new(StimulusInner::default());
+        let mut path = StimulusPath {
+            consumer,
+            inner: Arc::clone(&inner),
+            routing: StimulusRouting::Both,
+        };
+        let mut sink = StimulusOutput {
+            capacity,
+            device_stalled: false,
+            format: format.clone(),
+            inner: Arc::clone(&inner),
+            producer,
+            stopped: false,
+        };
+
+        // What the pacing loop leaves behind: a block still at level, then the
+        // ramp.
+        let residual = [0.9f32; FRAMES];
+        let ramp: Vec<f32> = (0..FRAMES)
+            .map(|i| 0.8 * (1.0 - i as f32 / FRAMES as f32))
+            .collect();
+        for &v in residual.iter().chain(ramp.iter()) {
+            sink.producer.push(v).expect("the ring is deep enough");
+        }
+
+        // The device, on its own thread, one mono block at a time.
+        let halt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let device_halt = Arc::clone(&halt);
+        let device = std::thread::spawn(move || {
+            let mut played: Vec<f32> = Vec::new();
+            while !device_halt.load(Ordering::Relaxed) {
+                let mut storage = [0.0f32; FRAMES];
+                let mut list = AudioBufferList {
+                    mNumberBuffers: 1,
+                    mBuffers: [buffer_over(&mut storage, 1)],
+                };
+                {
+                    // SAFETY: one buffer over live, aligned, exclusively-owned
+                    // f32 storage that outlives the view.
+                    let mut view = unsafe { BufferListMut::new(NonNull::from(&mut list)) };
+                    path.fill(&mut view);
+                }
+                played.extend_from_slice(&storage);
+                std::thread::sleep(std::time::Duration::from_micros(100));
+            }
+            played
+        });
+
+        sink.stop().expect("stop never fails");
+
+        // A few more cycles, so a flush that DID drop samples would show up as
+        // silence where the ramp should be.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        halt.store(true, Ordering::Relaxed);
+        let played = device.join().expect("the device thread finishes");
+
+        assert_eq!(
+            inner.flushed.load(Ordering::Relaxed),
+            0,
+            "nothing queued was discarded"
+        );
+        let rendered: Vec<f32> = played.into_iter().filter(|v| *v != 0.0).collect();
+        let expected: Vec<f32> = residual.iter().chain(ramp.iter()).copied().collect();
+        assert_eq!(
+            rendered, expected,
+            "every queued sample reached the device, in order, ending on the ramp"
         );
     }
 

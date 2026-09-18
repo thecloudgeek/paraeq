@@ -17,8 +17,17 @@ const RATE: f64 = 48_000.0;
 
 #[derive(Default)]
 struct Recorded {
-    /// Every sample handed to the sink, in order.
+    /// Every sample handed to the sink, in order. (Accepted, which since R-B1
+    /// is no longer the same thing as rendered — see `rendered`.)
     written: Vec<f32>,
+    /// Accepted but not yet taken by the device: the mock's ONE block of
+    /// queue. A real paced sink returns from `write` while up to one block is
+    /// still in flight, which is why the abort ramp could be lost.
+    queued: Vec<f32>,
+    /// Every sample the DEVICE actually rendered, in order.
+    rendered: Vec<f32>,
+    /// Accepted samples `stop` discarded instead of rendering.
+    dropped: usize,
     /// `ramp_out` was called, and at which sample offset.
     ramped_at: Option<usize>,
     stops: usize,
@@ -27,10 +36,41 @@ struct Recorded {
     writes_after_ramp: usize,
 }
 
-#[derive(Clone, Default)]
+/// A sink with a REAL queue, so the MS-14 acceptance tests can see a ramp be
+/// lost.
+///
+/// The old mock appended every block straight to a `Vec`, which made it
+/// structurally incapable of dropping anything — so `RenderSink::stop`'s
+/// pre-R-B1 flush-first order passed every test here while discarding the
+/// whole 5 ms ramp on a real device. This one holds a block back, exactly as
+/// the pacing loop does, and `drain_on_stop` chooses which contract it keeps.
+#[derive(Clone)]
 struct MockSink {
+    /// R-B1's contract: `stop` lets everything already queued render. False
+    /// models the OLD sink, which dropped it — see
+    /// `a_sink_that_drops_its_queue_at_stop_loses_the_whole_abort_ramp`.
+    drain_on_stop: Arc<AtomicBool>,
     fail_next_write: Arc<AtomicBool>,
     log: Arc<Mutex<Recorded>>,
+}
+
+impl Default for MockSink {
+    fn default() -> Self {
+        MockSink {
+            drain_on_stop: Arc::new(AtomicBool::new(true)),
+            fail_next_write: Arc::default(),
+            log: Arc::default(),
+        }
+    }
+}
+
+impl MockSink {
+    /// Keep the pre-R-B1 contract: drop whatever is still queued at `stop`.
+    fn dropping_stop() -> MockSink {
+        let sink = MockSink::default();
+        sink.drain_on_stop.store(false, Ordering::SeqCst);
+        sink
+    }
 }
 
 impl RenderSink for MockSink {
@@ -49,7 +89,14 @@ impl RenderSink for MockSink {
     }
 
     fn stop(&mut self) {
-        self.log.lock().expect("uncontended").stops += 1;
+        let mut log = self.log.lock().expect("uncontended");
+        log.stops += 1;
+        let queued = std::mem::take(&mut log.queued);
+        if self.drain_on_stop.load(Ordering::SeqCst) {
+            log.rendered.extend_from_slice(&queued);
+        } else {
+            log.dropped += queued.len();
+        }
     }
 
     fn write(&mut self, block: &[f32]) -> Result<(), MeasureError> {
@@ -63,6 +110,14 @@ impl RenderSink for MockSink {
             log.writes_after_ramp += 1;
         }
         log.written.extend_from_slice(block);
+        log.queued.extend_from_slice(block);
+        // Pace: the device takes everything but the last block, which is what
+        // a paced `write` returning "within about one block of caught up"
+        // means.
+        let keep = BLOCK.min(log.queued.len());
+        let take = log.queued.len() - keep;
+        let taken: Vec<f32> = log.queued.drain(..take).collect();
+        log.rendered.extend_from_slice(&taken);
         Ok(())
     }
 }
@@ -97,6 +152,14 @@ fn a_clean_play_emits_every_sample_once_and_then_tears_down() {
     assert_eq!(log.written, samples, "every sample, once, in order");
     assert_eq!(log.stops, 1, "the device is destroyed exactly once");
     assert!(log.ramped_at.is_none(), "a clean play never arms the abort");
+    // R-B1's second-order half: the CLEAN end of file was truncated too. The
+    // last block in flight is the tail of MS-4's 50 ms fade-out — quieter than
+    // an abort ramp, but discarding it is the same defect one order down.
+    assert_eq!(log.dropped, 0);
+    assert_eq!(
+        log.rendered, samples,
+        "the file's own fade-out reached the device as well"
+    );
 }
 
 #[test]
@@ -132,6 +195,14 @@ fn an_abort_arms_the_sink_first_then_writes_exactly_one_faded_block() {
     assert_eq!(log.writes_after_ramp, 1, "exactly one block after arming");
     assert_eq!(log.written.len(), ramp_len);
     assert_eq!(log.stops, 1, "the device is destroyed");
+    // R-B1: handed to the sink is not enough — every ramp sample must reach
+    // the DEVICE. `stop` follows the ramp write immediately, and the sink is
+    // paced, so a stop that dropped its queue would drop the ramp entire.
+    assert_eq!(log.dropped, 0, "no accepted sample was discarded");
+    assert_eq!(
+        log.rendered, log.written,
+        "the ramp was rendered, not flushed into a counter"
+    );
 
     // And the fade is the SHARED envelope applied to the stimulus's own next
     // samples — not a re-render, and not a second shape.
@@ -280,5 +351,48 @@ fn progress_is_reported_without_a_clock_on_the_render_path() {
     assert!(
         reports.windows(2).all(|pair| pair[1] > pair[0]),
         "frame counts only rise: {reports:?}"
+    );
+}
+
+#[test]
+fn a_sink_that_drops_its_queue_at_stop_loses_the_whole_abort_ramp() {
+    // The defect R-B1 fixes, kept as a live witness rather than a paragraph.
+    // A paced sink returns from `write` with up to one block still in flight;
+    // after `abort_from` that block IS the ramp. A `stop` that discards it —
+    // which is what arming the flush before stopping the IOProc did — leaves
+    // the DEVICE's last rendered sample at level: "a hard stop is itself a
+    // full-scale click", on every abort.
+    let sink = MockSink::dropping_stop();
+    let log = Arc::clone(&sink.log);
+    let mut player = Player::new(Box::new(sink));
+    let samples = stimulus(BLOCK * 20);
+
+    player
+        .play(&samples, &|| true, |_| {})
+        .expect("an abort is not a failure");
+
+    let log = log.lock().expect("uncontended");
+    let ramp_len = abort_ramp_len(RATE);
+    assert_eq!(
+        log.written.len(),
+        ramp_len,
+        "the ramp was handed over in full"
+    );
+    assert_eq!(
+        log.dropped, BLOCK,
+        "the block still in flight was discarded — and it is the ramp's tail"
+    );
+    assert_eq!(log.rendered.len(), ramp_len - BLOCK);
+    // The acoustic consequence, stated as an assertion: the fade is cut off
+    // while its envelope is still well above zero — about -16 dB of the
+    // ramp's starting level here — so the device's last rendered sample is a
+    // step to silence, which is the click. (Asserting on the ENVELOPE rather
+    // than on the sample: the stimulus itself crosses zero, so an individual
+    // sample near the cut can be 0.0 by coincidence.)
+    let env = abort_envelope(ramp_len, ramp_len);
+    assert!(
+        env[log.rendered.len() - 1] > 0.1,
+        "the fade never got near zero before the device stopped: envelope {}",
+        env[log.rendered.len() - 1]
     );
 }
