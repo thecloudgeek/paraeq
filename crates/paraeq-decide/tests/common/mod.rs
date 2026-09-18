@@ -7,11 +7,11 @@
 
 use paraeq_decide::{
     Analysis, AuthorityCurve, AuthorityPreset, AveragingMode, CalFile, CalVariant, CapturePlan,
-    CaptureRouting, CaptureStats, CorrectionForm, CorrectionPlan, Decision, DecisionSet, Decisions,
-    Diagnostic, DiagnosticCode, Domain, Evidence, EvidenceLabel, ImpulseResponse, Invalidation,
-    MeasurementBundle, NoiseFloor, Overrides, Position, Rationale, RationaleKey, Severity,
-    SmoothingMode, Source, SweepPlan, TargetChoice, TransducerClass, TwoClockFit, Unit, Verdict,
-    Verification, VerificationReport, WindowType,
+    CaptureRouting, CaptureStats, CorrectionForm, CorrectionPlan, CouplingPath, Decision,
+    DecisionSet, Decisions, Diagnostic, DiagnosticCode, Domain, Evidence, EvidenceLabel,
+    ImpulseResponse, Invalidation, MeasurementBundle, NoiseFloor, Overrides, Position, Rationale,
+    RationaleKey, Severity, SmoothingMode, Source, SweepPlan, TargetChoice, TransducerClass,
+    TwoClockFit, Unit, Verdict, Verification, VerificationReport, WindowType,
 };
 use paraeq_dsp::authority::{
     build_authority, AuthorityPolicy, Clamp, COUPLER_Q_CEILING, ROOM_Q_CEILING,
@@ -797,5 +797,78 @@ pub fn assert_refusal_is_consistent(set: &DecisionSet) {
             "verdict {:?} against a Warn diagnostic being present = {warning}",
             set.verdict
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shaped bundles for the RULE tests (B7b) — additive; nothing above changes.
+//
+// The generator above builds a plausible but arbitrary response, which is what
+// the invariants need and exactly what a rule test cannot use: "the low corner
+// is 38 Hz" is only checkable against a capture whose low corner IS 38 Hz.
+// These build an impulse response with a KNOWN magnitude response, by filtering
+// a unit impulse through a biquad cascade the caller names — so the oracle is
+// the filter's own closed form, not a second copy of the rule.
+// ---------------------------------------------------------------------------
+
+/// [`synthetic_bundle`] with every position's impulse response replaced by a
+/// unit impulse filtered through `shape(position.index)`.
+///
+/// Noiseless and identical across channels on purpose: the only variation
+/// between positions is the one `shape` introduces, so σ(f) is a quantity the
+/// test chose rather than a property of a random tail. An empty cascade is the
+/// identity, which gives every position the same flat response and σ ≈ 0.
+pub fn shaped_bundle(
+    spec: SyntheticSpec,
+    shape: impl Fn(usize) -> Vec<[f64; 6]>,
+) -> MeasurementBundle {
+    let mut bundle = synthetic_bundle(spec);
+    for position in &mut bundle.positions {
+        let sos = shape(position.index);
+        let peak = position.ir.peak;
+        let len = position.ir.samples[0].len();
+        let mut stimulus = vec![0.0; len];
+        stimulus[peak] = 1.0;
+        let filtered = paraeq_dsp::peq::sosfilt(&sos, &stimulus);
+        for channel in &mut position.ir.samples {
+            channel.clone_from(&filtered);
+        }
+    }
+    bundle
+}
+
+/// One target curve, on the three-point grid [`synthetic_targets`] uses, legal
+/// for every class — so a test can name the exact shape the `target` rows and
+/// `correction_range`'s high edge are graded against.
+pub fn target_curve(name: &str, gains_db: [f64; 3]) -> TargetCurve {
+    TargetCurve {
+        name: name.to_string(),
+        frequencies: vec![20.0, 1000.0, 20_000.0],
+        gains_db: gains_db.to_vec(),
+        category: None,
+        classes: EVERY_CLASS.to_vec(),
+        description: None,
+        source: None,
+    }
+}
+
+/// The `AuthorityPolicy` `decide()` composes for `class`, rebuilt from the
+/// public `PathProfile` fields.
+///
+/// A test-side mirror of `analysis::authority_policy`, which is `pub(crate)`.
+/// It exists so a test can re-derive the authority curve from σ(f) ALONE and
+/// compare — which is how "the EGD trace changes nothing" is checked without an
+/// injection point the public API does not have.
+pub fn authority_policy_for(class: TransducerClass) -> AuthorityPolicy {
+    let profile = paraeq_decide::profile_for(class);
+    let base = match profile.coupling {
+        CouplingPath::Coupler => AuthorityPolicy::coupler(),
+        CouplingPath::Room => AuthorityPolicy::room(),
+    };
+    AuthorityPolicy {
+        boost_ratio: profile.boost_ratio,
+        excursion: profile.excursion_breakpoints_db.to_vec(),
+        q_ceiling: profile.q_cap,
+        ..base
     }
 }

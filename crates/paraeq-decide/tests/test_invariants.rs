@@ -128,11 +128,19 @@ fn overriding_a_decision_to_its_auto_value_changes_only_its_source() {
 /// The complement of idempotence, and the reason it is not vacuous: an
 /// override must actually ARRIVE. Without this, "idempotence" is satisfiable by
 /// making overrides inert, which would be the same fork wearing the other mask.
+///
+/// **The precondition is `!= UserOverride`, not `== Default`.** B7a's skeleton
+/// answered every row with the fallback, so `Default` was the only value this
+/// could read; B7b's σ-crossing scan gives `transition_hz` a measured answer on
+/// bundles that have a crossing, and which of `Auto`/`Default` this particular
+/// fixture lands on is a property of the synthetic σ, not of the override path
+/// this test is about. Asserting the precondition the test actually needs keeps
+/// it from failing every time a rule starts measuring something.
 #[test]
 fn an_override_is_recorded_as_a_user_override() {
     let bundle = minimal_bundle(TransducerClass::Bookshelf);
     let auto = decide(&bundle);
-    assert_eq!(auto.decisions.transition_hz.source, Source::Default);
+    assert_ne!(auto.decisions.transition_hz.source, Source::UserOverride);
 
     let pinned = decide(&with_override(
         &bundle,
