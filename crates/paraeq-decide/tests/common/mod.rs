@@ -837,6 +837,63 @@ pub fn shaped_bundle(
     bundle
 }
 
+// Refusal-table helpers (B7c). Additive: nothing above this line moved.
+//
+// The refusal rows are graded against the ANALYSED curve, not against raw
+// samples, so a test that wants "this position's bass is 8 dB low" has to make
+// the analysis stage produce that curve. These helpers do it the only honest
+// way: drive a unit delta through a biquad cascade whose magnitude response IS
+// the shape under test, and let the real gate → spectrum → compensation →
+// smoothing → Align SPL → average pipeline carry it through. A hand-written
+// `averaged_db` would test the assertion against itself.
+// ---------------------------------------------------------------------------
+
+/// The impulse response of a biquad cascade: a unit delta at `peak` driven
+/// through `sections` in series, Direct Form I. An empty cascade gives the bare
+/// delta, whose magnitude response is flat — the blank canvas every shaped
+/// bundle starts from.
+///
+/// Rows are `[b0, b1, b2, 1, a1, a2]`, already normalized by `a0`
+/// (`crates/paraeq-dsp/src/biquad.rs`), so the recurrence is
+/// `y[n] = b0·x[n] + b1·x[n−1] + b2·x[n−2] − a1·y[n−1] − a2·y[n−2]`.
+pub fn sos_impulse(sections: &[[f64; 6]], peak: usize, len: usize) -> Vec<f64> {
+    let mut signal = vec![0.0; len];
+    signal[peak] = 1.0;
+    for row in sections {
+        let (mut x1, mut x2, mut y1, mut y2) = (0.0, 0.0, 0.0, 0.0);
+        for sample in signal.iter_mut() {
+            let x0 = *sample;
+            let y0 = row[0] * x0 + row[1] * x1 + row[2] * x2 - row[4] * y1 - row[5] * y2;
+            (x2, x1) = (x1, x0);
+            (y2, y1) = (y1, y0);
+            *sample = y0;
+        }
+    }
+    signal
+}
+
+/// A mono bundle whose position `p` has the magnitude response of `shapes[p]`.
+///
+/// Everything except the impulse responses comes from [`synthetic_bundle`], so
+/// the capture plan, the cal and the noise floor are the same nominal values
+/// every other test uses and only the curve under test differs.
+pub fn shaped_positions(class: TransducerClass, shapes: &[Vec<[f64; 6]>]) -> MeasurementBundle {
+    let mut bundle = synthetic_bundle(SyntheticSpec {
+        channels: 1,
+        class,
+        positions: shapes.len(),
+        ..SyntheticSpec::default()
+    });
+    for (position, sections) in bundle.positions.iter_mut().zip(shapes) {
+        let peak = position.ir.peak;
+        let len = position.ir.samples[0].len();
+        for channel in position.ir.samples.iter_mut() {
+            *channel = sos_impulse(sections, peak, len);
+        }
+    }
+    bundle
+}
+
 /// One target curve, on the three-point grid [`synthetic_targets`] uses, legal
 /// for every class — so a test can name the exact shape the `target` rows and
 /// `correction_range`'s high edge are graded against.
@@ -871,4 +928,49 @@ pub fn authority_policy_for(class: TransducerClass) -> AuthorityPolicy {
         q_ceiling: profile.q_cap,
         ..base
     }
+}
+
+/// `n` positions of bare delta: the flattest analysed curve this pipeline can
+/// produce, and therefore the one a shaped test perturbs from.
+pub fn flat_bundle(class: TransducerClass, positions: usize) -> MeasurementBundle {
+    shaped_positions(class, &vec![Vec::new(); positions])
+}
+
+/// A cal file carrying `curve` verbatim. The compensation stage subtracts it
+/// from every position, so a cal is also the cheapest way to give the averaged
+/// curve a known shape that is the SAME at every position — which is what the
+/// two whole-curve rows (`AbsurdCurve`) are graded on.
+pub fn cal_with_curve(freqs_hz: Vec<f64>, gains_db: Vec<f64>) -> CalFile {
+    CalFile {
+        content: String::new(),
+        curve: (freqs_hz, gains_db),
+        gain_db: None,
+        sensitivity_db: Some(-0.9),
+        serial: Some("7005770".to_string()),
+        variant: CalVariant::Plain,
+    }
+}
+
+/// Every diagnostic carrying `code`, in the order `decide()` emitted them.
+pub fn diagnostics_with(set: &DecisionSet, code: DiagnosticCode) -> Vec<&Diagnostic> {
+    set.diagnostics.iter().filter(|d| d.code == code).collect()
+}
+
+/// Whether `code` fired at all.
+pub fn has_code(set: &DecisionSet, code: DiagnosticCode) -> bool {
+    !diagnostics_with(set, code).is_empty()
+}
+
+/// The one diagnostic carrying `code`. Panics with the whole diagnostic list
+/// when there is not exactly one, because "which codes actually fired" is the
+/// thing a failing refusal test needs to see.
+pub fn only_diagnostic(set: &DecisionSet, code: DiagnosticCode) -> &Diagnostic {
+    let found = diagnostics_with(set, code);
+    assert_eq!(
+        found.len(),
+        1,
+        "expected exactly one {code:?}; diagnostics were {:?}",
+        set.diagnostics
+    );
+    found[0]
 }
