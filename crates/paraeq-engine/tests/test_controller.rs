@@ -1368,6 +1368,13 @@ fn tap_activity_emits_no_snapshot_and_no_event() {
         EngineStatus::NoInputDetected { .. }
     )));
     let snapshots = handle.subscribe();
+    // `publish` stores the new snapshot (which is what `wait_until` just
+    // observed) BEFORE it notifies subscribers, so a subscription taken between
+    // those two steps receives the `NoInputDetected` transition itself and this
+    // test would blame `tap_activity` for it. Let that in-flight notification
+    // land and drain it, then measure from a quiet baseline.
+    std::thread::sleep(Duration::from_millis(TICK_MS * 2));
+    while snapshots.try_recv().is_ok() {}
     let before = handle.state();
 
     for _ in 0..100 {
