@@ -425,54 +425,149 @@ fn clipping_refuses_per_position_on_peak_and_per_session_on_sustain() {
     assert!(!has_code(&decide(&brief), DiagnosticCode::ClippingSession));
 }
 
+/// The same bundle with a FLAT silence-capture spectrum at `level_dbfs`.
+///
+/// Flat on purpose: since ruling R-A8 the two level rows read the SPECTRUM and
+/// reduce it to a band RMS, and the band RMS of a flat curve is that curve's own
+/// level — so the test can name the floor exactly without re-implementing the
+/// reduction. `NoiseFloor::rms_dbfs` is deliberately left where it is: it is the
+/// FALLBACK the rows use only when the spectrum cannot be read, and leaving it
+/// untouched is what proves the spectrum is what they read.
+fn with_flat_floor(level_dbfs: f64) -> MeasurementBundle {
+    let mut bundle = clean();
+    let bins = bundle.noise_floor.freqs_hz.len();
+    for channel in bundle.noise_floor.spectrum_db.iter_mut() {
+        *channel = vec![level_dbfs; bins];
+    }
+    bundle
+}
+
 /// Dirac's gate. Above it the room is too noisy to measure, and the remedy
 /// explicitly refuses to solve it with output level.
 #[test]
 fn noise_floor_too_high_refuses() {
-    let mut noisy = clean();
-    noisy.noise_floor.rms_dbfs = vec![-23.9];
-    let set = decide(&noisy);
+    let set = decide(&with_flat_floor(-23.9));
     assert_eq!(
         only_diagnostic(&set, DiagnosticCode::NoiseFloorTooHigh).severity,
         Severity::Refuse
     );
+    assert!(
+        set.diagnostics
+            .iter()
+            .find(|d| d.code == DiagnosticCode::NoiseFloorTooHigh)
+            .and_then(|d| d.value)
+            .is_some_and(|v| (v + 23.9).abs() < 0.05),
+        "the row reports the band RMS, which on a flat floor is its own level: {:?}",
+        set.diagnostics
+    );
 
-    let mut quiet = clean();
-    quiet.noise_floor.rms_dbfs = vec![-24.0];
     assert!(!has_code(
-        &decide(&quiet),
+        &decide(&with_flat_floor(-24.0)),
         DiagnosticCode::NoiseFloorTooHigh
     ));
 }
 
-/// The two SNR rows at their boundaries. The soft row is a Warn that
-/// de-weights; the hard row refuses, and its copy forbids the remedy a user
-/// reaches for first.
+/// The two SNR rows at their boundaries. The soft row is a Warn; the hard row
+/// refuses, and its copy forbids the remedy a user reaches for first.
+///
+/// Since ruling R-A8 the SNR is band-restricted, so the level the rows grade
+/// against is the analysed curve's own band RMS rather than
+/// `CaptureStats::rms_dbfs`. The floor is FLAT, so its band RMS is its own
+/// level whatever the band turns out to be, and the SNR the rule should report
+/// is re-derived here from the PUBLISHED curves — an oracle over what
+/// `decide()` published, not a second copy of the rule's answer.
+///
+/// **The cohort is scaled down first, and that is not cosmetic.** The two rows
+/// overlap with Dirac's `-24 dBFS` noise-floor gate: at the `clean()` fixture's
+/// own level a floor 15 dB under it sits well above `-24`, so
+/// `NoiseFloorTooHigh` would fire alongside and the test would be grading two
+/// rows at once. Scaling to about `-20 dBFS` — the level the fixture's own
+/// `CaptureStats` already claims — puts both floors below the gate, which is the
+/// arrangement the pre-R-A8 version of this test had for free.
+///
+/// **A ladder rather than four hand-placed floors.** The band the RMS is taken
+/// over moves with `correction_range`, which moves with the floor, so a floor
+/// computed to land on exactly 24.9 dB lands a few tenths away. Walking the
+/// floor in 0.25 dB steps and asserting the EQUIVALENCE at every step — the row
+/// fires exactly when the re-derived SNR is under its threshold — tests the
+/// thresholds without needing to hit them.
 #[test]
 fn snr_soft_warns_and_hard_refuses_at_the_boundary() {
-    // The capture's broadband RMS is -20 dBFS, so the floor sets the SNR.
-    let warn = {
-        let mut bundle = clean();
-        bundle.noise_floor.rms_dbfs = vec![-44.9];
-        decide(&bundle)
-    };
-    let diagnostic = &diagnostics_with(&warn, DiagnosticCode::LowSnrSoft)[0];
-    assert_eq!(diagnostic.severity, Severity::Warn);
-    assert!(!has_code(&warn, DiagnosticCode::LowSnrHard));
-    assert_eq!(warn.verdict, Verdict::ProceedWithWarnings);
+    const CAPTURE_DBFS: f64 = -20.0;
 
-    let quiet = {
-        let mut bundle = clean();
-        bundle.noise_floor.rms_dbfs = vec![-45.1];
-        decide(&bundle)
-    };
-    assert!(!has_code(&quiet, DiagnosticCode::LowSnrSoft));
+    let probe = decide(&with_flat_floor(-160.0));
+    let probe_level = snr_band_rms(&probe, 0);
+    let scale = 10f64.powf((CAPTURE_DBFS - probe_level) / 20.0);
 
-    let hard = {
-        let mut bundle = clean();
-        bundle.noise_floor.rms_dbfs = vec![-34.9];
+    let at_floor = |floor_db: f64| {
+        let mut bundle = with_flat_floor(floor_db);
+        for position in &mut bundle.positions {
+            for channel in position.ir.samples.iter_mut() {
+                for sample in channel.iter_mut() {
+                    *sample *= scale;
+                }
+            }
+        }
         decide(&bundle)
     };
+
+    let mut saw_soft = false;
+    let mut saw_hard = false;
+    let mut saw_clean = false;
+    // 12 dB to 28 dB of SNR, which brackets both thresholds with room either
+    // side. The floor is what moves; the capture does not.
+    for step in 0..=32 {
+        let floor_db = CAPTURE_DBFS - 12.0 - 0.5 * f64::from(step);
+        let set = at_floor(floor_db);
+        // The floor is flat, so its band RMS IS its level, whatever band the
+        // run settled on.
+        let snr = snr_band_rms(&set, 0) - floor_db;
+
+        assert!(
+            !has_code(&set, DiagnosticCode::NoiseFloorTooHigh),
+            "floor {floor_db} is below Dirac's gate; this ladder must grade the SNR rows alone"
+        );
+
+        let hard = has_code(&set, DiagnosticCode::LowSnrHard);
+        let soft = has_code(&set, DiagnosticCode::LowSnrSoft);
+        assert_eq!(
+            hard,
+            snr < 15.0,
+            "floor {floor_db}: SNR {snr:.3} against the 15 dB hard gate"
+        );
+        assert_eq!(
+            soft,
+            (15.0..25.0).contains(&snr),
+            "floor {floor_db}: SNR {snr:.3} against the 25 dB soft gate — hard outranks soft, \
+             so a position that tripped 15 must not be reported twice"
+        );
+        if let Some(reported) = set
+            .diagnostics
+            .iter()
+            .find(|d| {
+                matches!(
+                    d.code,
+                    DiagnosticCode::LowSnrHard | DiagnosticCode::LowSnrSoft
+                )
+            })
+            .and_then(|d| d.value)
+        {
+            assert!(
+                (reported - snr).abs() < 0.05,
+                "floor {floor_db}: the row reports {reported:.3}, the curves say {snr:.3}"
+            );
+        }
+        saw_hard |= hard;
+        saw_soft |= soft;
+        saw_clean |= !hard && !soft;
+    }
+    assert!(
+        saw_hard && saw_soft && saw_clean,
+        "the ladder must cross both gates"
+    );
+
+    // The severities and the copy, once, on a floor deep in each band.
+    let hard = at_floor(CAPTURE_DBFS - 12.0);
     assert_eq!(
         diagnostics_with(&hard, DiagnosticCode::LowSnrHard)[0].severity,
         Severity::Refuse
@@ -481,6 +576,117 @@ fn snr_soft_warns_and_hard_refuses_at_the_boundary() {
         .remedy
         .contains("do not"));
     assert_eq!(hard.verdict, Verdict::Refuse);
+
+    let soft = at_floor(CAPTURE_DBFS - 20.0);
+    assert_eq!(
+        diagnostics_with(&soft, DiagnosticCode::LowSnrSoft)[0].severity,
+        Severity::Warn
+    );
+    assert_eq!(soft.verdict, Verdict::ProceedWithWarnings);
+}
+
+/// One position's analysed band RMS, over the band the level rows grade on:
+/// the published `correction_range`, or the whole grid when that range has
+/// collapsed to fewer than two bins.
+///
+/// The collapse is not hypothetical — `correction_range`'s low edge is the
+/// lowest bin with SNR ≥ 25 dB, so every run the SNR rows fire on has collapsed
+/// it — which is why `refusal.rs` carries the same fallback.
+fn snr_band_rms(set: &paraeq_decide::DecisionSet, position: usize) -> f64 {
+    let freqs = &set.analysis.freqs_hz;
+    let (lo, hi) = set.decisions.correction_range.value;
+    let kept = freqs.iter().filter(|f| **f >= lo && **f <= hi).count();
+    let (lo, hi) = if kept >= 2 {
+        (lo, hi)
+    } else {
+        (f64::NEG_INFINITY, f64::INFINITY)
+    };
+    band_rms_db(&set.analysis.per_position_db[position], freqs, (lo, hi))
+}
+
+/// § D-P, taken honestly: the soft row's copy says the position was used
+/// UNWEIGHTED, because nothing de-weights it.
+///
+/// Ruling R-A7. `fr::average_measurements_rms_weighted` and `fr::sigma_db_weighted`
+/// shipped with no non-test caller, so "We used it, but weighted it down" was a
+/// sentence about a mechanism that is not wired. D-P's own interim is "emit the
+/// Warn and do **not** de-weight, **and say so**".
+#[test]
+fn the_soft_snr_remedy_does_not_claim_a_de_weighting_that_never_happened() {
+    let probe = decide(&with_flat_floor(-160.0));
+    let level = band_rms_db(
+        &probe.analysis.per_position_db[0],
+        &probe.analysis.freqs_hz,
+        probe.decisions.correction_range.value,
+    );
+    let set = decide(&with_flat_floor(level - 20.0));
+    let soft = &diagnostics_with(&set, DiagnosticCode::LowSnrSoft)[0];
+    assert!(
+        !soft.remedy.contains("weighted it down"),
+        "the copy claims a de-weighting nothing performs: {}",
+        soft.remedy
+    );
+    assert!(
+        soft.remedy.contains("as it is"),
+        "…and it has to say what really happened: {}",
+        soft.remedy
+    );
+}
+
+/// The two level rows read the band the correction is placed in, not the whole
+/// spectrum.
+///
+/// Ruling R-A8's falsifier. A floor that is quiet INSIDE `correction_range` and
+/// railed above it is the case the two readings disagree on: a broadband RMS is
+/// dominated by the loud part and refuses a measurement the noise cannot affect,
+/// while the band-restricted read sees the quiet band the filters go in. The
+/// spec words both rows against a band — "in `correction_range`", "in the
+/// analysis band" — and this is what that costs an implementation that ignores
+/// it.
+#[test]
+fn the_snr_and_floor_rows_are_restricted_to_the_correction_range() {
+    let mut bundle = clean();
+    let bins = bundle.noise_floor.freqs_hz.len();
+    assert!(bins >= 3, "the fixture's floor needs a top bin to rail");
+    for channel in bundle.noise_floor.spectrum_db.iter_mut() {
+        *channel = vec![-120.0; bins];
+        // 20 kHz, well above anything a coupler correction is placed at.
+        *channel.last_mut().expect("a top bin") = 0.0;
+    }
+    // The broadband summary still says the room is unusable. The rows must not
+    // be reading it.
+    bundle.noise_floor.rms_dbfs = vec![0.0; bundle.noise_floor.spectrum_db.len()];
+
+    let set = decide(&bundle);
+    assert!(
+        !has_code(&set, DiagnosticCode::NoiseFloorTooHigh),
+        "a railed bin outside the corrected band is not a reason to refuse: {:?}",
+        set.diagnostics
+    );
+    assert!(
+        !has_code(&set, DiagnosticCode::LowSnrHard) && !has_code(&set, DiagnosticCode::LowSnrSoft),
+        "the SNR inside the corrected band is enormous: {:?}",
+        set.diagnostics
+    );
+    assert!(
+        set.decisions.correction_range.value.1 < 20_000.0,
+        "the railed bin should also have pulled the correction range in, got {:?}",
+        set.decisions.correction_range.value
+    );
+}
+
+/// A band RMS in the power domain — the same reduction `refusal.rs` applies,
+/// re-derived here from the PUBLISHED curves so the assertion has an oracle
+/// rather than a copy of the rule's own answer.
+fn band_rms_db(curve: &[f64], freqs_hz: &[f64], (lo, hi): (f64, f64)) -> f64 {
+    let power: Vec<f64> = freqs_hz
+        .iter()
+        .zip(curve)
+        .filter(|(f, _)| **f >= lo && **f <= hi)
+        .map(|(_, db)| 10f64.powf(db / 10.0))
+        .collect();
+    assert!(!power.is_empty(), "the correction range keeps no bin");
+    10.0 * (power.iter().sum::<f64>() / power.len() as f64).log10()
 }
 
 // ---------------------------------------------------------------------------

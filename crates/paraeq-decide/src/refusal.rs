@@ -189,10 +189,10 @@ pub(crate) fn diagnostics(
     out.extend(clipping_session(bundle));
     out.extend(coherent_averaging(decisions));
     out.extend(excessive_variance(decisions, analysis, freqs));
-    out.extend(low_snr(bundle));
+    out.extend(low_snr(bundle, decisions, analysis, &grid, freqs));
     out.extend(mic_not_connected(bundle));
     out.extend(no_signal(bundle));
-    out.extend(noise_floor_too_high(bundle));
+    out.extend(noise_floor_too_high(bundle, decisions, &grid, freqs));
     out.extend(override_out_of_domain(bundle, decisions));
     out.extend(position_count(bundle, profile));
     out.extend(position_outliers(bundle, analysis, profile, freqs));
@@ -443,28 +443,74 @@ fn clipping_session(bundle: &MeasurementBundle) -> Option<Diagnostic> {
 /// The two SNR rows, per position. Hard outranks soft: a position that trips 15
 /// dB has already tripped 25 and must not be reported twice.
 ///
-/// **Composed, and the composition is a gap worth naming.** The row is "capture
-/// RMS − floor RMS in `correction_range`", i.e. a per-band SNR — and the bundle
-/// carries no per-position captured SPECTRUM. `CaptureStats::rms_dbfs` is
-/// broadband and `NoiseFloor::spectrum_db` is the floor's, so the band
-/// restriction cannot be honoured here. This is the broadband read of the same
-/// quantity: the worst channel's floor against each pass's own RMS.
+/// **Band-restricted, as the row is written** (ruling R-A8). The spec's
+/// Detection column is "capture RMS − floor RMS in `correction_range`", and the
+/// bundle does carry the two curves that answer it: `per_position_db` is the
+/// analysed per-position response — `fr::align_spl` aligns each position to the
+/// ENSEMBLE mean rather than zeroing it, so the curve still carries the
+/// capture's absolute level — and `rules::noise_floor_on_grid` puts the silence
+/// capture's own spectrum on the same grid. Both are then reduced to a band RMS
+/// over the decided `correction_range` and subtracted.
 ///
-/// **The soft row's "+ de-weight" is NOT wired here** and cannot be: the
-/// averaging that would carry the weights ran before this pass did. Per § D-P's
-/// own interim ("emit the Warn and do **not** de-weight, **and say so**"), the
-/// weighting belongs at the analysis stage, beside
-/// `fr::average_measurements_rms_weighted`.
-fn low_snr(bundle: &MeasurementBundle) -> Vec<Diagnostic> {
-    let Some(floor) = worst_noise_floor_dbfs(bundle) else {
-        return Vec::new();
-    };
+/// **Why a band RMS of each curve and not the RMS of their difference.** The
+/// two are different statistics and only one of them is an SNR: the RMS of a
+/// per-bin difference is `|SNR|`, so a position sitting 5 dB BELOW its own noise
+/// floor would report +5 dB and clear the hard gate — the worst possible input
+/// reading as the best. Each curve is reduced in the power domain and the two
+/// levels are subtracted, which is what "capture RMS − floor RMS" says and what
+/// the broadband pair it replaces (`CaptureStats::rms_dbfs` against
+/// `NoiseFloor::rms_dbfs`) already was.
+///
+/// **The broadband read survives as the FALLBACK**, for the bundle whose
+/// analysis produced no curves at all: there is then no band to restrict to,
+/// and the two summary numbers are the only evidence there is.
+///
+/// **§ D-P: the soft row's "+ de-weight" is NOT wired** and the remedy says so.
+/// The averaging that would carry the weights ran before this pass did, so the
+/// weighting belongs at the analysis stage beside
+/// `fr::average_measurements_rms_weighted` / `fr::sigma_db_weighted`, which
+/// ship and have no non-test caller. Per § D-P's own interim — "emit the Warn
+/// and do **not** de-weight, **and say so**" — the copy states that the position
+/// was used UNWEIGHTED (ruling R-A7). Telling the user we weighted a position
+/// down when we did not is the "second, lying source of truth about what the
+/// app did" this design exists to prevent.
+fn low_snr(
+    bundle: &MeasurementBundle,
+    decisions: &Decisions,
+    analysis: &AnalysisProducts,
+    grid: &LogGrid,
+    freqs: &[f64],
+) -> Vec<Diagnostic> {
+    let indices = level_row_band(freqs, decisions.correction_range.value);
+    let floor_curve = crate::rules::noise_floor_on_grid(bundle, grid)
+        .filter(|curve| curve.len() == freqs.len() && !indices.is_empty());
+    let floor_in_band = floor_curve
+        .as_deref()
+        .and_then(|curve| band_rms_db(curve, &indices));
+    let broadband_floor = worst_noise_floor_dbfs(bundle);
+
     let mut out = Vec::new();
-    for position in &bundle.positions {
-        if !position.capture.rms_dbfs.is_finite() {
+    for (p, position) in bundle.positions.iter().enumerate() {
+        let banded = floor_in_band.zip(
+            analysis
+                .per_position_db
+                .get(p)
+                .filter(|curve| curve.len() == freqs.len())
+                .and_then(|curve| band_rms_db(curve, &indices)),
+        );
+        let snr = match banded {
+            Some((floor, capture)) => capture - floor,
+            None => {
+                let (Some(floor), true) = (broadband_floor, position.capture.rms_dbfs.is_finite())
+                else {
+                    continue;
+                };
+                position.capture.rms_dbfs - floor
+            }
+        };
+        if !snr.is_finite() {
             continue;
         }
-        let snr = position.capture.rms_dbfs - floor;
         let i = position.index;
         if snr < SNR_HARD_DB {
             out.push(Diagnostic {
@@ -482,8 +528,13 @@ fn low_snr(bundle: &MeasurementBundle) -> Vec<Diagnostic> {
             out.push(Diagnostic {
                 code: DiagnosticCode::LowSnrSoft,
                 position: Some(i),
+                // § D-P's interim, taken honestly (ruling R-A7): the position
+                // is used UNWEIGHTED, because nothing de-weights it. The
+                // weighted `fr` functions exist and are the documented future
+                // mechanism; until one is called, this sentence is the true one.
                 remedy: format!(
-                    "Position {i} was noisy ({snr:.0} dB). We used it, but weighted it down."
+                    "Position {i} was noisy ({snr:.0} dB). We used it as it is — we do not yet \
+                     weight a noisy position down."
                 ),
                 severity: Severity::Warn,
                 value: Some(snr),
@@ -491,6 +542,27 @@ fn low_snr(bundle: &MeasurementBundle) -> Vec<Diagnostic> {
         }
     }
     out
+}
+
+/// A band RMS in the POWER domain, back in dB: `10·log₁₀(mean over the band of
+/// 10^(v/10))`.
+///
+/// The mean rather than the sum, so the number is a LEVEL that does not move
+/// with how many bins the band happens to hold — the analysis grid is
+/// log-spaced, so a sum would make a wide band read louder than a narrow one at
+/// the same level and the SNR thresholds would depend on `correction_range`'s
+/// width. `None` when the band keeps no bin, or when nothing in it is finite.
+fn band_rms_db(values: &[f64], indices: &[usize]) -> Option<f64> {
+    let mut power = 0.0f64;
+    let mut counted = 0usize;
+    for &i in indices {
+        let Some(v) = values.get(i).copied().filter(|v| v.is_finite()) else {
+            continue;
+        };
+        power += 10f64.powf(v / 10.0);
+        counted += 1;
+    }
+    (counted > 0 && power > 0.0).then(|| 10.0 * (power / counted as f64).log10())
 }
 
 /// "Per-position capture RMS and peak — RMS `< −60 dBFS` or peak `< −50 dBFS`."
@@ -517,13 +589,33 @@ fn no_signal(bundle: &MeasurementBundle) -> Vec<Diagnostic> {
         .collect()
 }
 
-/// "Silence capture RMS in the analysis band `> −24 dBFS` (Dirac's gate; target
-/// −36) ⇒ Refuse."
+/// "Silence capture RMS **in the analysis band** `> −24 dBFS` (Dirac's gate;
+/// target −36) ⇒ Refuse."
 ///
-/// The worst channel decides: a floor is a property of the room, and one noisy
-/// input is enough to make the measurement untrustworthy.
-fn noise_floor_too_high(bundle: &MeasurementBundle) -> Option<Diagnostic> {
-    let worst = worst_noise_floor_dbfs(bundle)?;
+/// **The band is the row's own words** (ruling R-A8). "The analysis band" is the
+/// band `decide()` analyses over and places filters in — the decided
+/// `correction_range` — so the floor is reduced to a band RMS over it, through
+/// the same [`crate::rules::noise_floor_on_grid`] resample the SNR rows and
+/// `correction_range`'s own gate use. A broadband read answers a different
+/// question: it sums power from 20 Hz to 20 kHz, so a mains buzz outside the
+/// corrected band refuses a measurement it cannot affect, and a quiet
+/// wideband floor with a loud patch INSIDE the band passes.
+///
+/// **The broadband read survives as the FALLBACK**, for a bundle whose floor
+/// spectrum will not resample or whose band keeps no bin — the summary number is
+/// then the only evidence there is. The worst channel decides there: a floor is
+/// a property of the room, and one noisy input is enough.
+fn noise_floor_too_high(
+    bundle: &MeasurementBundle,
+    decisions: &Decisions,
+    grid: &LogGrid,
+    freqs: &[f64],
+) -> Option<Diagnostic> {
+    let indices = level_row_band(freqs, decisions.correction_range.value);
+    let worst = crate::rules::noise_floor_on_grid(bundle, grid)
+        .filter(|curve| curve.len() == freqs.len())
+        .and_then(|curve| band_rms_db(&curve, &indices))
+        .or_else(|| worst_noise_floor_dbfs(bundle))?;
     if worst <= NOISE_FLOOR_MAX_DBFS {
         return None;
     }
@@ -1156,6 +1248,28 @@ fn describe<T: Serialize>(domain: &Domain<T>) -> String {
 // Curve arithmetic. Local because each is three lines and none of them is DSP:
 // `paraeq-dsp` owns transforms, not the reading of a curve someone else made.
 // ---------------------------------------------------------------------------
+
+/// The band the two LEVEL rows grade over: the decided `correction_range`,
+/// falling back to the WHOLE analysis grid when that range has collapsed.
+///
+/// **The fallback closes a circularity, and it is not optional** (ruling R-A8).
+/// `correction_range`'s low edge is "the lowest bin with SNR ≥ 25 dB", and
+/// `rules::correction_range_scan` collapses the range to `(20000, 20000)` when
+/// NO bin clears that floor — which is exactly the run `LowSnrHard` exists to
+/// refuse. Grading the SNR rows over the collapsed band would leave them with
+/// one bin or none, so they would fall through to the broadband read or not
+/// fire at all: the rows would fail OPEN on the worst input there is.
+///
+/// Falling back to the full grid fails closed instead, and it is still "the
+/// analysis band" in the spec's own words — it is the band the analysis
+/// produced curves over. Two bins is the fewest a band RMS says anything about.
+fn level_row_band(freqs: &[f64], range: (f64, f64)) -> Vec<usize> {
+    let restricted = band(freqs, range.0, range.1);
+    if restricted.len() >= 2 {
+        return restricted;
+    }
+    (0..freqs.len()).collect()
+}
 
 /// The indices of `freqs` inside `[lo, hi]`, both ends inclusive. Empty when the
 /// band does not intersect the grid, which every caller treats as "no evidence"

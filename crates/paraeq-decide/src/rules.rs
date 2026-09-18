@@ -1123,6 +1123,32 @@ fn transition_scan(freqs: &[f64], sigma: &[f64]) -> Option<f64> {
 /// not apply, which widens `correction_range` rather than narrowing it, and the
 /// missing floor is the refusal table's to report (B7c).
 fn snr_db(bundle: &MeasurementBundle, grid: &LogGrid, measured_db: &[f64]) -> Option<Vec<f64>> {
+    let on_grid = noise_floor_on_grid(bundle, grid)?;
+    if measured_db.len() != on_grid.len() {
+        return None;
+    }
+    Some(
+        measured_db
+            .iter()
+            .zip(&on_grid)
+            .map(|(m, n)| m - n)
+            .collect(),
+    )
+}
+
+/// The silence capture's own spectrum, channel-averaged and resampled onto the
+/// analysis grid.
+///
+/// `pub(crate)` because the refusal table's two level rows grade against the
+/// SAME curve (ruling R-A8): the spec words them "capture RMS − floor RMS in
+/// `correction_range`" and "silence capture RMS in the analysis band", and both
+/// need the floor on the grid the band is expressed on. One resample, one
+/// place, so `correction_range`'s SNR gate and `LowSnr*`'s thresholds cannot be
+/// reading two different floors.
+///
+/// `None` when the bundle carries no usable floor — a missing floor is not the
+/// same claim as a quiet one, and each caller decides what to do without one.
+pub(crate) fn noise_floor_on_grid(bundle: &MeasurementBundle, grid: &LogGrid) -> Option<Vec<f64>> {
     let floor = &bundle.noise_floor;
     if floor.freqs_hz.len() < 2 || floor.spectrum_db.is_empty() {
         return None;
@@ -1142,17 +1168,7 @@ fn snr_db(bundle: &MeasurementBundle, grid: &LogGrid, measured_db: &[f64]) -> Op
     }
     // `Prefilter::None`: the anti-comb lowpass is justified for a gated impulse
     // spectrum, not for a noise floor that is already a power average.
-    let on_grid = resample_db_to_log_grid(&floor.freqs_hz, &mean, grid, Prefilter::None).ok()?;
-    if measured_db.len() != on_grid.len() {
-        return None;
-    }
-    Some(
-        measured_db
-            .iter()
-            .zip(&on_grid)
-            .map(|(m, n)| m - n)
-            .collect(),
-    )
+    resample_db_to_log_grid(&floor.freqs_hz, &mean, grid, Prefilter::None).ok()
 }
 
 /// "…no filters above the frequency where measured **last drops below**
