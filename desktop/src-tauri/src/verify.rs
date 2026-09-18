@@ -1054,6 +1054,10 @@ fn grade(
 ) -> VerifyReport {
     bundle.verification = Some(lift_verification(outcome, plan, capture_channels));
     let decided: DecisionSet = paraeq_decide::decide(&bundle);
+    // B17's third leg. `decide()` cannot log at all -- its determinism test
+    // forbids I/O inside it -- so the crate that CAN log does it, at the one
+    // place a `DecisionSet` reaches this process.
+    crate::engine_bridge::log_transition_source(&decided.decisions);
     let report = decided.verification.as_ref();
     VerifyReport {
         abort_acoustic_budget_ms: outcome.abort_acoustic_budget_ms,

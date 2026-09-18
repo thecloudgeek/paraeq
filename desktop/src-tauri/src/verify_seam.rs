@@ -1249,6 +1249,72 @@ mod tests {
         );
     }
 
+    /// A5's "Export/engine agreement" row, DESKTOP HALF: the preamp in the
+    /// exported AutoEQ text equals `EngineState.auto_preamp_db` -- the number
+    /// the live engine is actually applying, read off a running controller
+    /// rather than off `build_correction`'s return value.
+    ///
+    /// The crate-side half of this test (`eq.rs`'s
+    /// `exported_preamp_equals_engine_state_auto_preamp_db`) compares the
+    /// export against `BuildReport::preamp_db`. That is one hop short of the
+    /// claim: it proves the BUILDER agrees, not that the field the UI reads and
+    /// the verification gate compares against carries the same number. This
+    /// closes the hop.
+    ///
+    /// Compared through the exporter's own formatter rather than as raw
+    /// numbers, for the reason that test gives: the engine publishes an f32 and
+    /// the exporter rewrites any preamp in `(-0.05, 0]` as `0.0`, so the
+    /// agreement that matters is the agreement of the RENDERED line.
+    #[test]
+    fn exported_preamp_equals_engine_state_auto_preamp_db() {
+        let (slot, seam) = live_seam(None);
+        assert!(wait_until(WAIT, || seam.engine_engaged()));
+
+        // A boosting set, so the preamp is a real number and the assertion is
+        // not vacuous.
+        let bands = vec![peaking(45.0, 9.0), peaking(1_000.0, 12.0)];
+        slot.lock()
+            .unwrap()
+            .as_ref()
+            .expect("a live handle")
+            .send(EngineCommand::SetCorrection(CorrectionConfig::Peq {
+                bands: vec![bands.clone()],
+                design_rate: RATE,
+            }));
+        assert!(wait_until(WAIT, || seam.installed_preamp_lin().is_some()));
+
+        let armed_db = slot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("a live handle")
+            .state()
+            .auto_preamp_db
+            .expect("an installed correction publishes its armed preamp");
+        assert!(armed_db < 0.0, "boosts must pull the output down");
+
+        let exported = paraeq_dsp::peq::ParametricEQ {
+            bands,
+            sample_rate: RATE,
+        }
+        .export_autoeq_format_with_preamp();
+        let exported_preamp = exported.lines().next().expect("a Preamp line");
+        assert_ne!(
+            exported_preamp, "Preamp: 0.0 dB",
+            "a boosting band set must export a real preamp, or this test is vacuous"
+        );
+
+        let engine_preamp = paraeq_dsp::peq::ParametricEQ {
+            bands: Vec::new(),
+            sample_rate: RATE,
+        }
+        .export_autoeq_format_with_preamp_db(f64::from(armed_db));
+        assert_eq!(
+            engine_preamp, exported_preamp,
+            "the engine is applying a preamp the export does not name"
+        );
+    }
+
     /// The lease is acquired through the seam, suspends the fail-open
     /// auto-disable, and suspends NOTHING ELSE -- `NoInputDetected` keeps being
     /// produced and published while it is held, because a genuine silent
@@ -1529,6 +1595,48 @@ mod helper_tests {
         HelperSpawner::with_exe_dir(&dir)
             .locate()
             .expect_err("a non-executable file is not a helper");
+    }
+
+    /// The packaging instructions and the runtime resolver must name the SAME
+    /// binary.
+    ///
+    /// They are two files that cannot see each other: `binaries/README.md`
+    /// tells the owner what the bundler will copy, and `HELPER_BIN` tells the
+    /// app what to look for. Rename one and the app ships a helper it cannot
+    /// find -- a failure that appears only in a real bundle, only at the moment
+    /// a user asks for a verification, and never in any test that does not
+    /// compare these two strings.
+    ///
+    /// It reads the README rather than `tauri.conf.json` because the
+    /// `externalBin` entry is deliberately NOT in the config yet: `tauri-build`
+    /// resolves that key in the BUILD SCRIPT, on every `cargo build`, so an
+    /// entry with nothing staged turns `cargo test --workspace` red for
+    /// everyone. The README carries the entry verbatim and the staging command
+    /// beside it; this test is what keeps that copy honest until it lands.
+    ///
+    /// The `-<target-triple>` suffix is the BUNDLER's, not the runtime's -- it
+    /// exists on disk before packaging so the bundler can pick the right
+    /// architecture, and the copy inside the bundle carries the plain name.
+    #[test]
+    fn the_packaged_helper_and_the_resolver_name_the_same_binary() {
+        let readme = include_str!("../binaries/README.md");
+        assert!(
+            readme.contains(&format!("\"externalBin\": [\"binaries/{HELPER_BIN}\"]")),
+            "the staging instructions must name '{HELPER_BIN}' in the bundler entry"
+        );
+        assert!(
+            readme.contains(&format!("{HELPER_BIN}-$(rustc --print host-tuple)")),
+            "and the staged file must carry the target-triple suffix"
+        );
+        // The config does not carry the entry yet, and the reason is in the
+        // README. When it lands, THIS assertion is the one to invert.
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("valid JSON");
+        assert!(
+            config["bundle"]["externalBin"].is_null(),
+            "externalBin landed in the config: stage the binary in the same \
+             commit and invert this assertion, or every cargo build fails"
+        );
     }
 
     /// Rung 1b is SIGTERM and rung 1c is SIGKILL, and the order is the whole
