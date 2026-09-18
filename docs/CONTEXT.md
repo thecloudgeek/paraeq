@@ -156,9 +156,15 @@ here runs in CI (every test is `#[ignore]`d and the spike is an `examples/`
 binary). Run them in this order, in one sitting, from a TCC-granted terminal:
 
 ```bash
-# 0. Build both binaries in the SAME profile. `cargo test -p paraeq-coreaudio`
-#    does NOT build the helper: paraeq-stimulus depends on paraeq-coreaudio,
-#    not the other way round, so it is not in that package's dependency graph.
+# 0. Name the measurement mic, then build both binaries in the SAME profile.
+#    Every rig test and the spike read PARAEQ_MIC_UID and fall back to the
+#    system default input SILENTLY when it is unset -- and a run captured
+#    through the laptop's own microphone looks like a measurement and is not
+#    one. Either export the UID or make the measurement mic the default input.
+#    `cargo test -p paraeq-coreaudio` does NOT build the helper:
+#    paraeq-stimulus depends on paraeq-coreaudio, not the other way round, so
+#    it is not in that package's dependency graph.
+export PARAEQ_MIC_UID=<uid>
 cargo build --release -p paraeq-stimulus
 cargo build --release -p paraeq-coreaudio --examples
 
@@ -215,17 +221,24 @@ question, which no API can answer.
 **Post-merge and Stage-6 calls (2026-09-16).** The post-merge queue and Stage 6
 carried ~49 unresolved shape/value questions across the six 2026-07-15 specs.
 They are ruled in `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md`,
-which also reproduces the seven items **escalated to the owner** (the
-verification residual threshold; in-session TCC-failure detection; MMM scope and
-sequencing; the MMM level-safety row; MS-17's chain-sensitivity envelope; the
-tap-aggregate/measure-aggregate coexistence spike; and the `fixtures/decide/`
-freeze sign-off). The losing spec text each ruling supersedes was corrected in
-the same commit. Read that record before reopening any decision in those specs.
+which also reproduces the **thirty-one items escalated to the owner**: E1–E7
+from 2026-09-16 (the verification residual threshold; in-session TCC-failure
+detection; MMM scope and sequencing; the MMM level-safety row; MS-17's
+chain-sensitivity envelope; the tap-aggregate/measure-aggregate coexistence
+spike; and the `fixtures/decide/` freeze sign-off), plus **E2-bis and E8–E31**
+raised while Stage 6 was built — among them E19 (the helper's dependency rule,
+which cannot be honoured as a `cargo tree` property), E17 (the wizard's
+"`Running`" gate), E18/E20 (the two sanctioned non-CoreAudio `unsafe` blocks)
+and E31 (the AutoEq import preamp double-count). **E16 is withdrawn and its
+number retired.** The same record now carries §"Rulings from the Stage-6
+review" — the thirteen R-A/R-B rows the review's fix lanes implement. The
+losing spec text each ruling supersedes was corrected in the same commit. Read
+that record before reopening any decision in those specs.
 
 ## How to Pick Up the Work
 
 1. Read this document, `CLAUDE.md`, the Rust-port spec at `docs/specs/2026-07-02-rust-port-design.md`, and (for Phase-1 history) the original design at `docs/specs/2026-04-22-paraeq-design.md`.
-2. Continue the Rust port: next stage per the spec's port order (stage 5: Target editor + profiles — see the stage-4 completion entry above for what it builds on). On `feature/integration` the live staging is the rescope plan's (`docs/plans/2026-07-16-rescope-implementation.md`), whose 2026-07-15 specs partially supersede that port order.
+2. Continue the Rust port: next stage per the spec's port order (stage 5: Target editor + profiles — see the stage-4 completion entry above for what it builds on). The live staging is the rescope plan's (`docs/plans/2026-07-16-rescope-implementation.md`), whose 2026-07-15 specs partially supersede that port order; **Stage 6 is built on `feature/pb-int`** (worktree `.worktrees/pb-int`, forked from `feature/integration`), and that is the branch to fork from for Stage-6 work. `main` is untouched pending the owner's ears-on run.
 3. Use the brainstorming → writing-plans → subagent-driven-development workflow for substantial new work. Smaller fixes can be done directly.
 4. Each major change should follow TDD where possible (DSP changes definitely; GUI changes by manual smoke test since no display in CI).
 
