@@ -393,7 +393,10 @@ fn clipping_refuses_per_position_on_peak_and_per_session_on_sustain() {
     };
     let set = decide(&peaked);
     let diagnostic = only_diagnostic(&set, DiagnosticCode::ClippingPosition);
-    assert_eq!(diagnostic.severity, Severity::Refuse);
+    // Ruling R-A1: the spec's Severity column is "Refuse *that position*", and
+    // the copy promises a drop. `a_clipped_position_is_dropped_and_the_surviving_cohort_still_corrects`
+    // asserts what the drop costs the session.
+    assert_eq!(diagnostic.severity, Severity::RefusePosition);
     assert_eq!(diagnostic.position, Some(3));
     assert!(!has_code(&set, DiagnosticCode::ClippingSession));
 
@@ -690,6 +693,154 @@ fn band_rms_db(curve: &[f64], freqs_hz: &[f64], (lo, hi): (f64, f64)) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
+// Position-scoped refusal (ruling R-A1)
+// ---------------------------------------------------------------------------
+
+/// "Refuse *that position*" drops the position and the session goes on.
+///
+/// Ruling R-A1, and the spec's own Severity column. The remedy copy the row
+/// renders — "We dropped it — reduce input gain by 6 dB and re-measure just
+/// that one" — is a promise about ONE capture, and mapping the row onto a
+/// session `Refuse` made that sentence false while throwing away four good
+/// positions.
+#[test]
+fn a_clipped_position_is_dropped_and_the_surviving_cohort_still_corrects() {
+    let mut bundle = flat_bundle(TransducerClass::OverEar, 5);
+    bundle.positions[3].capture = CaptureStats {
+        clipped_samples: 4_096,
+        peak_dbfs: -0.006,
+        rms_dbfs: -11.2,
+    };
+    let set = decide(&bundle);
+
+    let diagnostic = only_diagnostic(&set, DiagnosticCode::ClippingPosition);
+    assert_eq!(diagnostic.severity, Severity::RefusePosition);
+    assert_eq!(diagnostic.position, Some(3));
+    assert!(diagnostic.remedy.contains("We dropped it"));
+
+    assert_eq!(set.verdict, Verdict::ProceedWithWarnings);
+    assert!(
+        set.correction.is_some(),
+        "four survivors above the hard minimum still produce a correction"
+    );
+    assert_eq!(
+        set.analysis.per_position_db.len(),
+        4,
+        "the dropped capture must not appear in the published curves"
+    );
+}
+
+/// The coupler LF outlier is the other "Refuse *that position*" row, and it is
+/// the one `over_ear_lost_seal_reseat` is built around.
+#[test]
+fn a_coupler_lf_outlier_drops_that_position_not_the_session() {
+    // Four ordinary reseats and one that lost its seal: everything below
+    // ~200 Hz leaked away.
+    let seal = vec![biquad::low_shelf(200.0, -12.0, 0.7, 48_000.0)];
+    let shapes: Vec<Vec<[f64; 6]>> = (0..5)
+        .map(|i| if i == 2 { seal.clone() } else { Vec::new() })
+        .collect();
+    let set = decide(&shaped_positions(TransducerClass::OverEar, &shapes));
+
+    let diagnostic = only_diagnostic(&set, DiagnosticCode::PositionOutlierCouplerLf);
+    assert_eq!(diagnostic.severity, Severity::RefusePosition);
+    assert_eq!(diagnostic.position, Some(2));
+    assert_eq!(set.verdict, Verdict::ProceedWithWarnings);
+    assert!(set.correction.is_some());
+    assert_eq!(set.analysis.per_position_db.len(), 4);
+
+    // …and the second pass does not re-flag it: the position is gone, so the
+    // surviving four are graded against each other and none of them is an
+    // outlier in the cohort that remains.
+    assert_eq!(
+        diagnostics_with(&set, DiagnosticCode::PositionOutlierCouplerLf).len(),
+        1
+    );
+}
+
+/// Dropping below the hard minimum refuses the SESSION, on the survivor count.
+///
+/// The spec says so in as many words, under "User cancelled mid-sweep": "If the
+/// survivors fall below 3, `TooFewPositions` fires."
+#[test]
+fn a_drop_that_takes_the_cohort_under_the_minimum_refuses_the_session() {
+    let mut bundle = flat_bundle(TransducerClass::OverEar, 3);
+    bundle.positions[1].capture = CaptureStats {
+        clipped_samples: 4_096,
+        peak_dbfs: -0.006,
+        rms_dbfs: -11.2,
+    };
+    let set = decide(&bundle);
+
+    assert_eq!(
+        only_diagnostic(&set, DiagnosticCode::ClippingPosition).severity,
+        Severity::RefusePosition
+    );
+    let too_few = only_diagnostic(&set, DiagnosticCode::TooFewPositions);
+    assert_eq!(too_few.severity, Severity::Refuse);
+    assert_eq!(
+        too_few.value,
+        Some(2.0),
+        "the count it grades is the SURVIVORS', not the captures that were taken"
+    );
+    assert_eq!(set.verdict, Verdict::Refuse);
+    assert!(set.correction.is_none());
+}
+
+/// The position-count rows grade the survivor cohort, not the original one.
+#[test]
+fn the_position_count_rows_grade_the_survivors() {
+    // A room run of nine, one railed: eight survive, which is below the room
+    // path's default of nine.
+    let mut bundle = flat_bundle(TransducerClass::Bookshelf, 9);
+    bundle.positions[5].capture = CaptureStats {
+        clipped_samples: 4_096,
+        peak_dbfs: -0.006,
+        rms_dbfs: -11.2,
+    };
+    let set = decide(&bundle);
+    let few = only_diagnostic(&set, DiagnosticCode::FewPositions);
+    assert_eq!(few.severity, Severity::Warn);
+    assert_eq!(few.value, Some(8.0));
+    assert!(
+        few.remedy.contains("We averaged 8 positions."),
+        "{}",
+        few.remedy
+    );
+    assert_eq!(set.verdict, Verdict::ProceedWithWarnings);
+}
+
+/// Every other row that carries a `position` is scoped to the SESSION.
+///
+/// `NoSignal` and `SweepRateMismatch` name a position so the drawer can say
+/// which capture, but the spec's Severity column reads a plain "Refuse" on both
+/// and their copy is about the whole chain. Mapping them onto `RefusePosition`
+/// would silently drop a capture on a bundle whose whole chain is wrong.
+#[test]
+fn the_other_position_scoped_rows_still_refuse_the_session() {
+    let mut silent = flat_bundle(TransducerClass::OverEar, 5);
+    silent.positions[2].capture = CaptureStats {
+        rms_dbfs: -61.0,
+        ..capture_stats()
+    };
+    let set = decide(&silent);
+    assert_eq!(
+        only_diagnostic(&set, DiagnosticCode::NoSignal).severity,
+        Severity::Refuse
+    );
+    assert_eq!(set.verdict, Verdict::Refuse);
+
+    let mut mismatched = flat_bundle(TransducerClass::OverEar, 5);
+    mismatched.capture.sweep_rate = 44_100;
+    let set = decide(&mismatched);
+    assert_eq!(
+        diagnostics_with(&set, DiagnosticCode::SweepRateMismatch)[0].severity,
+        Severity::Refuse
+    );
+    assert_eq!(set.verdict, Verdict::Refuse);
+}
+
+// ---------------------------------------------------------------------------
 // The cohort rows
 // ---------------------------------------------------------------------------
 
@@ -754,6 +905,14 @@ fn the_position_count_rows_interpolate_a_noun_not_the_retry_phrase() {
 
 /// σ(f) below the transition is where the positions are supposed to AGREE, so
 /// a high median there says the cohort is not measuring one system.
+///
+/// **Graded on the ROOM path, and that is not arbitrary.** Since ruling R-A1 the
+/// coupler's LF outlier row removes the position it names, so a coupler cohort
+/// spread this wide sheds its extremes before the σ row is ever graded — it
+/// ends as `TooFewPositions` over the survivors instead, which is the drop
+/// mechanism working. The room path's outlier row is a Warn and removes
+/// nothing, so it is where a whole-cohort σ refusal is actually reachable. The
+/// row itself is not class-specific: one code path, graded here.
 #[test]
 fn excessive_variance_refuses_above_the_median_sigma_gate() {
     let spread = |gains: [f64; 5]| {
@@ -761,7 +920,7 @@ fn excessive_variance_refuses_above_the_median_sigma_gate() {
             .iter()
             .map(|g| vec![biquad::low_shelf(300.0, *g, SHELF_Q, 48_000.0)])
             .collect();
-        decide(&shaped_positions(TransducerClass::OverEar, &shapes))
+        decide(&shaped_positions(TransducerClass::Bookshelf, &shapes))
     };
 
     let refused = spread([-12.0, -6.0, 0.0, 6.0, 12.0]);
@@ -785,7 +944,8 @@ fn position_outliers_fire_at_their_own_band_and_severity() {
         decide(&shaped_positions(TransducerClass::OverEar, &shapes))
     };
     let diagnostic = only_diagnostic(&lf, DiagnosticCode::PositionOutlierCouplerLf);
-    assert_eq!(diagnostic.severity, Severity::Refuse);
+    // "Refuse *that position*" — ruling R-A1, same as the clipping row.
+    assert_eq!(diagnostic.severity, Severity::RefusePosition);
     assert_eq!(diagnostic.position, Some(1));
     assert!(!has_code(&lf, DiagnosticCode::PositionOutlierCouplerHf));
 

@@ -912,12 +912,22 @@ pub fn assert_every_value_in_domain(d: &Decisions, class: TransducerClass) {
 /// correction.is_none()`" and "`verdict == Refuse ⟺ any diagnostic has
 /// `Severity::Refuse`" — plus the `ProceedWithWarnings` leg that makes the
 /// three-way verdict total rather than a two-way one with a spare variant.
+///
+/// **Ruling R-A1 narrowed the second equivalence to a SESSION-scoped
+/// `Refuse`.** `Severity::RefusePosition` removed one capture and the survivors
+/// produced an installable correction, so it grades on the warning side here —
+/// and a run that loses its last survivors is caught by `TooFewPositions`,
+/// which is session-scoped. Counting it as a refusal would re-assert the rule
+/// the ruling replaced.
 pub fn assert_refusal_is_consistent(set: &DecisionSet) {
     let refusing = set
         .diagnostics
         .iter()
         .any(|d| d.severity == Severity::Refuse);
-    let warning = set.diagnostics.iter().any(|d| d.severity == Severity::Warn);
+    let warning = set
+        .diagnostics
+        .iter()
+        .any(|d| matches!(d.severity, Severity::RefusePosition | Severity::Warn));
     assert_eq!(
         set.verdict == Verdict::Refuse,
         set.correction.is_none(),

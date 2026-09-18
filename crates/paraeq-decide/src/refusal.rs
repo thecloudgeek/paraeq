@@ -159,6 +159,24 @@ const SNR_SOFT_DB: f64 = 25.0;
 // The pass
 // ---------------------------------------------------------------------------
 
+/// The positions this diagnostic list says must leave the cohort.
+///
+/// Ruling R-A1: [`Severity::RefusePosition`] is the spec's "Refuse *that
+/// position*", so `decide()` drops the named positions and re-analyses the
+/// survivors. Sorted and deduplicated, because two rows can name one position
+/// (a reseat that both clipped and lost its seal) and the caller subtracts a
+/// set.
+pub(crate) fn dropped_positions(diagnostics: &[Diagnostic]) -> Vec<usize> {
+    let mut out: Vec<usize> = diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::RefusePosition)
+        .filter_map(|d| d.position)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// Every refusal and warning the bundle earns, in a stable order.
 ///
 /// Takes the decided values as well as the bundle because most rows are graded
@@ -330,7 +348,9 @@ fn position_outliers(
             (
                 band(freqs, COUPLER_LF_HZ.0, COUPLER_LF_HZ.1),
                 DiagnosticCode::PositionOutlierCouplerLf,
-                Severity::Refuse,
+                // "Refuse *that position*", and the copy says "Reseat and
+                // measure again" about ONE reseat. Ruling R-A1.
+                Severity::RefusePosition,
             ),
             (
                 band(freqs, COUPLER_HF_MIN_HZ, f64::INFINITY),
@@ -401,7 +421,11 @@ fn clipping_position(bundle: &MeasurementBundle) -> Vec<Diagnostic> {
                     "Position {i} clipped. We dropped it — reduce input gain by 6 dB and \
                      re-measure just that one."
                 ),
-                severity: Severity::Refuse,
+                // The spec's Severity column: "Refuse *that position*". The
+                // copy above promises a drop and ruling R-A1 makes it true —
+                // `decide()` removes the position and re-analyses the
+                // survivors. See [`Severity::RefusePosition`].
+                severity: Severity::RefusePosition,
                 value: Some(p.capture.peak_dbfs),
             }
         })

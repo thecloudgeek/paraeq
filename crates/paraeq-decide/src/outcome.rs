@@ -88,8 +88,16 @@ pub struct Analysis {
     pub excess_group_delay_s: Vec<f64>,
     /// The log-f analysis grid every curve here is sampled on.
     pub freqs_hz: Vec<f64>,
-    /// Aligned, smoothed, per-position curves, dB — index-parallel to
-    /// `MeasurementBundle::positions`. σ(f) is one pass over these.
+    /// Aligned, smoothed, per-position curves, dB — index-parallel to the
+    /// positions that SURVIVED the refusal table. σ(f) is one pass over these.
+    ///
+    /// Usually that is `MeasurementBundle::positions` exactly. It is shorter
+    /// when a row scoped to a position fired: ruling R-A1 removes those
+    /// captures from the cohort and re-analyses, so a dropped position appears
+    /// in neither these curves nor [`Self::averaged_db`] nor `sigma_db` — which
+    /// is what "We dropped it" means. The `Diagnostic::position` of the
+    /// [`Severity::RefusePosition`] rows says which, by the index the capture
+    /// was taken under; those indices are never renumbered.
     pub per_position_db: Vec<Vec<f64>>,
     /// Per-bin standard deviation in dB across positions, on `freqs_hz`.
     pub sigma_db: Vec<f64>,
@@ -159,10 +167,36 @@ pub struct Diagnostic {
 /// guess*. `Warn` means *we did it, and here is what you should know*. The
 /// distinction is not severity theatre: a `Refuse` produces no installable
 /// correction, so the system stays as it was.
+///
+/// `RefusePosition` is the spec's THIRD column value, which had no
+/// representation until ruling R-A1: the refusal table's Severity column says
+/// "Refuse *that position*" on two rows, and the remedy copy those rows render
+/// promises a drop — "We dropped it — re-measure just that one". Mapping them
+/// onto `Refuse` refused the whole session while telling the user one capture
+/// had been discarded, which is two different answers to one question.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Severity {
     /// Cannot proceed. `verdict = Refuse`, `correction = None`.
     Refuse,
+    /// **That position** cannot be used. The position is removed from the
+    /// cohort, the analysis re-runs over the survivors, and the session
+    /// continues as `ProceedWithWarnings` — so the correction is installable and
+    /// the dropped capture appears in neither `Analysis::per_position_db` nor
+    /// the averaged curves.
+    ///
+    /// The spec's own Severity column, on two rows: "Clipping (position) | any |
+    /// Refuse *that position*" and "Position outlier — coupler LF | > 6 dB |
+    /// Refuse *that position*". Every other row that carries a `position` is
+    /// scoped to the SESSION and stays [`Self::Refuse`] — `NoSignal` and
+    /// `SweepRateMismatch` name a position so the drawer can say which capture,
+    /// but their Severity column reads a plain "Refuse" and their copy is about
+    /// the whole chain.
+    ///
+    /// If the survivors fall below the path's hard minimum, `TooFewPositions`
+    /// fires on the SURVIVOR count and refuses the session — which is the spec's
+    /// own words for the same situation under "User cancelled mid-sweep": "If
+    /// the survivors fall below 3, `TooFewPositions` fires."
+    RefusePosition,
     /// Proceed with a caveat; may de-weight a position.
     Warn,
 }

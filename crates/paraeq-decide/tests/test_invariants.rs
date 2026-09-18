@@ -207,10 +207,50 @@ fn refuse_iff_correction_is_none() {
 /// "`verdict == Refuse ⟺ any diagnostic has `Severity::Refuse`". The
 /// complementary half stops a `Refuse` verdict that cannot explain itself, and
 /// a refusing diagnostic that was raised and then ignored.
+///
+/// Ruling R-A1 narrows the right-hand side to a SESSION-scoped `Refuse`: a
+/// `Severity::RefusePosition` removed one capture and the survivors produced an
+/// installable correction, so it is a warning as far as the verdict is
+/// concerned. `a_position_scoped_refusal_does_not_refuse_the_session` below is
+/// the non-vacuous half — without it, this pair is satisfiable by never
+/// emitting the new severity at all.
 #[test]
-fn refuse_iff_a_diagnostic_is_refuse_severity() {
+fn refuse_iff_a_session_scoped_diagnostic_is_refuse_severity() {
     for class in EVERY_CLASS {
         assert_refusal_is_consistent(&decide(&well_formed_bundle(class)));
+    }
+}
+
+/// The non-vacuity guard on the pair above: a run whose ONLY refusal is scoped
+/// to a position proceeds, with a correction, on the survivors.
+#[test]
+fn a_position_scoped_refusal_does_not_refuse_the_session() {
+    for class in [TransducerClass::InEar, TransducerClass::OverEar] {
+        let mut bundle = well_formed_bundle(class);
+        bundle.positions[1].capture = paraeq_decide::CaptureStats {
+            clipped_samples: 4_096,
+            peak_dbfs: -0.006,
+            rms_dbfs: -11.2,
+        };
+        let set = decide(&bundle);
+        let severities: Vec<Severity> = set.diagnostics.iter().map(|d| d.severity).collect();
+        assert!(
+            severities.contains(&Severity::RefusePosition),
+            "{class:?}: the fixture must trip the position-scoped row, got {severities:?}"
+        );
+        assert!(
+            !severities.contains(&Severity::Refuse),
+            "{class:?}: nothing here is session-scoped, got {:?}",
+            set.diagnostics
+        );
+        assert_eq!(set.verdict, Verdict::ProceedWithWarnings, "{class:?}");
+        assert!(set.correction.is_some(), "{class:?}");
+        assert_eq!(
+            set.analysis.per_position_db.len(),
+            bundle.positions.len() - 1,
+            "{class:?}: the dropped capture must leave the published curves"
+        );
+        assert_refusal_is_consistent(&set);
     }
 }
 

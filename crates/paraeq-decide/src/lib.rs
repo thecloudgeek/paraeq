@@ -97,77 +97,72 @@ pub use verification::VERIFICATION_RESIDUAL_MULTIPLE;
 /// that did the dropping, because the positions they named are gone.
 pub fn decide(bundle: &MeasurementBundle) -> DecisionSet {
     let grid = paraeq_dsp::logf::LogGrid::standard();
-    let geometry = analysis::geometry(bundle);
-    let class = rules::class(bundle);
-    let profile = profile_for(class.value);
 
-    let analysis_decisions = rules::analysis_decisions(bundle, class, &grid, profile, &geometry);
-    let products = analysis::analyze(
-        bundle,
-        &grid,
-        &analysis::AnalysisSettings {
-            align_spl_band: analysis_decisions.align_spl_band.value,
-            averaging: analysis_decisions.averaging.value,
-            // The profile decides whether the pass runs at all — "Coupler: off"
-            // is `GatingMode::None` — while the two decisions carry the cycle
-            // counts it runs with.
-            fdw: match profile.gating {
-                GatingMode::Fdw { .. } => Some(paraeq_dsp::fdw::FdwSpec {
-                    post_cycles: analysis_decisions.fdw_post_cycles.value,
-                    pre_cycles: analysis_decisions.fdw_pre_cycles.value,
-                }),
-                GatingMode::None => None,
-            },
-            left_window_ms: analysis_decisions.left_window_ms.value,
-            right_window_ms: analysis_decisions.right_window_ms.value,
-            smoothing: analysis_decisions.smoothing.value,
-            window: paraeq_dsp::window::WindowSpec {
-                left: analysis::window_kind(analysis_decisions.window_type.value),
-                right: analysis::window_kind(analysis_decisions.window_type.value),
-            },
-        },
-    );
-
-    let (mut design, authority_curve) = rules::design_decisions(
-        bundle,
-        analysis_decisions.class.value,
-        &grid,
-        profile,
-        &products,
-    );
-
-    // `autofit::auto_fit_room`, between the design decisions and the preamp: it
-    // is the one step that turns the decided authority, Q cap, correction range,
-    // filter budget, flatness target and shelf policy into bands. Everything
-    // safety-related is already composed into `authority_curve`; see
-    // `rules::fit_correction` for the `min_gain_db = flatness/2` binding and for
-    // why the correction is level-matched to the target first.
+    // The drop loop. Each round analyses a cohort, grades the refusal table over
+    // it, and removes whatever the table scoped to a POSITION; the next round
+    // sees the survivors. It terminates because every round that continues
+    // removes at least one position from a finite list, and in practice it runs
+    // exactly twice — the ruling's "two passes" — because a cohort that sheds
+    // one capture rarely sheds another. It keeps going only in the case where
+    // stopping at two would print "We dropped it" about a position that was not
+    // dropped.
     //
-    // `PerChannel` is non-empty by construction, and a bundle the analysis could
-    // not read reports zero channels — so the fit answers one channel of zero
-    // bands, which is the honest shape for "there is a plan and it contains
-    // nothing".
-    let design_rate = geometry.sample_rate;
-    let fit = rules::fit_correction(
-        bundle,
-        &design,
-        &products,
-        &authority_curve,
-        &grid,
-        profile,
-        design_rate,
-    );
-    // Two rationales count the bands the fit EMITTED rather than the cap it was
-    // given, so they are rendered here and nowhere else.
-    rules::render_realized(&mut design, &fit);
-    let preamp_db = rules::preamp_decision(bundle, &fit.bands, design_rate);
-    let decisions = rules::assemble(analysis_decisions, design, preamp_db);
+    // `Position::index` is NOT renumbered when a position is removed, so every
+    // diagnostic keeps naming the capture the user took. The rows that did the
+    // dropping are kept from the round that produced them (`dropped_rows`) —
+    // the next round cannot re-emit them, because the positions they name are
+    // gone, and the user still has to be told why a capture is missing.
+    let mut excluded: Vec<usize> = Vec::new();
+    let mut dropped_rows: Vec<Diagnostic> = Vec::new();
+    let pass = loop {
+        let cohort = without_positions(bundle, &excluded);
+        let pass = grade(&cohort, &grid);
+        let newly: Vec<usize> = refusal::dropped_positions(&pass.diagnostics)
+            .into_iter()
+            .filter(|i| !excluded.contains(i))
+            .collect();
+        if newly.is_empty() {
+            break pass;
+        }
+        dropped_rows.extend(
+            pass.diagnostics
+                .iter()
+                .filter(|d| d.severity == Severity::RefusePosition)
+                .filter(|d| d.position.is_some_and(|i| newly.contains(&i)))
+                .cloned(),
+        );
+        excluded.extend(newly);
+        excluded.sort_unstable();
+    };
 
-    let mut diagnostics = refusal::diagnostics(bundle, &decisions, &products);
+    let Pass {
+        authority_curve,
+        decisions,
+        design_rate,
+        diagnostics: table,
+        fit,
+        products,
+    } = pass;
+
+    // The rows that removed a capture come FIRST, and the order is the story:
+    // everything after them is a statement about the cohort that survived them.
+    // Within each group the order is the refusal table's own, which is fixed
+    // because `fixtures/decide/<case>/expected.json` compares `diagnostics` as a
+    // list.
+    let mut diagnostics = dropped_rows;
+    diagnostics.extend(table);
+
     // B8's rows are APPENDED to the refusal table's, never interleaved: B7c's
     // order is the frozen shape `fixtures/decide/<case>/expected.json` compares
     // as a list. A verification block only ever ADDS refusals — it can never
     // clear a row the table earned or turn a Refuse into a Proceed.
+    //
+    // Graded against the ORIGINAL bundle, not the survivor cohort:
+    // `Verification::position_index` indexes the captures the user took, and
+    // re-indexing it against a shortened list would difference the verification
+    // against the wrong baseline. The verification's own `ClippingPosition` row
+    // stays session-scoped for the same reason — the verification pass is not a
+    // member of the cohort and there is nothing to drop it from.
     let verified = verification::verify(bundle, &decisions, &authority_curve, &grid);
     if let Some(outcome) = &verified {
         diagnostics.extend(outcome.diagnostics.iter().cloned());
@@ -185,7 +180,9 @@ pub fn decide(bundle: &MeasurementBundle) -> DecisionSet {
         correction: match verdict {
             // "`None` iff `verdict == Refuse`", and the refusal is what earns
             // auto mode the right to hide everything: a `Refuse` produces no
-            // installable correction, so the system stays as it was.
+            // installable correction, so the system stays as it was. A
+            // `RefusePosition` is NOT that: it removed one capture and the
+            // survivors produced a plan.
             Verdict::Refuse => None,
             _ => Some(CorrectionPlan {
                 bands: paraeq_dsp::PerChannel::new(fit.bands)
@@ -215,8 +212,137 @@ pub fn decide(bundle: &MeasurementBundle) -> DecisionSet {
     }
 }
 
+/// One round of the drop loop: every decision, the analysis, the fit and the
+/// refusal table, over ONE cohort.
+struct Pass {
+    authority_curve: AuthorityCurve,
+    decisions: Decisions,
+    design_rate: f64,
+    /// The refusal table's rows only. The verification gate's are appended by
+    /// [`decide`] once, after the loop.
+    diagnostics: Vec<Diagnostic>,
+    fit: rules::FitOutcome,
+    products: analysis::AnalysisProducts,
+}
+
+/// The bundle with `excluded` positions removed — ruling R-A1's cohort.
+///
+/// `Position::index` is deliberately NOT renumbered: it is the number every
+/// diagnostic quotes and the number the user's own capture list shows, and
+/// renumbering it would make "Position 3 clipped" name a different capture the
+/// moment an earlier one was dropped. The analysis is index-parallel to this
+/// SHORTENED list, which is why [`Analysis::per_position_db`] says so.
+///
+/// `Clone` rather than a borrowed view: `MeasurementBundle` is the one value
+/// every rule reads, and threading a "which positions count" argument through
+/// twenty rules is exactly the second source of truth this design avoids. The
+/// empty case is free — `excluded` is empty on every bundle with no
+/// position-scoped refusal, which is all of them but two.
+fn without_positions(bundle: &MeasurementBundle, excluded: &[usize]) -> MeasurementBundle {
+    if excluded.is_empty() {
+        return bundle.clone();
+    }
+    MeasurementBundle {
+        positions: bundle
+            .positions
+            .iter()
+            .filter(|p| !excluded.contains(&p.index))
+            .cloned()
+            .collect(),
+        ..bundle.clone()
+    }
+}
+
+/// Every stage, over one cohort. Extracted from [`decide`] so the drop loop can
+/// run it twice without a second copy of the order the stages run in.
+fn grade(bundle: &MeasurementBundle, grid: &paraeq_dsp::logf::LogGrid) -> Pass {
+    let geometry = analysis::geometry(bundle);
+    let class = rules::class(bundle);
+    let profile = profile_for(class.value);
+
+    let analysis_decisions = rules::analysis_decisions(bundle, class, grid, profile, &geometry);
+    let products = analysis::analyze(
+        bundle,
+        grid,
+        &analysis::AnalysisSettings {
+            align_spl_band: analysis_decisions.align_spl_band.value,
+            averaging: analysis_decisions.averaging.value,
+            // The profile decides whether the pass runs at all — "Coupler: off"
+            // is `GatingMode::None` — while the two decisions carry the cycle
+            // counts it runs with.
+            fdw: match profile.gating {
+                GatingMode::Fdw { .. } => Some(paraeq_dsp::fdw::FdwSpec {
+                    post_cycles: analysis_decisions.fdw_post_cycles.value,
+                    pre_cycles: analysis_decisions.fdw_pre_cycles.value,
+                }),
+                GatingMode::None => None,
+            },
+            left_window_ms: analysis_decisions.left_window_ms.value,
+            right_window_ms: analysis_decisions.right_window_ms.value,
+            smoothing: analysis_decisions.smoothing.value,
+            window: paraeq_dsp::window::WindowSpec {
+                left: analysis::window_kind(analysis_decisions.window_type.value),
+                right: analysis::window_kind(analysis_decisions.window_type.value),
+            },
+        },
+    );
+
+    let (mut design, authority_curve) = rules::design_decisions(
+        bundle,
+        analysis_decisions.class.value,
+        grid,
+        profile,
+        &products,
+    );
+
+    // `autofit::auto_fit_room`, between the design decisions and the preamp: it
+    // is the one step that turns the decided authority, Q cap, correction range,
+    // filter budget, flatness target and shelf policy into bands. Everything
+    // safety-related is already composed into `authority_curve`; see
+    // `rules::fit_correction` for the `min_gain_db = flatness/2` binding and for
+    // why the correction is level-matched to the target first.
+    //
+    // `PerChannel` is non-empty by construction, and a bundle the analysis could
+    // not read reports zero channels — so the fit answers one channel of zero
+    // bands, which is the honest shape for "there is a plan and it contains
+    // nothing".
+    let design_rate = geometry.sample_rate;
+    let fit = rules::fit_correction(
+        bundle,
+        &design,
+        &products,
+        &authority_curve,
+        grid,
+        profile,
+        design_rate,
+    );
+    // Two rationales count the bands the fit EMITTED rather than the cap it was
+    // given, so they are rendered here and nowhere else.
+    rules::render_realized(&mut design, &fit);
+    let preamp_db = rules::preamp_decision(bundle, &fit.bands, design_rate);
+    let decisions = rules::assemble(analysis_decisions, design, preamp_db);
+    let diagnostics = refusal::diagnostics(bundle, &decisions, &products);
+
+    Pass {
+        authority_curve,
+        decisions,
+        design_rate,
+        diagnostics,
+        fit,
+        products,
+    }
+}
+
 /// The verdict the diagnostics imply. Refusal outranks a warning, and a
 /// `Refuse` is not "severity theatre": it produces no installable correction.
+///
+/// **Only a SESSION-scoped `Refuse` refuses** (ruling R-A1).
+/// [`Severity::RefusePosition`] removed one capture and the survivors produced
+/// a correction, so it grades as a warning here — and the run that loses its
+/// last survivors is caught by `TooFewPositions`, which is session-scoped and
+/// grades the survivor count. The equivalence the spec's own testing section
+/// states is therefore "`verdict == Refuse` ⟺ a session-scoped `Refuse`
+/// diagnostic", and `correction` is `Some` in every other case.
 fn verdict_for(diagnostics: &[Diagnostic]) -> Verdict {
     if diagnostics.iter().any(|d| d.severity == Severity::Refuse) {
         Verdict::Refuse
