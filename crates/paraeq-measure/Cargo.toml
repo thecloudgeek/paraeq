@@ -8,7 +8,21 @@ version.workspace = true
 # ONLY among the workspace crates. No Tauri (the policy must stay reachable
 # from a future `paraeqd`), no paraeq-coreaudio (the hardware side arrives
 # through the `seam` traits, so the level policy stays testable against mocks),
-# no unsafe. The `cargo tree` assertion in CI is the enforcement;
+# NO paraeq-engine and no paraeq-decide either -- an engine fact reaches this
+# crate only across a declared trait, and `EngineStatusKind`, `TapActivity` and
+# `HelperRouting` are MIRROR types declared here rather than imports, so no
+# paraeq-engine or paraeq-coreaudio type ever crosses. No unsafe.
+#
+# The seams, all in `seam.rs` except the two engine ones in `engine_seam.rs`:
+# CaptureSource, DeviceFacts, EngineControl, EngineFacts, HelperProcess,
+# RenderSink, StimulusHelper, StimulusSink, TapStatus, VolumeControl. Each has
+# exactly one production impl, in paraeq-coreaudio or in desktop/src-tauri; the
+# mocks in this crate's tests are the other implementors and they are the whole
+# reason the seam exists.
+#
+# The `cargo tree` assertion in CI is the enforcement -- and note that it greps
+# for paraeq-engine and paraeq-decide as well as Tauri and CoreAudio, because
+# the earlier, narrower grep would have passed a paraeq-engine edge.
 # `#![forbid(unsafe_code)]` is the rest.
 #
 # `hound` arrives with Stage 5's per-position IR store (`store.rs`), which the
