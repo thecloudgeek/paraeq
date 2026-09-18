@@ -17,9 +17,10 @@ import type { JSX } from "react";
 
 import { Button } from "@/components/ui/button";
 import { verifyAbort, verifyRun } from "@/ipc/commands";
-import type { VerifyState } from "@/ipc/types";
+import type { VerifyDiagnostic, VerifyState } from "@/ipc/types";
 import {
   acknowledgementPrompt,
+  diagnosticLabel,
   orderedDiagnostics,
   preampDisclosure,
   residualLine,
@@ -123,6 +124,19 @@ export function VerifyPanel({ state }: { state: VerifyState }): JSX.Element {
   );
 }
 
+/** The badge's colour for one severity. The same three-way split
+ *  `diagnosticLabel` makes in words, made in weight. */
+function severityTone(severity: VerifyDiagnostic["severity"]): string {
+  switch (severity) {
+    case "dropped":
+      return "text-amber-700 dark:text-amber-400";
+    case "refuse":
+      return "text-destructive";
+    case "warn":
+      return "text-muted-foreground";
+  }
+}
+
 function Report({
   state,
 }: {
@@ -156,14 +170,14 @@ function Report({
               key={`${d.code}-${d.summary}`}
             >
               <div className="flex items-baseline gap-2">
+                {/* Three severities, three weights. A dropped capture sits
+                    between the two: it did not stop the run, so it is not
+                    destructive, but it threw away one of the user's
+                    measurements, so it must not read as a footnote either. */}
                 <span
-                  className={
-                    d.severity === "refuse"
-                      ? "text-xs font-medium uppercase text-destructive"
-                      : "text-xs font-medium uppercase text-muted-foreground"
-                  }
+                  className={`text-xs font-medium uppercase ${severityTone(d.severity)}`}
                 >
-                  {d.severity === "refuse" ? "stops here" : "note"}
+                  {diagnosticLabel(d)}
                 </span>
                 <span className="text-xs text-muted-foreground">
                   {d.summary} (code {d.code})

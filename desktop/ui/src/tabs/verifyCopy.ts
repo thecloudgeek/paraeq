@@ -100,16 +100,51 @@ export function acknowledgementPrompt(state: VerifyState): string | null {
 }
 
 /**
- * Diagnostics in the order a person should read them: refusals first.
+ * Diagnostics in the order a person should read them: refusals, then what we
+ * threw away, then what we merely noticed.
  *
  * A warning listed above the refusal that stopped the run buries the reason
- * nothing was installed. Within a severity the engine's own order is kept —
- * it is the order the checks ran in, and that is the order the failure
- * happened in.
+ * nothing was installed, and a dropped capture listed among the notes buries
+ * the fact that the correction on offer was computed without one of the user's
+ * measurements. Within a severity the engine's own order is kept — it is the
+ * order the checks ran in, and that is the order the failure happened in.
+ *
+ * `sort` is stable in every JS engine this ships on (ES2019 requires it), which
+ * is what "the engine's own order is kept" relies on.
  */
 export function orderedDiagnostics(report: VerifyReport): VerifyDiagnostic[] {
-  const rank = (d: VerifyDiagnostic) => (d.severity === "refuse" ? 0 : 1);
+  const rank = (d: VerifyDiagnostic) => {
+    switch (d.severity) {
+      case "refuse":
+        return 0;
+      case "dropped":
+        return 1;
+      case "warn":
+        return 2;
+    }
+  };
   return [...report.diagnostics].sort((a, b) => rank(a) - rank(b));
+}
+
+/**
+ * The badge over a diagnostic: what this row DID, in the fewest words that are
+ * still true.
+ *
+ * Three severities, three phrases, and none of them is the enum's own name.
+ * "Dropped" on its own would be read as "the app dropped something" without
+ * saying what, so the phrase names the thing that was set aside — a position,
+ * one of the captures the user took — and leaves the remedy underneath to say
+ * which one and what to do about it.
+ */
+export function diagnosticLabel(diagnostic: VerifyDiagnostic): string {
+  switch (diagnostic.severity) {
+    case "dropped":
+      return "one position was set aside";
+    case "refuse":
+      return "stops here";
+    case "warn":
+      return "note";
+  }
 }
 
 /**

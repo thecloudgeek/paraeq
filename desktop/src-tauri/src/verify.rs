@@ -1268,15 +1268,16 @@ fn grade(
                 remedy: d.remedy.clone(),
                 severity: match d.severity {
                     Severity::Refuse => "refuse".to_owned(),
-                    // Ruling R-A1's third severity, rendered on the WARNING
-                    // side: the position was removed from the cohort and the
-                    // session produced an installable correction, so a Verify
-                    // screen that showed it as a refusal would contradict the
-                    // verdict beside it. The remedy text says which capture and
-                    // what to do about it. Flagged for the desktop owner: a
-                    // distinct "dropped" affordance would read better than a
-                    // warning, and that is a UI call, not a wire one.
-                    Severity::RefusePosition => "warn".to_owned(),
+                    // Ruling R-A1's third severity gets a third wire value.
+                    // It was folded onto `"warn"` because it is not a refusal —
+                    // the session produced an installable correction — but a
+                    // warning is a thing we noticed, and this is a thing we DID:
+                    // one of the user's captures was thrown away and the
+                    // correction they are about to install was computed without
+                    // it. The remedy names the capture and what to do about it,
+                    // and the screen can now put that where it belongs — under
+                    // the refusals, above the notes.
+                    Severity::RefusePosition => "dropped".to_owned(),
                     Severity::Warn => "warn".to_owned(),
                 },
                 summary: match d.value {

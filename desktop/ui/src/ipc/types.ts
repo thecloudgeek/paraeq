@@ -116,8 +116,16 @@ export interface EqState {
 export interface VerifyDiagnostic {
   code: number;
   remedy: string;
-  /** `paraeq_decide::Severity`, snake_cased on this wire. */
-  severity: "refuse" | "warn";
+  /** `paraeq_decide::Severity`, snake_cased on this wire — one value per
+   *  variant, listed alphabetically per the repo convention rather than by
+   *  severity (the reading order lives in `orderedDiagnostics`).
+   *
+   *  `"dropped"` is `Severity::RefusePosition` (ruling R-A1). It is not a
+   *  refusal — the session still produced an installable correction — and it is
+   *  not a warning either: one of the user's captures was thrown away and the
+   *  correction was computed without it. A warning is something we noticed;
+   *  this is something we did. */
+  severity: "dropped" | "refuse" | "warn";
   summary: string;
 }
 

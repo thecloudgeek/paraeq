@@ -46,8 +46,15 @@ pub struct EqState {
 pub struct VerifyDiagnostic {
     pub code: u16,
     pub remedy: String,
-    /// `"refuse"` or `"warn"`. Snake case because everything else on this wire
-    /// is; the Rust enum is `paraeq_decide::Severity`.
+    /// `"dropped"`, `"refuse"` or `"warn"`. Snake case because everything else
+    /// on this wire is; the Rust enum is `paraeq_decide::Severity`, and the
+    /// three values map one to one onto its three variants.
+    ///
+    /// `"dropped"` is `Severity::RefusePosition` (ruling R-A1) and it is its own
+    /// value rather than a second spelling of `"warn"`: the session still
+    /// produced an installable correction, so it is not a refusal, but one of
+    /// the user's captures was thrown away and the correction was computed
+    /// without it. A warning is something we noticed; this is something we did.
     pub severity: String,
     pub summary: String,
 }
@@ -453,12 +460,27 @@ mod tests {
                 VerifyState::Complete {
                     report: VerifyReport {
                         abort_acoustic_budget_ms: 21.7,
-                        diagnostics: vec![VerifyDiagnostic {
-                            code: 41,
-                            remedy: "Re-run the measurement.".into(),
-                            severity: "refuse".into(),
-                            summary: "VerificationResidual (2.9)".into(),
-                        }],
+                        // Two rows, because `severity` has three values and a
+                        // golden that exercises one of them pins a string
+                        // rather than a mapping. `"dropped"` is ruling R-A1's
+                        // `Severity::RefusePosition`, and the hand-mirrored
+                        // TypeScript union has to carry it too.
+                        diagnostics: vec![
+                            VerifyDiagnostic {
+                                code: 41,
+                                remedy: "Re-run the measurement.".into(),
+                                severity: "refuse".into(),
+                                summary: "VerificationResidual (2.9)".into(),
+                            },
+                            VerifyDiagnostic {
+                                code: 31,
+                                remedy: "Position 3 clipped. We dropped it — reduce input gain \
+                                         by 6 dB and re-measure just that one."
+                                    .into(),
+                                severity: "dropped".into(),
+                                summary: "ClippingPosition (-0.2)".into(),
+                            },
+                        ],
                         gate_db: Some(2.0),
                         installed_preamp_db: -6.0,
                         level_dbfs: -21.0,
@@ -522,6 +544,13 @@ mod tests {
                                 "remedy": "Re-run the measurement.",
                                 "severity": "refuse",
                                 "summary": "VerificationResidual (2.9)"
+                            },
+                            {
+                                "code": 31,
+                                "remedy": "Position 3 clipped. We dropped it — reduce input \
+                                           gain by 6 dB and re-measure just that one.",
+                                "severity": "dropped",
+                                "summary": "ClippingPosition (-0.2)"
                             }
                         ],
                         "gate_db": 2.0,

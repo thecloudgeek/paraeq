@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import type { VerifyReport } from "@/ipc/types";
+import type { VerifyDiagnostic, VerifyReport } from "@/ipc/types";
 import {
   abortBannerText,
   acknowledgementPrompt,
   canAbort,
+  diagnosticLabel,
   orderedDiagnostics,
   preampDisclosure,
   residualLine,
@@ -144,6 +145,40 @@ describe("orderedDiagnostics", () => {
       "first warn",
       "second warn",
     ]);
+  });
+
+  // Ruling R-A1's severity reads between the two: it did not stop the run, so
+  // it goes under the refusals, but it threw away one of the user's captures,
+  // so it must not be buried among the notes.
+  it("sorts a dropped position under the refusals and above the notes", () => {
+    const ordered = orderedDiagnostics(
+      report({
+        diagnostics: [
+          { code: 105, remedy: "a", severity: "warn", summary: "a note" },
+          { code: 31, remedy: "b", severity: "dropped", summary: "position 3" },
+          { code: 41, remedy: "c", severity: "refuse", summary: "the refusal" },
+          { code: 32, remedy: "d", severity: "dropped", summary: "position 4" },
+        ],
+      }),
+    );
+    expect(ordered.map((d) => d.summary)).toEqual([
+      "the refusal",
+      "position 3",
+      "position 4",
+      "a note",
+    ]);
+  });
+});
+
+describe("diagnosticLabel", () => {
+  // The badge is the only word most people read. "Dropped" alone does not say
+  // what was dropped, and the enum's own name is not user-facing copy.
+  it("says what each severity DID, and names the thing set aside", () => {
+    const at = (severity: VerifyDiagnostic["severity"]) =>
+      diagnosticLabel({ code: 1, remedy: "r", severity, summary: "s" });
+    expect(at("refuse")).toBe("stops here");
+    expect(at("dropped")).toBe("one position was set aside");
+    expect(at("warn")).toBe("note");
   });
 });
 
