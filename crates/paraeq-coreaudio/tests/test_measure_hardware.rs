@@ -934,6 +934,7 @@ fn a_full_measurement_session_runs_against_the_live_witness() {
 // | `CaptureSource` | `MicCapture` (this crate) | the real one |
 // | `VolumeControl` | `DeviceVolume` (this crate) | the real one |
 // | `TapStatus` | `ExclusionWitness` (this crate) | the real one |
+// | `DeviceFacts` | `DeviceSeam` (`desktop/src-tauri`) | [`RigDeviceFacts`], below — the same two HAL reads |
 // | `EngineFacts` / `EngineControl` | `desktop/src-tauri/src/verify_seam.rs` | [`RigEngineSeam`], below |
 // | `StimulusHelper` / `HelperProcess` | `desktop/src-tauri` (B14) | [`RigHelper`] / [`HelperChild`], below |
 //
@@ -972,6 +973,7 @@ use paraeq_engine::controller::{
 };
 use paraeq_engine::preamp;
 use paraeq_engine::status::EngineStatus;
+use paraeq_measure::seam::{DeviceFacts, HelperLine};
 use paraeq_measure::{
     expected_render_device_uid, CalSensitivity, CalSummary, EngineControl, EngineFacts,
     EngineStatusKind, GainPin, HelperExit, HelperProcess, HelperRouting, MeasureError,
@@ -1109,8 +1111,8 @@ fn stimulus_binary() -> PathBuf {
 /// the owner's output device.
 struct HelperChild {
     child: Option<Child>,
-    /// Cached so [`HelperProcess::reap`] is idempotent rather than blocking a
-    /// second time on an already-reaped pid.
+    /// Cached so [`HelperProcess::reap`] and [`HelperProcess::try_reap`] are
+    /// idempotent rather than blocking a second time on an already-reaped pid.
     exit: Option<HelperExit>,
     lines: Receiver<String>,
     pid: u32,
@@ -1150,7 +1152,7 @@ impl HelperChild {
                 }
             }
             // Dropping `tx` here disconnects the channel, which is how EOF
-            // reaches `read_deadline` as `Ok(None)`.
+            // reaches `read_deadline` as `HelperLine::Eof`.
         });
         Ok(HelperChild {
             child: Some(child),
@@ -1161,17 +1163,23 @@ impl HelperChild {
         })
     }
 
-    /// One line, or `Ok(None)` at EOF. A TIMEOUT is an `Err`, not an EOF: the
-    /// two mean different things to the pass's gates (a child that closed its
-    /// stdout has ended; a child that has said nothing may still be wedged
-    /// inside a device open), and collapsing them would report the wrong one.
-    fn read_deadline(&mut self, deadline: Duration) -> Result<Option<String>, MeasureError> {
+    /// The reader thread's three outcomes, in the seam's vocabulary — the same
+    /// mapping `desktop/src-tauri/src/verify_seam.rs` makes.
+    ///
+    /// A timeout and an EOF stay APART, which is why [`HelperLine`] has three
+    /// variants rather than two: a child that closed its stdout has ended, a
+    /// child that has said nothing may still be wedged inside a device open,
+    /// and the teardown ladder escalates to SIGTERM only in the second case.
+    /// Collapsing them reads a wedged helper as a dead one and leaves it
+    /// rendering into the owner's output device.
+    ///
+    /// Infallible on purpose: `recv_timeout`'s two failure modes are both
+    /// answers here, so there is no error left to return.
+    fn read_deadline(&mut self, deadline: Duration) -> HelperLine {
         match self.lines.recv_timeout(deadline) {
-            Ok(line) => Ok(Some(line)),
-            Err(RecvTimeoutError::Disconnected) => Ok(None),
-            Err(RecvTimeoutError::Timeout) => Err(MeasureError::Sink(format!(
-                "the verification helper said nothing within {deadline:?}"
-            ))),
+            Ok(line) => HelperLine::Line(line),
+            Err(RecvTimeoutError::Disconnected) => HelperLine::Eof,
+            Err(RecvTimeoutError::Timeout) => HelperLine::DeadlineExpired,
         }
     }
 
@@ -1186,12 +1194,15 @@ impl HelperChild {
                 return None;
             }
             match self.read_deadline(remaining) {
-                Ok(Some(line)) => {
+                HelperLine::Line(line) => {
                     if line.contains(&needle) {
                         return Some(line);
                     }
                 }
-                Ok(None) | Err(_) => return None,
+                // Both ways of hearing nothing more end the wait: the caller
+                // asked for one named event within `deadline`, and neither a
+                // closed stdout nor an expired deadline can still produce it.
+                HelperLine::DeadlineExpired | HelperLine::Eof => return None,
             }
         }
     }
@@ -1218,6 +1229,34 @@ impl HelperChild {
         let status = child
             .wait()
             .map_err(|e| MeasureError::Sink(format!("cannot reap the helper: {e}")))?;
+        Ok(self.record_exit(status))
+    }
+
+    /// The NON-BLOCKING twin of [`reap_inner`](Self::reap_inner), over
+    /// `Child::try_wait` exactly as `desktop/src-tauri/src/verify_seam.rs` does.
+    ///
+    /// It must not block: the ladder polls liveness against a deadline while
+    /// the helper may still be rendering, and a `wait` there would hang on the
+    /// very child the poll exists to escalate against.
+    fn try_reap_inner(&mut self) -> Result<Option<HelperExit>, MeasureError> {
+        if let Some(exit) = self.exit {
+            return Ok(Some(exit));
+        }
+        let child = self
+            .child
+            .as_mut()
+            .ok_or_else(|| MeasureError::Sink("the helper is already gone".to_owned()))?;
+        let polled = child
+            .try_wait()
+            .map_err(|e| MeasureError::Sink(format!("cannot read the helper's status: {e}")))?;
+        Ok(polled.map(|status| self.record_exit(status)))
+    }
+
+    /// Cache one observed exit status, in the seam's vocabulary.
+    ///
+    /// One home for the mapping so the blocking and the non-blocking reap
+    /// cannot come to disagree about what `signalled` means.
+    fn record_exit(&mut self, status: std::process::ExitStatus) -> HelperExit {
         let exit = HelperExit {
             code: status.code(),
             // `code()` is `None` exactly when the process died OF a signal,
@@ -1226,7 +1265,7 @@ impl HelperChild {
             signalled: status.code().is_none(),
         };
         self.exit = Some(exit);
-        Ok(exit)
+        exit
     }
 }
 
@@ -1284,12 +1323,16 @@ impl HelperProcess for HelperChild {
         self.reap_inner()
     }
 
+    fn try_reap(&mut self) -> Result<Option<HelperExit>, MeasureError> {
+        self.try_reap_inner()
+    }
+
     fn send_play(&mut self) -> Result<(), MeasureError> {
         self.write_line("play")
     }
 
-    fn read_line(&mut self, deadline: Duration) -> Result<Option<String>, MeasureError> {
-        self.read_deadline(deadline)
+    fn read_line(&mut self, deadline: Duration) -> Result<HelperLine, MeasureError> {
+        Ok(self.read_deadline(deadline))
     }
 }
 
@@ -1307,6 +1350,52 @@ impl StimulusHelper for RigHelper {
     ) -> Result<Box<dyn HelperProcess>, MeasureError> {
         let child = HelperChild::spawn(wav_path, device_uid, &routing.as_channel_arg())?;
         Ok(Box::new(child))
+    }
+}
+
+// ───────────────────────── the device facts, test-side ───────────────────────
+
+/// The pass's by-UID HAL questions, answered by the real HAL.
+///
+/// A hardware test must not stub these. The teardown's device-gone check asks
+/// whether the helper's private render aggregate is still wrapping the owner's
+/// output device, and a stubbed answer would turn the one assertion that can
+/// catch a real leak into a tautology. So this calls the same two shipped
+/// `properties` wrappers `DeviceSeam` calls in
+/// `desktop/src-tauri/src/verify_seam.rs`, with the same conservative bias; it
+/// differs only in reporting to stderr, which is where a rig run is read, rather
+/// than to the desktop app's log.
+struct RigDeviceFacts;
+
+impl DeviceFacts for RigDeviceFacts {
+    /// **An unreadable answer is `true`**, which the seam requires: a teardown
+    /// that could not establish the device is gone must report a possible leak
+    /// rather than assume a clean one. The two errors are not symmetric — a
+    /// false report costs the owner a line of stderr, a false clean leaves a
+    /// private device on their output with nothing watching it.
+    fn device_exists(&self, uid: &str) -> bool {
+        match properties::device_exists(uid) {
+            Ok(present) => present,
+            Err(e) => {
+                eprintln!(
+                    "RIG: cannot tell whether '{uid}' still exists ({e}); reporting it present"
+                );
+                true
+            }
+        }
+    }
+
+    /// `None` is "cannot answer", never "0 Hz" — including when no device
+    /// carries this UID, which is the benign race the rate fence expects when
+    /// the helper has already destroyed its aggregate.
+    fn nominal_sample_rate(&self, device_uid: &str) -> Option<f64> {
+        match properties::nominal_sample_rate_for_uid(device_uid) {
+            Ok(rate) => rate,
+            Err(e) => {
+                eprintln!("RIG: cannot read '{device_uid}''s nominal rate: {e}");
+                None
+            }
+        }
     }
 }
 
@@ -1800,7 +1889,7 @@ fn play_through_helper(mic: &mut MicCapture, device_uid: &str, wav: &Path) -> He
             capture.extend_from_slice(&scratch[..n]);
         }
         // Non-blocking: the terminating line may already be waiting.
-        if let Ok(Some(line)) = child.read_deadline(Duration::from_millis(1)) {
+        if let HelperLine::Line(line) = child.read_deadline(Duration::from_millis(1)) {
             if line.contains(r#""event":"done""#) || line.contains(r#""event":"aborted""#) {
                 done = Some(line);
             } else if line.contains(r#""event":"error""#) {
@@ -2535,6 +2624,7 @@ fn the_verification_gates_arm_on_a_genuinely_quiet_machine() {
         VerifySeam {
             capture: Box::new(WaitingCapture { inner: mic }),
             control: engine.control(),
+            devices: Box::new(RigDeviceFacts),
             engine: engine.facts(),
             helper: Box::new(RigHelper),
             tap: Box::new(engine.witness.clone()),
@@ -2673,6 +2763,7 @@ fn the_full_verification_pass_runs_end_to_end_on_the_rig() {
         VerifySeam {
             capture: Box::new(WaitingCapture { inner: mic }),
             control: engine.control(),
+            devices: Box::new(RigDeviceFacts),
             engine: engine.facts(),
             helper: Box::new(RigHelper),
             tap: Box::new(engine.witness.clone()),
