@@ -230,6 +230,27 @@ fn fdw_pre_cycles_never_exceeds_the_post_lobe() {
             "{class:?}: the pre lobe must follow the post lobe down, got {}",
             pinched.decisions.fdw_pre_cycles.value
         );
+
+        // Ruling R-A11: the row's rule is "clamped `≤ fdw_post_cycles`", and a
+        // DRAWER value has to obey it too. 61.0 is the top of the pre lobe's
+        // own domain, so it is legal on its own terms and § D-N's out-of-domain
+        // clamp never sees it — the clamp that binds here is this row's.
+        let over_the_post_lobe = decide(&with_override(
+            &bundle,
+            "fdw_pre_cycles",
+            serde_json::json!(61.0),
+        ));
+        let post = over_the_post_lobe.decisions.fdw_post_cycles.value;
+        assert!(
+            over_the_post_lobe.decisions.fdw_pre_cycles.value <= post + EPS,
+            "{class:?}: an override of 61.0 with post {post} survived as {}",
+            over_the_post_lobe.decisions.fdw_pre_cycles.value
+        );
+        assert_eq!(
+            over_the_post_lobe.decisions.fdw_pre_cycles.source,
+            Source::UserOverride,
+            "{class:?}: the clamp must not un-record the user's intent"
+        );
     }
 }
 

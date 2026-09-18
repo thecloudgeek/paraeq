@@ -263,6 +263,29 @@ pub(crate) fn position_noun(profile: &PathProfile) -> &'static str {
     }
 }
 
+/// `fdw_pre_cycles`' own rule — "Default 3; clamped `≤ fdw_post_cycles`" —
+/// applied to the RESOLVED value, so a drawer override obeys it too.
+///
+/// Ruling R-A11. The pre lobe's domain is the decision table's `1.0..=61.0`
+/// verbatim, and § D-K narrowed only the POST ceiling, so an override of 61.0
+/// against a 15-cycle post lobe is INSIDE its own domain: § D-N's out-of-domain
+/// clamp never sees it and the row's rule was the only thing left to enforce
+/// it. The clamp moves the value and never the `source` — the user asked for
+/// 61 and the record must still say so — which is the same posture § D-N takes.
+///
+/// A debug assertion rather than a plain `min`, so that a future rule that
+/// lets the post lobe move after this point fails loudly in tests instead of
+/// publishing a pre lobe longer than the window it sits inside.
+fn clamp_pre_to_post(mut d: Decision<f64>, post_cycles: f64) -> Decision<f64> {
+    d.value = d.value.min(post_cycles);
+    debug_assert!(
+        d.value <= post_cycles,
+        "fdw_pre_cycles {} exceeds fdw_post_cycles {post_cycles}",
+        d.value
+    );
+    d
+}
+
 /// `right_window_ms`'s VALUE, resolved, without building the decision.
 ///
 /// `design_decisions` and [`fit_correction`] both need the decided window — it
@@ -428,30 +451,40 @@ pub(crate) fn analysis_decisions(
             ),
             over.fdw_post_cycles.as_ref(),
         ),
-        fdw_pre_cycles: resolve(
-            decision(
-                // "Asymmetric pre-lobe. Default 3" — a noise gate on pre-peak
-                // artifacts, not a resolution control, and DR1 § Q3 calls it
-                // "the lowest-confidence knob".
-                pre_cycles,
-                // The decision table's `Range 1.0..=61.0`, verbatim. § D-K
-                // narrowed the POST ceiling to what the implementation can
-                // honour and said nothing about this one, and the row's own rule
-                // ("clamped `≤ fdw_post_cycles`") is a rule rather than a
-                // domain — so the ceiling stands as written and the clamp is
-                // applied to the VALUE below. Flagged rather than quietly
-                // narrowed: a domain is what the drawer draws, and changing one
-                // is a wire change.
-                // OPEN [OWNER] (§ D-K sibling): keep 61.0, or derive it too?
-                Domain::Range {
-                    max: 61.0,
-                    min: 1.0,
-                    step: None,
-                },
-                rationale::fdw_pre_cycles(),
-                Invalidation::Reanalyze,
+        // The row's own rule — "clamped `≤ fdw_post_cycles`" — applied AFTER
+        // `resolve`, so a drawer value obeys it too (ruling R-A11). 61.0 is the
+        // top of this row's own domain, so § D-N's out-of-domain clamp never
+        // sees it; without this the drawer could ask for a 61-cycle pre lobe
+        // against a 15-cycle post lobe, which is in-domain and violates the
+        // row. `source` stays `UserOverride`: the value moved, the intent did
+        // not. Asserted below, and by `fdw_pre_cycles_never_exceeds_the_post_lobe`.
+        fdw_pre_cycles: clamp_pre_to_post(
+            resolve(
+                decision(
+                    // "Asymmetric pre-lobe. Default 3" — a noise gate on pre-peak
+                    // artifacts, not a resolution control, and DR1 § Q3 calls it
+                    // "the lowest-confidence knob".
+                    pre_cycles,
+                    // The decision table's `Range 1.0..=61.0`, verbatim. § D-K
+                    // narrowed the POST ceiling to what the implementation can
+                    // honour and said nothing about this one, and the row's own rule
+                    // ("clamped `≤ fdw_post_cycles`") is a rule rather than a
+                    // domain — so the ceiling stands as written and the clamp is
+                    // applied to the VALUE below. Flagged rather than quietly
+                    // narrowed: a domain is what the drawer draws, and changing one
+                    // is a wire change.
+                    // OPEN [OWNER] (§ D-K sibling): keep 61.0, or derive it too?
+                    Domain::Range {
+                        max: 61.0,
+                        min: 1.0,
+                        step: None,
+                    },
+                    rationale::fdw_pre_cycles(),
+                    Invalidation::Reanalyze,
+                ),
+                over.fdw_pre_cycles.as_ref(),
             ),
-            over.fdw_pre_cycles.as_ref(),
+            post_cycles,
         ),
         left_window_ms: resolve(
             with_evidence(
