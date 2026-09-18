@@ -12,7 +12,7 @@
 // `CorrectionPlan`, which only the wizard produces. The panel says so instead
 // of offering a button that cannot work.
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import type { JSX } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -20,29 +20,21 @@ import { verifyAbort, verifyRun } from "@/ipc/commands";
 import type { VerifyState } from "@/ipc/types";
 import {
   acknowledgementPrompt,
-  canAbort,
   orderedDiagnostics,
   preampDisclosure,
   residualLine,
   verifyHeadline,
 } from "./verifyCopy";
 
+// The Esc binding used to live here, and that was the defect: Radix
+// `TabsContent` unmounts inactive tabs, so it existed only while the Measure
+// tab was selected -- which it is not by default. It now lives in App.tsx's
+// `VerifyAbortBar`, outside the tabs, along with an always-visible Stop.
+// The buttons below stay: they are the controls in reach when the user IS
+// looking at this panel, and MS-18's acknowledgement needs its Cancel beside
+// its Play.
 export function VerifyPanel({ state }: { state: VerifyState }): JSX.Element {
   const [error, setError] = useState<string | null>(null);
-
-  // Esc aborts, which measurement-safety lists as a UI-owned abort trigger
-  // alongside the window close the shell already intercepts. It is bound while
-  // a pass exists and unbound the moment one does not, so Esc never fires a
-  // command that has nothing to stop.
-  const abortable = canAbort(state);
-  useEffect(() => {
-    if (!abortable) return;
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") void verifyAbort().catch((e) => setError(String(e)));
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [abortable]);
 
   const acknowledgement = acknowledgementPrompt(state);
 

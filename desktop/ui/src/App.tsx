@@ -8,13 +8,15 @@ import { useEffect, useState } from "react";
 import type { JSX } from "react";
 
 import { OutputPicker } from "@/components/OutputPicker";
+import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { engineListOutputs, engineSetDefaultOutput } from "@/ipc/commands";
-import type { AppState } from "@/ipc/types";
+import { engineListOutputs, engineSetDefaultOutput, verifyAbort } from "@/ipc/commands";
+import type { AppState, VerifyState } from "@/ipc/types";
 import { useAppState } from "@/ipc/useAppState";
 import { EqTab } from "@/tabs/EqTab";
 import { PlaceholderTab } from "@/tabs/PlaceholderTab";
 import { VerifyPanel } from "@/tabs/VerifyPanel";
+import { abortBannerText, canAbort } from "@/tabs/verifyCopy";
 import { SetupWizard } from "@/wizard/SetupWizard";
 
 function App() {
@@ -35,6 +37,7 @@ function App() {
   return (
     <div className="flex h-screen flex-col p-4">
       <OutputHeader state={state} />
+      {state && <VerifyAbortBar state={state.verification} />}
       <Tabs defaultValue="eq" className="flex h-full min-h-0 flex-col">
         <TabsList>
           <TabsTrigger value="measure">Measure</TabsTrigger>
@@ -72,6 +75,61 @@ function App() {
           <PlaceholderTab stage="stage 5" title="Profiles" />
         </TabsContent>
       </Tabs>
+    </div>
+  );
+}
+
+// The abort, lifted OUT of the Measure tab.
+//
+// Radix `TabsContent` unmounts inactive tabs, so VerifyPanel's Esc listener and
+// its Stop button existed only while Measure was the selected tab -- and the
+// default tab is EQ. A verification pass keeps its measurement lease, its
+// pinned trim and, once running, a sweep playing into the user's headphones no
+// matter which tab is in front, so the way to stop it cannot live behind one.
+// measurement-safety's abort-trigger table names Esc a UI-owned trigger; a
+// trigger that depends on the selected tab is not one.
+//
+// Rendered here rather than by force-mounting the Measure tab because the tab
+// is Stage 7's and will grow a wizard: a hidden-but-mounted wizard is a
+// different and worse problem. The panel keeps its own buttons for the case
+// where the user IS looking at it.
+function VerifyAbortBar({ state }: { state: VerifyState }): JSX.Element | null {
+  const [error, setError] = useState<string | null>(null);
+  const abortable = canAbort(state);
+
+  // Bound while a pass exists and unbound the moment one does not, so Esc never
+  // fires a command that has nothing to stop. This is now the ONLY Esc binding
+  // -- the panel's was removed rather than duplicated, because two listeners
+  // would send two aborts for one keypress.
+  useEffect(() => {
+    if (!abortable) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") void verifyAbort().catch((e) => setError(String(e)));
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [abortable]);
+
+  const line = abortBannerText(state);
+  if (!abortable || !line) return null;
+
+  return (
+    <div
+      className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2"
+      role="status"
+    >
+      <span className="text-sm">{line}</span>
+      <Button
+        onClick={() => {
+          setError(null);
+          void verifyAbort().catch((e) => setError(String(e)));
+        }}
+        size="sm"
+        variant="outline"
+      >
+        Stop (Esc)
+      </Button>
+      {error ? <span className="text-xs text-destructive">{error}</span> : null}
     </div>
   );
 }

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { VerifyReport } from "@/ipc/types";
 import {
+  abortBannerText,
   acknowledgementPrompt,
   canAbort,
   orderedDiagnostics,
@@ -160,5 +161,47 @@ describe("canAbort", () => {
     expect(
       canAbort({ phase: "failed", code: null, remedy: null, summary: "x" }),
     ).toBe(false);
+  });
+});
+
+describe("abortBannerText", () => {
+  // The banner lives outside the Measure tab, because a pass keeps its lease,
+  // its pinned trim and its sweep no matter which tab is in front. Its two
+  // lines are different promises: armed means nothing has made a sound yet,
+  // running means something is making one right now.
+  it("distinguishes armed from running and names the device", () => {
+    const armed = abortBannerText({
+      phase: "armed",
+      device_name: "AirPods Max",
+      level_dbfs: -21,
+      projected_spl_db: 78,
+    });
+    expect(armed).toContain("AirPods Max");
+    expect(armed).toContain("Nothing has played yet");
+    expect(abortBannerText({ phase: "running" })).toContain("playing");
+  });
+
+  it("says nothing when there is nothing to stop", () => {
+    expect(abortBannerText({ phase: "idle" })).toBeNull();
+    expect(
+      abortBannerText({ phase: "failed", code: null, remedy: null, summary: "x" }),
+    ).toBeNull();
+  });
+
+  // The banner and the Esc binding are shown by the same predicate, so a phase
+  // that can be aborted must always have a line to show.
+  it("has a line for exactly the phases that can be aborted", () => {
+    for (const state of [
+      { phase: "idle" } as const,
+      { phase: "running" } as const,
+      {
+        phase: "armed",
+        device_name: "d",
+        level_dbfs: -21,
+        projected_spl_db: 78,
+      } as const,
+    ]) {
+      expect(abortBannerText(state) !== null).toBe(canAbort(state));
+    }
   });
 });

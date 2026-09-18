@@ -120,3 +120,24 @@ export function orderedDiagnostics(report: VerifyReport): VerifyDiagnostic[] {
 export function canAbort(state: VerifyState): boolean {
   return state.phase === "armed" || state.phase === "running";
 }
+
+/**
+ * The app-wide abort banner's line, or `null` when there is nothing to stop.
+ *
+ * This copy belongs to a control that lives OUTSIDE the Measure tab, and that
+ * is the point: a verification pass keeps its lease, its pinned trim and — once
+ * running — its sweep, no matter which tab the user is looking at, so the way
+ * to stop it has to be visible from all of them. It names the phase because
+ * "armed" and "playing" are different promises: one says nothing has made a
+ * sound yet, the other says something is making one right now.
+ */
+export function abortBannerText(state: VerifyState): string | null {
+  switch (state.phase) {
+    case "armed":
+      return `Verification is armed on ${state.device_name}. Nothing has played yet.`;
+    case "running":
+      return "A verification sweep is playing. Keep the room quiet.";
+    default:
+      return null;
+  }
+}
