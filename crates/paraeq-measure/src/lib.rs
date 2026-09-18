@@ -56,6 +56,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod align;
 pub mod cal;
 pub mod capture;
 pub mod diagnostic;
@@ -68,6 +69,10 @@ pub mod session;
 pub mod stimulus;
 pub mod store;
 
+pub use align::{
+    align, AlignRequest, Alignment, MARKER_SNR_WARN_DB, TWO_CLOCK_RESIDUAL_REFUSE_SAMPLES,
+    TWO_CLOCK_RESIDUAL_WARN_SAMPLES,
+};
 pub use cal::{
     margined_emit_dbfs, CalSummary, PinnedGain, CAL_ERROR_MARGIN_DB, GAIN_MATCH_TOLERANCE,
 };
