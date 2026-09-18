@@ -593,6 +593,92 @@ fn transition_hz_is_never_an_authority_input() {
     );
 }
 
+/// § D-D's split, enforced: the `authority` DOMAIN carries names, and the
+/// resolved curve lives in `Analysis` and nowhere else.
+///
+/// Ruling R-A4. The domain used to carry `Custom(analysis.authority.clone())` —
+/// the run's own resolved curve, byte for byte, 77–89 KB per `expected.json`
+/// for a value that is "Custom = whatever Standard produced". A domain is what
+/// the drawer DRAWS; it is not a second copy of a product.
+///
+/// `Custom` is still legal, and legal by CONSTRUCTION rather than by being
+/// enumerated: `AuthorityCurve` is sealed, so every representable
+/// `AuthorityPreset` has already been validated and a `Choice` list could not
+/// enumerate the curves anyway.
+#[test]
+fn the_authority_domain_lists_the_two_named_presets_and_not_the_resolved_curve() {
+    for class in EVERY_CLASS {
+        let set = decide(&lumpy_bundle(class));
+        let authority = &set.decisions.authority;
+        assert_eq!(
+            authority.domain,
+            paraeq_decide::Domain::Choice(vec![
+                AuthorityPreset::Conservative,
+                AuthorityPreset::Standard,
+            ]),
+            "{class:?}: the domain is the two NAMES"
+        );
+        assert_eq!(authority.value, AuthorityPreset::Standard, "{class:?}");
+
+        // The curve is still published — as a product, once.
+        assert!(
+            !set.analysis.authority.freqs().is_empty(),
+            "{class:?}: the resolved curve is still an Analysis product"
+        );
+
+        // And the wire no longer carries it twice. The whole `Decisions::authority`
+        // subtree must be far smaller than the resolved curve's own JSON.
+        let domain_json = serde_json::to_string(&authority.domain)
+            .expect("a domain is plain derived data")
+            .len();
+        let curve_json = serde_json::to_string(&set.analysis.authority)
+            .expect("a curve is plain derived data")
+            .len();
+        assert!(
+            domain_json * 100 < curve_json,
+            "{class:?}: the domain is {domain_json} bytes against the curve's              {curve_json} — it is still carrying a copy"
+        );
+    }
+}
+
+/// A `Custom(curve)` override is in-domain by construction, so it neither warns
+/// nor gets clamped away.
+///
+/// Ruling R-A4, the other half. The `Choice` list cannot enumerate a curve, so
+/// a `contains` that only walked the list would call every legitimate custom
+/// ceiling illegal — and § D-N's clamp would then replace it with the rule's
+/// own value, silently discarding exactly the override the drawer exists to
+/// offer.
+#[test]
+fn a_custom_authority_override_is_in_domain_and_survives() {
+    let bundle = lumpy_bundle(TransducerClass::Bookshelf);
+    let resolved = decide(&bundle).analysis.authority;
+    let custom = serde_json::to_value(AuthorityPreset::Custom(resolved))
+        .expect("a preset is plain derived data");
+
+    let set = decide(&with_override(&bundle, "authority", custom));
+    assert_eq!(set.decisions.authority.source, Source::UserOverride);
+    assert!(
+        matches!(set.decisions.authority.value, AuthorityPreset::Custom(_)),
+        "the override must survive, got {:?}",
+        set.decisions.authority.value
+    );
+    assert!(
+        set.decisions
+            .authority
+            .domain
+            .contains(&set.decisions.authority.value),
+        "a sealed custom curve is in-domain by construction"
+    );
+    assert!(
+        !set.diagnostics
+            .iter()
+            .any(|d| d.code == paraeq_decide::DiagnosticCode::OverrideOutOfDomain),
+        "{:?}",
+        set.diagnostics
+    );
+}
+
 // ===========================================================================
 // Scans 3 and 4 — `correction_range`
 //

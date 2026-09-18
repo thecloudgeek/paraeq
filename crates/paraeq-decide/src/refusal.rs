@@ -880,19 +880,25 @@ fn cal_has_target_baked_in(bundle: &MeasurementBundle) -> Option<Diagnostic> {
 /// the override is taken as given and this row says so rather than leaving the
 /// user with a value the drawer should never have offered.
 ///
-/// **Two decisions are deliberately not checked**, because their `Choice` lists
-/// carry a run-specific REPRESENTATIVE rather than an enumeration of every legal
-/// value, so `contains` answers `false` for perfectly legitimate overrides:
+/// **The two by-construction exceptions are checked like everything else now**
+/// (ruling R-A4). `authority` and `target` used to be omitted from this list,
+/// because their `Choice` lists carry a run-specific REPRESENTATIVE rather than
+/// an enumeration of every legal value and a membership test answered `false`
+/// for legitimate overrides:
 ///
-/// * `authority` — the list holds `Custom(THIS run's curve)`, so any other
-///   custom curve reads as illegal. It cannot be: `AuthorityCurve` is sealed
-///   (only `build_authority` makes one), so every representable
-///   `AuthorityPreset` is already legal.
-/// * `target` — the list holds `Parametric(the room default)`, so moving the
-///   tilt inside the spec's own `-1.5..=0.0` reads as illegal.
+/// * `authority` — `Custom(curve)` cannot be enumerated at all.
+///   `AuthorityCurve` is sealed (only `build_authority` makes one, and
+///   deserialization goes through a guarded `TryFrom`), so every representable
+///   `Custom` has already been validated and is in-domain by construction.
+/// * `target` — `Parametric { .. }` is a four-number shape, so moving the tilt
+///   inside `targets`' own `-1.5..=0.0` reads as illegal against a list.
 ///
-/// Both need a domain that can express a shape rather than a value; recorded
-/// here as the seam rather than papered over with a special case.
+/// The exception now lives in [`crate::decision::InRange::legal_by_construction`],
+/// which `Domain::contains` consults first — one named, tested place instead of
+/// two omissions a reader has to notice. So a `Custom` ceiling and a re-tilted
+/// house curve pass silently, while an `authority` or `target` override that
+/// really is outside the domain (a `Curve` naming a target the bundle does not
+/// carry) finally earns its row instead of passing unremarked.
 fn override_out_of_domain(bundle: &MeasurementBundle, decisions: &Decisions) -> Vec<Diagnostic> {
     let over = &bundle.overrides;
     let mut out = Vec::new();
@@ -901,6 +907,13 @@ fn override_out_of_domain(bundle: &MeasurementBundle, decisions: &Decisions) -> 
         "align_spl_band",
         over.align_spl_band.as_ref(),
         &decisions.align_spl_band,
+        None,
+    );
+    row(
+        &mut out,
+        "authority",
+        over.authority.as_ref(),
+        &decisions.authority,
         None,
     );
     row(
@@ -1020,6 +1033,13 @@ fn override_out_of_domain(bundle: &MeasurementBundle, decisions: &Decisions) -> 
         "smoothing",
         over.smoothing.as_ref(),
         &decisions.smoothing,
+        None,
+    );
+    row(
+        &mut out,
+        "target",
+        over.target.as_ref(),
+        &decisions.target,
         None,
     );
     row(

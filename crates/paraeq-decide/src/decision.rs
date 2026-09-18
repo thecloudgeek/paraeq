@@ -62,6 +62,35 @@ pub trait InRange {
     fn in_range(&self, _min: &Self, _max: &Self) -> bool {
         false
     }
+
+    /// Whether this value is legal no matter what a [`Domain::Choice`] list
+    /// enumerates, because its own type already guarantees it.
+    ///
+    /// `false` by default, which is the ordinary case: a `Choice` is an
+    /// enumeration and membership is the whole test. **Two decisions need the
+    /// escape**, and neither can be expressed by lengthening a list:
+    ///
+    /// * `authority` — `AuthorityPreset::Custom(curve)` carries a 957-point
+    ///   [`paraeq_dsp::authority::AuthorityCurve`], which is SEALED: only
+    ///   `build_authority` constructs one and deserialization goes through a
+    ///   guarded `TryFrom`, so every representable `Custom` has already been
+    ///   validated. Enumerating them is impossible and enumerating THIS run's
+    ///   one was the defect ruling R-A4 closes — the domain carried a byte-for-byte
+    ///   copy of `Analysis::authority`, 77–89 KB per frozen case, to say
+    ///   "Custom = whatever Standard produced".
+    /// * `target` — `TargetChoice::Parametric { .. }` is a SHAPE with four
+    ///   numbers, and the list holds one representative (the room default), so
+    ///   moving the tilt anywhere inside `targets`' own `-1.5..=0.0` would read
+    ///   as illegal. `build_room_target` is the validator; a spec outside its
+    ///   range produces no curve and the fit emits nothing, which is a
+    ///   different failure from an out-of-domain override.
+    ///
+    /// Expressed as a trait method rather than as an omission from the
+    /// out-of-domain row list, so that the exception is one named, tested place
+    /// instead of two call sites that have to remember it.
+    fn legal_by_construction(&self) -> bool {
+        false
+    }
 }
 
 macro_rules! in_range_scalar {
@@ -112,7 +141,13 @@ impl<T: InRange + PartialEq> Domain<T> {
     /// value is the constraint, and there is no control to bound.
     pub fn contains(&self, value: &T) -> bool {
         match self {
-            Domain::Choice(alternatives) => alternatives.iter().any(|a| a == value),
+            // The by-construction escape comes FIRST: a `Choice` list cannot
+            // enumerate a sealed 957-point curve or a four-number shape, and a
+            // membership test over such a list answers `false` for values that
+            // are legal by their own type. See [`InRange::legal_by_construction`].
+            Domain::Choice(alternatives) => {
+                value.legal_by_construction() || alternatives.iter().any(|a| a == value)
+            }
             Domain::Derived => true,
             Domain::Range { max, min, .. } => value.in_range(min, max),
         }

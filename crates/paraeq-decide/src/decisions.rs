@@ -192,8 +192,19 @@ pub enum AuthorityPreset {
     Standard,
 }
 
-/// `authority` is a `Choice` over three named presets — unordered.
-impl InRange for AuthorityPreset {}
+/// `authority` is a `Choice` over the two NAMED presets — unordered — plus
+/// `Custom`, which is legal by construction rather than by enumeration.
+///
+/// Ruling R-A4: [`AuthorityCurve`] is sealed (only `build_authority` makes one,
+/// and deserialization goes through a guarded `TryFrom`), so every
+/// representable `Custom` has already been validated. The domain lists
+/// `Conservative` and `Standard`; it does NOT carry a curve, because a domain
+/// is what the drawer draws and the resolved curve is an `Analysis` product.
+impl InRange for AuthorityPreset {
+    fn legal_by_construction(&self) -> bool {
+        matches!(self, AuthorityPreset::Custom(_))
+    }
+}
 
 /// Which SHAPE of correction the plan carries.
 ///
@@ -293,7 +304,18 @@ impl TargetChoice {
 
 /// `target` is a `Choice` over the class-filtered candidate set plus
 /// `Parametric` — unordered.
-impl InRange for TargetChoice {}
+///
+/// `Parametric` is legal by construction: the list holds one REPRESENTATIVE
+/// (the room default), so moving the tilt anywhere inside `targets`' own
+/// `-1.5..=0.0` would read as illegal against a membership test.
+/// `build_room_target` is the validator for the four numbers, and a spec it
+/// refuses produces no curve at all — a different failure from an
+/// out-of-domain override. See [`InRange::legal_by_construction`].
+impl InRange for TargetChoice {
+    fn legal_by_construction(&self) -> bool {
+        matches!(self, TargetChoice::Parametric { .. })
+    }
+}
 
 /// `window_type` is a `Choice` over the four window shapes — unordered.
 impl InRange for WindowType {}

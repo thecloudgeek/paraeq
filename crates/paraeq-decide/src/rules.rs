@@ -665,9 +665,15 @@ pub(crate) fn design_decisions(
 
     let authority = with_evidence(
         Decision {
+            // The two NAMED presets, and nothing else. Ruling R-A4: this list
+            // used to carry `Custom(authority_curve.clone())` — a byte-for-byte
+            // copy of `Analysis::authority`, 77–89 KB in every frozen case — to
+            // express "Custom = whatever Standard just produced", which is not
+            // an alternative the drawer can offer. `Custom` stays legal through
+            // `InRange::legal_by_construction`: `AuthorityCurve` is sealed, so a
+            // list could neither enumerate the legal curves nor need to.
             domain: Domain::Choice(vec![
                 AuthorityPreset::Conservative,
-                AuthorityPreset::Custom(authority_curve.clone()),
                 AuthorityPreset::Standard,
             ]),
             rationale: rationale::authority(transition_hz.value),
