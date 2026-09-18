@@ -177,12 +177,88 @@ pub(crate) fn dropped_positions(diagnostics: &[Diagnostic]) -> Vec<usize> {
     out
 }
 
+/// The rows that are statements about the CAPTURE the user took rather than
+/// about the cohort that survived, graded ONCE against the ORIGINAL bundle.
+///
+/// Held as a value so [`crate::decide`] can compute them before the drop loop
+/// and hand the same three answers to every round. They are spliced back into
+/// [`diagnostics`] at their own alphabetical slots, because the emitted order is
+/// frozen by `fixtures/decide/<case>/expected.json`.
+///
+/// # Why these three, and why not the others
+///
+/// A row qualifies when it makes a SESSION-scoped claim (`Severity::Refuse`,
+/// which is what `crate::verdict_for` turns into `Verdict::Refuse`) out of RAW
+/// capture facts — fields of `CaptureStats`, `ImpulseResponse::sample_rate` and
+/// the sweep plan, none of which any drop can change. Grading such a row over
+/// the survivors lets the drop loop erase it, and for `ClippingSession` that was
+/// not hypothetical: `clipped_samples > 0` means the meter reached full scale,
+/// so `peak_dbfs >= 0 >= CLIP_POSITION_DBFS` and [`clipping_position`] had
+/// already removed every position that could raise the fraction. A partly railed
+/// run proceeded, and an all-railed run refused as `TooFewPositions` — the right
+/// verdict with the wrong remedy, sending the user to take more captures instead
+/// of to turn the gain down.
+///
+/// - [`clipping_session`] — REW's sustained-clipping rule over the whole
+///   capture. The row this struct exists for.
+/// - [`no_signal`] — names a position so the drawer can say which pass was
+///   silent, but its severity is a plain `Refuse` and its copy is about the
+///   whole chain ("Check the mic is selected as the input"). A capture that
+///   heard nothing is a fact about the chain whether or not that capture also
+///   clipped and left the cohort.
+/// - [`sweep_rate_mismatch`] — "Internal error — this is a bug, not a user
+///   condition." A bundle carrying an IR deconvolved at a rate its own stimulus
+///   did not use is a bug report, and dropping the position it was found on does
+///   not unfile it.
+///
+/// Every other row stays inside the loop, and each for its own reason:
+///
+/// - `NoiseFloorTooHigh` reads the SILENCE capture and the decided
+///   `correction_range`, not the positions. Its band is the survivors' decided
+///   band, so grading it per round is what makes it read the band `decide()`
+///   actually analysed; the positions cannot move it.
+/// - `MicNotConnected`, `SelfExclusionUnavailable`, `TwoClock` and
+///   `WrongTransducer` read `bundle.capture` fields that are session-wide
+///   already. No cohort can change their answer, so where they are graded does
+///   not matter and they stay where they read best.
+/// - `LowSnrHard` is a `Refuse`, but it is graded on the ANALYSIS — the
+///   survivors' `per_position_db` against the floor over the decided band — and
+///   there is no original-bundle version of it that is not a second analysis
+///   pass over a cohort `decide()` never published. A dropped capture's noise is
+///   no longer in the ensemble, so the claim leaves correctly with the position.
+/// - `ClippingPosition` and `PositionOutlierCouplerLf` are the rows that DO the
+///   dropping. They must be graded per round: re-emitting them from the original
+///   bundle would print them twice, once from `dropped_rows` and once from the
+///   final round's table.
+/// - The cal rows, `AbsurdCurve`, `ExcessiveVariance`, `OverrideOutOfDomain` and
+///   the two position-count rows make claims about the cohort or about the
+///   decisions taken over it, which is exactly what the second pass is for.
+pub(crate) struct SessionCaptureRows {
+    clipping_session: Option<Diagnostic>,
+    no_signal: Vec<Diagnostic>,
+    sweep_rate_mismatch: Vec<Diagnostic>,
+}
+
+/// Grade [`SessionCaptureRows`] against `bundle`, which must be the ORIGINAL
+/// bundle and never a cohort the drop loop shortened.
+pub(crate) fn session_capture_rows(bundle: &MeasurementBundle) -> SessionCaptureRows {
+    SessionCaptureRows {
+        clipping_session: clipping_session(bundle),
+        no_signal: no_signal(bundle),
+        sweep_rate_mismatch: sweep_rate_mismatch(bundle),
+    }
+}
+
 /// Every refusal and warning the bundle earns, in a stable order.
 ///
 /// Takes the decided values as well as the bundle because most rows are graded
 /// against a decision rather than against a raw input — the SNR rows against
 /// `correction_range`, the variance row against `transition_hz` and
 /// `low_corner_hz`, the position-count rows against `positions_default`.
+///
+/// Takes `session` because three of the rows are NOT graded here at all: they
+/// are the original bundle's, and this function only puts them back in their
+/// alphabetical place. See [`SessionCaptureRows`].
 ///
 /// The order is alphabetical by check, which is this repo's convention and, more
 /// importantly, is FIXED: `fixtures/decide/<case>/expected.json` compares
@@ -191,6 +267,7 @@ pub(crate) fn diagnostics(
     bundle: &MeasurementBundle,
     decisions: &Decisions,
     analysis: &AnalysisProducts,
+    session: &SessionCaptureRows,
 ) -> Vec<Diagnostic> {
     // The same grid `decide()` analysed on. Rebuilt rather than threaded through
     // because `LogGrid::standard()` is a constant-valued constructor and the
@@ -204,18 +281,18 @@ pub(crate) fn diagnostics(
     out.extend(cal_defects(bundle));
     out.extend(cal_has_target_baked_in(bundle));
     out.extend(clipping_position(bundle));
-    out.extend(clipping_session(bundle));
+    out.extend(session.clipping_session.iter().cloned());
     out.extend(coherent_averaging(decisions));
     out.extend(excessive_variance(decisions, analysis, freqs));
     out.extend(low_snr(bundle, decisions, analysis, &grid, freqs));
     out.extend(mic_not_connected(bundle));
-    out.extend(no_signal(bundle));
+    out.extend(session.no_signal.iter().cloned());
     out.extend(noise_floor_too_high(bundle, decisions, &grid, freqs));
     out.extend(override_out_of_domain(bundle, decisions));
     out.extend(position_count(bundle, profile));
     out.extend(position_outliers(bundle, analysis, profile, freqs));
     out.extend(self_exclusion(bundle));
-    out.extend(sweep_rate_mismatch(bundle));
+    out.extend(session.sweep_rate_mismatch.iter().cloned());
     out.extend(two_clock(bundle, profile));
     out.extend(wrong_transducer(bundle, decisions, profile));
     out
@@ -440,6 +517,11 @@ fn clipping_position(bundle: &MeasurementBundle) -> Vec<Diagnostic> {
 /// same physical event is [`clipping_position`], and the two rows exist
 /// separately because one overshoot loses a capture while sustained railing
 /// loses the session.
+///
+/// **Graded against the ORIGINAL bundle**, through [`SessionCaptureRows`], and
+/// that is what makes the sentence above true: a railed position also peaks at
+/// full scale, so [`clipping_position`] removes it first and a survivor-cohort
+/// reading of this row could never see the capture that railed.
 fn clipping_session(bundle: &MeasurementBundle) -> Option<Diagnostic> {
     let sweep_samples =
         bundle.capture.sweep.duration_s * f64::from(bundle.capture.sweep_rate.max(1));
@@ -594,6 +676,11 @@ fn band_rms_db(values: &[f64], indices: &[usize]) -> Option<f64> {
 /// Position-scoped in `position` so the drawer can say which pass was silent,
 /// but session-refusing in severity: the spec's row is a plain `Refuse`, and the
 /// copy it renders is about the whole chain rather than about one capture.
+///
+/// **Graded against the ORIGINAL bundle**, through [`SessionCaptureRows`],
+/// because of that severity: the claim is about the chain, and a capture that
+/// heard nothing made that claim whether or not it also clipped and left the
+/// cohort.
 fn no_signal(bundle: &MeasurementBundle) -> Vec<Diagnostic> {
     bundle
         .positions
@@ -715,6 +802,10 @@ fn self_exclusion(bundle: &MeasurementBundle) -> Option<Diagnostic> {
 
 /// "`ir.sample_rate != capture.sweep_rate` ⇒ Refuse." The deconvolution and the
 /// stimulus that produced it disagree about time itself.
+///
+/// **Graded against the ORIGINAL bundle**, through [`SessionCaptureRows`]: the
+/// remedy is "Internal error — this is a bug, not a user condition", and
+/// dropping the position the bug was found on does not unfile the bug report.
 fn sweep_rate_mismatch(bundle: &MeasurementBundle) -> Vec<Diagnostic> {
     bundle
         .positions

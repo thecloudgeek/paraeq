@@ -95,8 +95,29 @@ pub use verification::VERIFICATION_RESIDUAL_MULTIPLE;
 /// the survivors' and not the original cohort's. See [`Severity::RefusePosition`]
 /// and `refusal::dropped_positions`; the second pass cannot re-flag the rows
 /// that did the dropping, because the positions they named are gone.
+///
+/// # What the drop loop must not be allowed to erase
+///
+/// A row scoped to the SESSION is a statement about the capture the user took,
+/// and a capture that was set aside is still a capture the user took. Grading
+/// those rows over the survivors let the drop loop erase them: every position
+/// that could raise `ClippingSession`'s fraction was already dropped by
+/// `ClippingPosition` in round one — clipped samples mean the meter reached
+/// full scale, so the peak row fires on the same position — and "sustained
+/// railing loses the session" could therefore never fire on a real capture.
+///
+/// The rows that read RAW capture facts are computed ONCE against the ORIGINAL
+/// bundle, before the loop, and carried into every round, exactly as the
+/// verification gate is graded against the original bundle. See
+/// `refusal::session_capture_rows` for which rows qualify and why each of the
+/// others does not.
 pub fn decide(bundle: &MeasurementBundle) -> DecisionSet {
     let grid = paraeq_dsp::logf::LogGrid::standard();
+
+    // Graded ONCE, on the ORIGINAL bundle, and spliced into every round's table
+    // at its own alphabetical slot. A session `Refuse` from one of these rows
+    // therefore refuses regardless of what the drop loop removed.
+    let session_rows = refusal::session_capture_rows(bundle);
 
     // The drop loop. Each round analyses a cohort, grades the refusal table over
     // it, and removes whatever the table scoped to a POSITION; the next round
@@ -116,7 +137,7 @@ pub fn decide(bundle: &MeasurementBundle) -> DecisionSet {
     let mut dropped_rows: Vec<Diagnostic> = Vec::new();
     let pass = loop {
         let cohort = without_positions(bundle, &excluded);
-        let pass = grade(&cohort, &grid);
+        let pass = grade(&cohort, &grid, &session_rows);
         let newly: Vec<usize> = refusal::dropped_positions(&pass.diagnostics)
             .into_iter()
             .filter(|i| !excluded.contains(i))
@@ -255,7 +276,16 @@ fn without_positions(bundle: &MeasurementBundle, excluded: &[usize]) -> Measurem
 
 /// Every stage, over one cohort. Extracted from [`decide`] so the drop loop can
 /// run it twice without a second copy of the order the stages run in.
-fn grade(bundle: &MeasurementBundle, grid: &paraeq_dsp::logf::LogGrid) -> Pass {
+///
+/// `session_rows` are the ORIGINAL bundle's — see [`decide`]'s "What the drop
+/// loop must not be allowed to erase". They are passed in rather than recomputed
+/// here precisely because `bundle` is the cohort and they must not be graded
+/// against it.
+fn grade(
+    bundle: &MeasurementBundle,
+    grid: &paraeq_dsp::logf::LogGrid,
+    session_rows: &refusal::SessionCaptureRows,
+) -> Pass {
     let geometry = analysis::geometry(bundle);
     let class = rules::class(bundle);
     let profile = profile_for(class.value);
@@ -321,7 +351,7 @@ fn grade(bundle: &MeasurementBundle, grid: &paraeq_dsp::logf::LogGrid) -> Pass {
     rules::render_realized(&mut design, &fit);
     let preamp_db = rules::preamp_decision(bundle, &fit.bands, design_rate);
     let decisions = rules::assemble(analysis_decisions, design, preamp_db);
-    let diagnostics = refusal::diagnostics(bundle, &decisions, &products);
+    let diagnostics = refusal::diagnostics(bundle, &decisions, &products, session_rows);
 
     Pass {
         authority_curve,

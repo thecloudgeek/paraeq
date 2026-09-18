@@ -382,6 +382,24 @@ fn no_signal_refuses_on_rms_and_on_peak_independently() {
     assert!(!has_code(&decide(&at_the_gate), DiagnosticCode::NoSignal));
 }
 
+/// A capture that actually railed: `clipped` of its samples reached full scale,
+/// so its PEAK reached full scale too.
+///
+/// The two fields cannot be set independently and stay physical. A meter that
+/// counted a clipped sample SAW 1.0, so `clipped_samples: 100_000` beside
+/// `capture_stats()`'s comfortable `peak_dbfs: -6.2` is a reading no meter
+/// produces — and that impossible pairing is what let the session-clipping
+/// fixtures ask for a row on a position the peak row would have removed first.
+/// Every railed fixture below is built here so the pairing cannot drift apart
+/// again.
+fn railed(clipped_samples: u64) -> CaptureStats {
+    CaptureStats {
+        clipped_samples,
+        peak_dbfs: 0.0,
+        rms_dbfs: -11.2,
+    }
+}
+
 /// The position row is a PEAK test — one sample over the line loses that
 /// capture — and the session row is REW's sustained-clipping rule.
 #[test]
@@ -408,24 +426,132 @@ fn clipping_refuses_per_position_on_peak_and_per_session_on_sustain() {
     assert!(!has_code(&decide(&under), DiagnosticCode::ClippingPosition));
 
     // 5.5 s at 48 kHz is 264 000 samples; 100 000 of them clipped is 37.9%,
-    // which no distribution over blocks can keep under 30% in every block.
-    let mut railed = clean();
-    railed.positions[1].capture = CaptureStats {
-        clipped_samples: 100_000,
-        ..capture_stats()
-    };
-    let set = decide(&railed);
+    // which no distribution over blocks can keep under 30% in every block. The
+    // position railed, so the peak row takes it too — which is the whole reason
+    // the session row is graded on the ORIGINAL bundle.
+    let mut sustained = clean();
+    sustained.positions[1].capture = railed(100_000);
+    let set = decide(&sustained);
     assert_eq!(
         only_diagnostic(&set, DiagnosticCode::ClippingSession).severity,
         Severity::Refuse
     );
+    assert_eq!(
+        only_diagnostic(&set, DiagnosticCode::ClippingPosition).position,
+        Some(1),
+        "a railed capture trips the peak row as well, by construction"
+    );
 
     let mut brief = clean();
-    brief.positions[1].capture = CaptureStats {
-        clipped_samples: 50_000,
-        ..capture_stats()
-    };
+    brief.positions[1].capture = railed(50_000);
     assert!(!has_code(&decide(&brief), DiagnosticCode::ClippingSession));
+}
+
+/// Sustained railing loses the SESSION even though the peak row already lost the
+/// position — which before ruling R-A1's second pass learned about session
+/// scope, it could not.
+///
+/// The bug this pins: `ClippingSession` took its maximum over the SURVIVORS, and
+/// every position that could raise that maximum had already been dropped by
+/// `ClippingPosition` in round one, because `clipped_samples > 0` implies a peak
+/// at full scale. So the row could not fire on any capture a real meter
+/// produces: a partly railed run proceeded, and an all-railed run refused as
+/// `TooFewPositions` — the right verdict with the wrong remedy, telling a user
+/// whose input gain is 12 dB too high to go and take more captures.
+#[test]
+fn sustained_railing_loses_the_session_even_though_the_peak_row_lost_the_position() {
+    // One of five, over the fraction. Four survivors is above the hard minimum,
+    // so nothing else in the table refuses and this row is the whole verdict.
+    let mut one_of_five = clean();
+    one_of_five.positions[1].capture = railed(100_000);
+    let set = decide(&one_of_five);
+    let session = only_diagnostic(&set, DiagnosticCode::ClippingSession);
+    assert_eq!(session.severity, Severity::Refuse);
+    assert_eq!(session.position, None, "the claim is about the capture");
+    assert!(
+        session.value.is_some_and(|v| v > 0.30),
+        "it reports the fraction it graded, {:?}",
+        session.value
+    );
+    assert!(
+        !has_code(&set, DiagnosticCode::TooFewPositions),
+        "four survivors are plenty — the refusal is the railing, not the count"
+    );
+    assert_eq!(set.verdict, Verdict::Refuse);
+    assert!(set.correction.is_none());
+
+    // Under the fraction, the session goes on: one capture is set aside, the
+    // survivors correct, and the user is warned rather than stopped.
+    let mut brief = clean();
+    brief.positions[1].capture = railed(50_000);
+    let set = decide(&brief);
+    assert!(!has_code(&set, DiagnosticCode::ClippingSession));
+    assert_eq!(
+        only_diagnostic(&set, DiagnosticCode::ClippingPosition).severity,
+        Severity::RefusePosition
+    );
+    assert_eq!(set.verdict, Verdict::ProceedWithWarnings);
+    assert!(set.correction.is_some());
+    assert_eq!(set.analysis.per_position_db.len(), 4);
+
+    // And the all-railed run now carries the remedy that is about the input
+    // gain, beside the count row that is about the survivors.
+    let mut every_one = clean();
+    for position in every_one.positions.iter_mut() {
+        position.capture = railed(100_000);
+    }
+    let set = decide(&every_one);
+    assert!(has_code(&set, DiagnosticCode::TooFewPositions));
+    assert!(
+        only_diagnostic(&set, DiagnosticCode::ClippingSession)
+            .remedy
+            .contains("Turn the input gain down"),
+        "the remedy that names what is actually wrong must survive the drops"
+    );
+    assert_eq!(set.verdict, Verdict::Refuse);
+}
+
+/// The other two session-scoped rows that read raw capture facts survive the
+/// drop that removes the position they name.
+///
+/// `NoSignal` and `SweepRateMismatch` carry a `position` so the drawer can say
+/// which capture, but their severity is a plain `Refuse` and their copy is about
+/// the whole chain. Graded over the survivors, a capture that both railed and
+/// heard nothing took its own chain diagnosis out of the session with it.
+#[test]
+fn the_session_scoped_capture_rows_survive_the_drop_that_removes_their_position() {
+    // Full scale reached, and almost nothing else: a cable pop on a sweep that
+    // never played. The peak row removes the capture; "we heard nothing" is
+    // still true of the chain.
+    let mut silent = clean();
+    silent.positions[2].capture = CaptureStats {
+        clipped_samples: 0,
+        peak_dbfs: 0.0,
+        rms_dbfs: -61.0,
+    };
+    let set = decide(&silent);
+    assert_eq!(
+        only_diagnostic(&set, DiagnosticCode::ClippingPosition).position,
+        Some(2)
+    );
+    let no_signal = only_diagnostic(&set, DiagnosticCode::NoSignal);
+    assert_eq!(no_signal.severity, Severity::Refuse);
+    assert_eq!(no_signal.position, Some(2));
+    assert_eq!(set.verdict, Verdict::Refuse);
+
+    // "Internal error — this is a bug, not a user condition." Dropping the
+    // capture the bug was found on does not unfile the bug report, so all five
+    // rows are still here after position 2 leaves the cohort.
+    let mut mismatched = clean();
+    mismatched.capture.sweep_rate = 44_100;
+    mismatched.positions[2].capture = railed(4_096);
+    let set = decide(&mismatched);
+    assert_eq!(
+        diagnostics_with(&set, DiagnosticCode::SweepRateMismatch).len(),
+        5,
+        "one row per capture the user took, not per survivor"
+    );
+    assert_eq!(set.verdict, Verdict::Refuse);
 }
 
 /// Both clipping rows at the exact number the spec writes, from the side the
@@ -481,20 +607,14 @@ fn the_two_clipping_rows_are_inclusive_at_exactly_their_own_thresholds() {
         0.30,
         "precondition: this fixture must land ON the threshold, not near it"
     );
-    at_thirty_percent.positions[1].capture = CaptureStats {
-        clipped_samples: 79_200,
-        ..capture_stats()
-    };
+    at_thirty_percent.positions[1].capture = railed(79_200);
     assert!(
         !has_code(&decide(&at_thirty_percent), DiagnosticCode::ClippingSession),
         "exactly 0.30 is the most the sustained rule tolerates"
     );
 
     let mut one_sample_more = clean();
-    one_sample_more.positions[1].capture = CaptureStats {
-        clipped_samples: 79_201,
-        ..capture_stats()
-    };
+    one_sample_more.positions[1].capture = railed(79_201);
     let set = decide(&one_sample_more);
     assert_eq!(
         only_diagnostic(&set, DiagnosticCode::ClippingSession).severity,
