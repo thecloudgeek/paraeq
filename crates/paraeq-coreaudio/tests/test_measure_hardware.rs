@@ -1290,21 +1290,42 @@ impl HelperProcess for HelperChild {
     /// SIGTERM, which `std` cannot send — `Child::kill()` is SIGKILL. The child
     /// installs a handler that arms the SAME abort flag `abort\n` does, so this
     /// is a second RAMP request and not a stop.
+    ///
+    /// Mirrors `desktop/src-tauri/src/verify_seam.rs`'s `Helper::signal`,
+    /// including both of its guards. The SAFETY comment below used to assert
+    /// "has not yet reaped" with nothing establishing it — and the ladder calls
+    /// every rung on every exit path, INCLUDING after a reap, so the assertion
+    /// was reachable and false.
     fn request_terminate(&mut self) -> Result<(), MeasureError> {
-        // SAFETY: `pid` is a child this process spawned and has not yet reaped,
-        // and SIGTERM is a valid signal number on every supported target. The
-        // identical call, with the identical argument, is what
-        // `crates/paraeq-stimulus/tests/test_signals.rs` already makes.
+        // The reaped check is a safety interlock, not an optimization: once a
+        // pid has been waited on the kernel may reuse it, and a SIGTERM aimed
+        // at a recycled pid is a signal delivered to an unrelated process on
+        // the user's machine. `self.exit` is set only by a successful
+        // `wait`/`try_wait`, i.e. exactly when the pid stops being ours.
+        if self.exit.is_some() {
+            return Ok(());
+        }
+        // SAFETY: both preconditions are established by code above. (1)
+        // `self.pid` names a child this process spawned and has NOT reaped —
+        // the guard immediately above is that fact, and only a successful wait
+        // sets `self.exit`. (2) `SIGTERM` is a valid signal constant on every
+        // supported target. `kill` has no other requirements and touches no
+        // memory.
         let sent = unsafe { libc::kill(self.pid as i32, libc::SIGTERM) };
         if sent == 0 {
-            Ok(())
-        } else {
-            Err(MeasureError::Sink(format!(
-                "SIGTERM to the helper (pid {}) failed: {}",
-                self.pid,
-                std::io::Error::last_os_error()
-            )))
+            return Ok(());
         }
+        let error = std::io::Error::last_os_error();
+        // ESRCH: no such process. The child exited between the check and the
+        // call, which is the normal race on this path and not a failure — the
+        // signal was asking it to stop, and it has.
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        Err(MeasureError::Sink(format!(
+            "SIGTERM to the helper (pid {}) failed: {error}",
+            self.pid
+        )))
     }
 
     fn kill(&mut self) -> Result<(), MeasureError> {
