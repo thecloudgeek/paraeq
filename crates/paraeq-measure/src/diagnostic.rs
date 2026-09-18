@@ -40,7 +40,30 @@
 //! `docs/specs/2026-07-15-wizard-design.md` (§ The fail-open hazard and § The
 //! fail-open watchdog, plus "engine lease" in the `Probe` box of the spine):
 //! the wizard requires a running engine, and the safety spec never names the
-//! condition because it assumes one.
+//! condition because it assumes one. **That variant's own doc was written
+//! against a literal `status == Running` reading and is re-pointed there at
+//! the predicate the verification gate actually evaluates** — see its doc
+//! comment, and [`crate::verify`]'s header for the argument.
+//!
+//! # The verification block (25–40, 105–107)
+//!
+//! Stage 6 appends nineteen codes for the closed-loop verification pass:
+//! sixteen blocking errors and three warnings. Two rules about them, stated
+//! once here so the next reader neither mints more nor deletes one:
+//!
+//! - **Nothing is minted for a failure this crate already names.** A
+//!   disengaged engine reuses [`MeasurementDiagnostic::EngineNotRunning`]
+//!   (24); a railed microphone reuses
+//!   [`MeasurementDiagnostic::InputClipping`] (12); a level the sole
+//!   constructor refuses reuses
+//!   [`MeasurementDiagnostic::SolvedLevelIllegal`] (23); a lost baseline
+//!   witness reuses [`MeasurementDiagnostic::SelfExclusionUnavailable`] (1).
+//! - **Exactly ONE of the nineteen has a `paraeq-decide` twin**:
+//!   [`MeasurementDiagnostic::VerificationPreampMismatch`] (40), because
+//!   `decide()` re-checks a number the pass CARRIES rather than trusting it.
+//!   Every other verification code refuses **before** the capture, so no
+//!   bundle carrying that failure can exist for `decide()` to see, and none
+//!   of them needs a twin.
 
 /// The blocking/non-blocking split the spec draws between "Refuse — do not
 /// warn, do not degrade, do not escalate" and "proceed, with a warning".
@@ -103,6 +126,15 @@ pub enum MeasurementDiagnostic {
     SplOverCap = 11,
     /// More than 30% of samples in an input block clipped (REW's rule); the
     /// measurement is invalid regardless of level.
+    ///
+    /// This is the **mic's ADC**, on the FAR side of the transducer, and the
+    /// verification pass reuses it rather than minting a code for a failure
+    /// this crate already names (MS-21, via [`crate::capture::CaptureMeter`]
+    /// and its per-attempt `reset_clips`). Distinct from
+    /// [`Self::VerificationChainClipped`], which reads the engine's own ±1.0
+    /// **output** clamp on the NEAR side: both can fire, neither implies the
+    /// other, and a residual computed over a railed capture is meaningless
+    /// whichever one is silent.
     InputClipping = 12,
     /// The SNR gate was still missed after ≤2 automatic remedies — and
     /// remedies are input gain and length, never output level.
@@ -156,7 +188,145 @@ pub enum MeasurementDiagnostic {
     /// flip. Measurement needs the engine: the MS-6 witness only exists while
     /// a tap does, and the verification pass plays through the correction
     /// chain (MS-19).
+    ///
+    /// **What "not running" means at the verification gate, stated here
+    /// because the code and its own diagnostic must not disagree.** The gate
+    /// reads [`EngineFacts::engine_engaged()`](crate::engine_seam::EngineFacts::engine_engaged)
+    /// — `enabled && stream.is_some() && status ∉ {Stopped, Failed,
+    /// AutoDisabledNoInput}` — and **not** `status == EngineStatus::Running`.
+    /// The shipped watchdog sets `Running` only while `nonzero_blocks` is
+    /// advancing, and it decays to `InputSilent` and then `Idle` on a quiet
+    /// machine; the verification pre-roll *requires* a quiet machine, because
+    /// the tap is global and excludes only ParaEQ, so any other application's
+    /// audio would land in the corrected capture. A literal-`Running` gate
+    /// would therefore refuse a perfectly healthy engine on every run. This
+    /// variant landed under that literal reading and is re-pointed here.
+    ///
+    /// The verification gate also refuses with this code for `bypass == true`
+    /// and for "no correction installed": all three are the same sentence to
+    /// the user — the chain is not running the correction we came to verify.
     EngineNotRunning = 24,
+
+    // ── Verification loop (Stage 6): 25… ────────────────────────────────────
+    /// The verification helper could not be started, or the device it was
+    /// pointed at does not exist. Nothing played.
+    HelperUnavailable = 25,
+    /// The helper started but ended badly: bad arguments, a WAV it refused, or
+    /// its own level backstop. `exit_code` is the child's own number, which is
+    /// a closed table on its side, so a value outside it is itself a finding.
+    HelperFailed { exit_code: i32 } = 26,
+    /// The helper stopped producing status lines, or its device stopped
+    /// cycling. The teardown ladder still ran: ramp request, SIGTERM, then
+    /// SIGKILL only after both deadlines.
+    HelperStalled = 27,
+    /// A timing-marker fit FORMED but scattered: the per-marker residual peak
+    /// is past the credibility ladder's refuse bound, so `t = 0` is not
+    /// trustworthy and the impulse response would be cut at the wrong instant.
+    ///
+    /// Distinct from [`Self::VerificationMarkersNotCredible`], which is "no
+    /// credible marker train at all" — a different remedy (raise the level or
+    /// quiet the room, versus a clock problem).
+    VerificationMarkersNotFound { residual_peak_samples: f64 } = 28,
+    /// The user's trim did not read back as 0.0 after the verification pass
+    /// pinned it. Refuse rather than proceed: an unpinned trim of +10 dB
+    /// against a +6 dB peak boost makes the verification sweep LOUDER than the
+    /// baseline the level ladder validated — a safety failure, not an
+    /// accounting one.
+    VerificationGainNotPinned { read_back_db: f64 } = 29,
+    /// `L_verify` sits too close to the measured noise floor to produce a
+    /// trustworthy residual. Refused **before spawning**, rather than emitting
+    /// an unusably quiet sweep and reporting a shape failure afterwards.
+    ///
+    /// Never remedied by raising the level — MS-8: "≤2 automatic remedies, and
+    /// **remedies never touch output level**".
+    VerificationLevelBelowSnrBudget { projected_snr_db: f64 } = 30,
+    /// The tap saw no audio while the helper was playing — the genuine TCC
+    /// silent failure the wizard's fail-open section calls "still a `Refuse`".
+    ///
+    /// Also raised when the realtime activity counters cannot be read at all
+    /// (`tap_activity()` is `None`: no realtime block, so no session). "Cannot
+    /// witness" is not "witnessed nothing", and the pass refuses rather than
+    /// assuming either way.
+    TapSilentDuringVerification = 31,
+    /// Something else was playing during the verification pre-roll. The tap is
+    /// global and excludes only ParaEQ, so another application's audio lands
+    /// in the corrected capture and the residual measures that instead.
+    SystemAudioNotQuiet = 32,
+    /// **Two triggers, one code.** (i) The helper echoed a `--channel` that is
+    /// not the baseline's routing for this position, so the verification
+    /// capture and the baseline are not the same measurement. (ii) The routing
+    /// is `Both` while the plan's per-channel band sets differ, so the capture
+    /// heard the SUM of two differently-EQ'd channels and no single predicted
+    /// response exists to difference it against. Both refuse before `play`.
+    HelperRoutingMismatch = 33,
+    /// **Two triggers, one code.** (i) Before spawning: the engine reports
+    /// `correction_rate_mismatch`, i.e. the chain is running coefficients
+    /// designed for a different rate — the wizard's own named failure, "stale
+    /// coefficients after a rate change". (ii) During the pass: the rate of
+    /// the device the child actually opened disagrees with the rate the WAV
+    /// was generated at, or moves while the measurement aggregate is created.
+    /// Creating a second aggregate on a live device is exactly when the HAL
+    /// may renegotiate.
+    OutputRateChangedDuringVerify { expected_hz: f64, observed_hz: f64 } = 34,
+    /// The engine's own ±1.0 output clamp fired during the verification
+    /// window: the corrected chain clipped, which is on the list of things
+    /// verification exists to catch, and "the chain clipped" is a far better
+    /// sentence than "the residual was too high".
+    ///
+    /// This is the **NEAR** side of the transducer. The mic's ADC is
+    /// [`Self::InputClipping`]; each names the other so a later reader does
+    /// not collapse two facts into one.
+    VerificationChainClipped { count: u64 } = 35,
+    /// No credible timing-marker train was found at all: the matched filter's
+    /// picks did not clear their own off-peak floor, so no fit was formed.
+    ///
+    /// This is the FIRST thing that fails when the verification sweep is
+    /// quiet, which is why it gets its own code and its own remedy rather than
+    /// the generic not-found ([`Self::VerificationMarkersNotFound`], which is
+    /// a fit that formed and scattered).
+    ///
+    /// Also raised when the aligned slice carries no direct arrival at all —
+    /// the deconvolution finds no peak because the capture is digitally
+    /// silent or non-finite. Same user-visible cause, same remedy: nothing
+    /// usable reached the microphone.
+    VerificationMarkersNotCredible = 36,
+    /// A clock-skew fit formed but asks for an adjustment past the reject
+    /// bound. Four markers on a straight line fit a straight line perfectly no
+    /// matter how steep it is, so a residual-only ladder would bless an absurd
+    /// ppm and then stretch the capture on the strength of it.
+    ClockAdjustTooLarge { skew_ppm: f64 } = 37,
+    /// The helper's private render device may have survived its own process.
+    ///
+    /// SIGKILL bypasses `Drop`, so the child's render-aggregate RAII never
+    /// ran; a reaped child that leaked an aggregate still satisfies "no
+    /// zombie" while leaving a private device wrapping the user's output. The
+    /// expected UID is `com.paraeq.render.<pid>`. Collected, never masked, and
+    /// it never aborts the rest of the teardown ladder.
+    RenderDeviceLeaked { pid: u32 } = 38,
+    /// The engine could not design every band of the plan at the live rate and
+    /// dropped some. A partially-installed cascade is not the plan's cascade,
+    /// and verifying it would grade the wrong object — the residual would be
+    /// nonzero and would blame the chain for our own prediction fault.
+    VerificationBandsDropped { dropped: u64, rate_hz: f64 } = 39,
+    /// The engine's ARMED preamp disagrees with the gate's own recomputation
+    /// of it at the live rate over the plan's bands.
+    ///
+    /// Also raised when a correction is installed but the armed preamp reads
+    /// `None`: a missing preamp and a unity preamp predict different
+    /// responses, and defaulting the first to the second is precisely the
+    /// failure verification exists to catch.
+    ///
+    /// **One condition, two crates, two codes with the same name — read both
+    /// before deleting either.** THIS code is what `paraeq-measure` refuses
+    /// with **before the capture**, at the verify gate; no bundle exists yet.
+    /// `DiagnosticCode::VerificationPreampMismatch` (`paraeq-decide`) is what
+    /// `decide()` refuses with **after the fact**, when a bundle arrives
+    /// carrying an `installed_preamp_db` its own bands do not reproduce.
+    /// `decide()` re-checks rather than trusts, which is the only reason one
+    /// condition is reachable from two sides; every other verification code
+    /// here refuses before the capture, so no bundle carrying that failure can
+    /// exist for `decide()` to see, and none of them needs a twin.
+    VerificationPreampMismatch { armed_db: f64, recomputed_db: f64 } = 40,
 
     // ── Non-blocking warnings: 100… ─────────────────────────────────────────
     /// SNR accepted on the degraded row (median ≥ 30 dB but below the
@@ -177,6 +347,22 @@ pub enum MeasurementDiagnostic {
     /// The MS-4 emit guard zeroed `count` non-finite samples. Same posture as
     /// [`Self::EmitClamped`]: contained, surfaced, counted.
     EmitNonFiniteSanitized { count: u64 } = 104,
+    /// The verification helper had to be SIGKILLed after both abort deadlines
+    /// passed. The kill IS the full-scale click the ramp exists to prevent, so
+    /// it is reported rather than being silent — and it is the reason
+    /// [`Self::RenderDeviceLeaked`] is checked immediately afterwards.
+    HelperKilledAfterRampDeadline = 105,
+    /// The clock-skew fit formed and was used, but its per-marker residuals
+    /// scatter more than the silent rung of the credibility ladder allows.
+    /// `t = 0` is usable; it is less precise than a clean bracket.
+    TwoClockResidualHigh { residual_peak_samples: f64 } = 106,
+    /// The timing markers were located, but only just: their level above the
+    /// capture's own pre-roll floor is thin, so the next quieter run may not
+    /// find them at all.
+    ///
+    /// Distinct from [`Self::VerificationMarkersNotCredible`], which is "no
+    /// credible train at all". This is the early warning for it.
+    VerificationMarkerSnrLow { margin_db: f64 } = 107,
 }
 
 impl MeasurementDiagnostic {
@@ -210,11 +396,30 @@ impl MeasurementDiagnostic {
             Self::EngineFailed => 22,
             Self::SolvedLevelIllegal => 23,
             Self::EngineNotRunning => 24,
+            Self::HelperUnavailable => 25,
+            Self::HelperFailed { .. } => 26,
+            Self::HelperStalled => 27,
+            Self::VerificationMarkersNotFound { .. } => 28,
+            Self::VerificationGainNotPinned { .. } => 29,
+            Self::VerificationLevelBelowSnrBudget { .. } => 30,
+            Self::TapSilentDuringVerification => 31,
+            Self::SystemAudioNotQuiet => 32,
+            Self::HelperRoutingMismatch => 33,
+            Self::OutputRateChangedDuringVerify { .. } => 34,
+            Self::VerificationChainClipped { .. } => 35,
+            Self::VerificationMarkersNotCredible => 36,
+            Self::ClockAdjustTooLarge { .. } => 37,
+            Self::RenderDeviceLeaked { .. } => 38,
+            Self::VerificationBandsDropped { .. } => 39,
+            Self::VerificationPreampMismatch { .. } => 40,
             Self::LowSnr => 100,
             Self::FixedMaxVolume => 101,
             Self::TwoClock => 102,
             Self::EmitClamped { .. } => 103,
             Self::EmitNonFiniteSanitized { .. } => 104,
+            Self::HelperKilledAfterRampDeadline => 105,
+            Self::TwoClockResidualHigh { .. } => 106,
+            Self::VerificationMarkerSnrLow { .. } => 107,
         }
     }
 
@@ -223,13 +428,20 @@ impl MeasurementDiagnostic {
     pub fn severity(&self) -> Severity {
         match self {
             Self::CapExceedsMicFullScale
+            | Self::ClockAdjustTooLarge { .. }
             | Self::EngineFailed
             | Self::EngineNotRunning
+            | Self::HelperFailed { .. }
+            | Self::HelperRoutingMismatch
+            | Self::HelperStalled
+            | Self::HelperUnavailable
             | Self::InputClipping
             | Self::MicDisconnected
             | Self::MicUnidentified
             | Self::OutputDeviceChanged
+            | Self::OutputRateChangedDuringVerify { .. }
             | Self::ProjectedSplOverCap
+            | Self::RenderDeviceLeaked { .. }
             | Self::RungOverCap
             | Self::SelfExclusionUnavailable
             | Self::SensitivityMissing
@@ -244,13 +456,25 @@ impl MeasurementDiagnostic {
             | Self::StimulusFadeNotMonotone
             | Self::StimulusNonFinite { .. }
             | Self::StimulusOverFullScale { .. }
+            | Self::SystemAudioNotQuiet
+            | Self::TapSilentDuringVerification
             | Self::UserAborted
+            | Self::VerificationBandsDropped { .. }
+            | Self::VerificationChainClipped { .. }
+            | Self::VerificationGainNotPinned { .. }
+            | Self::VerificationLevelBelowSnrBudget { .. }
+            | Self::VerificationMarkersNotCredible
+            | Self::VerificationMarkersNotFound { .. }
+            | Self::VerificationPreampMismatch { .. }
             | Self::VolumeUncontrollable => Severity::Error,
             Self::EmitClamped { .. }
             | Self::EmitNonFiniteSanitized { .. }
             | Self::FixedMaxVolume
+            | Self::HelperKilledAfterRampDeadline
             | Self::LowSnr
-            | Self::TwoClock => Severity::Warning,
+            | Self::TwoClock
+            | Self::TwoClockResidualHigh { .. }
+            | Self::VerificationMarkerSnrLow { .. } => Severity::Warning,
         }
     }
 
@@ -352,6 +576,81 @@ impl MeasurementDiagnostic {
                 "ParaEQ's EQ is switched off. Turn it on with Enable, then \
                  start the measurement again."
             }
+            Self::HelperUnavailable => {
+                "ParaEQ could not start the small player it uses to check its \
+                 own work. Reinstall ParaEQ and try again. Nothing was played."
+            }
+            Self::HelperFailed { .. } => {
+                "The check playback stopped before it started. Nothing useful \
+                 was played, and your volume was put back. Try again — if it \
+                 keeps happening, please report it."
+            }
+            Self::HelperStalled => {
+                "The check playback stopped responding and was shut down. Try \
+                 again; if it keeps happening, restart ParaEQ."
+            }
+            Self::VerificationMarkersNotFound { .. } => {
+                "ParaEQ could not line the check recording up with what it \
+                 played. Run the check again with as little else going on as \
+                 possible."
+            }
+            Self::VerificationGainNotPinned { .. } => {
+                "ParaEQ could not set its volume slider to 0 dB for the check. \
+                 Set it to 0 dB yourself and run the check again."
+            }
+            Self::VerificationLevelBelowSnrBudget { .. } => {
+                "The room is too noisy for this check at a safe volume. Reduce \
+                 background noise — close windows, pause appliances — and try \
+                 again. ParaEQ will not play louder to get around it."
+            }
+            Self::TapSilentDuringVerification => {
+                "ParaEQ heard nothing from your system audio while the check \
+                 was playing. Check that ParaEQ still has permission to \
+                 process system audio, then try again."
+            }
+            Self::SystemAudioNotQuiet => {
+                "Something else was playing audio. Pause it and run the check \
+                 again."
+            }
+            Self::HelperRoutingMismatch => {
+                "The check played to a different speaker or ear than the \
+                 measurement did, so the two cannot be compared. Run the \
+                 measurement again from the start."
+            }
+            Self::OutputRateChangedDuringVerify { .. } => {
+                "Your output device changed its sample rate. Set it back in \
+                 Audio MIDI Setup, or just run the measurement again."
+            }
+            Self::VerificationChainClipped { .. } => {
+                "The correction is asking for more level than your output can \
+                 give and it clipped. Turn the output volume down, or reduce \
+                 the boost, and check again."
+            }
+            Self::VerificationMarkersNotCredible => {
+                "The check playback was too quiet to find in the recording. \
+                 Turn the output device's own volume up a little and run the \
+                 check again."
+            }
+            Self::ClockAdjustTooLarge { .. } => {
+                "Your microphone and your speakers disagree about time by more \
+                 than ParaEQ will correct for. Run both at the same sample \
+                 rate in Audio MIDI Setup and try again."
+            }
+            Self::RenderDeviceLeaked { .. } => {
+                "ParaEQ may have left a hidden audio device behind. Restart \
+                 ParaEQ, and restart your Mac if a strange device is still \
+                 listed."
+            }
+            Self::VerificationBandsDropped { .. } => {
+                "Some filters cannot run at your device's current sample rate, \
+                 so there is nothing complete to check. Run the measurement \
+                 again at this sample rate."
+            }
+            Self::VerificationPreampMismatch { .. } => {
+                "ParaEQ's safety volume reduction does not match the filters \
+                 it is running. This is a defect, not something you did. \
+                 Nothing was measured; please report it."
+            }
             Self::LowSnr => {
                 "The measurement is usable, but a quieter room would make it \
                  better."
@@ -367,6 +666,18 @@ impl MeasurementDiagnostic {
             Self::EmitClamped { .. } | Self::EmitNonFiniteSanitized { .. } => {
                 "The safety limiter engaged. The measurement may be unreliable \
                  — please report this."
+            }
+            Self::HelperKilledAfterRampDeadline => {
+                "No action needed. The check playback had to be stopped \
+                 abruptly; you may have heard a short click."
+            }
+            Self::TwoClockResidualHigh { .. } => {
+                "No action needed, but if the result looks odd, run the check \
+                 again with less going on in the room."
+            }
+            Self::VerificationMarkerSnrLow { .. } => {
+                "No action needed this time. If checks start failing, turn \
+                 your output device's own volume up a little."
             }
         }
         .to_owned()
@@ -544,6 +855,170 @@ impl MeasurementDiagnostic {
                  already running it was stopped and your volume put back."
                     .to_owned()
             }
+            Self::HelperUnavailable => {
+                "The verification pass plays its sweep from a separate helper \
+                 process, because ParaEQ's own audio is deliberately excluded \
+                 from the system tap and therefore never traverses the \
+                 correction chain. That helper could not be started, or the \
+                 output device it was pointed at no longer exists, so no \
+                 sample was ever emitted."
+                    .to_owned()
+            }
+            Self::HelperFailed { exit_code } => {
+                format!(
+                    "The verification helper exited with status {exit_code} \
+                     instead of playing. Its exit codes are a closed table — \
+                     bad arguments, a WAV it would not accept, or its own \
+                     independent level backstop refusing the file before it \
+                     opened a device. Whichever fired, it fired BEFORE audio, \
+                     which is what the two-phase start-up exists for."
+                )
+            }
+            Self::HelperStalled => "The verification helper stopped producing status lines, or \
+                 its render device stopped cycling. The teardown ladder ran in \
+                 full: a ramp request first, then SIGTERM (which arms the same \
+                 5 ms fade), and only after both deadlines a kill — because a \
+                 hard stop is itself a full-scale click."
+                .to_owned(),
+            Self::VerificationMarkersNotFound {
+                residual_peak_samples,
+            } => {
+                format!(
+                    "Timing markers were found and a clock fit was formed, but \
+                     the markers scatter {residual_peak_samples:.1} samples \
+                     around that fit — past the bound at which `t = 0` can be \
+                     trusted. Every gate downstream cuts the impulse response \
+                     at that instant, and a wrong t = 0 produces a plausible \
+                     wrong answer rather than an obvious failure, so the pass \
+                     refuses instead."
+                )
+            }
+            Self::VerificationGainNotPinned { read_back_db } => {
+                format!(
+                    "The verification pass pins your manual trim to 0 dB for \
+                     the duration and reads it back; it still reports \
+                     {read_back_db} dB. The read-back is not a formality: with \
+                     a +10 dB trim against a +6 dB peak boost the verification \
+                     sweep would reach the transducer LOUDER than the baseline \
+                     the level ladder validated. Nothing was played."
+                )
+            }
+            Self::VerificationLevelBelowSnrBudget { projected_snr_db } => {
+                format!(
+                    "The verification sweep must play at the baseline level \
+                     minus the correction's peak boost, which puts it \
+                     {projected_snr_db:.1} dB above the measured noise floor — \
+                     below the bar at which a residual means anything. It is \
+                     refused before spawning rather than played and then \
+                     reported as a shape failure. The one remedy ParaEQ will \
+                     not apply is raising the output level."
+                )
+            }
+            Self::TapSilentDuringVerification => {
+                "While the helper was playing, the system tap recorded no \
+                 blocks carrying audio — or its realtime counters could not be \
+                 read at all. The helper is a separate process and is \
+                 therefore NOT excluded from the tap, so the tap must see it. \
+                 Silence here is the genuine permission-denied failure, and \
+                 'cannot witness' is not 'witnessed nothing': the pass refuses \
+                 rather than assuming either way."
+                    .to_owned()
+            }
+            Self::SystemAudioNotQuiet => "The system tap's activity counters advanced during the \
+                 pre-roll, which means some other application was playing. The \
+                 tap is global and excludes only ParaEQ itself, so that audio \
+                 would be captured alongside the verification sweep and \
+                 measured as part of the corrected response."
+                .to_owned(),
+            Self::HelperRoutingMismatch => {
+                "The verification capture cannot be differenced against the \
+                 baseline it claims to verify. Either the helper played to a \
+                 different channel than the baseline did, or it played to \
+                 every channel while the two channels carry different filters \
+                 — in which case the microphone heard their sum, and a sum of \
+                 differently-corrected channels is not the response of either \
+                 one. Refused before playing."
+                    .to_owned()
+            }
+            Self::OutputRateChangedDuringVerify {
+                expected_hz,
+                observed_hz,
+            } => {
+                format!(
+                    "The verification pass expected {expected_hz} Hz and saw \
+                     {observed_hz} Hz. Either the correction chain is running \
+                     coefficients designed for a different rate, or the render \
+                     device renegotiated while the measurement aggregate was \
+                     being created. Both make the measured response an \
+                     artefact of the rate change rather than of the filter."
+                )
+            }
+            Self::VerificationChainClipped { count } => {
+                format!(
+                    "The correction chain's own ±1.0 output clamp engaged on \
+                     {count} sample(s) during the verification window, so what \
+                     reached the transducer is not what the filter designed. \
+                     That is the NEAR side of the transducer; the microphone's \
+                     own converter clipping is reported separately. 'The chain \
+                     clipped' is a far better sentence than 'the residual was \
+                     too high', which is why this has its own code."
+                )
+            }
+            Self::VerificationMarkersNotCredible => {
+                "The verification file is bracketed with short timing chirps, \
+                 and none of them cleared the matched filter's own credibility \
+                 floor — six times the off-peak correlation level. No fit was \
+                 formed, so no t = 0 exists and no impulse response can be \
+                 cut. This is the first thing that fails when the verification \
+                 sweep is quiet, which is why it is reported separately from a \
+                 fit that formed and scattered."
+                    .to_owned()
+            }
+            Self::ClockAdjustTooLarge { skew_ppm } => {
+                format!(
+                    "The microphone and the output device run on independent \
+                     crystals, and the fit says they differ by {skew_ppm:.0} \
+                     parts per million — past the reject bound. Four markers \
+                     on a straight line fit a straight line perfectly however \
+                     steep it is, so the scatter figure alone would bless this \
+                     and then stretch the capture on the strength of it."
+                )
+            }
+            Self::RenderDeviceLeaked { pid } => {
+                format!(
+                    "The verification helper had to be killed outright, which \
+                     bypasses its cleanup, so the private render device it \
+                     created (UID com.paraeq.render.{pid}) may still be \
+                     wrapping your output. A reaped child that leaked a device \
+                     still satisfies 'no zombie', which is why this is checked \
+                     separately. It is reported, never masked, and it does not \
+                     stop the rest of the teardown."
+                )
+            }
+            Self::VerificationBandsDropped { dropped, rate_hz } => {
+                format!(
+                    "The engine could not design {dropped} of the plan's \
+                     filters at the live rate of {rate_hz} Hz and dropped \
+                     them. Verification compares the measured result against \
+                     the response the PLAN predicts, so grading a partially \
+                     installed cascade would blame the chain for a prediction \
+                     fault of our own."
+                )
+            }
+            Self::VerificationPreampMismatch {
+                armed_db,
+                recomputed_db,
+            } => {
+                format!(
+                    "The engine reports an armed safety attenuation of \
+                     {armed_db} dB while recomputing it from the plan's own \
+                     filters at the live rate gives {recomputed_db} dB. Those \
+                     are two independent computations of one number, and they \
+                     must agree before a residual means anything. The same \
+                     condition is checked a second time after the fact, in the \
+                     decision engine, against the number this pass carries."
+                )
+            }
             Self::LowSnr => "The measurement cleared the reduced signal-to-noise bar \
                  (median ≥ 30 dB) but not the preferred one (median ≥ 40 dB \
                  with every band ≥ 20 dB). It is usable; the quiet parts of \
@@ -577,6 +1052,35 @@ impl MeasurementDiagnostic {
                      infinite) sample(s) just before the device. A verified \
                      stimulus contains none, so a nonzero count means an \
                      upstream defect — contained here, but worth reporting."
+                )
+            }
+            Self::HelperKilledAfterRampDeadline => {
+                "The verification helper did not fade out within its abort \
+                 deadline, and did not respond to SIGTERM either, so it was \
+                 killed. A kill IS the full-scale click the 5 ms ramp exists \
+                 to prevent, so it is recorded rather than passed over — and \
+                 it is why the render device is checked for survival \
+                 immediately afterwards."
+                    .to_owned()
+            }
+            Self::TwoClockResidualHigh {
+                residual_peak_samples,
+            } => {
+                format!(
+                    "The timing markers fit a clock-skew line, but they \
+                     scatter {residual_peak_samples:.1} samples around it — \
+                     more than a clean bracket, less than the bound at which \
+                     the fit stops being usable. The impulse response's time \
+                     origin carries that much extra uncertainty."
+                )
+            }
+            Self::VerificationMarkerSnrLow { margin_db } => {
+                format!(
+                    "The timing markers sit only {margin_db:.1} dB above the \
+                     capture's own pre-roll floor. They were found, so this \
+                     pass is fine; a quieter verification sweep — which a \
+                     larger peak boost produces — may not clear the matched \
+                     filter's credibility floor at all."
                 )
             }
         }

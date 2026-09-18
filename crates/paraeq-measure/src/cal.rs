@@ -185,6 +185,22 @@ impl PinnedGain {
 /// The result still goes through `SweepLevel::new` — the sole level
 /// constructor — at the session's solve boundary; this function decides the
 /// number, not the type.
+///
+/// # The margin is applied EXACTLY ONCE, here, and every level downstream
+/// # already carries it
+///
+/// [`crate::session::MeasurementSession::install_solve`] calls this function
+/// and hands its RESULT to `SweepLevel::new`, so `L_measure` — the level the
+/// Direct sweep actually played, and the number
+/// `bundle.capture.sweep.level_dbfs` carries — is **post-margin**. Every level
+/// derived from it inherits the derate, including the verification pass's
+/// `L_verify = L_measure + preamp_db` ([`crate::verify`]). Passing such a
+/// level through this function a second time subtracts
+/// [`CAL_ERROR_MARGIN_DB`] twice, which against a gate as small as
+/// `2 · flatness_target_db` = 2.0 dB is a guaranteed refusal of a correct
+/// engine on every run with a mismatched input gain — i.e. on the common case
+/// the margin exists for. **Call this once, at the solve, and never on a level
+/// that came out of it.**
 pub fn margined_emit_dbfs(solved_dbfs_rms: f64, pin: PinnedGain) -> f64 {
     if pin.matches() {
         solved_dbfs_rms
