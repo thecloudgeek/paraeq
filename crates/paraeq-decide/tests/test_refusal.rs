@@ -316,10 +316,29 @@ fn two_clock_warns_on_a_gated_path_only_when_no_skew_estimate_was_formed() {
     estimated.capture.clock_skew_ppm = Some(12.5);
     assert!(!has_code(&decide(&estimated), DiagnosticCode::TwoClock));
 
-    // Same rates, no two-clock problem to warn about.
-    let mut one_clock = room.clone();
-    one_clock.capture.input_rate = 48_000;
-    assert!(!has_code(&decide(&one_clock), DiagnosticCode::TwoClock));
+    // EQUAL NOMINAL RATES ARE NOT ONE CLOCK — ruling R-A3. Two devices both
+    // reporting 48 000 Hz is the ordinary two-clock case: a USB mic and a USB
+    // DAC each run their own crystal, and the nominal number is a label rather
+    // than a measurement. The old rate-equality short-circuit made the row
+    // unreachable on exactly the configuration it is about, and D-Q's condition
+    // is the SKEW ESTIMATE, not the rates: "fire only when it is `None`".
+    let mut same_nominal_rate = room.clone();
+    same_nominal_rate.capture.input_rate = 48_000;
+    same_nominal_rate.capture.output_rate = 48_000;
+    let set = decide(&same_nominal_rate);
+    assert_eq!(
+        only_diagnostic(&set, DiagnosticCode::TwoClock).severity,
+        Severity::Warn,
+        "equal nominal rates with no skew estimate is the two-clock hazard"
+    );
+
+    // …and a formed estimate still clears it, on equal rates as on unequal.
+    let mut same_rate_estimated = same_nominal_rate.clone();
+    same_rate_estimated.capture.clock_skew_ppm = Some(3.1);
+    assert!(!has_code(
+        &decide(&same_rate_estimated),
+        DiagnosticCode::TwoClock
+    ));
 
     // The coupler path does not gate, so it has no trustworthy-t=0 stake.
     let mut coupler = clean();

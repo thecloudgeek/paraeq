@@ -38,9 +38,14 @@
 //!   the Refuse, and [`self_exclusion`] reads `bundle.capture` only. If the
 //!   measurement capture was contaminated the whole bundle is already refused,
 //!   which is what verification relies on instead of a witness of its own.
-//! - **§ D-Q — `TwoClock` is conditional now.** It fires as a `Warn` only when
+//! - **§ D-Q — `TwoClock` is conditional now, and conditional on the ESTIMATE.**
+//!   It fires as a `Warn` on a gated (FDW) path exactly when
 //!   `capture.clock_skew_ppm` is `None`; `Some(ppm)` means the estimate was
-//!   formed and applied, and the ppm rides on `Diagnostic::value`.
+//!   formed and applied, and the ppm rides on `Diagnostic::value`. There is
+//!   **no rate compare** (ruling R-A3): the spec's `input_rate != output_rate`
+//!   detection is a proxy that misses the common case, because a USB mic and a
+//!   USB DAC both reporting 48 000 Hz are two crystals and one label. Equal
+//!   nominal rates do not imply one clock — that IS the two-clock hazard.
 //!
 //! # The layering (§ D-M), threshold by threshold
 //!
@@ -611,25 +616,31 @@ fn sweep_rate_mismatch(bundle: &MeasurementBundle) -> Vec<Diagnostic> {
         .collect()
 }
 
-/// "`capture.input_rate != capture.output_rate`, any, on `Room` ⇒ Warn."
+/// "Two-clock (gated paths) ⇒ Warn", fired on the SKEW ESTIMATE rather than on
+/// a rate compare.
 ///
 /// Keyed on GATING rather than on the class, because the spec's own qualifier is
 /// "(gated paths)" and the stake is a trustworthy t=0: the coupler does not gate
 /// and has nothing to lose.
 ///
-/// **§ D-Q.** The decision record post-dates the spec: the skew is now estimated
-/// from bracketed timing markers and resampled away, default on, with this Warn
-/// as the fallback *when no estimate can be formed*. So `Some(ppm)` earns no
-/// row. `value` is read from the field rather than written as a literal `None`,
-/// so that a later ruling widening the condition — a large `Some(ppm)` on equal
-/// NOMINAL rates is the two-clock hazard a rate compare cannot see — carries the
-/// number without a second edit.
+/// **§ D-Q, as ruling R-A3 reads it.** The decision record post-dates the spec:
+/// the skew is now estimated from bracketed timing markers and resampled away,
+/// default on, with this Warn as the fallback *when no estimate can be formed*.
+/// So `Some(ppm)` earns no row, and `None` on a gated path earns one — that is
+/// the whole condition.
+///
+/// **The rate compare is gone, and its absence is the fix.** The spec's
+/// Detection column reads `input_rate != output_rate`, and the guard built from
+/// it made this row unreachable on exactly the configuration it is about: a USB
+/// mic and a USB DAC both reporting 48 000 Hz are two crystals, not one clock,
+/// and the nominal rate is a label rather than a measurement. Every golden
+/// bundle in `fixtures/decide/` captures at 48 000/48 000, so the row was graded
+/// by no golden case at all. `value` carries the ppm when one was formed, which
+/// is `None` on every path that reaches the `Some(Diagnostic)` below — read from
+/// the field rather than written as a literal so the two cannot drift.
 fn two_clock(bundle: &MeasurementBundle, profile: &PathProfile) -> Option<Diagnostic> {
     let gated = matches!(profile.gating, GatingMode::Fdw { .. });
-    if !gated
-        || bundle.capture.input_rate == bundle.capture.output_rate
-        || bundle.capture.clock_skew_ppm.is_some()
-    {
+    if !gated || bundle.capture.clock_skew_ppm.is_some() {
         return None;
     }
     Some(Diagnostic {
