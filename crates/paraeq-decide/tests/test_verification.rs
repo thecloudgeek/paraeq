@@ -893,6 +893,59 @@ fn decide_is_idempotent_with_a_verification_present() {
     assert_eq!(decide(&bundle), decide(&bundle));
 }
 
+/// **T6.** The residual is taken from the RAW position curves, never from the
+/// aligned ones the analysis publishes.
+///
+/// Plan B8's falsifier, named. `curve_db` deliberately omits `align_spl`: the
+/// verification capture is not a member of the position cohort, so aligning the
+/// baseline to the ensemble mean would remove a level difference that the
+/// verification side never had — and re-aligning the pair would absorb a real
+/// `preamp_lin`-not-applied failure into the alignment, which is the one
+/// failure this module exists to catch.
+///
+/// The falsifier: scale the BASELINE position the pass verifies by +3 dB and
+/// leave the verification capture alone. `U` rises by 3 dB, so the residual
+/// mean must be exactly −3 dB. An implementation that aligned the positions
+/// first would spread that offset across the five-position cohort and leave a
+/// mean near −0.6 dB, which is why the assertion is a two-sided window on 3.0
+/// rather than "the mean moved".
+#[test]
+fn the_residual_uses_raw_position_curves_not_aligned_ones() {
+    let bundle = verified_bundle(&VerifiedSpec::default());
+    let verified_index = bundle
+        .verification
+        .as_ref()
+        .expect("carried")
+        .position_index;
+
+    let mut offset = bundle.clone();
+    let scale = 10f64.powf(3.0 / 20.0);
+    for channel in offset.positions[verified_index].ir.samples.iter_mut() {
+        for sample in channel.iter_mut() {
+            *sample *= scale;
+        }
+    }
+
+    let set = decide(&offset);
+    let report = set.verification.as_ref().expect("carried");
+    let mean = report
+        .evidence
+        .iter()
+        .find_map(|e| match e {
+            Evidence::Scalar {
+                label: EvidenceLabel::ResidualMean,
+                value,
+                ..
+            } => Some(*value),
+            _ => None,
+        })
+        .expect("the residual mean is attached per capture channel");
+    assert!(
+        (mean + 3.0).abs() < SHAPE_TOLERANCE_DB,
+        "a +3 dB baseline offset must reach the residual as −3 dB, got {mean};          a mean near −0.6 dB is the signature of align_spl having run over the          five-position cohort first"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

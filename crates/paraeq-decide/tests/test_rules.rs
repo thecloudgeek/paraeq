@@ -392,6 +392,59 @@ fn an_isolated_dip_moves_the_low_corner_only_when_it_breaks_the_ten_db_run() {
     );
 }
 
+/// `low_corner_hz`'s FALLBACK: no crossing anywhere at or below 200 Hz ⇒ the
+/// TOP of the scan, `Source::Default`.
+///
+/// Ruling R-A5. The number is load-bearing — it is `correction_range`'s low
+/// edge and the bottom of the `AbsurdCurve` span band and the
+/// `ExcessiveVariance` band — and nothing named it before this test.
+///
+/// **200 Hz, not 20 Hz, and the direction is the whole reason.** "We never got
+/// within 10 dB of midband anywhere below 200 Hz" means nothing below 200 Hz is
+/// worth correcting; answering with the bottom of the grid would claim the
+/// opposite and spend excursion on a band the measurement says is not there.
+/// Narrowing is the safe direction.
+#[test]
+fn low_corner_falls_back_to_the_scan_top_with_source_default() {
+    // A −40 dB low shelf at 400 Hz: an octave below its corner the curve is
+    // still tens of dB down, so there is no frequency at or below 200 Hz from
+    // which the run to 200 Hz stays within 10 dB of midband.
+    let bottomless = shaped_bundle(
+        SyntheticSpec {
+            cal: true,
+            channels: 1,
+            class: TransducerClass::Bookshelf,
+            positions: 5,
+            sample_rate: RATE as u32,
+            seed: 0x5EED_0011,
+        },
+        |_| vec![biquad::low_shelf(400.0, -40.0, 0.707, RATE)],
+    );
+    let set = decide(&bottomless);
+    let corner = &set.decisions.low_corner_hz;
+    assert_eq!(
+        corner.value, 200.0,
+        "the fallback is the TOP of the scan, not the bottom of the grid"
+    );
+    assert_eq!(
+        corner.source,
+        Source::Default,
+        "the enum's own meaning: evidence absent or inconclusive"
+    );
+    // And the narrowing really reaches the band that spends excursion.
+    assert!(
+        set.decisions.correction_range.value.0 >= 200.0,
+        "the fallback must narrow `correction_range`, got {:?}",
+        set.decisions.correction_range.value
+    );
+
+    // The complement, so the test is not vacuous: a bundle that DOES have a
+    // corner reports it as measured rather than falling back.
+    let measured = decide(&rolled_off_bundle(60.0)).decisions.low_corner_hz;
+    assert_eq!(measured.source, Source::Auto);
+    assert!(measured.value < 200.0, "got {}", measured.value);
+}
+
 // ===========================================================================
 // Scan 2 — `transition_hz`
 //

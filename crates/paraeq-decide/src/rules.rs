@@ -705,6 +705,14 @@ pub(crate) fn design_decisions(
     // 10 dB of midband anywhere below 200 Hz" means nothing below 200 Hz is
     // worth correcting, and answering with the lowest bin would claim the
     // opposite. Narrowing is the safe direction; widening burns excursion.
+    //
+    // **Ruling R-A5**, recorded because the number has no spec row of its own
+    // and is load-bearing three times over: it is `correction_range`'s low
+    // edge, the bottom of `AbsurdCurve`'s span band and the bottom of
+    // `ExcessiveVariance`'s. `Source::Default` is the machine-readable half —
+    // "we could not measure this" — and
+    // `low_corner_falls_back_to_the_scan_top_with_source_default` is the test
+    // that names it.
     let low_corner_value = corner.unwrap_or(LOW_CORNER_SCAN_TOP_HZ);
     let mut low_corner = decision(
         low_corner_value,
