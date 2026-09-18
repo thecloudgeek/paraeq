@@ -42,7 +42,18 @@ pub struct VerificationReport {
     /// **max over capture channels** — the worst channel, never the mean. One
     /// bad ear must not be rescued by a good one, which is the same
     /// "worst channel wins" posture the engine already takes for the preamp.
-    pub residual_rms_db: f64,
+    ///
+    /// **`None` when nothing was measured** (ruling R-A12), which is every path
+    /// that refuses before a residual exists: the routing fence, a pass whose
+    /// curves cannot be produced, an authority band that keeps no bin. It used
+    /// to be an `f64` those paths filled with `0.0`, a number the module's own
+    /// comment called "not a measurement" — and the desktop then rendered
+    /// "Residual 0.0 dB RMS — within the 2.0 dB limit" beside a refusal. `None`
+    /// is exactly one bit and it is the bit a renderer needs.
+    ///
+    /// It is `Some` iff a `ResidualVsPrediction` evidence item was computed, so
+    /// the number and the curve behind it appear and disappear together.
+    pub residual_rms_db: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

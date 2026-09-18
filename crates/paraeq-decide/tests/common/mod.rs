@@ -540,7 +540,7 @@ pub fn verification_report() -> VerificationReport {
             value: 0.4,
         }],
         gate_db: 6.0,
-        residual_rms_db: 0.4,
+        residual_rms_db: Some(0.4),
     }
 }
 

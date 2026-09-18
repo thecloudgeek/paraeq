@@ -1288,7 +1288,12 @@ fn grade(
         gate_db: report.map(|r| r.gate_db),
         installed_preamp_db: outcome.installed_preamp_db,
         level_dbfs: outcome.level_dbfs,
-        residual_rms_db: report.map(|r| r.residual_rms_db),
+        // `and_then`, not `map`: since ruling R-A12 `decide()`'s own
+        // `residual_rms_db` is an `Option<f64>` that is `None` when nothing was
+        // measured, and this field is already `Option<f64>` for the pass that
+        // produced no report at all. The two absences mean the same thing to the
+        // renderer — there is no residual to show — so they flatten.
+        residual_rms_db: report.and_then(|r| r.residual_rms_db),
         verdict: match decided.verdict {
             Verdict::Proceed => "proceed".to_owned(),
             Verdict::ProceedWithWarnings => "proceed_with_warnings".to_owned(),

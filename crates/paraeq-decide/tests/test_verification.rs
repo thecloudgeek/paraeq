@@ -72,10 +72,20 @@ fn cut_4db() -> Vec<EQBand> {
 }
 
 fn residual_rms(bundle: &MeasurementBundle) -> f64 {
-    decide(bundle)
-        .verification
+    graded_residual(&decide(bundle))
+}
+
+/// The graded residual of a pass that HAS one.
+///
+/// Since ruling R-A12 `residual_rms_db` is `None` on every path that refuses
+/// before a residual exists, so a test that wants the number says so and fails
+/// loudly rather than reading a `0.0` that means "nothing was measured".
+fn graded_residual(set: &paraeq_decide::DecisionSet) -> f64 {
+    set.verification
+        .as_ref()
         .expect("the bundle carries a verification")
         .residual_rms_db
+        .expect("this pass computed a residual")
 }
 
 // ---------------------------------------------------------------------------
@@ -89,10 +99,10 @@ fn residual_vs_prediction_is_zero_when_the_engine_did_what_we_designed() {
     let bundle = verified_bundle(&VerifiedSpec::default());
     let set = decide(&bundle);
     let report = set.verification.as_ref().expect("carried");
+    let rms = report.residual_rms_db.expect("a graded pass");
     assert!(
-        report.residual_rms_db < SHAPE_TOLERANCE_DB,
-        "residual {} dB on a correct engine",
-        report.residual_rms_db
+        rms < SHAPE_TOLERANCE_DB,
+        "residual {rms} dB on a correct engine"
     );
     assert_eq!(set.verdict, Verdict::Proceed);
     assert!(!has_code(&set, DiagnosticCode::VerificationResidual));
@@ -135,7 +145,7 @@ fn residual_is_invariant_to_preamp_db() {
         );
         let set = decide(&bundle);
         assert_eq!(set.verdict, Verdict::Proceed, "boost {boost_db} dB refused");
-        residuals.push(set.verification.expect("carried").residual_rms_db);
+        residuals.push(graded_residual(&set));
     }
     for (i, residual) in residuals.iter().enumerate() {
         assert!(
@@ -197,7 +207,7 @@ fn omitting_the_preamp_from_the_prediction_refuses_a_correct_engine() {
         }
     }
     let set = decide(&bundle);
-    let residual = set.verification.as_ref().expect("carried").residual_rms_db;
+    let residual = graded_residual(&set);
     assert!(
         (residual - preamp.abs()).abs() < SHAPE_TOLERANCE_DB,
         "a dropped preamp must leave exactly |preamp_db| = {} dB, got {residual}",
@@ -297,8 +307,8 @@ fn the_prediction_uses_the_carried_installed_preamp_not_the_plans() {
     );
     let set = decide(&bundle);
     assert!(
-        set.verification.as_ref().expect("carried").residual_rms_db < SHAPE_TOLERANCE_DB,
-        "the prediction must use the carried preamp: {}",
+        graded_residual(&set) < SHAPE_TOLERANCE_DB,
+        "the prediction must use the carried preamp: {:?}",
         set.verification.as_ref().expect("carried").residual_rms_db
     );
     assert_eq!(set.verdict, Verdict::Proceed);
@@ -363,7 +373,7 @@ fn the_prediction_uses_the_realized_cascade_not_the_designed_one() {
     });
     let set = decide(&bundle);
     assert!(
-        set.verification.as_ref().expect("carried").residual_rms_db < SHAPE_TOLERANCE_DB,
+        graded_residual(&set) < SHAPE_TOLERANCE_DB,
         "an identity-substituted row must leave no residual"
     );
     assert_eq!(set.verdict, Verdict::Proceed);
@@ -495,6 +505,78 @@ fn residual_outside_the_authority_band_does_not_refuse() {
     assert_eq!(set.verdict, Verdict::Proceed);
 }
 
+/// An EMPTY authority band refuses. It does not pass with a residual of zero.
+///
+/// Ruling R-A12. `masked_rms` answers `None` when the mask keeps no bin, the
+/// per-channel loop `continue`d, `worst` stayed at its `0.0` initializer and the
+/// gate compared `0.0 > gate_db` — false. So a verification that checked
+/// NOTHING reported "0.0 dB RMS, within the 2.0 dB limit" and proceeded. The
+/// number was not a measurement and the pass was not a pass.
+///
+/// A band with no authority in it means the correction claims nothing we can
+/// check there, which is a reason to refuse to confirm — not a reason to
+/// confirm.
+#[test]
+fn an_empty_authority_band_refuses_instead_of_passing_with_a_zero_residual() {
+    let mut bundle = verified_bundle(&VerifiedSpec::default());
+    // The coupler excursion envelope is zeroed at 10 kHz, so a correction range
+    // sitting entirely above it carries no boost and no cut authority anywhere:
+    // the mask keeps nothing. The value is inside `correction_range`'s own
+    // domain, so § D-N's clamp leaves it alone.
+    bundle.overrides.correction_range = Some((19_000.0, 20_000.0));
+
+    let set = decide(&bundle);
+    let refusal = only_diagnostic(&set, DiagnosticCode::VerificationResidual);
+    assert_eq!(refusal.severity, Severity::Refuse);
+    assert_eq!(refusal.position, Some(0));
+    assert_eq!(set.verdict, Verdict::Refuse);
+
+    let report = set.verification.as_ref().expect("carried");
+    assert_eq!(
+        report.residual_rms_db, None,
+        "nothing was measured, so there is no number to report"
+    );
+}
+
+/// A structural refusal carries no residual: `None`, not `0.0`.
+///
+/// Ruling R-A12. `VerificationReport::residual_rms_db` used to be an `f64` that
+/// the two early-return paths filled with `0.0` — a value the module's own
+/// comment called "not a measurement" — and the desktop then rendered
+/// "Residual 0.0 dB RMS — within the 2.0 dB limit" beside a refusal. The type
+/// now says what the comment said.
+#[test]
+fn a_structural_refusal_carries_no_residual_number() {
+    let mut bundle = verified_bundle(&VerifiedSpec::default());
+    // The routing fence: a per-ear routing against a `Both` baseline. No
+    // prediction exists, so no residual does either.
+    bundle.verification.as_mut().expect("carried").routing = CaptureRouting::Only(0);
+
+    let set = decide(&bundle);
+    assert!(has_code(&set, DiagnosticCode::VerificationRoutingMismatch));
+    let report = set.verification.as_ref().expect("carried");
+    assert_eq!(report.residual_rms_db, None);
+    assert!(
+        !report.evidence.iter().any(|e| matches!(
+            e,
+            Evidence::Scalar {
+                label: EvidenceLabel::ResidualVsPrediction,
+                ..
+            }
+        )),
+        "no residual evidence either — the absence is the witness"
+    );
+
+    // And a pass that DOES compute one still reports it.
+    let graded = decide(&verified_bundle(&VerifiedSpec::default()));
+    assert!(graded
+        .verification
+        .as_ref()
+        .expect("carried")
+        .residual_rms_db
+        .is_some());
+}
+
 /// `residual_vs_target` is computed, attached and **never** gated: "Report it,
 /// plot it, never gate on it."
 #[test]
@@ -534,8 +616,8 @@ fn residual_vs_target_is_reported_but_never_gates() {
     // rig-dependent, and it is not the claim we make.
     assert!(vs_target.1.is_finite());
     assert!(
-        vs_target.1 > 10.0 * report.residual_rms_db,
-        "vs_target {} against the gated {}",
+        vs_target.1 > 10.0 * report.residual_rms_db.expect("a graded pass"),
+        "vs_target {} against the gated {:?}",
         vs_target.1,
         report.residual_rms_db
     );
@@ -627,7 +709,7 @@ fn a_both_routing_over_identical_per_channel_bands_predicts_normally() {
     });
     let set = decide(&bundle);
     assert!(!has_code(&set, DiagnosticCode::VerificationRoutingMismatch));
-    assert!(set.verification.expect("carried").residual_rms_db < SHAPE_TOLERANCE_DB);
+    assert!(graded_residual(&set) < SHAPE_TOLERANCE_DB);
 }
 
 /// A routing naming a channel the plan never corrected cannot be predicted at
@@ -687,8 +769,8 @@ fn the_residual_is_computed_per_capture_channel_and_the_gate_is_the_worst_one() 
     let set = decide(&bundle);
     let report = set.verification.as_ref().expect("carried");
     assert!(
-        (report.residual_rms_db - 3.0).abs() < SHAPE_TOLERANCE_DB,
-        "the worst channel is 3 dB out, got {}",
+        (report.residual_rms_db.expect("a graded pass") - 3.0).abs() < SHAPE_TOLERANCE_DB,
+        "the worst channel is 3 dB out, got {:?}",
         report.residual_rms_db
     );
     assert_eq!(
@@ -740,10 +822,7 @@ fn decide_refuses_a_verification_that_did_not_carry_its_level() {
     assert!(diagnostic.remedy.contains("trim"), "{}", diagnostic.remedy);
     // And the residual is still attached as evidence, because "the level is off
     // by 10 dB" is what confirms the diagnosis.
-    assert!(
-        (set.verification.as_ref().expect("carried").residual_rms_db - 10.0).abs()
-            < SHAPE_TOLERANCE_DB
-    );
+    assert!((graded_residual(&set) - 10.0).abs() < SHAPE_TOLERANCE_DB);
 
     let mut louder = bundle.clone();
     louder.verification.as_mut().expect("carried").level_dbfs =
@@ -829,7 +908,7 @@ fn a_railed_verification_capture_refuses_as_clipping_not_as_a_residual() {
         !has_code(&set, DiagnosticCode::VerificationResidual),
         "R23: report the clipping, NOT the residual"
     );
-    assert!(set.verification.as_ref().expect("carried").residual_rms_db > 8.0);
+    assert!(graded_residual(&set) > 8.0);
     assert_eq!(set.verdict, Verdict::Refuse);
 }
 

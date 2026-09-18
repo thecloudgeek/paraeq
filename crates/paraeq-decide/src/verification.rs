@@ -267,7 +267,7 @@ pub(crate) fn verify(
                 report: VerificationReport {
                     evidence,
                     gate_db,
-                    residual_rms_db: 0.0,
+                    residual_rms_db: None,
                 },
             });
         }
@@ -321,7 +321,7 @@ pub(crate) fn verify(
             report: VerificationReport {
                 evidence,
                 gate_db,
-                residual_rms_db: 0.0,
+                residual_rms_db: None,
             },
         });
     };
@@ -335,21 +335,53 @@ pub(crate) fn verify(
         });
     }
 
+    // **Nothing was graded** — the authority band kept no bin on any capture
+    // channel, so the correction claims nothing inside the corrected range that
+    // this pass could check. Ruling R-A12 makes that a REFUSAL rather than the
+    // silent pass it was: `worst` stayed at its `0.0` initializer, the gate
+    // compared `0.0 > gate_db` and answered false, and a verification that
+    // checked nothing reported "0.0 dB RMS, within the limit". A band with no
+    // authority in it is a reason to refuse to confirm, not a reason to confirm.
+    //
+    // `VerificationResidual` with its own remedy rather than a new variant: the
+    // code space is append-only and frozen, and this IS a residual failure —
+    // one whose cause we happen to know, so the sentence names it. Same posture
+    // as the two level-book rows.
+    let Some(rms_db) = residual.rms_db else {
+        diagnostics.push(Diagnostic {
+            code: DiagnosticCode::VerificationResidual,
+            position: Some(verification.position_index),
+            remedy: "The correction does not claim anything inside the range we \
+                     can check, so the check cannot confirm it landed. Nothing \
+                     has been changed. Re-run the measurement."
+                .to_string(),
+            severity: Severity::Refuse,
+            value: None,
+        });
+        return Some(VerificationOutcome {
+            diagnostics,
+            report: VerificationReport {
+                evidence,
+                gate_db,
+                residual_rms_db: None,
+            },
+        });
+    };
+
     // The gate is the WORST channel, never the mean: one bad ear must not be
     // rescued by a good one.
-    if gradeable && residual.rms_db > gate_db {
+    if gradeable && rms_db > gate_db {
         diagnostics.push(Diagnostic {
             code: DiagnosticCode::VerificationResidual,
             position: Some(verification.position_index),
             remedy: format!(
                 "We checked our work and it didn't land: the corrected \
-                 measurement is {:.1} dB RMS away from what we designed, \
+                 measurement is {rms_db:.1} dB RMS away from what we designed, \
                  against a limit of {gate_db:.1} dB. Nothing has been changed. \
-                 Try the guided path, which shows the residual curve.",
-                residual.rms_db
+                 Try the guided path, which shows the residual curve."
             ),
             severity: Severity::Refuse,
-            value: Some(residual.rms_db),
+            value: Some(rms_db),
         });
     }
 
@@ -358,7 +390,7 @@ pub(crate) fn verify(
         report: VerificationReport {
             evidence,
             gate_db,
-            residual_rms_db: residual.rms_db,
+            residual_rms_db: Some(rms_db),
         },
     })
 }
@@ -601,8 +633,11 @@ fn railed_capture(verification: &Verification) -> Option<Diagnostic> {
 struct Residual {
     corrected_db: Vec<f64>,
     evidence: Vec<Evidence>,
-    /// The **max** over capture channels.
-    rms_db: f64,
+    /// The **max** over capture channels, or `None` when no channel was graded
+    /// at all — an authority band that keeps no bin (ruling R-A12). `Some` iff
+    /// [`Self::evidence`] carries at least one `ResidualVsPrediction`, so the
+    /// number and the curve behind it appear and disappear together.
+    rms_db: Option<f64>,
 }
 
 /// Steps 0–4, per capture channel.
@@ -655,7 +690,7 @@ fn residual(
     let mask = authority_band_mask(grid.freqs(), authority, decisions.correction_range.value);
 
     let mut evidence = Vec::new();
-    let mut worst = 0.0f64;
+    let mut worst: Option<f64> = None;
     let mut corrected_db_first = Vec::new();
     for channel in 0..prediction.channels {
         let uncorrected = curve_db(baseline, channel, bundle, decisions, grid, right_ms)?;
@@ -680,9 +715,11 @@ fn residual(
         let smoothed = smooth(&raw, grid, decisions.smoothing.value.into()).ok()?;
 
         let Some(rms) = masked_rms(&smoothed, &mask) else {
-            // Nothing in the correction range carries authority, so there is
-            // nothing the correction claims and nothing to verify. Not a
-            // refusal: a gate over an empty band would refuse on arithmetic.
+            // The mask keeps no bin: nothing in the correction range carries
+            // authority, so there is nothing the correction claims and nothing
+            // this channel can be graded on. `worst` stays `None`, and the
+            // CALLER turns that into a refusal (ruling R-A12) rather than into a
+            // pass with a residual of zero.
             continue;
         };
         let mean = masked_mean(&smoothed, &mask).unwrap_or(0.0);
@@ -712,7 +749,7 @@ fn residual(
             unit: Unit::Db,
             value: scatter,
         });
-        worst = worst.max(rms);
+        worst = Some(worst.map_or(rms, |w: f64| w.max(rms)));
     }
 
     Some(Residual {
