@@ -18,15 +18,19 @@ use std::sync::{Arc, Mutex};
 
 use paraeq_dsp::targets::TransducerClass;
 use paraeq_measure::{
-    assemble_sweep, AbortHandle, AbortReason, CalSensitivity, CalSummary, MeasureError,
-    MeasurementDiagnostic as D, MeasurementSession, SessionError, SessionEvent, SessionPhase,
-    SessionSeam, SolveOutcome, StimulusSink, StreamFormat, SweepOutcome, TapStatus, VolumeControl,
-    ABORT_RAMP_MS, CAL_ERROR_MARGIN_DB,
+    assemble_sweep, volume_restore_target, AbortHandle, AbortReason, CalSensitivity, CalSummary,
+    MeasureError, MeasurementDiagnostic as D, MeasurementSession, SessionError, SessionEvent,
+    SessionPhase, SessionSeam, SolveOutcome, StimulusSink, StreamFormat, SweepOutcome, TapStatus,
+    VolumeControl, ABORT_RAMP_MS, CAL_ERROR_MARGIN_DB, VOLUME_UNREADABLE_AT_TEARDOWN,
 };
 
 const RATE: f64 = 48_000.0;
 const BLOCK: usize = 512;
 const PRE_VOLUME: f64 = 0.4;
+/// What MS-5 case 1 sets the system to for the measurement. ABOVE
+/// [`PRE_VOLUME`], because that is the direction a measurement moves it and it
+/// is the direction R-B2's "never raise it back" rule has to be tested in.
+const MEASURE_VOLUME: f64 = 0.7;
 
 // ── Mock kit ──────────────────────────────────────────────────────────────
 // Shared interior state (Arc) so every mock stays observable after the
@@ -237,26 +241,50 @@ impl StimulusSink for PanickingSink {
     }
 }
 
+/// The system volume, with a CURRENT the test can move.
+///
+/// The old mock had a fixed `scalar`, which made the one situation R-B2 is
+/// about — the user reaching for the volume mid-sweep because it is too loud —
+/// literally inexpressible. Every read goes through `current`, and
+/// [`MockVolume::user_sets`] is the user's hand on it.
 #[derive(Clone)]
 struct MockVolume {
+    current: Arc<Mutex<f64>>,
+    fail_read: Arc<AtomicBool>,
     fail_set: Arc<AtomicBool>,
     journal: Journal,
-    scalar: f64,
     sets: Arc<Mutex<Vec<f64>>>,
 }
 
 impl MockVolume {
     fn new(scalar: f64, journal: Journal) -> Self {
         Self {
+            current: Arc::new(Mutex::new(scalar)),
+            fail_read: Arc::default(),
             fail_set: Arc::default(),
             journal,
-            scalar,
             sets: Arc::default(),
         }
     }
 
+    fn current(&self) -> f64 {
+        *lock(&self.current)
+    }
+
     fn sets(&self) -> Vec<f64> {
         lock(&self.sets).clone()
+    }
+
+    /// The USER turns the volume, from outside ParaEQ, while a run is live.
+    /// Not recorded in `sets`: `sets` is what ParaEQ wrote.
+    fn user_sets(&self, scalar: f64) {
+        *lock(&self.current) = scalar;
+    }
+
+    /// Make `volume` return `Err` — teardown cannot then honour "never raise
+    /// it", so it must write nothing and say so.
+    fn fail_read(&self) {
+        self.fail_read.store(true, Ordering::SeqCst);
     }
 
     /// Make `set_volume` return `Err` — the restore failure must be logged
@@ -268,7 +296,12 @@ impl MockVolume {
 
 impl VolumeControl for MockVolume {
     fn volume(&self) -> Result<f64, MeasureError> {
-        Ok(self.scalar)
+        if self.fail_read.load(Ordering::SeqCst) {
+            return Err(MeasureError::Sink(
+                "injected volume read failure".to_owned(),
+            ));
+        }
+        Ok(*lock(&self.current))
     }
 
     fn set_volume(&mut self, scalar: f64) -> Result<(), MeasureError> {
@@ -277,6 +310,7 @@ impl VolumeControl for MockVolume {
         if self.fail_set.load(Ordering::SeqCst) {
             return Err(MeasureError::Sink("injected volume failure".to_owned()));
         }
+        *lock(&self.current) = scalar;
         Ok(())
     }
 }
@@ -311,8 +345,15 @@ fn seam(sink: MockSink, tap: MockTap, volume: MockVolume) -> SessionSeam {
     }
 }
 
-/// begin → install_solve → acknowledge, on a healthy OverEar chain with a
-/// matching gain read-back: the shortest legal path to the sweep gate.
+/// begin → install_solve → set the measurement volume → acknowledge, on a
+/// healthy OverEar chain with a matching gain read-back: the shortest legal
+/// path to the sweep gate.
+///
+/// The volume write is MS-5 case 1, and since R-B2 it is what creates the
+/// restore duty at all: a session that never wrote the volume has nothing to
+/// put back, and re-asserting the pinned value anyway is the defect. So the
+/// teardown tests below run over a session that DID set it — that is the case
+/// where "restore" means something.
 fn acknowledged_session(sink: MockSink, tap: MockTap, volume: MockVolume) -> MeasurementSession {
     let mut session = MeasurementSession::begin(
         healthy_cal(TransducerClass::OverEar),
@@ -321,6 +362,9 @@ fn acknowledged_session(sink: MockSink, tap: MockTap, volume: MockVolume) -> Mea
     )
     .expect("begin succeeds");
     session.install_solve(solve()).expect("solve installs");
+    session
+        .set_measurement_volume(MEASURE_VOLUME)
+        .expect("the measurement volume is settable");
     session
         .acknowledge("External Headphone Amp", 84.0)
         .expect("ack records");
@@ -369,8 +413,12 @@ fn ms6_rechecks_at_the_sweep_gate() {
     }
     assert_eq!(sink.emit_calls(), 0, "no sample may be emitted");
     // The refusal terminated the session: full restore sequence, in order.
-    assert_eq!(journal.calls(), vec!["stop", "set_volume"]);
-    assert_eq!(volume.sets(), vec![PRE_VOLUME]);
+    assert_eq!(
+        journal.calls(),
+        vec!["set_volume", "stop", "set_volume"],
+        "the measurement write, then the restore sequence"
+    );
+    assert_eq!(volume.sets(), vec![MEASURE_VOLUME, PRE_VOLUME]);
     assert_eq!(session.phase(), SessionPhase::Terminated);
 }
 
@@ -568,7 +616,11 @@ fn a_projection_over_the_cap_refuses_before_a_single_sample() {
             other => panic!("expected a refusal, got {other:?}"),
         }
         assert_eq!(sink.emit_calls(), 0, "no sample may be emitted");
-        assert_eq!(journal.calls(), vec!["stop", "set_volume"]);
+        // The refusal lands INSIDE `install_solve`, before MS-5 case 1 has
+        // set anything, so the restore sequence runs with nothing to restore.
+        // R-B2: a volume ParaEQ never wrote is a volume ParaEQ must not write.
+        assert_eq!(journal.calls(), vec!["stop"]);
+        assert!(volume.sets().is_empty());
         assert_eq!(session.phase(), SessionPhase::Terminated);
         assert_eq!(
             session.log().events().last(),
@@ -731,9 +783,10 @@ fn ms14_abort_ramps_to_zero_then_restores_in_order() {
     // The restore sequence, in order, exactly once: stop, then volume.
     assert_eq!(
         journal.calls(),
-        vec!["emit", "emit", "emit", "stop", "set_volume"]
+        vec!["set_volume", "emit", "emit", "emit", "stop", "set_volume"],
+        "MS-5 case 1's write, the sweep, then the restore sequence in order"
     );
-    assert_eq!(volume.sets(), vec![PRE_VOLUME]);
+    assert_eq!(volume.sets(), vec![MEASURE_VOLUME, PRE_VOLUME]);
     // State teardown last: the phase is terminal and the log closes with the
     // terminating diagnostic.
     assert_eq!(session.phase(), SessionPhase::Terminated);
@@ -823,8 +876,12 @@ fn a_mid_run_engine_stop_terminates_as_not_running_not_as_failed() {
         "a mid-run Disable/auto-disable must not be misreported as EngineFailed"
     );
     // The restore sequence still ran, in order, exactly once.
-    assert_eq!(journal.calls(), vec!["stop", "set_volume"]);
-    assert_eq!(volume.sets(), vec![PRE_VOLUME]);
+    assert_eq!(
+        journal.calls(),
+        vec!["set_volume", "stop", "set_volume"],
+        "the measurement write, then the restore sequence"
+    );
+    assert_eq!(volume.sets(), vec![MEASURE_VOLUME, PRE_VOLUME]);
 }
 
 /// First trigger wins: a second trigger cannot re-label the abort.
@@ -863,6 +920,9 @@ fn raii_volume_restore_survives_a_panic() {
         .expect("begin succeeds");
         session.install_solve(solve()).expect("solve installs");
         session
+            .set_measurement_volume(MEASURE_VOLUME)
+            .expect("the measurement volume is settable");
+        session
             .acknowledge("External Headphone Amp", 84.0)
             .expect("ack records");
         let level = session.emit_level().expect("level installed");
@@ -873,10 +933,14 @@ fn raii_volume_restore_survives_a_panic() {
     assert!(unwind.is_err(), "the injected panic must propagate");
     assert_eq!(
         volume_probe.sets(),
-        vec![PRE_VOLUME],
+        vec![MEASURE_VOLUME, PRE_VOLUME],
         "the pre-measurement volume must be restored during unwinding"
     );
-    assert_eq!(journal.calls(), vec!["stop", "set_volume"]);
+    assert_eq!(
+        journal.calls(),
+        vec!["set_volume", "stop", "set_volume"],
+        "the measurement write, then the restore sequence"
+    );
 }
 
 /// A session dropped without `finish` — a window close, an early return —
@@ -891,8 +955,12 @@ fn drop_without_finish_restores_exactly_once() {
         let _session = acknowledged_session(sink, MockTap::new(true), volume.clone());
         // dropped here, mid-session
     }
-    assert_eq!(volume.sets(), vec![PRE_VOLUME]);
-    assert_eq!(journal.calls(), vec!["stop", "set_volume"]);
+    assert_eq!(volume.sets(), vec![MEASURE_VOLUME, PRE_VOLUME]);
+    assert_eq!(
+        journal.calls(),
+        vec!["set_volume", "stop", "set_volume"],
+        "the measurement write, then the restore sequence"
+    );
 }
 
 /// `abort_now` outside a sweep (nothing is playing, so no ramp) still runs
@@ -905,7 +973,11 @@ fn abort_outside_a_sweep_still_restores_in_order() {
     let mut session = acknowledged_session(sink.clone(), MockTap::new(true), volume.clone());
     session.abort_now(AbortReason::MicDisconnected);
     assert_eq!(sink.emit_calls(), 0);
-    assert_eq!(journal.calls(), vec!["stop", "set_volume"]);
+    assert_eq!(
+        journal.calls(),
+        vec!["set_volume", "stop", "set_volume"],
+        "the measurement write, then the restore sequence"
+    );
     assert_eq!(session.phase(), SessionPhase::Terminated);
     let log = session.finish();
     assert_eq!(
@@ -915,7 +987,7 @@ fn abort_outside_a_sweep_still_restores_in_order() {
         })
     );
     // finish() after the abort tears down nothing twice.
-    assert_eq!(volume.sets(), vec![PRE_VOLUME]);
+    assert_eq!(volume.sets(), vec![MEASURE_VOLUME, PRE_VOLUME]);
 }
 
 // ── MS-23: the structured session log ─────────────────────────────────────
@@ -1133,7 +1205,11 @@ fn abort_on_the_final_block_is_not_lost() {
         !log.events().contains(&SessionEvent::SweepCompleted),
         "a lost abort would have logged SweepCompleted"
     );
-    assert_eq!(volume.sets(), vec![PRE_VOLUME], "restore still runs");
+    assert_eq!(
+        volume.sets(),
+        vec![MEASURE_VOLUME, PRE_VOLUME],
+        "restore still runs"
+    );
 }
 
 /// A solve that clears the SPL projection cap but whose margined output level
@@ -1176,10 +1252,17 @@ fn an_illegal_solved_level_refuses_with_a_diagnostic() {
             diagnostic: Some(D::SolvedLevelIllegal),
         }),
     );
+    // The refusal lands INSIDE `install_solve`, before MS-5 case 1 has set
+    // anything — so R-B2 leaves the volume alone rather than re-asserting a
+    // value it never changed.
+    assert!(
+        volume.sets().is_empty(),
+        "nothing was written, so nothing is restored"
+    );
     assert_eq!(
-        volume.sets(),
-        vec![PRE_VOLUME],
-        "restore runs on the refusal"
+        volume.current(),
+        PRE_VOLUME,
+        "and the system is where it was"
     );
 }
 
@@ -1201,7 +1284,7 @@ fn a_failing_stop_still_restores_the_volume() {
     // stop failed, yet the volume was still restored after it.
     assert_eq!(
         volume.sets(),
-        vec![PRE_VOLUME],
+        vec![MEASURE_VOLUME, PRE_VOLUME],
         "volume restored despite a failing stop"
     );
     let log = session.finish();
@@ -1222,15 +1305,21 @@ fn a_failing_volume_restore_is_logged() {
     let journal = Journal::default();
     let sink = MockSink::with_journal(journal.clone());
     let volume = MockVolume::new(PRE_VOLUME, journal.clone());
-    volume.fail_set();
     let mut session = acknowledged_session(sink.clone(), MockTap::new(true), volume.clone());
+    // Armed AFTER the measurement write: the failure under test is the
+    // RESTORE's, and arming it earlier would break the fixture instead.
+    volume.fail_set();
     session.abort_handle().trigger(AbortReason::UserRequest);
     let level = session.emit_level().expect("level installed");
     let stim = assemble_sweep(0.25, 48_000, 20.0, 20_000.0, level).expect("stimulus assembles");
     let _ = session.sweep(&stim).expect("abort is an outcome");
 
     // The restore was attempted (recorded) and its failure logged.
-    assert_eq!(volume.sets(), vec![PRE_VOLUME], "restore attempted");
+    assert_eq!(
+        volume.sets(),
+        vec![MEASURE_VOLUME, PRE_VOLUME],
+        "restore attempted"
+    );
     let log = session.finish();
     assert!(
         log.events()
@@ -1527,4 +1616,107 @@ fn the_refactored_ramp_down_is_sample_identical_to_the_shipped_one() {
             );
         }
     }
+}
+
+// ── R-B2: the restore may never turn the system UP ────────────────────────
+
+/// The moment the rule exists for. A sweep is loud; the reflex to "too loud"
+/// is to reach for the volume. Re-asserting the pinned scalar at teardown
+/// overrides the user at exactly the wrong moment, and the next thing they
+/// play is at the level they just rejected.
+#[test]
+fn a_user_lowering_the_volume_mid_sweep_is_not_raised_at_teardown() {
+    let journal = Journal::default();
+    let sink = MockSink::with_journal(journal.clone());
+    let volume = MockVolume::new(PRE_VOLUME, journal.clone());
+    let mut session = acknowledged_session(sink.clone(), MockTap::new(true), volume.clone());
+
+    // Mid-sweep: the user turns it right down, then aborts.
+    let user_choice = 0.05;
+    let handle = session.abort_handle();
+    let volume_hand = volume.clone();
+    sink.trip_on_call(2, handle, AbortReason::UserRequest);
+    let level = session.emit_level().expect("level installed");
+    let stim = assemble_sweep(0.25, 48_000, 20.0, 20_000.0, level).expect("stimulus assembles");
+    volume_hand.user_sets(user_choice);
+    session.sweep(&stim).expect("an abort is an outcome");
+
+    assert_eq!(
+        volume.sets(),
+        vec![MEASURE_VOLUME],
+        "only the measurement write; the restore declined to raise it"
+    );
+    assert_eq!(
+        volume.current(),
+        user_choice,
+        "the user's number survives the teardown"
+    );
+}
+
+/// The other direction: a user who turned it UP mid-run is still brought back
+/// down to where they started, because that is a restore rather than an
+/// override — it never leaves the system louder than ParaEQ found it.
+#[test]
+fn a_volume_paraeq_set_is_restored_when_nothing_lower_intervened() {
+    let journal = Journal::default();
+    let sink = MockSink::with_journal(journal.clone());
+    let volume = MockVolume::new(PRE_VOLUME, journal.clone());
+    let mut session = acknowledged_session(sink, MockTap::new(true), volume.clone());
+    session.abort_now(AbortReason::UserRequest);
+
+    assert_eq!(volume.sets(), vec![MEASURE_VOLUME, PRE_VOLUME]);
+    assert_eq!(volume.current(), PRE_VOLUME);
+}
+
+/// "Never raise it" cannot be honoured against a volume that cannot be read,
+/// so nothing is written — and the log says why rather than going quiet.
+#[test]
+fn an_unreadable_volume_at_teardown_is_reported_rather_than_re_asserted_blind() {
+    let journal = Journal::default();
+    let sink = MockSink::with_journal(journal.clone());
+    let volume = MockVolume::new(PRE_VOLUME, journal.clone());
+    let mut session = acknowledged_session(sink, MockTap::new(true), volume.clone());
+    volume.fail_read();
+    session.abort_now(AbortReason::UserRequest);
+
+    assert_eq!(
+        volume.sets(),
+        vec![MEASURE_VOLUME],
+        "the restore wrote nothing"
+    );
+    let log = session.finish();
+    assert!(
+        log.events().iter().any(|e| matches!(
+            e,
+            SessionEvent::VolumeRestoreFailed { error } if error == VOLUME_UNREADABLE_AT_TEARDOWN
+        )),
+        "the skipped restore must be visible: {:?}",
+        log.events()
+    );
+}
+
+/// The policy itself, arm by arm. It is a free function because both teardowns
+/// call it and because the `written == true` arms have no production caller
+/// yet — pinning them now is what makes the first one correct.
+#[test]
+fn volume_restore_target_never_raises_and_never_writes_what_it_did_not_set() {
+    // Nothing written: nothing to restore, whatever the two readings say.
+    assert_eq!(volume_restore_target(false, Some(0.4), Some(0.9)), None);
+    assert_eq!(volume_restore_target(false, Some(0.9), Some(0.4)), None);
+
+    // Written, and the volume is still where we left it: put it back.
+    assert_eq!(
+        volume_restore_target(true, Some(0.4), Some(0.7)),
+        Some(0.4),
+        "a restore from the measurement volume to the pre-measurement one"
+    );
+
+    // Written, but the user has already gone LOWER: their number wins.
+    assert_eq!(volume_restore_target(true, Some(0.4), Some(0.05)), None);
+    // Exactly equal is not a raise, but it is also not a change worth writing.
+    assert_eq!(volume_restore_target(true, Some(0.4), Some(0.4)), None);
+
+    // Either reading missing: "never raise it" cannot be honoured blind.
+    assert_eq!(volume_restore_target(true, None, Some(0.7)), None);
+    assert_eq!(volume_restore_target(true, Some(0.4), None), None);
 }

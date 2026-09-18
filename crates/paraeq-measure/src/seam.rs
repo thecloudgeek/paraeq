@@ -134,14 +134,22 @@ pub trait TapStatus: Send {
 /// convention: 0.0 silent, 1.0 full scale.
 ///
 /// Contract:
-/// - `volume` reads without side effects; the session pins the pre-measurement
-///   value from it exactly once, at `begin`.
-/// - `set_volume` is called on the RAII restore path on **every** exit —
-///   command, drop, panic — in the same teardown position tap destruction
-///   occupies in the engine. The system must never be left at measurement
-///   volume. Implementations must therefore be safe to call during unwinding:
-///   no panics of their own on the restore path, failures reported as `Err`
-///   (the session records them; it never masks the remaining teardown steps).
+/// - `volume` reads without side effects. It is read TWICE per run: once at
+///   `begin`/arming to pin the pre-measurement value, and once at teardown to
+///   decide the restore — so an implementation may not cache the first answer.
+/// - The restore STEP runs on the RAII path on **every** exit — command, drop,
+///   panic — in the same teardown position tap destruction occupies in the
+///   engine. Whether it WRITES is decided by
+///   [`volume_restore_target`](crate::session::volume_restore_target), and
+///   R-B2 makes that two rules: restore only a volume the pass actually set,
+///   and never above the value the teardown just read. A blind
+///   `set_volume(pinned)` puts the system back UP over a user who turned it
+///   down mid-sweep, which is the one moment the product must not override
+///   them.
+/// - `set_volume` must therefore be safe to call during unwinding: no panics
+///   of its own on the restore path, failures reported as `Err` (the session
+///   records them; it never masks the remaining teardown steps). The system
+///   must never be left at measurement volume.
 pub trait VolumeControl: Send {
     fn volume(&self) -> Result<f64, MeasureError>;
 

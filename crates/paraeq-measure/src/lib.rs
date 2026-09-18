@@ -99,8 +99,9 @@ pub use seam::{
     StimulusSink, StreamFormat, TapStatus, VolumeControl,
 };
 pub use session::{
-    AbortHandle, AbortReason, MeasurementSession, SessionError, SessionEvent, SessionLog,
-    SessionPhase, SessionSeam, SolveOutcome, SweepOutcome, ABORT_RAMP_MS, ACK_SPL_TOLERANCE_DB,
+    volume_restore_target, AbortHandle, AbortReason, MeasurementSession, SessionError,
+    SessionEvent, SessionLog, SessionPhase, SessionSeam, SolveOutcome, SweepOutcome, ABORT_RAMP_MS,
+    ACK_SPL_TOLERANCE_DB, VOLUME_UNREADABLE_AT_TEARDOWN,
 };
 pub use stimulus::{
     assemble_bracketed, assemble_pilot, assemble_sweep, emit_guard, verify_stimulus,

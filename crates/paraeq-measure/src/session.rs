@@ -226,8 +226,11 @@ pub enum SessionEvent {
         peak_correction_gain_db: f64,
         spl_cap_db: f64,
     },
-    /// The pre-measurement volume pinned at `begin` (`None`: unreadable — no
-    /// restore duty exists because nothing will be changed).
+    /// The pre-measurement volume READ at `begin`. A snapshot, not a change:
+    /// nothing in the shipped product writes the output volume, so this
+    /// records what the system was at rather than what ParaEQ set it to, and
+    /// teardown restores it only if a later stage actually wrote it
+    /// ([`volume_restore_target`]). `None`: unreadable.
     VolumePinned { pre_measurement_scalar: Option<f64> },
     /// Restoring the volume failed; collected, surfaced, never masked.
     VolumeRestoreFailed { error: String },
@@ -362,6 +365,12 @@ pub struct MeasurementSession {
     tap: Box<dyn TapStatus>,
     torn_down: bool,
     volume: Box<dyn VolumeControl>,
+    /// Did THIS session ever write the output volume? R-B2: teardown restores
+    /// only what it actually changed. Nothing in the shipped product sets the
+    /// volume — MS-5's case 1 is unbuilt — so this is `false` for the whole of
+    /// a run today, and the flag is what makes that fact explicit rather than
+    /// implicit in an unconditional `set_volume`.
+    volume_written: bool,
 }
 
 impl MeasurementSession {
@@ -422,6 +431,7 @@ impl MeasurementSession {
             tap,
             torn_down: false,
             volume,
+            volume_written: false,
         })
     }
 
@@ -656,6 +666,28 @@ impl MeasurementSession {
         std::mem::take(&mut self.log)
     }
 
+    /// MS-5 case 1: set the system output volume for the measurement, and
+    /// RECORD that this session did it.
+    ///
+    /// **The recording is the whole reason this exists** (R-B2). `teardown`
+    /// restores only what the session actually wrote, and never above where
+    /// the volume is when it runs — see [`volume_restore_target`]. Without a
+    /// method that records the write, the only honest teardown is one that
+    /// writes nothing, and the only alternative is the unconditional restore
+    /// that could turn a user's system back up after they reached for the
+    /// volume mid-sweep.
+    ///
+    /// Nothing in the product calls this yet: the volume-policy rows of MS-5
+    /// (`FixedMaxVolume` / `VolumeUncontrollable`) are the caller's to
+    /// arbitrate, and the wizard that would is Stage 7.
+    pub fn set_measurement_volume(&mut self, scalar: f64) -> Result<(), MeasureError> {
+        // Before the call, not after: a write that fails partway has still
+        // moved the system, and the restore duty must not depend on the HAL
+        // agreeing that it did.
+        self.volume_written = true;
+        self.volume.set_volume(scalar)
+    }
+
     /// A clone of the abort trigger for the UI, metering and listeners.
     pub fn abort_handle(&self) -> AbortHandle {
         self.abort.clone()
@@ -715,11 +747,24 @@ impl MeasurementSession {
                 error: e.to_string(),
             });
         }
-        if let Some(pre) = self.pre_volume {
-            if let Err(e) = self.volume.set_volume(pre) {
-                self.log.push(SessionEvent::VolumeRestoreFailed {
-                    error: e.to_string(),
-                });
+        // R-B2. The read-back is taken HERE, at teardown, not reused from
+        // `begin`: the user may have moved the volume since, and the one thing
+        // this must never do is move it back up.
+        let current = self.volume.volume().ok();
+        match volume_restore_target(self.volume_written, self.pre_volume, current) {
+            Some(target) => {
+                if let Err(e) = self.volume.set_volume(target) {
+                    self.log.push(SessionEvent::VolumeRestoreFailed {
+                        error: e.to_string(),
+                    });
+                }
+            }
+            None => {
+                if self.volume_written && current.is_none() {
+                    self.log.push(SessionEvent::VolumeRestoreFailed {
+                        error: VOLUME_UNREADABLE_AT_TEARDOWN.to_owned(),
+                    });
+                }
             }
         }
         self.phase = SessionPhase::Terminated;
@@ -766,6 +811,56 @@ impl MeasurementSession {
             }
         }
     }
+}
+
+/// What `VolumeRestoreFailed` says when the teardown cannot read the current
+/// volume. One string, because both teardowns log it and a user comparing two
+/// logs should not have to decide whether two wordings mean the same thing.
+pub const VOLUME_UNREADABLE_AT_TEARDOWN: &str =
+    "the current output volume could not be read, so the pre-measurement value was not \
+     re-asserted — re-asserting it blind can turn the system UP";
+
+/// MS-5's restore, decided: what — if anything — teardown should WRITE to the
+/// output volume. `None` means "leave it alone".
+///
+/// R-B2. The old rule was `set_volume(pre_measurement)`, unconditionally, on
+/// every exit path. Two things are wrong with that, and the second is the
+/// serious one:
+///
+/// 1. **Nothing in the shipped product writes the volume.** The pass only
+///    READS it, so the "restore" re-asserted a value that had never been
+///    changed. MS-14's step 4 presumes a step 0 that set it; MS-5's case 1
+///    ("set to the solved value") is not built yet.
+/// 2. **It could turn the system UP.** A sweep is loud; the reflex to "too
+///    loud" is to reach for the volume. Writing the pinned scalar back at
+///    teardown overrides the user at the one moment the product must not — and
+///    the next thing they play is at the level they just rejected.
+///
+/// So: restore only what we actually set, and never above where the volume is
+/// now. `pre_measurement` is what `begin` read; `current` is a FRESH read taken
+/// at teardown, `None` when it could not be taken — in which case nothing is
+/// written, because "never raise it" cannot be honoured blind.
+///
+/// This is deliberately a free function rather than a method: it is the whole
+/// of the policy, both teardowns call it, and it is the piece worth testing
+/// directly (the `written == true` arm has no production caller yet, and the
+/// point of pinning it now is that the arm is correct when one arrives).
+pub fn volume_restore_target(
+    volume_written: bool,
+    pre_measurement: Option<f64>,
+    current: Option<f64>,
+) -> Option<f64> {
+    if !volume_written {
+        return None;
+    }
+    let pre = pre_measurement?;
+    let current = current?;
+    // Never raise. `pre > current` means the user lowered it while we were
+    // running — their number wins, and there is nothing to write.
+    if pre >= current {
+        return None;
+    }
+    Some(pre)
 }
 
 impl std::fmt::Debug for MeasurementSession {

@@ -90,6 +90,13 @@ impl Journal {
     fn index_of(&self, call: &str) -> Option<usize> {
         self.calls().iter().position(|c| c == call)
     }
+
+    /// The LAST occurrence. The volume is read twice — once at the arming
+    /// gate to pin it, once at teardown to decide the restore (R-B2) — and
+    /// the teardown-order assertion is about the second one.
+    fn last_index_of(&self, call: &str) -> Option<usize> {
+        self.calls().iter().rposition(|c| c == call)
+    }
 }
 
 /// Everything the realtime witness needs to be scripted: audio only flows
@@ -366,35 +373,53 @@ impl TapStatus for MockTap {
     }
 }
 
+/// The system volume, with a CURRENT the test can move.
+///
+/// The old mock had a fixed `scalar`, which made the one situation R-B2 is
+/// about — the user reaching for the volume mid-sweep because it is too loud —
+/// literally inexpressible. Every read goes through `current`, and
+/// [`MockVolume::user_sets`] is the user's hand on it.
 #[derive(Clone)]
 struct MockVolume {
+    current: Arc<Mutex<f64>>,
     journal: Journal,
-    scalar: f64,
     sets: Arc<Mutex<Vec<f64>>>,
 }
 
 impl MockVolume {
     fn new(scalar: f64, journal: Journal) -> Self {
         Self {
+            current: Arc::new(Mutex::new(scalar)),
             journal,
-            scalar,
             sets: Arc::default(),
         }
+    }
+
+    fn current(&self) -> f64 {
+        *lock(&self.current)
     }
 
     fn sets(&self) -> Vec<f64> {
         lock(&self.sets).clone()
     }
+
+    /// The USER turns the volume, from outside ParaEQ, while a pass is live.
+    /// Not recorded in `sets`: `sets` is what ParaEQ wrote.
+    fn user_sets(&self, scalar: f64) {
+        *lock(&self.current) = scalar;
+    }
 }
 
 impl VolumeControl for MockVolume {
     fn volume(&self) -> Result<f64, MeasureError> {
-        Ok(self.scalar)
+        self.journal.record("volume.read");
+        Ok(*lock(&self.current))
     }
 
     fn set_volume(&mut self, scalar: f64) -> Result<(), MeasureError> {
         self.journal.record("volume.set");
         lock(&self.sets).push(scalar);
+        *lock(&self.current) = scalar;
         Ok(())
     }
 }
@@ -1387,8 +1412,10 @@ fn a_level_below_the_snr_budget_refuses_before_spawning() {
     }
     assert_eq!(rig.helper.spawns(), 0);
     assert!(
-        rig.volume.sets().contains(&PRE_VOLUME),
-        "the volume is restored even on the cheapest refusal"
+        rig.volume.sets().is_empty(),
+        "R-B2: the pass never WROTE the volume, so the refusal must not write \
+         one either — re-asserting the pinned scalar is how a user's mid-run \
+         turn-down gets undone"
     );
 }
 
@@ -1989,7 +2016,7 @@ fn every_exit_path_stops_the_helper_reaps_it_and_restores_volume_and_gain() {
     }
     assert_teardown_order(&rig.journal);
     assert_eq!(rig.engine.gain_db(), -4.0);
-    assert!(rig.volume.sets().contains(&PRE_VOLUME));
+    assert!(rig.volume.sets().is_empty(), "R-B2: read, never written");
     assert_eq!(
         rig.control.leases_live.load(Ordering::SeqCst),
         0,
@@ -2000,7 +2027,7 @@ fn every_exit_path_stops_the_helper_reaps_it_and_restores_volume_and_gain() {
     let rig = Rig::new("every-exit", &scratch, boost_plan());
     drop(rig.acknowledged());
     assert_eq!(rig.control.leases_live.load(Ordering::SeqCst), 0);
-    assert!(rig.volume.sets().contains(&PRE_VOLUME));
+    assert!(rig.volume.sets().is_empty());
 
     // (c) panic injection.
     let rig = Rig::new("every-exit", &scratch, boost_plan());
@@ -2011,7 +2038,34 @@ fn every_exit_path_stops_the_helper_reaps_it_and_restores_volume_and_gain() {
     }));
     assert!(unwind.is_err());
     assert_eq!(rig.control.leases_live.load(Ordering::SeqCst), 0);
-    assert!(rig.volume.sets().contains(&PRE_VOLUME));
+    assert!(rig.volume.sets().is_empty());
+}
+
+/// R-B2, on the verification path. The pass READS the system volume at the
+/// arming gate and never writes it — the WAV is the level — so a teardown that
+/// re-asserted the pinned scalar would be pure override: a user who reached for
+/// the volume mid-sweep because it was too loud gets it put back up, and the
+/// next thing they play is at the level they just rejected.
+#[test]
+fn a_user_lowering_the_volume_mid_pass_is_not_raised_at_teardown() {
+    let scratch = Scratch::new("volume-not-raised");
+    let rig = Rig::new("volume-not-raised", &scratch, boost_plan());
+    let user_choice = 0.05;
+    {
+        let mut pass = rig.acknowledged();
+        // The reflex to "too loud", while the pass is live.
+        rig.volume.user_sets(user_choice);
+        pass.run().expect("runs");
+    }
+    assert!(
+        rig.volume.sets().is_empty(),
+        "nothing ParaEQ set, so nothing ParaEQ restores"
+    );
+    assert_eq!(
+        rig.volume.current(),
+        user_choice,
+        "the user's number survives the teardown"
+    );
 }
 
 fn assert_teardown_order(journal: &Journal) {
@@ -2022,7 +2076,12 @@ fn assert_teardown_order(journal: &Journal) {
     let stop = journal
         .index_of("capture.stop")
         .expect("the capture is stopped");
-    let volume = journal.index_of("volume.set").expect("volume is restored");
+    // The volume STEP, not a write: R-B2 makes the teardown re-READ the
+    // volume and then decline to raise it, and this pass never wrote one. The
+    // step still happens, in the same slot MS-14 gives it.
+    let volume = journal
+        .last_index_of("volume.read")
+        .expect("the volume step runs");
     let gain = journal
         .index_of("control.restore_gain")
         .expect("the trim is restored");

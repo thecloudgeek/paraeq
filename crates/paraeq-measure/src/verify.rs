@@ -100,7 +100,10 @@ use crate::engine_seam::{EngineControl, EngineFacts, GainPin, MeasurementLeaseTo
 use crate::level::{caps_for, SweepLevel};
 use crate::seam::{CaptureSource, DeviceFacts, HelperExit, HelperLine, HelperProcess};
 use crate::seam::{HelperRouting, StimulusHelper, TapStatus, VolumeControl};
-use crate::session::{AbortHandle, SessionEvent, SessionLog, ABORT_RAMP_MS, ACK_SPL_TOLERANCE_DB};
+use crate::session::{
+    volume_restore_target, AbortHandle, SessionEvent, SessionLog, ABORT_RAMP_MS,
+    ACK_SPL_TOLERANCE_DB, VOLUME_UNREADABLE_AT_TEARDOWN,
+};
 use crate::stimulus::{assemble_bracketed, assemble_sweep, AssembledStimulus, StimulusKind};
 use crate::MeasureError;
 use paraeq_dsp::gating::ImpulseResponse;
@@ -421,6 +424,11 @@ pub struct VerificationPass {
     tap: Box<dyn TapStatus>,
     torn_down: bool,
     volume: Box<dyn VolumeControl>,
+    /// Did THIS pass ever write the output volume? R-B2: teardown restores
+    /// only what it actually changed. Nothing in the shipped product sets the
+    /// volume, so this is `false` for the whole of a run today — see
+    /// [`volume_restore_target`].
+    volume_written: bool,
 
     // Decided at arming.
     clipped_at_arm: u64,
@@ -476,6 +484,7 @@ impl VerificationPass {
             tap,
             torn_down: false,
             volume,
+            volume_written: false,
             clipped_at_arm: 0,
             l_verify: None,
             peak_correction_gain_db: 0.0,
@@ -616,6 +625,11 @@ impl VerificationPass {
         // two reasons: MS-23's log reads cal → volume → level, matching
         // `begin`'s own order; and owning the restore duty from the first gate
         // onward is strictly safer than owning it from the seventh.
+        //
+        // It is a READ and stays one. The verification pass never sets the
+        // system volume — the WAV is the level — so R-B2 makes `teardown`
+        // write nothing: re-asserting this scalar would override a user who
+        // turned the volume down mid-sweep, at the one moment it must not.
         self.pre_volume = self.volume.volume().ok();
         self.log.push(SessionEvent::VolumePinned {
             pre_measurement_scalar: self.pre_volume,
@@ -1356,11 +1370,24 @@ impl VerificationPass {
                 error: e.to_string(),
             });
         }
-        if let Some(pre) = self.pre_volume {
-            if let Err(e) = self.volume.set_volume(pre) {
-                self.log.push(SessionEvent::VolumeRestoreFailed {
-                    error: e.to_string(),
-                });
+        // R-B2. The read-back is taken HERE, at teardown, not reused from the
+        // arming gate: the user may have moved the volume since, and the one
+        // thing this must never do is move it back up.
+        let current = self.volume.volume().ok();
+        match volume_restore_target(self.volume_written, self.pre_volume, current) {
+            Some(target) => {
+                if let Err(e) = self.volume.set_volume(target) {
+                    self.log.push(SessionEvent::VolumeRestoreFailed {
+                        error: e.to_string(),
+                    });
+                }
+            }
+            None => {
+                if self.volume_written && current.is_none() {
+                    self.log.push(SessionEvent::VolumeRestoreFailed {
+                        error: VOLUME_UNREADABLE_AT_TEARDOWN.to_owned(),
+                    });
+                }
             }
         }
         if let Some(mut pin) = self.gain_pin.take() {
