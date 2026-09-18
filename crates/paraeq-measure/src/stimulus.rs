@@ -68,6 +68,7 @@ use crate::seam::StimulusSink;
 use crate::MeasureError;
 use paraeq_dsp::sweep::{apply_fade, generate_sweep};
 use paraeq_dsp::targets::TransducerClass;
+use paraeq_dsp::two_clock::{self, MarkerLayout, SweepSpan};
 
 /// The MS-3 DC gate: `|mean(x)|` must be under this before a buffer reaches a
 /// sink. The pilot clears it natively; the sweep clears it only because of
@@ -100,10 +101,25 @@ pub const PILOT_LEVEL_DBFS_RMS: f64 = -40.0;
 pub const PILOT_MAX_DURATION_S: f64 = 1.0;
 
 /// Which stimulus a buffer carries. Pink noise for MMM is a later stage.
+///
+/// Not a wire type — no serde, no explicit discriminants — so the order here
+/// is alphabetical per the repo convention rather than a numbering contract.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StimulusKind {
+    /// A [`Self::Sweep`] with timing markers spliced around it, played on the
+    /// **Direct** path as the baseline. Bracketing the baseline is not
+    /// optional: the verification pass differences two captures, and two
+    /// captures aligned by different means cannot be subtracted.
+    BracketedSweep,
     Pilot,
     Sweep,
+    /// A bracketed sweep for the **Helper** path, re-levelled to `L_verify`.
+    ///
+    /// It must never reach an in-process [`StimulusSink`]: it plays from the
+    /// helper child process, which is what makes it tapped and therefore
+    /// clamped. [`crate::session::MeasurementSession::sweep`] refuses it at
+    /// runtime, and `tests/ui/` refuses the seam confusion at compile time.
+    VerificationSweep,
 }
 
 /// A stimulus that provably went through the full assembly pipeline.
@@ -233,6 +249,13 @@ pub enum StimulusError {
     Level(#[from] crate::level::LevelError),
     #[error("duration {requested_s} s is not a positive finite duration")]
     NonPositiveDuration { requested_s: f64 },
+    #[error(
+        "assemble_bracketed cannot produce a {kind:?}: the bracketed kinds are \
+         BracketedSweep and VerificationSweep"
+    )]
+    NotABracketedKind { kind: StimulusKind },
+    #[error("assemble_bracketed takes a verified Sweep, not a {kind:?}")]
+    NotASweep { kind: StimulusKind },
     #[error("pilot duration {requested_s} s exceeds the {max_s} s spec maximum")]
     PilotTooLong { max_s: f64, requested_s: f64 },
     #[error(
@@ -306,6 +329,110 @@ pub fn assemble_pilot(
     let omega = 2.0 * std::f64::consts::PI * PILOT_FREQ_HZ / f64::from(sample_rate_hz);
     let samples: Vec<f64> = (0..n).map(|i| (omega * i as f64).sin()).collect();
     finish(samples, StimulusKind::Pilot, level, sample_rate_hz)
+}
+
+/// Assemble a marker-bracketed stimulus: the verification file, and the
+/// Direct path's baseline, from ONE function.
+///
+/// # Order is load-bearing, and it is the MS-3 span rule
+///
+/// `fade → DC-block → scale → verify_stimulus(SWEEP SPAN) → splice markers →
+/// three whole-buffer checks`. The first four steps are [`assemble_sweep`]'s
+/// own `finish()`, which is why this function takes an already-verified
+/// [`AssembledStimulus`] **by value** rather than re-implementing them: an
+/// `AssembledStimulus` still cannot exist without [`verify_stimulus`] having
+/// passed on the sweep, so the provenance chain gets LONGER, not shorter.
+///
+/// The MS-3 assertion set cannot run on the spliced buffer, and this is not a
+/// preference: [`verify_stimulus`] asserts `samples.len() == envelope.len()`
+/// and checks fade monotonicity over the envelope's tail — both break outright
+/// once markers and silence are spliced around the sweep — and its DC gate is
+/// a mean over the whole buffer, which ~2.2 s of padding dilutes.
+///
+/// # The three whole-buffer checks
+///
+/// Assumed properties are not checked properties. The bracketed buffer is
+/// re-checked for **all finite**, **`max|x| ≤ 1.0`**, and **first and last
+/// samples exactly 0.0** — the last of which is MS-3's own first test column,
+/// and which `verify_stimulus` itself refuses to assume. Each returns the
+/// shipped [`MeasurementDiagnostic`] variant wrapped in
+/// [`StimulusError::Defect`], so no new diagnostic is minted for an old
+/// failure.
+///
+/// # Marker level
+///
+/// `marker_scale` is **not** a parameter. It is `max|sweep|` — the realized
+/// peak of the levelled sweep — computed inside, so the rule cannot be passed
+/// the wrong number. `two_clock::default_marker` is documented at peak 1.0,
+/// and splicing that verbatim into a file whose sweep sits near −18 dBFS RMS
+/// would put a full-scale 50 ms burst into the transducer, louder than
+/// anything the caps table validated. On the Direct path that burst is
+/// tap-EXCLUDED, i.e. the one signal the engine's safety clamps never see.
+///
+/// # The level rides through unchanged, and stays EXACT
+///
+/// The returned stimulus's [`AssembledStimulus::level`] is the level the sweep
+/// it consumed was scaled to, unchanged. `finish()`'s `scale_to` already set
+/// the SWEEP SPAN's RMS to exactly that level, and `bracket` copies the sweep
+/// bit-identically into silence, so splicing cannot change it. The assembled
+/// file's own RMS is lower — `10·log10(5.5/7.7) = −1.46 dB` for the shipped
+/// layout — and is never reported anywhere.
+pub fn assemble_bracketed(
+    sweep: AssembledStimulus,
+    layout: &MarkerLayout,
+    kind: StimulusKind,
+) -> Result<(AssembledStimulus, SweepSpan), StimulusError> {
+    if !matches!(
+        kind,
+        StimulusKind::BracketedSweep | StimulusKind::VerificationSweep
+    ) {
+        return Err(StimulusError::NotABracketedKind { kind });
+    }
+    if sweep.kind() != StimulusKind::Sweep {
+        return Err(StimulusError::NotASweep { kind: sweep.kind() });
+    }
+    let sample_rate_hz = sweep.sample_rate_hz();
+    let rate = f64::from(sample_rate_hz);
+    // R8's rule, computed here so it cannot be passed wrong.
+    let marker_scale = sweep
+        .samples()
+        .iter()
+        .fold(0.0f64, |acc, v| acc.max(v.abs()));
+    let (samples, span) = two_clock::bracket(sweep.samples(), layout, marker_scale, rate);
+
+    // Check 1 — finiteness first, because a NaN makes every later comparison
+    // lie (`NaN > 1.0` is false).
+    let non_finite = samples.iter().filter(|v| !v.is_finite()).count() as u64;
+    if non_finite > 0 {
+        return Err(StimulusError::Defect(
+            MeasurementDiagnostic::StimulusNonFinite { count: non_finite },
+        ));
+    }
+    // Check 2 — full scale. The markers are added into silence, so this can
+    // only fire if the layout overlapped something or the scale was wrong.
+    let peak = samples.iter().fold(0.0f64, |acc, v| acc.max(v.abs()));
+    if peak > 1.0 {
+        return Err(StimulusError::Defect(
+            MeasurementDiagnostic::StimulusOverFullScale { peak },
+        ));
+    }
+    // Check 3 — endpoints. MS-3's own first test column, and the property a
+    // caller would most readily argue from construction instead of checking.
+    if samples.is_empty() || samples[0] != 0.0 || samples[samples.len() - 1] != 0.0 {
+        return Err(StimulusError::Defect(
+            MeasurementDiagnostic::StimulusEndpointNonzero,
+        ));
+    }
+
+    Ok((
+        AssembledStimulus {
+            kind,
+            level: sweep.level(),
+            sample_rate_hz,
+            samples,
+        },
+        span,
+    ))
 }
 
 /// The MS-4 emit guard: clamp finite samples to ±1.0 and zero non-finite

@@ -205,6 +205,27 @@ pub enum SessionEvent {
     Terminated {
         diagnostic: Option<MeasurementDiagnostic>,
     },
+    /// The verification pass's level decision — MS-23's "final level, cap,
+    /// class" for a pass that runs no rungs and no solve, so
+    /// [`Self::SolveInstalled`] does not apply and [`Self::RungMeasured`]
+    /// never appears.
+    ///
+    /// `l_verify_dbfs_rms` is SWEEP-SPAN RMS, the same convention
+    /// [`Self::SweepStarted`]'s `level_dbfs_rms` already uses — the bracketed
+    /// file's own RMS is lower and is never reported anywhere.
+    ///
+    /// No margin field: the MS-11 cal-error margin is applied exactly once,
+    /// upstream, and [`Self::CalLoaded`]'s `gain_matches` already records
+    /// which case fired while [`Self::SolveInstalled`]'s `margin_db` records
+    /// its size on the baseline side.
+    VerifyLevelled {
+        class: TransducerClass,
+        gain_db_pinned: f32,
+        l_measure_dbfs_rms: f64,
+        l_verify_dbfs_rms: f64,
+        peak_correction_gain_db: f64,
+        spl_cap_db: f64,
+    },
     /// The pre-measurement volume pinned at `begin` (`None`: unreadable — no
     /// restore duty exists because nothing will be changed).
     VolumePinned { pre_measurement_scalar: Option<f64> },
@@ -228,7 +249,12 @@ impl SessionLog {
         &self.events
     }
 
-    fn push(&mut self, event: SessionEvent) {
+    /// `pub(crate)` so the verification pass ([`crate::verify`]) writes into
+    /// the same MS-23 log rather than minting a second one. Without it a
+    /// sibling module cannot reach `events` — which is private — and an
+    /// implementer invents a parallel log type, which is exactly the
+    /// duplication MS-23 exists to prevent.
+    pub(crate) fn push(&mut self, event: SessionEvent) {
         self.events.push(event);
     }
 }
@@ -511,11 +537,25 @@ impl MeasurementSession {
         if !self.tap.self_excluded() {
             return Err(self.refuse(MeasurementDiagnostic::SelfExclusionUnavailable));
         }
-        // Provenance, part 1 — kind: the pilot's fixed −40 dBFS could coincide
-        // with a session's margined level, so a level match alone would let a
-        // pilot play under a `SweepStarted`/`SweepCompleted` log. The sweep gate
-        // takes a Sweep.
-        if stimulus.kind() != StimulusKind::Sweep {
+        // Provenance, part 1 — kind. The sweep gate takes a sweep of the
+        // Direct path: `Sweep`, or `BracketedSweep` (the same sweep with
+        // timing markers spliced around it). It still refuses `Pilot` — the
+        // reason this gate exists, since the pilot's fixed −40 dBFS could
+        // coincide with a session's margined level and let a pilot play under
+        // a `SweepStarted`/`SweepCompleted` log — and it also refuses
+        // `VerificationSweep`, which plays from the HELPER child process and
+        // must never reach an in-process sink.
+        //
+        // The provenance property survives the widening rather than being
+        // traded away: `BracketedSweep` is strictly HARDER to forge than
+        // `Sweep`, because `assemble_bracketed` consumes a verified
+        // `AssembledStimulus` by value and adds three whole-buffer checks on
+        // top of `verify_stimulus`. Part 2 below is untouched, and a bracketed
+        // buffer's `level()` is still exact.
+        if !matches!(
+            stimulus.kind(),
+            StimulusKind::Sweep | StimulusKind::BracketedSweep
+        ) {
             return Err(SessionError::StimulusNotSweep {
                 kind: stimulus.kind(),
             });
@@ -691,17 +731,26 @@ impl MeasurementSession {
     /// of block time, zero-fill to the block edge, and emit. Never a
     /// re-render, never a hard stop. The envelope's last sample is forced to
     /// exactly `0.0` rather than trusting `cos(π)` rounding.
+    ///
+    /// The envelope itself lives in [`crate::ramp`], in ONE place, so the
+    /// in-process abort here and the helper child process's cross-process
+    /// abort are one shape with one test — two envelopes would mean two fade
+    /// shapes, and "a hard stop is itself a full-scale click". The second
+    /// argument is `padded`, not `ramp_len`: this loop runs `0..padded` and
+    /// `padded > ramp_len` for every block size that is not an exact divisor,
+    /// so the padded tail is part of the function's contract rather than this
+    /// caller's. The lift is sample-identical by construction —
+    /// `abort_envelope` returns exactly `0.0` at and past `ramp_len - 1`,
+    /// which is what the expression it replaced produced for those indices.
     fn ramp_down(&mut self, remaining: &[f64], block: usize, sample_rate_hz: f64) {
-        let ramp_len = ((ABORT_RAMP_MS / 1000.0) * sample_rate_hz).round().max(1.0) as usize;
+        let ramp_len = crate::ramp::abort_ramp_len(sample_rate_hz);
         let padded = ramp_len.div_ceil(block) * block;
+        let env = crate::ramp::abort_envelope(ramp_len, padded);
         let mut out = Vec::with_capacity(padded);
-        for i in 0..padded {
-            let env = if i + 1 >= ramp_len {
-                0.0
-            } else {
-                0.5 * (1.0 + (std::f64::consts::PI * (i + 1) as f64 / ramp_len as f64).cos())
-            };
-            out.push(remaining.get(i).copied().unwrap_or(0.0) * env);
+        // `env.len() == padded` by construction, so this is the shipped
+        // `0..padded` loop with the coefficient read from the shared envelope.
+        for (i, coefficient) in env.iter().enumerate() {
+            out.push(remaining.get(i).copied().unwrap_or(0.0) * coefficient);
         }
         let level = self
             .emit_level

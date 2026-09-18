@@ -1127,3 +1127,292 @@ fn a_failing_volume_restore_is_logged() {
         "the restore failure must be logged"
     );
 }
+
+// ── R17: the sweep gate widens by exactly one variant ─────────────────────
+//
+// The Direct capture is now bracketed with timing markers (both captures must
+// be aligned by the same means or the verification subtraction is not
+// apples-to-apples), so the shipped gate — which took a bare `Sweep` — would
+// refuse the baseline the verification pass needs. It widens by ONE variant
+// and by no more.
+
+/// A compact bracket for the session tests: the shipped 2.20 s layout would
+/// make every one of these a 2.45 s buffer for no extra coverage. The rule
+/// under test is the KIND gate, not the layout.
+fn compact_layout() -> paraeq_dsp::two_clock::MarkerLayout {
+    paraeq_dsp::two_clock::MarkerLayout {
+        guard_gap_s: 0.01,
+        lead_in_s: 0.02,
+        marker_s: 0.005,
+        markers_per_end: 2,
+        pair_gap_s: 0.01,
+        tail_s: 0.02,
+    }
+}
+
+fn bracketed(
+    level: paraeq_measure::SweepLevel,
+    kind: paraeq_measure::StimulusKind,
+) -> (
+    paraeq_measure::AssembledStimulus,
+    paraeq_dsp::two_clock::SweepSpan,
+) {
+    let sweep = assemble_sweep(0.25, 48_000, 20.0, 20_000.0, level).expect("stimulus assembles");
+    paraeq_measure::assemble_bracketed(sweep, &compact_layout(), kind).expect("bracket assembles")
+}
+
+#[test]
+fn the_sweep_gate_accepts_a_bracketed_sweep_and_still_refuses_a_pilot() {
+    let journal = Journal::default();
+    let sink = MockSink::with_journal(journal.clone());
+    let volume = MockVolume::new(PRE_VOLUME, journal.clone());
+    let mut session = acknowledged_session(sink.clone(), MockTap::new(true), volume);
+    let level = session.emit_level().expect("level installed");
+
+    let (stim, _) = bracketed(level, paraeq_measure::StimulusKind::BracketedSweep);
+    match session.sweep(&stim).expect("a bracketed sweep is accepted") {
+        SweepOutcome::Completed { warnings } => assert!(warnings.is_empty()),
+        aborted => panic!("expected a clean completion, got {aborted:?}"),
+    }
+    assert!(sink.emit_calls() > 0, "the bracketed sweep actually played");
+
+    // The pilot is still refused, which is the reason the gate exists: its
+    // fixed −40 dBFS could coincide with a session's margined level, so a
+    // level match alone would let a pilot play under a SweepStarted log.
+    let sink = MockSink::default();
+    let volume = MockVolume::new(PRE_VOLUME, Journal::default());
+    let mut session = acknowledged_session(sink.clone(), MockTap::new(true), volume);
+    let pilot = paraeq_measure::assemble_pilot(0.25, 48_000, TransducerClass::OverEar)
+        .expect("a legal pilot");
+    let err = session.sweep(&pilot).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SessionError::StimulusNotSweep {
+                kind: paraeq_measure::StimulusKind::Pilot
+            }
+        ),
+        "got {err:?}"
+    );
+    assert_eq!(sink.emit_calls(), 0, "a refused pilot emits nothing");
+}
+
+/// The runtime half of the two-route interlock. A `VerificationSweep` plays
+/// from the HELPER child process — that is what makes it tapped, and therefore
+/// clamped at both `RealtimeChain` sites. Handing it to an in-process sink
+/// would play it on the path the engine's safety clamps never see, at a level
+/// solved for the other path. `tests/ui/` refuses the seam confusion at
+/// compile time; this refuses the value at runtime.
+#[test]
+fn the_sweep_gate_refuses_a_verification_sweep_at_an_in_process_sink() {
+    let sink = MockSink::default();
+    let volume = MockVolume::new(PRE_VOLUME, Journal::default());
+    let mut session = acknowledged_session(sink.clone(), MockTap::new(true), volume.clone());
+    let level = session.emit_level().expect("level installed");
+
+    let (stim, _) = bracketed(level, paraeq_measure::StimulusKind::VerificationSweep);
+    let err = session.sweep(&stim).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SessionError::StimulusNotSweep {
+                kind: paraeq_measure::StimulusKind::VerificationSweep
+            }
+        ),
+        "got {err:?}"
+    );
+    assert_eq!(sink.emit_calls(), 0, "not one sample may reach the sink");
+}
+
+/// R14 and R17 meet here: a bracketed sweep logs `SweepStarted` with the
+/// SPAN's RMS, not the file's. The bracket is mostly silence, so the two
+/// differ by `10·log10(sweep/file)` — 1.46 dB on the shipped layout, against a
+/// verification gate as small as 2.0 dB.
+#[test]
+fn a_bracketed_sweep_logs_sweep_started_with_the_span_rms() {
+    let journal = Journal::default();
+    let sink = MockSink::with_journal(journal.clone());
+    let volume = MockVolume::new(PRE_VOLUME, journal.clone());
+    let mut session = acknowledged_session(sink, MockTap::new(true), volume);
+    let level = session.emit_level().expect("level installed");
+    let (stim, span) = bracketed(level, paraeq_measure::StimulusKind::BracketedSweep);
+    session.sweep(&stim).expect("plays");
+
+    let logged = session
+        .log()
+        .events()
+        .iter()
+        .find_map(|e| match e {
+            SessionEvent::SweepStarted { level_dbfs_rms } => Some(*level_dbfs_rms),
+            _ => None,
+        })
+        .expect("SweepStarted is in the log");
+    assert_eq!(
+        logged,
+        level.dbfs_rms(),
+        "the log carries the decided level"
+    );
+
+    let samples = stim.samples();
+    let span_rms = 20.0
+        * (samples[span.start..span.start + span.len]
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            / span.len as f64)
+            .sqrt()
+            .log10();
+    assert!(
+        (span_rms - logged).abs() < 1e-12,
+        "the logged number is the SPAN's RMS ({span_rms}), not the file's"
+    );
+    let file_rms = 20.0
+        * (samples.iter().map(|v| v * v).sum::<f64>() / samples.len() as f64)
+            .sqrt()
+            .log10();
+    assert!(
+        file_rms < logged - 0.5,
+        "the file's own RMS ({file_rms}) is lower and is reported nowhere"
+    );
+}
+
+// ── R21 (d): the lifted MS-14 envelope is sample-identical ────────────────
+
+/// A sink with a caller-chosen block size, so the padded-tail regime can be
+/// exercised. `MockSink`'s 512 frames is shared by every other test in this
+/// file and is deliberately left alone.
+#[derive(Clone)]
+struct BlockSink {
+    blocks: Arc<Mutex<Vec<Vec<f64>>>>,
+    frames_per_block: usize,
+    trip: Arc<Mutex<Option<(usize, AbortHandle, AbortReason)>>>,
+}
+
+impl BlockSink {
+    fn new(frames_per_block: usize) -> Self {
+        Self {
+            blocks: Arc::default(),
+            frames_per_block,
+            trip: Arc::default(),
+        }
+    }
+
+    fn trip_on_call(&self, nth: usize, handle: AbortHandle, reason: AbortReason) {
+        *lock(&self.trip) = Some((nth, handle, reason));
+    }
+
+    fn blocks(&self) -> Vec<Vec<f64>> {
+        lock(&self.blocks).clone()
+    }
+}
+
+impl StimulusSink for BlockSink {
+    fn format(&self) -> StreamFormat {
+        StreamFormat {
+            channels: 1,
+            frames_per_block: self.frames_per_block,
+            sample_rate_hz: RATE,
+        }
+    }
+
+    fn emit(
+        &mut self,
+        block: &[f64],
+        _level: paraeq_measure::SweepLevel,
+    ) -> Result<(), MeasureError> {
+        let mut blocks = lock(&self.blocks);
+        blocks.push(block.to_vec());
+        let n = blocks.len();
+        drop(blocks);
+        if let Some((nth, handle, reason)) = lock(&self.trip).clone() {
+            if n == nth {
+                handle.trigger(reason);
+            }
+        }
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<(), MeasureError> {
+        Ok(())
+    }
+}
+
+/// The falsifier for moving the MS-14 envelope out of `session.rs` into
+/// `ramp.rs`: compute the SHIPPED expression inline here, run the refactored
+/// `ramp_down` through a sink, and assert **bit equality** across the whole
+/// padded buffer. Without it, a refactor of Stage-5-validated abort code has
+/// no check at all.
+///
+/// Two regimes, and both are load-bearing:
+///
+/// - **block 512 at 48 kHz** pads: `ramp_len` is 240 and `padded` is 512, so
+///   272 of the 512 iterations are TAIL. A one-argument envelope of
+///   `ramp_len` coefficients would panic on exactly those indices.
+/// - **block 240** does not pad: `padded == ramp_len`, so the tail is empty
+///   and the non-degenerate half is covered too.
+///
+/// And `remaining` is longer than `padded` in both, because with a short
+/// `remaining` the tail multiplies `unwrap_or(0.0)` and is zero whatever the
+/// coefficient is — a wrong tail coefficient would be invisible.
+#[test]
+fn the_refactored_ramp_down_is_sample_identical_to_the_shipped_one() {
+    let ramp_len = (ABORT_RAMP_MS / 1000.0 * RATE).round().max(1.0) as usize;
+    assert_eq!(ramp_len, 240, "5 ms at 48 kHz");
+
+    for block in [512usize, 240] {
+        let sink = BlockSink::new(block);
+        let volume = MockVolume::new(PRE_VOLUME, Journal::default());
+        let mut session = MeasurementSession::begin(
+            healthy_cal(TransducerClass::OverEar),
+            1.0,
+            SessionSeam {
+                sink: Box::new(sink.clone()),
+                tap: Box::new(MockTap::new(true)),
+                volume: Box::new(volume),
+            },
+        )
+        .expect("begin succeeds");
+        session.install_solve(solve()).expect("solve installs");
+        session.acknowledge("Amp", 84.0).expect("ack records");
+        sink.trip_on_call(1, session.abort_handle(), AbortReason::UserRequest);
+
+        let level = session.emit_level().expect("level installed");
+        // 0.25 s = 12 000 samples, so `remaining` after the first block is
+        // thousands of samples long — comfortably longer than `padded`.
+        let stim = assemble_sweep(0.25, 48_000, 20.0, 20_000.0, level).expect("stimulus assembles");
+        session.sweep(&stim).expect("an abort is an outcome");
+
+        let padded = ramp_len.div_ceil(block) * block;
+        assert!(
+            stim.len() - block > padded,
+            "block {block}: `remaining` ({}) must exceed padded ({padded}) or a \
+             wrong tail coefficient is invisible",
+            stim.len() - block
+        );
+
+        let blocks = sink.blocks();
+        assert_eq!(
+            blocks.len(),
+            1 + padded / block,
+            "block {block}: one full-level block, then the padded ramp"
+        );
+        let remaining = &stim.samples()[block..];
+        let emitted: Vec<f64> = blocks[1..].iter().flatten().copied().collect();
+        assert_eq!(emitted.len(), padded, "block {block}: padded length");
+
+        for (i, &got) in emitted.iter().enumerate() {
+            // The SHIPPED expression, verbatim, evaluated per i.
+            let env = if i + 1 >= ramp_len {
+                0.0
+            } else {
+                0.5 * (1.0 + (std::f64::consts::PI * (i + 1) as f64 / ramp_len as f64).cos())
+            };
+            let want = remaining.get(i).copied().unwrap_or(0.0) * env;
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "block {block}, sample {i}: {got} != {want} (bit equality)"
+            );
+        }
+    }
+}

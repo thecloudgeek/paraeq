@@ -56,6 +56,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod align;
 pub mod cal;
 pub mod capture;
 pub mod diagnostic;
@@ -67,7 +68,12 @@ pub mod seam;
 pub mod session;
 pub mod stimulus;
 pub mod store;
+pub mod verify;
 
+pub use align::{
+    align, AlignRequest, Alignment, MARKER_SNR_WARN_DB, TWO_CLOCK_RESIDUAL_REFUSE_SAMPLES,
+    TWO_CLOCK_RESIDUAL_WARN_SAMPLES,
+};
 pub use cal::{
     margined_emit_dbfs, CalSummary, PinnedGain, CAL_ERROR_MARGIN_DB, GAIN_MATCH_TOLERANCE,
 };
@@ -97,10 +103,16 @@ pub use session::{
     SessionPhase, SessionSeam, SolveOutcome, SweepOutcome, ABORT_RAMP_MS, ACK_SPL_TOLERANCE_DB,
 };
 pub use stimulus::{
-    assemble_pilot, assemble_sweep, emit_guard, verify_stimulus, AssembledStimulus, GuardCounts,
-    StimulusError, StimulusKind,
+    assemble_bracketed, assemble_pilot, assemble_sweep, emit_guard, verify_stimulus,
+    AssembledStimulus, GuardCounts, StimulusError, StimulusKind,
 };
 pub use store::{IrStore, StoreError, StoredIr, StoredWindow};
+pub use verify::{
+    classify_exit, exit_diagnostic, expected_render_device_uid, ArmingFailure, HelperExitKind,
+    HelperReady, SweepShape, VerificationPass, VerifyCaptureStats, VerifyError, VerifyOutcome,
+    VerifyPhase, VerifyPlan, VerifyRequest, VerifySeam, VerifyTiming, VerifyTwoClockFit,
+    CAPTURE_FLOOR_DBFS, PREAMP_MATCH_TOLERANCE, VERIFY_MIN_SNR_DB,
+};
 
 /// Error type shared by this crate's entry points.
 ///
