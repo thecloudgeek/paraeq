@@ -5,9 +5,10 @@ A `Bookshelf` pair measured through one UMIK-1 at the profile's own default of
 nine positions (so `positions_n` echoes `positions_default` and no
 position-count diagnostic can fire), `routing: Both` because the system is being
 corrected as one, a plain vendor cal with no target baked into it, a noise floor
-~50 dB below the capture across the correction range, a clean capture readout at
-every position, and a two-clock skew estimate that was formed and applied
-(`clock_skew_ppm: Some(11.4)`, `clock_adjusted: true`). It is the case every
+**95.1 dB** below the analysed capture across the correction range — measured,
+not assumed, and quiet enough that no SNR row can fire on rounding — a clean
+capture readout at every position, and a two-clock skew estimate that was formed
+and applied (`clock_skew_ppm: Some(11.4)`, `clock_adjusted: true`). It is the case every
 other room case is read against: FDW gating, variable smoothing, Align SPL over
 the alignment band, the power average, σ(f), the room `Parametric` target and a
 3.0 dB flatness target all run here on data with no defect in it. It is also the
