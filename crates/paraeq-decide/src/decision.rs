@@ -176,8 +176,10 @@ pub struct Rationale {
     pub text: String,
 }
 
-/// One key per decision-table row. `target` carries three because its rationale
-/// depends on which selection rule fired, and the copy differs materially.
+/// One key per decision-table row. `target` carries FOUR because its rationale
+/// depends on which selection rule fired, and the copy differs materially —
+/// the three the spec's selection table names, plus the fallback arm where
+/// nothing could be matched at all (ruling R-A11).
 /// Retained alongside the rendered text for tests and future l10n.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum RationaleKey {
@@ -204,6 +206,11 @@ pub enum RationaleKey {
     Smoothing,
     /// Coupler, EARS HEQ/HPN/IDF cal: forced to `flat`.
     TargetCalBakedIn,
+    /// Coupler, nothing to match against: the first class-legal candidate, as a
+    /// FALLBACK. Its own key because the matched copy ("that's the curve we
+    /// matched") claims a comparison that never ran (ruling R-A11), and the
+    /// `Source` is `Default` here rather than `Auto` for the same reason.
+    TargetFallback,
     /// Coupler, normal cal: matched within the class-filtered candidate set.
     TargetMatched,
     /// Room: parametric, never matched.

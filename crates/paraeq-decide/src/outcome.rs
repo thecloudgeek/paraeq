@@ -110,9 +110,15 @@ pub struct CorrectionPlan {
     /// The rate the bands were fitted at. Provenance only — never the rate the
     /// engine designs at.
     pub design_rate: f64,
-    /// Indices of candidate bands the fit found and did not emit at all.
-    /// Index-parallel to nothing: these are positions in the fit's own
-    /// candidate order, carried so the drawer can say how many were dropped.
+    /// Per channel, index-parallel to [`Self::bands`]: how many candidate
+    /// bands the Jury funnel could not stabilize and therefore did not emit.
+    ///
+    /// A COUNT per channel, not a list of indices — `RoomFitReport::dropped` is
+    /// a `usize` count and this carries one per channel, so `dropped[c]` reads
+    /// "channel `c` lost this many candidates". In a healthy fit every entry is
+    /// 0: "a nonzero value is a bug report, not a tuning outcome". The doc used
+    /// to say "indices of candidate bands", which no reader could reconcile
+    /// with a `dropped` of `[0, 0]` on a two-channel plan (ruling R-A11).
     pub dropped: Vec<usize>,
     /// `-max(0, peak of the REALIZED cascade)`. No headroom constant.
     ///
@@ -206,6 +212,14 @@ pub enum Severity {
 /// The risk this table guards against is not the duplication; it is a future
 /// "cleanup" that merges the two enums, breaks the crate boundary and takes
 /// daemon-readiness with it.
+///
+/// **One asymmetry the table does not show.** A [`Diagnostic`] here carries ONE
+/// `remedy` string, while `paraeq_measure::MeasurementDiagnostic`'s twin
+/// carries two (a short headline and a longer body). That is deliberate and not
+/// an omission: this vocabulary is post-capture, so its copy is read once in a
+/// result panel rather than twice in a live capture HUD, and a second string
+/// would be a second thing for a copy review to keep in sync with the spec's
+/// single Remedy-copy column (ruling R-A11).
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[repr(u16)]
 pub enum DiagnosticCode {

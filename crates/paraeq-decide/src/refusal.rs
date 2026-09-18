@@ -694,7 +694,10 @@ fn wrong_transducer(
 fn position_count(bundle: &MeasurementBundle, profile: &PathProfile) -> Option<Diagnostic> {
     let n = bundle.positions.len();
     let minimum = *profile.positions_domain.start();
-    let noun = profile.reposition_noun;
+    // `rules::position_noun`, NOT `PathProfile::reposition_noun`: the latter is
+    // the imperative retry phrase ("move the mic ~30 cm") and rendered
+    // "We need at least 3 move the mic ~30 cms" here. Ruling R-A11.
+    let noun = crate::rules::position_noun(profile);
     if n < minimum {
         return Some(Diagnostic {
             code: DiagnosticCode::TooFewPositions,

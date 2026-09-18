@@ -214,13 +214,19 @@ pub(crate) fn positions_n(positions: usize, noun: &str) -> Rationale {
 /// `preamp_db`. `{p}` is how far everything was turned DOWN, so it renders the
 /// magnitude: `preamp_db` is `≤ 0` by construction and "turned everything down
 /// −3.2 dB" says the opposite of what happened.
+///
+/// **`+ 0.0` is not decoration.** A pure-cut cascade has `preamp_db == 0.0`, and
+/// IEEE negation makes `-0.0` out of it, which `{:.1}` renders as "-0.0": "We
+/// turned everything down -0.0 dB" is a minus sign in user-facing copy for a
+/// number that is zero. Adding zero maps `-0.0` to `+0.0` and leaves every other
+/// value untouched (ruling R-A10).
 pub(crate) fn preamp_db(preamp_db: f64) -> Rationale {
     rationale(
         RationaleKey::PreampDb,
         format!(
             "We turned everything down {:.1} dB to make room for the boosts. \
              That's normal, and it's why it may sound quieter at first.",
-            -preamp_db
+            -preamp_db + 0.0
         ),
     )
 }
@@ -288,6 +294,26 @@ pub(crate) fn target_matched(name: &str, candidates: usize) -> Rationale {
         format!(
             "Your headphones are closest to {name} — that's the curve we \
              matched, out of {candidates} we tried."
+        ),
+    )
+}
+
+/// `target`, coupler path, NOTHING MATCHED. `{name}` is the first class-legal
+/// candidate, taken because the value must stay inside its own domain.
+///
+/// A separate string from [`target_matched`] because that one says "that's the
+/// curve we matched, out of {k} we tried" — and on this arm nothing was
+/// matched and nothing was tried: either the bundle was unanalysable or
+/// `match_closest_target` refused. Claiming a match the run never performed is
+/// the kind of sentence the whole rationale mechanism exists to prevent
+/// (ruling R-A11).
+pub(crate) fn target_fallback(name: &str) -> Rationale {
+    rationale(
+        RationaleKey::TargetFallback,
+        format!(
+            "We could not compare your headphones against the curves we have, \
+             so we started from {name}. Pick a different one in the drawer if \
+             it does not sound right."
         ),
     )
 }

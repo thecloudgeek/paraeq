@@ -251,7 +251,12 @@ fn resolve<T: Clone>(mut d: Decision<T>, over: Option<&T>) -> Decision<T> {
 /// can take an "s". The decision table interpolates `{noun}s`, and no field
 /// anywhere carries that word — so it is stated here, once, and flagged: a copy
 /// review owns these two words, not this file.
-fn position_noun(profile: &PathProfile) -> &'static str {
+///
+/// `pub(crate)` because the two position-count refusal rows interpolate the
+/// same `{noun}s` (ruling R-A11): `refusal::position_count` used
+/// `PathProfile::reposition_noun` and rendered "We need at least 3 move the mic
+/// ~30 cms". One word, one source.
+pub(crate) fn position_noun(profile: &PathProfile) -> &'static str {
     match profile.coupling {
         CouplingPath::Coupler => "reseat",
         CouplingPath::Room => "position",
@@ -437,6 +442,7 @@ pub(crate) fn analysis_decisions(
                 // applied to the VALUE below. Flagged rather than quietly
                 // narrowed: a domain is what the drawer draws, and changing one
                 // is a wire change.
+                // OPEN [OWNER] (§ D-K sibling): keep 61.0, or derive it too?
                 Domain::Range {
                     max: 61.0,
                     min: 1.0,
@@ -1287,13 +1293,19 @@ fn target_decision(
                     // class-legal candidate at all. `Source::Default`, and the
                     // value is the first legal candidate if there is one, so the
                     // value stays inside its own domain.
+                    //
+                    // The COPY is `target_fallback`, not `target_matched`: this
+                    // arm ran no comparison, so "that's the curve we matched,
+                    // out of {k} we tried" would claim a match nobody made
+                    // (ruling R-A11). `Source::Default` already says the same
+                    // thing machine-readably; this is the half a user reads.
                     None => match candidates.first() {
                         Some(curve) => decision(
                             TargetChoice::Curve {
                                 name: curve.name.clone(),
                             },
                             Domain::Choice(domain.clone()),
-                            rationale::target_matched(&curve.name, candidates.len()),
+                            rationale::target_fallback(&curve.name),
                             Invalidation::Reanalyze,
                         ),
                         None => room(parametric.clone()),

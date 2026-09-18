@@ -537,7 +537,9 @@ fn level_book_violated(
     if !gain_db.is_finite() || gain_db != 0.0 {
         return refusal(
             format!(
-                "The check ran with your volume trim still at {gain_db:+.1} dB,                  so we cannot tell the trim apart from the correction. Nothing                  has been changed. Re-run the measurement."
+                "The check ran with your volume trim still at {gain_db:+.1} dB, \
+                 so we cannot tell the trim apart from the correction. Nothing \
+                 has been changed. Re-run the measurement."
             ),
             gain_db,
         );
@@ -547,7 +549,10 @@ fn level_book_violated(
     if !level_dbfs.is_finite() || level_dbfs > baseline_dbfs {
         return refusal(
             format!(
-                "The check sweep played at {level_dbfs:.1} dBFS, above the                  {baseline_dbfs:.1} dBFS the measurement used. A check is never                  louder than the measurement it checks. Nothing has been                  changed. Re-run the measurement."
+                "The check sweep played at {level_dbfs:.1} dBFS, above the \
+                 {baseline_dbfs:.1} dBFS the measurement used. A check is never \
+                 louder than the measurement it checks. Nothing has been \
+                 changed. Re-run the measurement."
             ),
             level_dbfs - baseline_dbfs,
         );

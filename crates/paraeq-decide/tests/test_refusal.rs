@@ -187,6 +187,13 @@ fn every_remedy_renders_non_empty_with_no_unsubstituted_placeholder() {
                 "unsubstituted {placeholder} in {diagnostic:?}"
             );
         }
+        // A run of spaces is the signature of a missing `\` line continuation
+        // inside a multi-line Rust string literal: the source indentation ends
+        // up in the copy the user reads. Ruling R-A11.
+        assert!(
+            !diagnostic.remedy.contains("  "),
+            "a run of spaces from a missing line continuation in {diagnostic:?}"
+        );
     }
 }
 
@@ -469,7 +476,11 @@ fn too_few_positions_refuses_and_below_default_warns() {
     let diagnostic = only_diagnostic(&refused, DiagnosticCode::TooFewPositions);
     assert_eq!(diagnostic.severity, Severity::Refuse);
     assert_eq!(diagnostic.value, Some(2.0));
-    assert!(diagnostic.remedy.contains("reseat the headphone"));
+    assert!(
+        diagnostic.remedy.contains("3 reseats"),
+        "{}",
+        diagnostic.remedy
+    );
     assert_eq!(refused.verdict, Verdict::Refuse);
 
     let warned = decide(&flat_bundle(TransducerClass::Bookshelf, 5));
@@ -483,6 +494,37 @@ fn too_few_positions_refuses_and_below_default_warns() {
     let full = decide(&flat_bundle(TransducerClass::Bookshelf, 9));
     assert!(!has_code(&full, DiagnosticCode::FewPositions));
     assert!(!has_code(&full, DiagnosticCode::TooFewPositions));
+}
+
+/// `{noun}` is a NOUN that can take an "s", on both rows and both paths.
+///
+/// Ruling R-A11. `PathProfile::reposition_noun` is the imperative retry phrase
+/// ("move the mic ~30 cm", "reseat the tip"), so interpolating it rendered
+/// "We need at least 3 move the mic ~30 cms". `rules::position_noun` is the
+/// word the decision table's `{noun}s` is written for.
+#[test]
+fn the_position_count_rows_interpolate_a_noun_not_the_retry_phrase() {
+    let coupler = decide(&flat_bundle(TransducerClass::OverEar, 2));
+    let hard = only_diagnostic(&coupler, DiagnosticCode::TooFewPositions);
+    assert!(
+        hard.remedy.contains("at least 3 reseats to tell"),
+        "{}",
+        hard.remedy
+    );
+
+    let room = decide(&flat_bundle(TransducerClass::Bookshelf, 5));
+    let soft = only_diagnostic(&room, DiagnosticCode::FewPositions);
+    assert!(
+        soft.remedy.contains("We averaged 5 positions."),
+        "{}",
+        soft.remedy
+    );
+
+    // The retry phrase must not reach either row.
+    for remedy in [&hard.remedy, &soft.remedy] {
+        assert!(!remedy.contains("move the mic"), "{remedy}");
+        assert!(!remedy.contains("reseat the headphone"), "{remedy}");
+    }
 }
 
 /// σ(f) below the transition is where the positions are supposed to AGREE, so

@@ -85,14 +85,16 @@ pub use verification::VERIFICATION_RESIDUAL_MULTIPLE;
 ///    bands the fit emitted rather than of the curve they were fitted to.
 /// 6. **The refusal table**, and the verdict it implies.
 ///
-/// # Skeleton status
+/// # Two passes over the refusal table, and why
 ///
-/// This is B7a: the stages, the types and the invariants are here; the decision
-/// RULES (B7b) and the refusal table (B7c) are not. Every decision therefore
-/// carries [`Source::Default`] — the enum's own documented meaning, "we could
-/// not measure this, so we used the default" — and the correction carries no
-/// bands. Nothing here is a plausible-looking value pretending to be a decided
-/// one, which is the condition the previous `unimplemented!()` existed to avoid.
+/// Two rows of the spec's table are scoped to a POSITION rather than to the
+/// session — "Refuse *that position*" in the Severity column — so the first
+/// pass can remove positions from the cohort. When it does, the analysis is
+/// re-run over the SURVIVORS and the table is graded a second time: every curve
+/// `decide()` publishes, and every count the position-count rows grade, must be
+/// the survivors' and not the original cohort's. See [`Severity::RefusePosition`]
+/// and `refusal::dropped_positions`; the second pass cannot re-flag the rows
+/// that did the dropping, because the positions they named are gone.
 pub fn decide(bundle: &MeasurementBundle) -> DecisionSet {
     let grid = paraeq_dsp::logf::LogGrid::standard();
     let geometry = analysis::geometry(bundle);
@@ -194,13 +196,12 @@ pub fn decide(bundle: &MeasurementBundle) -> DecisionSet {
                 // seat-to-seat disagreement did it".
                 clamps: fit.clamps,
                 design_rate,
-                // PER CHANNEL, and the field's doc says "indices": `RoomFitReport`
-                // reports `dropped` as a COUNT, not as a candidate index, so the
-                // count is what there is to carry. In a healthy fit it is 0 on
-                // every channel — "a nonzero value is a bug report, not a tuning
-                // outcome" — so the two readings agree on every plan that is not
-                // already a defect. Flagged for B6/B9: the field's doc comment is
-                // the thing that should move, not this call.
+                // PER CHANNEL: `RoomFitReport` reports `dropped` as a COUNT,
+                // not as a candidate index, so one count per channel is what
+                // there is to carry. In a healthy fit it is 0 on every channel —
+                // "a nonzero value is a bug report, not a tuning outcome". The
+                // field's doc used to say "indices"; ruling R-A11 moved the doc,
+                // which is the half that was wrong.
                 dropped: fit.dropped,
                 preamp_db: decisions.preamp_db.value,
             }),

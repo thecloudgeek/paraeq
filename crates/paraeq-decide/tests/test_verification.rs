@@ -733,6 +733,57 @@ fn decide_refuses_a_verification_that_did_not_carry_its_level() {
     );
 }
 
+/// Every verification remedy renders without a run of spaces.
+///
+/// Ruling R-A11: two of the level-book refusals lost their `\` line
+/// continuations, so the string literal carried the source file's own 18-space
+/// indentation into copy a user reads ("…still at +10.0 dB,                  so
+/// we cannot…"). The check is over a run of spaces rather than over an exact
+/// count, because the indentation depth is not the bug.
+#[test]
+fn every_verification_remedy_renders_without_a_run_of_spaces() {
+    let base = verified_bundle(&VerifiedSpec::default());
+
+    let mut trimmed = offset_by(&base, 10.0);
+    trimmed.verification.as_mut().expect("carried").gain_db = 10.0;
+
+    let mut louder = base.clone();
+    louder.verification.as_mut().expect("carried").level_dbfs = base.capture.sweep.level_dbfs + 0.1;
+
+    let mut railed = offset_by(&base, 9.0);
+    railed
+        .verification
+        .as_mut()
+        .expect("carried")
+        .capture
+        .peak_dbfs = -0.1;
+
+    let mut mismatched = base.clone();
+    mismatched.verification.as_mut().expect("carried").routing = CaptureRouting::Only(0);
+
+    let mut off = offset_by(&base, 9.0);
+    off.verification
+        .as_mut()
+        .expect("carried")
+        .capture
+        .peak_dbfs = -12.0;
+
+    let mut seen = 0usize;
+    for bundle in [&trimmed, &louder, &railed, &mismatched, &off] {
+        let set = decide(bundle);
+        assert!(!set.diagnostics.is_empty());
+        for diagnostic in &set.diagnostics {
+            seen += 1;
+            assert!(!diagnostic.remedy.is_empty(), "{diagnostic:?}");
+            assert!(
+                !diagnostic.remedy.contains("  "),
+                "a run of spaces from a missing line continuation in {diagnostic:?}"
+            );
+        }
+    }
+    assert!(seen >= 5, "only {seen} remedies were graded");
+}
+
 /// **R23 / MS-21.** A railed verification capture is a refusal about the
 /// MICROPHONE, not about the correction. Blaming the correction for a clipped
 /// ADC is exactly the silent failure this row exists to prevent.

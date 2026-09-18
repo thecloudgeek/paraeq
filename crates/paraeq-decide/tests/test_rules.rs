@@ -716,6 +716,45 @@ fn an_ears_cal_with_a_target_baked_in_forces_flat() {
     );
 }
 
+/// The fallback arm must not claim a match it never made.
+///
+/// Ruling R-A11. When the bundle is unanalysable there is no curve to compare
+/// against, so `target` falls back to the first class-legal candidate — and it
+/// used to render `TargetMatched`'s "that's the curve we matched, out of 4 we
+/// tried", which is a sentence about a comparison that did not happen.
+#[test]
+fn the_target_fallback_copy_does_not_claim_a_match() {
+    // Zero positions: the analysis publishes no curves, so `match_closest_target`
+    // is never reached and the fallback arm is the only one left.
+    let bundle = synthetic_bundle(SyntheticSpec {
+        class: TransducerClass::OverEar,
+        positions: 0,
+        ..SyntheticSpec::default()
+    });
+    let target = decide(&bundle).decisions.target;
+    assert!(
+        matches!(target.value, TargetChoice::Curve { .. }),
+        "the fallback still answers with a legal candidate, got {:?}",
+        target.value
+    );
+    assert_eq!(target.source, Source::Default);
+    assert_eq!(target.rationale.key, RationaleKey::TargetFallback);
+    assert!(
+        !target.rationale.text.contains("matched"),
+        "the fallback copy claims a match: {:?}",
+        target.rationale.text
+    );
+    assert!(
+        !target.rationale.text.contains("we tried"),
+        "the fallback copy counts candidates it never compared: {:?}",
+        target.rationale.text
+    );
+    assert!(
+        target.domain.contains(&target.value),
+        "the fallback value must stay inside its own domain"
+    );
+}
+
 /// "Coupler, normal cal: `match_closest_target(class-filtered candidates)`."
 /// The matched name must be one the class permits, and the copy names it.
 #[test]
@@ -953,6 +992,38 @@ fn preamp_is_minus_the_realized_cascade_peak_with_no_headroom() {
             );
         }
     }
+}
+
+/// A zero preamp renders as "0.0 dB", never "-0.0 dB".
+///
+/// Ruling R-A10. `preamp_db` is `≤ 0` and the copy renders its magnitude as
+/// `-preamp_db`; IEEE negation turns `0.0` into `-0.0`, which `{:.1}` writes
+/// with a minus sign. "We turned everything down -0.0 dB" is user-facing copy
+/// with a sign on a number that has none.
+#[test]
+fn a_zero_preamp_renders_without_a_negative_zero() {
+    for class in EVERY_CLASS {
+        let set = decide(&lumpy_bundle(class));
+        let text = &set.decisions.preamp_db.rationale.text;
+        assert!(
+            !text.contains("-0.0") && !text.contains("\u{2212}0.0"),
+            "{class:?}: negative zero in {text:?}"
+        );
+    }
+    // And the case the bug is actually about: a cut-only plan, where the
+    // preamp IS exactly zero.
+    let cut_only = decide(&minimal_bundle(TransducerClass::Bookshelf));
+    assert_eq!(cut_only.decisions.preamp_db.value, 0.0);
+    assert!(
+        cut_only
+            .decisions
+            .preamp_db
+            .rationale
+            .text
+            .contains("down 0.0 dB"),
+        "{:?}",
+        cut_only.decisions.preamp_db.rationale.text
+    );
 }
 
 /// `max_filters`: "Drop any band with `|gain| < flatness/2`", and the binding
@@ -1288,6 +1359,7 @@ fn every_rationale_key_matches_its_field_and_renders_non_empty() {
                 "smoothing" => &[RationaleKey::Smoothing],
                 "target" => &[
                     RationaleKey::TargetCalBakedIn,
+                    RationaleKey::TargetFallback,
                     RationaleKey::TargetMatched,
                     RationaleKey::TargetRoomParametric,
                 ],
