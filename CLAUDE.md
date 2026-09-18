@@ -72,6 +72,23 @@ python prototype/tools/generate_fixtures.py   # regenerates fixtures/ — commit
   - `paraeq-engine`: no Tauri deps (daemon-ready). No locks/allocation on the
     realtime path. Every exit path runs the full teardown sequence ending in
     tap destruction — the system must never be left muted.
+  - `paraeq-stimulus`: the verification helper child process — one `[[bin]]`,
+    plus the `lib.rs` its integration tests link. Its manifest names neither
+    `paraeq-measure` nor `paraeq-decide` nor Tauri; everything it needs from
+    `paraeq-measure` (`RenderSink`, `StreamFormat`, `MeasureError`,
+    `ABSOLUTE_MAX_DBFS_RMS`, the abort envelope) arrives through
+    `paraeq-coreaudio`'s documented re-export surface, so a missing re-export
+    is a build error rather than a silently re-added dependency. The
+    transitive link through `paraeq-coreaudio` is unavoidable — open owner
+    question **E19**.
+  - **Two `unsafe` blocks live outside `paraeq-coreaudio` and are sanctioned**,
+    because neither is CoreAudio FFI: `crates/paraeq-stimulus/src/signals.rs`'s
+    `libc::signal` (the SIGTERM handler, without which a terminated helper
+    leaks its private render aggregate onto the output device) and
+    `desktop/src-tauri/src/verify_seam.rs`'s `libc::kill` (the SIGTERM rung
+    itself — `std`'s `Child::kill()` is SIGKILL). One block each, with a SAFETY
+    comment naming its preconditions, pending owner confirmation as **E18** and
+    **E20**. A third one arrives only the same way.
   - Forbidden deps: ndarray, scirs2-anything, fundsp.
 - **Alphabetical ordering**: imports, dict keys, dep lists where order doesn't
   matter functionally.
