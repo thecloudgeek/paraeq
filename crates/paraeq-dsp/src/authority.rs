@@ -645,6 +645,21 @@ impl AuthorityAt {
         self.max_cut_db < self.excursion_db * (1.0 - 1e-12)
     }
 
+    /// Whether the envelope licenses ANY correction here, of either sign.
+    ///
+    /// The band predicate, named. It is the second half of
+    /// [`authority_band_mask`]'s definition — "`{ f : authority.at(f).max_boost_db
+    /// > 0 || max_cut_db > 0 }`" — and it exists as a method because a second
+    /// caller needs the per-frequency question without a range:
+    /// `autofit::cut_limit_db` has to tell "a region we declined to correct"
+    /// apart from "a region whose ceiling happens to be low", and re-spelling
+    /// the disjunction there would be the second copy
+    /// `the_authority_band_mask_is_the_same_function_the_gate_and_the_stop_both_use`
+    /// exists to prevent.
+    pub fn licenses_correction(&self) -> bool {
+        self.max_boost_db > 0.0 || self.max_cut_db > 0.0
+    }
+
     /// The `Clamp` variant describing a gain change at this frequency.
     pub fn gain_clamp(&self, from: f64, to: f64) -> Clamp {
         if self.throttled_by_sigma() {
@@ -904,8 +919,7 @@ pub fn authority_band_mask(
             if !f.is_finite() || f < low_hz || f > high_hz {
                 return false;
             }
-            let at = curve.at(f);
-            at.max_boost_db > 0.0 || at.max_cut_db > 0.0
+            curve.at(f).licenses_correction()
         })
         .collect()
 }

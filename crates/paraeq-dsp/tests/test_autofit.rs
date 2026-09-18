@@ -17,10 +17,11 @@ mod common;
 use common::Case;
 use paraeq_dsp::authority::{
     authority_band_mask, build_authority, width_oct_for_q, AuthorityCurve, AuthorityPolicy, Clamp,
-    DEFAULT_MIN_DIP_WIDTH_OCT,
+    COUPLER_CUTOFF_HZ, DEFAULT_MIN_DIP_WIDTH_OCT,
 };
 use paraeq_dsp::autofit::{
-    auto_fit_parametric_eq, auto_fit_room, RoomFitPolicy, RoomFitReport, SHELF_Q,
+    auto_fit_parametric_eq, auto_fit_room, RoomFitPolicy, RoomFitReport, CEILING_SLOP_DB,
+    NO_AUTHORITY_CUT_LEAK_DB, SHELF_Q,
 };
 use paraeq_dsp::logf::LogGrid;
 use paraeq_dsp::peq::{EQBand, FilterType, ParametricEQ};
@@ -141,6 +142,124 @@ fn residual_rms_over_band(
     }
     assert!(n > 0, "the authority band must not be empty in this test");
     (sum_sq / n as f64).sqrt()
+}
+
+/// A coupler envelope — **exactly zero above 10 kHz** — must still emit bands
+/// below it.
+///
+/// The spec's own words for the envelope are "On the coupler path,
+/// `A_base(f) = 0` above 10 kHz", and that hard zero met a cascade ceiling
+/// checked with a float-equality slop of 1e-9. Every realizable IIR band has a
+/// non-zero magnitude at EVERY frequency — a 1.5 kHz peaking filter leaves
+/// about 9e-3 dB at 13 kHz — so `shrink_into_cascade` answered "does not fit"
+/// for every candidate, bisected each one down to a gain below `min_gain_db`,
+/// and `auto_fit_room` returned ZERO bands. Both coupler paths, every in-ear
+/// and over-ear measurement, no correction at all.
+///
+/// The envelope bounds the CORRECTION, and the tail of a filter placed
+/// elsewhere is not one: no band may be placed in the zero region, and this
+/// test asserts that too.
+#[test]
+fn a_coupler_envelope_that_is_zero_above_10_khz_still_fits_bands_below_it() {
+    let grid = LogGrid::standard();
+    let curve = build_authority(&grid, &vec![1.0; grid.len()], &AuthorityPolicy::coupler())
+        .expect("valid inputs");
+
+    // A 6 dB peak at 1.5 kHz, comfortably inside the region the envelope
+    // licenses 2 dB of cut in.
+    let centre = nearest_bin_hz(&grid, 1500.0);
+    let correction: Vec<f64> = gaussian(&grid, centre, -6.0, 0.5);
+    let policy = RoomFitPolicy {
+        correction_range: (20.0, 20_000.0),
+        flatness_target_db: 1.0,
+        shelves: false,
+    };
+    let report = fit(&correction, &curve, 10, 0.5, Some(&policy));
+
+    assert!(
+        !report.bands.is_empty(),
+        "a coupler fit emitted nothing; clamps were {:?}",
+        report.clamps
+    );
+    for band in &report.bands {
+        assert!(
+            band.fc < COUPLER_CUTOFF_HZ,
+            "no band may be PLACED where the envelope licenses nothing, got {band:?}"
+        );
+    }
+
+    // And the cascade still respects the zero region to the two tolerances the
+    // ceiling states — and the ASYMMETRY is the design: what survives there is
+    // a cut, which cannot damage a driver, fill a null or ring, while a boost
+    // stays held to `CEILING_SLOP_DB`.
+    let realized = ParametricEQ {
+        bands: report.bands.clone(),
+        sample_rate: SR,
+    }
+    .frequency_response(grid.freqs());
+    let zero_region: Vec<f64> = grid
+        .freqs()
+        .iter()
+        .zip(&realized)
+        .filter(|(f, _)| !curve.at(**f).licenses_correction())
+        .map(|(_, r)| *r)
+        .collect();
+    assert!(
+        !zero_region.is_empty(),
+        "the coupler envelope has a zero region"
+    );
+    let worst_cut = zero_region.iter().copied().fold(0.0f64, |a, r| a.max(-r));
+    let worst_boost = zero_region.iter().copied().fold(0.0f64, f64::max);
+    assert!(
+        worst_cut <= NO_AUTHORITY_CUT_LEAK_DB,
+        "the cascade cuts {worst_cut} dB inside the zero-envelope region"
+    );
+    assert!(
+        worst_boost <= CEILING_SLOP_DB,
+        "a BOOST in the zero region is what the envelope exists to forbid, got {worst_boost} dB"
+    );
+    assert!(
+        worst_cut > 0.0,
+        "non-vacuity: a real biquad DOES leave something there, which is the \
+         whole reason a float-equality ceiling could not be right"
+    );
+}
+
+/// A no-authority region forgives a leaked CUT and never a leaked BOOST.
+///
+/// The asymmetry is the whole design of `NO_AUTHORITY_CUT_LEAK_DB`: what the
+/// envelope guards against is the corrector DRIVING the system — excursion, a
+/// filled null, a resonance that rings longer than the problem it fixes — and
+/// every one of those is a boost. A dip immediately under the coupler cutoff
+/// asks for exactly the boost that must not leak.
+#[test]
+fn a_leaked_boost_is_never_forgiven_where_the_envelope_licenses_nothing() {
+    let grid = LogGrid::standard();
+    let curve = build_authority(&grid, &vec![1.0; grid.len()], &AuthorityPolicy::coupler())
+        .expect("valid inputs");
+    // A DIP just under the cutoff: the fit would answer it with a boost, and a
+    // boost's skirt reaches over the step.
+    let centre = nearest_bin_hz(&grid, 8000.0);
+    let correction: Vec<f64> = gaussian(&grid, centre, 6.0, 0.5);
+    let policy = RoomFitPolicy {
+        correction_range: (20.0, 20_000.0),
+        flatness_target_db: 1.0,
+        shelves: false,
+    };
+    let report = fit(&correction, &curve, 10, 0.5, Some(&policy));
+    let realized = ParametricEQ {
+        bands: report.bands.clone(),
+        sample_rate: SR,
+    }
+    .frequency_response(grid.freqs());
+    for (f, r) in grid.freqs().iter().zip(&realized) {
+        let at = curve.at(*f);
+        assert!(
+            *r <= at.max_boost_db + CEILING_SLOP_DB,
+            "cascade boosts {r} dB at {f} Hz against a ceiling of {}",
+            at.max_boost_db
+        );
+    }
 }
 
 // ──────────────────────── the residual-RMS stop (B4.1) ───────────────────────

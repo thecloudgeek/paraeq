@@ -190,6 +190,66 @@ fn half_amplitude_crossings(residual: &[f64], peak_idx: usize) -> (Option<usize>
     (lo, hi)
 }
 
+/// How far the realized cascade may exceed the envelope before a band is
+/// refused, in dB.
+///
+/// **This is a physical tolerance, not a float-equality epsilon**, and it
+/// used to be the latter (`1e-9`) — a defect that cost two of the four
+/// transducer paths their entire correction. `COUPLER_EXCURSION_DB` is
+/// EXACTLY zero above 10 kHz, which is the decision-engine spec's own
+/// "On the coupler path, `A_base(f) = 0` above 10 kHz"; and every
+/// realizable IIR band has a non-zero magnitude at every frequency, so a
+/// 1.5 kHz peaking filter's tail at 13 kHz (measured: 8.8e-3 dB) exceeded a
+/// 1e-9 ceiling by seven orders of magnitude. `fits` was therefore false for
+/// every candidate on the coupler path, the bisection shrank each one below
+/// `min_gain_db`, and `auto_fit_room` returned **zero bands for every in-ear
+/// and over-ear measurement**.
+///
+/// The envelope bounds the CORRECTION; a skirt is not a correction. No band
+/// is ever PLACED in a zero-envelope region — `admissible` refuses it,
+/// because `max_cut.max(max_boost) >= min_gain_db` is false there — so what
+/// this forgives is only what a filter placed elsewhere leaves behind.
+///
+/// 0.1 dB is the resolution at which this product can state a gain at all:
+/// `ParametricEQ::export_autoeq_format` and every rationale render gains to
+/// one decimal, so an overshoot under it is below the smallest number the
+/// app can name, and far below the ~0.5 dB narrowband JND. It bounds the
+/// CASCADE, not one band, so the accumulated tails of a ten-band fit are
+/// bounded by it too — a fit whose skirts really do add up to 0.1 dB in a
+/// no-correction band stops placing filters, which is the ceiling working
+/// rather than failing.
+pub const CEILING_SLOP_DB: f64 = 0.1;
+
+/// How far the realized cascade may CUT inside a region the envelope licenses
+/// nothing in, in dB.
+///
+/// A region with `max_cut_db == max_boost_db == 0` is one the corrector may not
+/// TARGET — `admissible` already refuses to place a band there — and that is a
+/// different claim from "no filter placed anywhere else may have a magnitude
+/// here". No realizable filter bank has a magnitude of exactly 0 dB at any
+/// frequency, so the second claim forbids every filter: measured on the coupler
+/// path, a −2 dB peaking band at 8 kHz (Q 2.6, inside an envelope that licenses
+/// 2 dB there) leaves 0.65 dB at 10 kHz, where the coupler envelope steps to
+/// zero. Under a `CEILING_SLOP_DB` bound that band shrinks to −0.31 dB, falls
+/// under `min_gain_db` and is struck — so the envelope licensed a correction at
+/// 8 kHz that no realizable filter could deliver, which is a policy
+/// contradiction rather than a safety property.
+///
+/// **Only the CUT half is loosened, and that asymmetry is the whole design.**
+/// What the envelope guards is the corrector DRIVING the system: excursion,
+/// filling a null, a resonance that rings longer than the problem it fixes —
+/// every one of those is a BOOST, and boosts stay bounded by
+/// `max_boost_db + CEILING_SLOP_DB` everywhere, which in a no-authority region
+/// is 0.1 dB. A cut that leaks out of a neighbouring filter cannot damage a
+/// driver, cannot fill a null and cannot ring. `docs/decisions/...` § D-E puts
+/// it in one line: "cuts are free, boosts cost headroom and can damage
+/// drivers."
+///
+/// 1.0 dB, because that is the tightest `flatness_target_db` any path ships
+/// (the coupler's) — an unintended cut smaller than the error the fit is
+/// content to leave behind is not a correction anyone is entitled to notice.
+pub const NO_AUTHORITY_CUT_LEAK_DB: f64 = 1.0;
+
 /// What one channel's room fit produced: the bands, every clamp and veto that
 /// shaped them, and the count of bands the stability funnel dropped.
 ///
@@ -206,6 +266,13 @@ pub struct RoomFitReport {
     /// Every clamp and veto, in the order they happened.
     pub clamps: Vec<Clamp>,
     /// Bands the Jury retry funnel could not stabilize (`authority.band_dropped`).
+    ///
+    /// **Stability only.** A candidate the ceiling had no headroom left for is
+    /// NOT counted here: that is a tuning outcome the envelope is supposed to
+    /// produce, and it is reported through [`Self::clamps`] as the
+    /// `GainToExcursion` entry naming the gain that was asked for. A nonzero
+    /// `dropped` is a bug report; a nonzero clamp count is a correction being
+    /// shaped.
     /// With the Q cap applied this should always be 0; a nonzero value is a
     /// bug report, not a tuning outcome.
     pub dropped: usize,
@@ -474,6 +541,18 @@ fn fit_one_channel(
                 // than walking the whole grid one struck bin at a time; that
                 // is what `a_spent_ceiling_does_not_burn_the_band_budget`
                 // pins.
+                //
+                // **Deliberately NOT counted in `report.dropped`.** That field
+                // is the Jury/stability funnel's count, and its own doc says a
+                // nonzero value "is a bug report, not a tuning outcome" — an
+                // unstable design is a defect, while a spent ceiling is the
+                // envelope doing exactly what it exists to do. Counting the two
+                // together would make every healthy ceiling-limited fit look
+                // like a stability failure. The reporting a NoHeadroom strike
+                // owes the drawer is already there: `commit_band` pushes
+                // `clamp_band`'s own clamps BEFORE it can answer `NoHeadroom`,
+                // so the `GainToExcursion` entry naming the requested gain and
+                // the ceiling is in `report.clamps` either way.
                 admissible[idx] = false;
             }
         }
@@ -684,6 +763,20 @@ fn remaining_headroom(at: &authority::AuthorityAt, applied: f64) -> (f64, f64) {
     )
 }
 
+/// The most the cascade may CUT at one frequency: the envelope's own ceiling
+/// plus [`CEILING_SLOP_DB`] where the envelope licenses something, and
+/// [`NO_AUTHORITY_CUT_LEAK_DB`] where it licenses nothing.
+///
+/// One function because two call sites must not disagree about what "inside the
+/// envelope" means, and because the asymmetry needs a name to be argued with.
+fn cut_limit_db(at: &authority::AuthorityAt) -> f64 {
+    if at.licenses_correction() {
+        at.max_cut_db + CEILING_SLOP_DB
+    } else {
+        NO_AUTHORITY_CUT_LEAK_DB
+    }
+}
+
 /// Reduce `band`'s gain until adding it keeps the **whole cascade** inside the
 /// authority curve at every bin, and return it with its realized response.
 ///
@@ -716,9 +809,6 @@ fn shrink_into_cascade(
 ) -> Option<(EQBand, Vec<f64>)> {
     /// Enough halvings to land within ~0.4% of the true limit on a 20 dB band.
     const BISECTION_STEPS: usize = 12;
-    /// Bins are products of interpolations; a strict `<=` would reject a band
-    /// that lands exactly on the ceiling.
-    const CEILING_SLOP_DB: f64 = 1e-9;
 
     let response_at = |gain_db: f64| -> Vec<f64> {
         ParametricEQ {
@@ -739,7 +829,7 @@ fn shrink_into_cascade(
         freqs.iter().zip(applied).zip(response).all(|((&f, a), r)| {
             let at = authority.at(f);
             let total = a + r;
-            total <= at.max_boost_db + CEILING_SLOP_DB && total >= -at.max_cut_db - CEILING_SLOP_DB
+            total <= at.max_boost_db + CEILING_SLOP_DB && total >= -cut_limit_db(&at)
         })
     };
 

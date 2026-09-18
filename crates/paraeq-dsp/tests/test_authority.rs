@@ -14,7 +14,9 @@ use paraeq_dsp::authority::{
     DEFAULT_EXCURSION_DB, DEFAULT_MIN_DIP_WIDTH_OCT, EGD_FLATNESS_PERIODS, Q_CLAMP, ROOM_Q_CEILING,
     SIGMA_FULL_DB, SIGMA_NONE_DB,
 };
-use paraeq_dsp::autofit::{auto_fit_parametric_eq, auto_fit_room, RoomFitReport};
+use paraeq_dsp::autofit::{
+    auto_fit_parametric_eq, auto_fit_room, RoomFitReport, CEILING_SLOP_DB, NO_AUTHORITY_CUT_LEAK_DB,
+};
 use paraeq_dsp::fr;
 use paraeq_dsp::logf::{resample_db_to_log_grid, LogGrid, Prefilter};
 use paraeq_dsp::peq::{EQBand, FilterType};
@@ -841,8 +843,24 @@ proptest! {
         let cascade = cascade_db(&report.bands, &grid);
         for (&f, &total) in grid.freqs().iter().zip(&cascade) {
             let at = curve.at(f);
+            // The fit's own two tolerances, not a third number a test invented:
+            // a second definition of "inside the envelope" is a second thing to
+            // drift. Both are PHYSICAL rather than float-equality allowances —
+            // a realizable biquad has a non-zero magnitude at every frequency,
+            // so no cascade can sit exactly on a zero ceiling — and the
+            // asymmetry is the design: a BOOST is what the envelope guards
+            // against (excursion, filled nulls, ringing) and stays bounded by
+            // `CEILING_SLOP_DB` everywhere, including where the envelope
+            // licenses nothing; a CUT leaking out of a neighbouring filter can
+            // do none of those, and is bounded by `NO_AUTHORITY_CUT_LEAK_DB`
+            // there. See the two constants' own docs.
+            let cut_limit = if at.licenses_correction() {
+                at.max_cut_db + CEILING_SLOP_DB
+            } else {
+                NO_AUTHORITY_CUT_LEAK_DB
+            };
             prop_assert!(
-                total <= at.max_boost_db + 0.05 && total >= -at.max_cut_db - 0.05,
+                total <= at.max_boost_db + CEILING_SLOP_DB && total >= -cut_limit,
                 "cascade {} dB at {} Hz outside [{}, {}]",
                 total, f, -at.max_cut_db, at.max_boost_db
             );
