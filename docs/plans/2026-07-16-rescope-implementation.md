@@ -4,18 +4,22 @@
 **Specs covered:** the six `docs/specs/2026-07-15-*.md` rescope specs
 (decision-engine, engine-hardening, measurement-safety, measurement-suite,
 room-dsp, wizard).
-**Status (updated 2026-09-16):** Stages 1–5 are implemented
+**Status (updated 2026-09-18):** Stages 1–5 are implemented
 (`feature/rescope-stage1` → `-stage2` → `-stage3` → `-stage4` → `-stage5`) and
-the shell branch is merged on top of them. **The merge landed on
-`feature/integration`, not on `main`** (merge commit `8334583`, parents
-`c180658` + `2752c44`, forked from `main` at `179cd34`); `main` is untouched by
-rescope work, and promoting `feature/integration` to it still waits on the
-owner's ears-on 12-point acceptance run. Stage 2's merge-gated remainder
-(engine-hardening R1-1's engine half, R1-8, R1-6) and wizard/1 are unblocked
-and **in flight on `feature/integration`** as short-lived worktree branches;
-item 21 (`TapStatus` over the live `TapSystem`) is unblocked and closed as a
-question. Stage 5 closed cross-spec question 2 (the autofit shape). Still open
-from Stage 2: the Tier-4 REW characterization corpus. Next: Stage 6.
+the shell branch is merged on top of them. **Stage 6 is built on
+`feature/pb-int`** (worktree `.worktrees/pb-int`), and the Stage-6 review's
+fixes are landing on it now. The gating shell merge landed on
+`feature/integration`, not on `main` (merge commit `8334583`, parents
+`c180658` + `2752c44`, forked from `main` at `179cd34`); **`main` is untouched**
+by rescope work, and promoting anything to it still waits on the owner's ears-on
+12-point acceptance run. **Two Stage-6 gates are the owner's and no agent may
+close them:** the `fixtures/decide/` bless (**B10**) and the rig session
+(**B0**'s spike + **B16**'s hardware verification tests), whose runbook is in
+`docs/CONTEXT.md`. Stage 2's merge-gated remainder (engine-hardening R1-1's
+engine half, R1-8, R1-6) and wizard/1 landed; item 21 (`TapStatus` over the live
+`TapSystem`) is closed as a question. Stage 5 closed cross-spec question 2 (the
+autofit shape). Still open from Stage 2: the Tier-4 REW characterization corpus.
+**Next: Stage 7.**
 
 This plan sequences the six specs into seven stages. It exists because the
 specs cross-reference each other heavily (shared deliverables, ordering
@@ -27,8 +31,9 @@ the authoritative requirements are always the spec text itself.
 
 ## Branch strategy
 
-**Status (2026-09-16): the gating merge has landed — on
-`feature/integration`, not on `main`.** `feature/rust-port-tauri-shell` was
+**Status (2026-09-18): the gating merge has landed — on
+`feature/integration`, not on `main` — and Stage 6 is built one branch further
+out, on `feature/pb-int`.** `feature/rust-port-tauri-shell` was
 merged into the rescope stack exactly as it stood (merge `8334583`, parents
 `c180658` + `2752c44`, base `179cd34`): the measurement-suite spec's "do not
 reopen" ruling held, and the 27-commit branch was never rebased onto new work.
@@ -37,8 +42,10 @@ is **struck** — not softened — and every item this plan deferred behind the
 merge is unblocked.
 
 - **Where the work happens now.** Short-lived worktree branches
-  (`.worktrees/<name>`) forked from **`feature/integration`** and merged back
-  into it. `main` stays at `179cd34` until promotion. The owner's ears-on
+  (`.worktrees/<name>`) forked from **`feature/pb-int`** — Stage 6's integration
+  branch, itself forked from `feature/integration` — and merged back into it.
+  `feature/integration` remains the base for anything that is not Stage 6.
+  `main` stays at `179cd34` until promotion. The owner's ears-on
   12-point acceptance run now gates **promoting `feature/integration` to
   `main`** — it no longer gates doing the work. It is still the single cheapest
   unblock in the program, because nothing ships to `main` without it.
@@ -54,9 +61,11 @@ merge is unblocked.
   `crates/paraeq-engine/src/controller.rs`, so concurrent worktrees collide in
   `EngineState`, `publish()`, `effectively_equal()` and `start_with()`.
   Merged `EngineState` field order, alphabetical per CLAUDE.md, on top of the
-  shell's frozen shape: `auto_preamp_db, bypass, clipped_samples, correction,
-  correction_rate_mismatch, enabled, frame_mismatch_blocks, gain_db,
-  input_peak, input_peak_session, invalid_samples, latency_ms, output_peak,
+  shell's frozen shape — **eighteen fields** since Stage 6 published the two
+  build counts for verification gate 2 (§D-10): `auto_preamp_db, bands_dropped,
+  bypass, clipped_samples, correction, correction_rate_mismatch, enabled,
+  frame_mismatch_blocks, gain_db, input_peak, input_peak_session,
+  invalid_samples, latency_ms, output_peak, sections_substituted,
   self_excluded, status, stream`.
 - **All three hand-mirrored wire tripwires move in the same commit** as any
   `EngineState` change. There is no codegen, so a partial change is red CI in a
