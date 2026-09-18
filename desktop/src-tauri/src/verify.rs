@@ -642,6 +642,126 @@ mod tests {
         assert_eq!(lifted.installed.design_rate, 48_000.0);
         assert_ne!(lifted.running_rate_hz, lifted.installed.design_rate);
     }
+
+    // ── R-B4: a panicking worker must not wedge the slot ───────────────────
+
+    /// The worker's publish used to be its last statement, so a panic in
+    /// `run()`/`finish()`/`grade()` skipped it: the slot stayed `Running` with
+    /// an abort handle for the life of the process, `arm` refused forever, and
+    /// `abort` could not reset it. The user's only recovery was to restart
+    /// ParaEQ.
+    #[test]
+    fn a_panicking_worker_publishes_failed_instead_of_staying_running() {
+        let state = super::worker_state(|| panic!("injected: the pass blew up mid-grade"));
+        match state {
+            VerifyState::Failed {
+                code,
+                remedy,
+                summary,
+            } => {
+                assert_eq!(code, None, "a panic carries no diagnostic number");
+                assert!(
+                    summary.contains("injected: the pass blew up mid-grade"),
+                    "the panic's own message must survive into the summary: {summary}"
+                );
+                assert!(
+                    remedy
+                        .expect("a panic still gets a remedy")
+                        .contains("ParaEQ"),
+                    "and the remedy must say it is our bug, not theirs"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_worker_that_returns_normally_publishes_what_it_returned() {
+        let state = super::worker_state(|| VerifyState::Failed {
+            code: Some(42),
+            remedy: None,
+            summary: "a refusal, not a panic".to_owned(),
+        });
+        assert!(
+            matches!(state, VerifyState::Failed { code: Some(42), .. }),
+            "the guard must be transparent on the normal path, got {state:?}"
+        );
+    }
+
+    /// `Running` is published before the worker starts and cleared by the
+    /// worker's own last act. A `Running` whose worker has finished therefore
+    /// means the clearing never happened — stale, not live.
+    #[test]
+    fn a_running_state_whose_worker_has_finished_is_cleared() {
+        let mut runtime = super::VerifyRuntime {
+            state: VerifyState::Running,
+            worker: Some(std::thread::spawn(|| {})),
+            ..Default::default()
+        };
+        // Wait for the thread to actually be finished, not merely spawned.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !runtime.worker.as_ref().expect("a worker").is_finished() {
+            assert!(Instant::now() < deadline, "the empty worker never finished");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(super::clear_stale_running(&mut runtime));
+        assert!(matches!(runtime.state, VerifyState::Idle));
+        assert!(runtime.worker.is_none());
+    }
+
+    /// The other side of the same rule: a pass that really is running must not
+    /// be cleared out from under itself, or `arm` would happily start a second
+    /// helper against the same device.
+    #[test]
+    fn a_running_state_with_a_live_worker_is_left_alone() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let mut runtime = super::VerifyRuntime {
+            state: VerifyState::Running,
+            worker: Some(std::thread::spawn(move || {
+                let _ = rx.recv();
+            })),
+            ..Default::default()
+        };
+
+        assert!(!super::clear_stale_running(&mut runtime));
+        assert!(matches!(runtime.state, VerifyState::Running));
+        assert!(runtime.worker.is_some());
+
+        drop(tx);
+        runtime
+            .worker
+            .take()
+            .expect("a worker")
+            .join()
+            .expect("it ends");
+    }
+
+    /// A slot that is not `Running` at all is never touched — an `Armed` pass
+    /// waiting on MS-18 must survive an `arm` refusal, and a `Complete` report
+    /// must survive being looked at.
+    #[test]
+    fn a_slot_that_is_not_running_is_never_cleared() {
+        for state in [
+            VerifyState::Idle,
+            VerifyState::Armed {
+                device_name: "AirPods Max".to_owned(),
+                level_dbfs: -21.0,
+                projected_spl_db: 78.0,
+            },
+        ] {
+            let mut runtime = super::VerifyRuntime {
+                state: state.clone(),
+                ..Default::default()
+            };
+            assert!(!super::clear_stale_running(&mut runtime));
+            assert_eq!(
+                format!("{:?}", runtime.state),
+                format!("{state:?}"),
+                "the slot must be untouched"
+            );
+        }
+    }
 }
 
 // ══════════════════════════ the verification runtime ═══════════════════════
@@ -867,7 +987,11 @@ pub fn arm(app: &tauri::AppHandle, request: VerifyArmRequest) -> Result<VerifyAr
     let shared = app.state::<AppShared>();
 
     {
-        let runtime = shared.verify.lock().unwrap();
+        let mut runtime = shared.verify.lock().unwrap();
+        // R-B4: a `Running` whose worker has finished is a stale label, not a
+        // live pass. Clearing it here is what keeps a worker panic from
+        // refusing every later arm for the life of the process.
+        clear_stale_running(&mut runtime);
         if runtime.armed.is_some() || matches!(runtime.state, VerifyState::Running) {
             return Err("a verification pass is already armed or running".to_owned());
         }
@@ -961,23 +1085,32 @@ pub fn run(
     let worker = std::thread::Builder::new()
         .name("paraeq-verify".into())
         .spawn(move || {
-            let outcome = armed.pass.run();
-            // `finish` runs teardown again (idempotent) and hands back the
-            // MS-23 log by value, so the pass is fully terminated before the
-            // state is published.
-            let ArmedPass {
-                bundle,
-                capture_channels,
-                pass,
-                plan,
-            } = armed;
-            let _log = pass.finish();
-            let state = match outcome {
-                Ok(outcome) => VerifyState::Complete {
-                    report: grade(&outcome, bundle, plan, capture_channels),
-                },
-                Err(e) => failed_state(&e),
-            };
+            // R-B4. The publish used to BE the worker's last statement, so a
+            // panic in run()/finish()/grade() skipped it and left the slot at
+            // `Running` with an abort handle, for the life of the process:
+            // `arm` refused forever and `abort` could not reset it. Everything
+            // that matters for safety already runs on unwind — dropping
+            // `armed` tears the pass down and releases the lease — so only the
+            // published state lied. Now a panic publishes `Failed`.
+            let state = worker_state(move || {
+                let outcome = armed.pass.run();
+                // `finish` runs teardown again (idempotent) and hands back the
+                // MS-23 log by value, so the pass is fully terminated before
+                // the state is published.
+                let ArmedPass {
+                    bundle,
+                    capture_channels,
+                    pass,
+                    plan,
+                } = armed;
+                let _log = pass.finish();
+                match outcome {
+                    Ok(outcome) => VerifyState::Complete {
+                        report: grade(&outcome, bundle, plan, capture_channels),
+                    },
+                    Err(e) => failed_state(&e),
+                }
+            });
             {
                 let shared = worker_app.state::<AppShared>();
                 let mut runtime = shared.verify.lock().unwrap();
@@ -990,6 +1123,69 @@ pub fn run(
 
     shared.verify.lock().unwrap().worker = Some(worker);
     Ok(())
+}
+
+/// Run the verification worker's body and publish a state whatever happens.
+///
+/// R-B4. A panic here is not a safety event — the pass's own `Drop` runs on
+/// unwind, so the helper is stopped and reaped, the capture stopped, the trim
+/// restored and the lease released — but it IS a liveness event: without this,
+/// the slot keeps `Running` forever and the user cannot verify again without
+/// restarting ParaEQ.
+///
+/// `AssertUnwindSafe` is honest here rather than a silencer: the closure owns
+/// the `ArmedPass` outright, and nothing it touches is observed afterwards
+/// except through the `VerifyState` this returns.
+fn worker_state(body: impl FnOnce() -> VerifyState) -> VerifyState {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(state) => state,
+        Err(payload) => VerifyState::Failed {
+            // No `MeasurementDiagnostic`, so no canned remedy: a panic is a
+            // ParaEQ bug, and the only honest advice is to say so.
+            code: None,
+            remedy: Some(
+                "This is a fault in ParaEQ itself, not something you did. Try the verification \
+                 again; if it keeps happening, the message above is what to report."
+                    .to_owned(),
+            ),
+            summary: format!("the verification worker panicked: {}", panic_text(&payload)),
+        },
+    }
+}
+
+/// The panic's own message, when it left one. `panic!("...")` payloads are a
+/// `&str` or a `String`; anything else has no text to show.
+fn panic_text(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        return (*s).to_owned();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "no message".to_owned()
+}
+
+/// Is the slot's `Running` state STALE — nothing left to wait for?
+///
+/// R-B4's second half. `Running` is published before the worker starts and
+/// cleared by the worker's own last act, so a `Running` whose worker has
+/// already finished means the clearing never happened. Treat that as reset-able
+/// rather than as a live pass: the alternative is the wedge itself, where
+/// `arm` refuses forever because a thread that no longer exists is "running".
+///
+/// A finished handle is dropped rather than joined — `is_finished` is already
+/// the answer, and `shutdown` is where joining belongs.
+fn clear_stale_running(runtime: &mut VerifyRuntime) -> bool {
+    if !matches!(runtime.state, VerifyState::Running) {
+        return false;
+    }
+    if runtime.worker.as_ref().is_some_and(|w| !w.is_finished()) {
+        return false;
+    }
+    runtime.worker = None;
+    runtime.abort = None;
+    runtime.state = VerifyState::Idle;
+    true
 }
 
 /// Abort whatever is armed or running, through the MS-14 ladder.
@@ -1007,6 +1203,9 @@ pub fn abort(app: &tauri::AppHandle) -> Result<(), String> {
         if let Some(abort) = runtime.abort.as_ref() {
             abort.trigger(AbortReason::UserRequest);
         }
+        // R-B4: the same stale-`Running` reset, so the Stop button can clear a
+        // slot a panicked worker left behind instead of doing nothing visible.
+        clear_stale_running(&mut runtime);
         runtime.armed.take()
     };
     if let Some(armed) = armed {
