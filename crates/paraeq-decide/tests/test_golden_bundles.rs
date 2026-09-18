@@ -169,14 +169,17 @@ fn decide_reproduces_expected_json_byte_for_byte() {
 
     for case in CASES {
         let loaded = GoldenCase::load(case);
-        let produced = golden::canonical_json(&decide(&loaded.bundle()));
+        let bundle = loaded.bundle();
+        let set = decide(&bundle);
+        let produced = golden::canonical_json(&set);
 
         if let Some(root) = &root {
             let path = root.join(case).join("expected.json");
             std::fs::create_dir_all(path.parent().expect("a parent directory"))
                 .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             std::fs::write(&path, &produced).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-            eprintln!("blessed {}", path.display());
+            check_the_bless(case, &path, &bundle, &set, &produced);
+            eprintln!("blessed {} ({} bytes)", path.display(), produced.len());
             continue;
         }
 
@@ -351,6 +354,59 @@ fn blessing_is_off_unless_the_env_var_is_set() {
         golden::bless_mode(&only(golden::BLESS_OUT_VAR, "/tmp/paraeq-dry-bless")),
         BlessMode::To(std::path::PathBuf::from("/tmp/paraeq-dry-bless"))
     );
+}
+
+/// A bless checks its own output before the owner is asked to sign it.
+///
+/// Three things, at the one moment the file is being created and while the
+/// bundle that produced it is still in hand:
+///
+/// 1. It loads back. A `DecisionSet` that cannot be deserialized would be a
+///    freeze over a file nothing can read — and this is also where
+///    `AuthorityCurve`'s sealed `try_from` gets exercised, so a blessed curve
+///    that cannot round-trip back into a VALID curve fails here rather than in
+///    the next run's canonicalization test.
+/// 2. It is canonical, and it is semantically what was decided. Writing a file
+///    that `expected_json_is_canonical` would then reject hands the owner a
+///    freeze that fails on the next `cargo test`.
+/// 3. It satisfies the idempotence property — asserted against the value that
+///    was actually FROZEN rather than against the one in memory, which is the
+///    only version of that check that says anything about the file.
+///
+/// Bless-mode only: none of it runs in CI, which sets no bless variable.
+fn check_the_bless(
+    case: &str,
+    path: &std::path::Path,
+    bundle: &MeasurementBundle,
+    set: &paraeq_decide::DecisionSet,
+    produced: &str,
+) {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let reloaded: paraeq_decide::DecisionSet = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("{case}: the file just blessed is not a DecisionSet: {e}"));
+    assert_eq!(
+        golden::canonical_json(&reloaded),
+        produced,
+        "{case}: the blessed file does not re-serialize to its own bytes"
+    );
+    assert_eq!(
+        reloaded, *set,
+        "{case}: the blessed file does not carry what decide() produced"
+    );
+
+    let frozen = serde_json::to_value(&reloaded).expect("DecisionSet is plain derived data");
+    for view in reloaded.decisions.iter() {
+        let id = view.id;
+        let pinned = decide(&common::with_override(bundle, id, view.value.clone()));
+        let mut expected = frozen.clone();
+        expected["decisions"][id]["source"] = serde_json::json!("UserOverride");
+        assert_eq!(
+            serde_json::to_value(&pinned).expect("DecisionSet is plain derived data"),
+            expected,
+            "{case}: overriding `{id}` to the value the FROZEN file carries changed \
+             something other than its own source"
+        );
+    }
 }
 
 /// Regenerate every `bundle.json`, every `ir/*.f64` sidecar and the freeze
