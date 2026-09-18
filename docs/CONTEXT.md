@@ -148,6 +148,70 @@ can hear the detune. Record the result next to the 12-point acceptance run. See
 `docs/specs/2026-07-15-engine-hardening-design.md` R1-6 and
 `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md`.
 
+**Stage-6 rig session — the B0 spike and the B16 verification tests (added
+2026-09-18).** Add to the outstanding manual owner checklist above. These are
+the checks that cannot be made headlessly: they need real devices, the
+microphone TCC grant, and in two places a human watching the screen. Nothing
+here runs in CI (every test is `#[ignore]`d and the spike is an `examples/`
+binary). Run them in this order, in one sitting, from a TCC-granted terminal:
+
+```bash
+# 0. Build both binaries in the SAME profile. `cargo test -p paraeq-coreaudio`
+#    does NOT build the helper: paraeq-stimulus depends on paraeq-coreaudio,
+#    not the other way round, so it is not in that package's dependency graph.
+cargo build --release -p paraeq-stimulus
+cargo build --release -p paraeq-coreaudio --examples
+
+# 1. B0, the spike — three questions, one sitting. Select AirPods or a USB
+#    headset as the default output and run `tccutil reset Microphone` first,
+#    or the mic-prompt question cannot be answered. Read the `PROBE ...:` lines.
+cargo run --release -p paraeq-coreaudio --example hal_render_probe -- --bare
+cargo run --release -p paraeq-coreaudio --example hal_render_probe -- --wrapped
+cargo run --release -p paraeq-coreaudio --example hal_render_probe -- --coexist
+
+# 2. B16, the hardware verification tests. One at a time, in this order.
+#    `--release` because the matched filter is O(N*M); `--test-threads 1`
+#    because two taps on one output device is not the topology under test.
+cargo test -p paraeq-coreaudio --release --test test_measure_hardware -- \
+    --ignored --nocapture --test-threads 1 <one test name>
+```
+
+Test order, and what each one is for:
+
+1. `tap_and_measurement_aggregates_coexist_on_one_output_device` — the engine's
+   tap aggregate and the MS-22 measurement aggregate up at once on one default
+   output. **Owner question E6**; on a failure, **E12** picks the fallback.
+   Nothing downstream is meaningful if this fails.
+2. `muted_when_tapped_really_mutes_the_helper` (HW-2) — one number: the 1 kHz
+   tone minus the 300 Hz reference at the microphone, against a designed −18 dB
+   cut. Near 0 dB means the tap did not mute the helper's raw path, which is a
+   safety miss (up to +6 dB over the solve), not a measurement miss.
+3. `helper_audio_really_is_corrected` — **the premise of the whole feature**:
+   the same stimulus played by the helper twice, bypassed and corrected,
+   differing by the designed correction. A HAL fact, not a computation.
+4. `the_render_aggregate_round_trips_across_a_real_helper_run`,
+   `the_render_aggregate_does_not_survive_a_killed_helper`,
+   `the_sigterm_rung_ramps_the_child_and_its_cost_is_recorded` — the private
+   render aggregate's lifecycle across a real child process, including SIGKILL.
+   The SIGTERM test prints that rung's millisecond cost, which **owner question
+   E8** (the acceptable abort budget) needs priced separately.
+5. `the_verification_gates_arm_on_a_genuinely_quiet_machine` — the one-minute
+   experiment behind the ruling that the wizard's "Engine is `Running`" cannot
+   be read literally: the verification pre-roll requires silence, and the
+   watchdog only says `Running` while audio is flowing. If this fails, the gate
+   order downstream is re-derived from here.
+6. `the_full_verification_pass_runs_end_to_end_on_the_rig` — the whole loop
+   through the real seams. Prints the residual, the two-clock fit and the
+   computed `abort_acoustic_budget_ms` rather than asserting them; the
+   acceptance bounds are the owner's (**E8**, **E11**).
+
+What to read: every test writes labelled lines to stderr (`COEXIST:`, `HW-2:`,
+`CORRECTED:`, `ROUNDTRIP:`, `KILLED:`, `SIGTERM:`, `ARMED:`, `PASS:`), and the
+spike writes one `PROBE <question>: PASS|FAIL|OBSERVE` line per question with
+the fallback for each FAIL recorded in the example's own doc comment. Paste
+both into the PR body. The single `OBSERVE` line is the microphone-permission
+question, which no API can answer.
+
 **Post-merge and Stage-6 calls (2026-09-16).** The post-merge queue and Stage 6
 carried ~49 unresolved shape/value questions across the six 2026-07-15 specs.
 They are ruled in `docs/decisions/2026-09-16-post-merge-and-stage6-calls.md`,
