@@ -62,6 +62,10 @@ python prototype/tools/generate_fixtures.py   # regenerates fixtures/ — commit
 - **Fixtures are sacred**: `fixtures/` is generated ONLY by
   `prototype/tools/generate_fixtures.py` (deterministic, seeded). Never edit
   fixtures by hand; regenerate and commit script + output together.
+  The one exception is **`fixtures/decide/`** — owner-reviewed characterization
+  bundles that no Python oracle can produce, written instead by a seeded Rust
+  generator and preserved by the Python wipe; see `fixtures/decide/README.md`
+  for the carve-out and the bless protocol.
 - **Crate boundaries** (spec constraints):
   - `paraeq-dsp`: pure math, zero platform deps — no CoreAudio, no Tauri.
   - `paraeq-coreaudio`: the ONLY crate with unsafe CoreAudio FFI.
