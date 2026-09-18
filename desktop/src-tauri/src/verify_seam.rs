@@ -39,9 +39,10 @@ use paraeq_engine::controller::{
 };
 use paraeq_engine::preamp;
 use paraeq_engine::status::EngineStatus;
+use paraeq_measure::seam::{DeviceFacts, HelperLine};
 use paraeq_measure::{
-    EngineControl, EngineFacts, EngineStatusKind, GainPin, MeasureError, MeasurementLeaseToken,
-    TapStatus,
+    EngineControl, EngineFacts, EngineStatusKind, GainPin, HelperExit, HelperProcess,
+    HelperRouting, MeasureError, MeasurementLeaseToken, StimulusHelper, TapStatus,
 };
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -442,6 +443,415 @@ impl MeasurementLeaseToken for LeaseToken {
     }
 }
 
+// ─────────────────────────── the helper child process ──────────────────────
+
+/// The helper executable's file name, in the bundle and in the target dir
+/// alike. ONE spelling, because the bundler copies it under this name and the
+/// resolver looks for it under this name.
+const HELPER_BIN: &str = "paraeq-stimulus";
+
+/// The directory an app bundle puts its executables in, relative to the
+/// bundle root. The resolver only uses it to LABEL which branch it took --
+/// both branches look beside the running executable -- but the label is what
+/// makes a packaging failure legible instead of "file not found".
+const BUNDLE_EXEC_DIR: &str = "Contents/MacOS";
+
+/// Which layout the helper was found in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HelperSource {
+    /// Beside the app executable inside `ParaEQ.app/Contents/MacOS/`.
+    Bundle,
+    /// Beside the dev binary in cargo's target directory.
+    TargetDir,
+}
+
+/// Where the helper is, and which layout it was found in.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HelperLocation {
+    pub path: std::path::PathBuf,
+    pub source: HelperSource,
+}
+
+/// Resolve the helper's path from the directory holding the running executable.
+///
+/// **Both branches answer "the sibling", and that is not a coincidence to be
+/// tidied away.** In a release bundle the bundler copies the helper next to the
+/// app binary in `Contents/MacOS/`; in dev, cargo builds both workspace
+/// binaries into the same target directory. The two layouts agree on the
+/// answer and disagree on the reason, so the reason is carried in
+/// [`HelperSource`] and a "helper missing" report can say which one it expected.
+///
+/// Pure: it touches no filesystem, which is what lets
+/// `the_helper_path_resolves_in_dev_and_in_a_bundle` pin both branches against
+/// fixture directory layouts.
+pub fn resolve_helper(exe_dir: &std::path::Path) -> HelperLocation {
+    let bundled = exe_dir.ends_with(BUNDLE_EXEC_DIR);
+    HelperLocation {
+        path: exe_dir.join(HELPER_BIN),
+        source: if bundled {
+            HelperSource::Bundle
+        } else {
+            HelperSource::TargetDir
+        },
+    }
+}
+
+/// Is this a file we could actually exec?
+///
+/// Checked before spawning so a packaging mistake reports itself as "the helper
+/// is not where it should be" rather than as a generic spawn failure at the one
+/// moment the user is waiting to hear a sweep.
+fn is_executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// The production [`StimulusHelper`]: resolve, spawn, wire the pipes.
+///
+/// Plain [`std::process::Command`], exactly as `setup.rs` already spawns
+/// `afplay`, and deliberately NOT `tauri-plugin-shell`'s sidecar API: the
+/// plugin exists to let the FRONTEND launch processes, which is a permission
+/// surface this app has no reason to open. The bundler's only job is to copy
+/// the binary into `Contents/MacOS/`.
+pub struct HelperSpawner {
+    /// Overridable so a test can point at a fixture without a bundle. `None`
+    /// resolves from the running executable.
+    exe_dir: Option<std::path::PathBuf>,
+}
+
+impl Default for HelperSpawner {
+    fn default() -> Self {
+        HelperSpawner::new()
+    }
+}
+
+impl HelperSpawner {
+    pub fn new() -> HelperSpawner {
+        HelperSpawner { exe_dir: None }
+    }
+
+    /// Point the resolver at `dir` instead of the running executable's own
+    /// directory. For tests and for a future headless driver that is not
+    /// installed beside the helper.
+    pub fn with_exe_dir(dir: impl Into<std::path::PathBuf>) -> HelperSpawner {
+        HelperSpawner {
+            exe_dir: Some(dir.into()),
+        }
+    }
+
+    fn locate(&self) -> Result<HelperLocation, MeasureError> {
+        let exe_dir = match &self.exe_dir {
+            Some(dir) => dir.clone(),
+            None => std::env::current_exe()
+                .map_err(|e| MeasureError::Sink(format!("cannot locate this executable: {e}")))?
+                .parent()
+                .ok_or_else(|| MeasureError::Sink("this executable has no directory".to_owned()))?
+                .to_path_buf(),
+        };
+        let found = resolve_helper(&exe_dir);
+        if !is_executable(&found.path) {
+            return Err(MeasureError::Sink(format!(
+                "the verification helper is missing or not executable at {} (expected the {:?} \
+                 layout)",
+                found.path.display(),
+                found.source
+            )));
+        }
+        Ok(found)
+    }
+}
+
+impl StimulusHelper for HelperSpawner {
+    fn spawn(
+        &mut self,
+        wav_path: &std::path::Path,
+        device_uid: &str,
+        routing: HelperRouting,
+    ) -> Result<Box<dyn HelperProcess>, MeasureError> {
+        let found = self.locate()?;
+        log::info!(
+            "spawning the verification helper from {} ({:?} layout)",
+            found.path.display(),
+            found.source
+        );
+        let child = std::process::Command::new(&found.path)
+            .arg("--wav")
+            .arg(wav_path)
+            .arg("--device-uid")
+            .arg(device_uid)
+            .arg("--channel")
+            // `as_channel_arg`, never a local `format!`: the parent's enum and
+            // the child's CLI must not be able to disagree about what `Only(n)`
+            // means, and one mapping in the seam is how that is guaranteed.
+            .arg(routing.as_channel_arg())
+            // One JSON object per line on stdout. The parent reads one stream.
+            .arg("--json")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            // stderr is human-only and is inherited, so a refusal lands in the
+            // app's own log rather than in a pipe nothing drains.
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .map_err(|e| {
+                MeasureError::Sink(format!("cannot spawn {}: {e}", found.path.display()))
+            })?;
+
+        Ok(Box::new(Helper::adopt(child)?))
+    }
+}
+
+/// One live helper child.
+///
+/// **Every method is safe to call on an already-dead child**, which the seam
+/// requires and the teardown ladder depends on: a rung that failed loudly on a
+/// corpse would abort the ladder before the device-gone check runs.
+struct Helper {
+    child: std::process::Child,
+    lines: std::sync::mpsc::Receiver<String>,
+    /// Cached exit status. Its presence is ALSO the interlock that stops any
+    /// signal reaching a reaped pid -- see [`Helper::signal`].
+    reaped: Option<HelperExit>,
+    /// `None` once the pipe has been closed or lost.
+    stdin: Option<std::process::ChildStdin>,
+}
+
+impl Helper {
+    /// Take ownership of a spawned child: claim its pipes and start the reader.
+    ///
+    /// Factored out of `spawn` so the tests below can drive the whole
+    /// `HelperProcess` contract -- the signal ladder, the idempotent reap, the
+    /// deadline on a read -- against a REAL process without going anywhere near
+    /// the real helper, a device, or a sample of audio.
+    fn adopt(mut child: std::process::Child) -> Result<Helper, MeasureError> {
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| MeasureError::Sink("the helper's stdin was not piped".to_owned()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| MeasureError::Sink("the helper's stdout was not piped".to_owned()))?;
+
+        // A dedicated blocking reader thread, mirroring the child's own stdin
+        // reader. `read_line` then becomes `recv_timeout`, which is the only
+        // way to put a DEADLINE on a pipe read in std: `Read` has no timeout,
+        // and a wedged child must not be able to block the teardown ladder.
+        // It also keeps the pipe drained -- a child blocked writing into a full
+        // stdout buffer can never reach its own teardown.
+        let (lines_tx, lines_rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("paraeq-helper-stdout".into())
+            .spawn(move || {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(stdout).lines() {
+                    let Ok(line) = line else { break };
+                    if lines_tx.send(line).is_err() {
+                        return;
+                    }
+                }
+                // Dropping `lines_tx` here is the EOF signal.
+            })
+            .map_err(|e| MeasureError::Sink(format!("cannot read the helper's stdout: {e}")))?;
+
+        Ok(Helper {
+            child,
+            lines: lines_rx,
+            reaped: None,
+            stdin: Some(stdin),
+        })
+    }
+
+    /// Write one protocol line, tolerating a child that has already gone.
+    ///
+    /// A closed pipe is not a fault to report: the child this line was for is
+    /// no longer listening, which is the outcome the line was asking for. Any
+    /// OTHER write failure is reported, because it means the pipe is in a state
+    /// this process does not understand.
+    fn write_line(&mut self, line: &str) -> Result<(), MeasureError> {
+        use std::io::Write;
+        let Some(stdin) = self.stdin.as_mut() else {
+            return Ok(());
+        };
+        match stdin
+            .write_all(line.as_bytes())
+            .and_then(|()| stdin.flush())
+        {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                self.stdin = None;
+                Ok(())
+            }
+            Err(e) => Err(MeasureError::Sink(format!(
+                "cannot write '{}' to the helper: {e}",
+                line.trim_end()
+            ))),
+        }
+    }
+
+    /// Send `signal` to the child, or do nothing if it has been reaped.
+    ///
+    /// **The reaped check is a safety interlock, not an optimization.** Once a
+    /// pid has been waited on the kernel may reuse it, and a SIGTERM aimed at a
+    /// recycled pid is a signal delivered to an unrelated process on the user's
+    /// machine. `self.reaped` is set only by `reap`/`try_reap`, i.e. only after
+    /// a successful `wait`, so it is exactly the condition under which the pid
+    /// stops being ours.
+    fn signal(&mut self, signal: i32) -> Result<(), MeasureError> {
+        if self.reaped.is_some() {
+            return Ok(());
+        }
+        let pid = self.child.id() as i32;
+        // SAFETY: two preconditions, both established above. (1) `pid` names a
+        // child this process spawned and has NOT yet reaped -- `self.child`
+        // owns it and `self.reaped` is None, and only a successful `wait` sets
+        // that field. (2) `signal` is a valid signal constant: every caller
+        // passes a `libc::SIG*`. `kill` has no other requirements and touches
+        // no memory.
+        let status = unsafe { libc::kill(pid, signal) };
+        if status == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        // ESRCH: no such process. The child exited between the check and the
+        // call, which is the normal race on this path and not a failure --
+        // the signal was asking it to stop, and it has.
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        Err(MeasureError::Sink(format!(
+            "cannot signal the helper ({signal}): {error}"
+        )))
+    }
+}
+
+/// `std`'s exit status in the seam's vocabulary.
+///
+/// `signalled` is read off the signal number rather than inferred from a
+/// missing code, so "killed by SIGKILL" and "exited without a code we can read"
+/// cannot be confused.
+fn helper_exit(status: std::process::ExitStatus) -> HelperExit {
+    use std::os::unix::process::ExitStatusExt;
+    HelperExit {
+        code: status.code(),
+        signalled: status.signal().is_some(),
+    }
+}
+
+impl HelperProcess for Helper {
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn request_abort(&mut self) -> Result<(), MeasureError> {
+        self.write_line("abort\n")
+    }
+
+    fn request_terminate(&mut self) -> Result<(), MeasureError> {
+        // SIGTERM, never SIGKILL. The child installs a handler that arms the
+        // same abort flag `abort\n` does, so this is a SECOND ramp request: a
+        // child that missed the stdin write still fades rather than stopping
+        // dead, and "a hard stop is itself a full-scale click".
+        self.signal(libc::SIGTERM)
+    }
+
+    fn kill(&mut self) -> Result<(), MeasureError> {
+        // SIGKILL, and only after both deadlines. It bypasses `Drop`, so the
+        // child's render aggregate can outlive it -- which is why the ladder
+        // asks the HAL whether the device is gone immediately after this.
+        self.signal(libc::SIGKILL)
+    }
+
+    fn reap(&mut self) -> Result<HelperExit, MeasureError> {
+        if let Some(cached) = self.reaped {
+            return Ok(cached);
+        }
+        // Drop stdin before blocking: the child treats EOF as an abort, so a
+        // still-open pipe is a reason for it not to exit and this a reason to
+        // block forever.
+        self.stdin = None;
+        let status = self
+            .child
+            .wait()
+            .map_err(|e| MeasureError::Sink(format!("cannot reap the helper: {e}")))?;
+        let exit = helper_exit(status);
+        self.reaped = Some(exit);
+        Ok(exit)
+    }
+
+    fn try_reap(&mut self) -> Result<Option<HelperExit>, MeasureError> {
+        if let Some(cached) = self.reaped {
+            return Ok(Some(cached));
+        }
+        match self.child.try_wait() {
+            Ok(Some(status)) => {
+                let exit = helper_exit(status);
+                self.reaped = Some(exit);
+                Ok(Some(exit))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(MeasureError::Sink(format!(
+                "cannot read the helper's status: {e}"
+            ))),
+        }
+    }
+
+    fn send_play(&mut self) -> Result<(), MeasureError> {
+        self.write_line("play\n")
+    }
+
+    fn read_line(&mut self, deadline: Duration) -> Result<HelperLine, MeasureError> {
+        match self.lines.recv_timeout(deadline) {
+            Ok(line) => Ok(HelperLine::Line(line)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(HelperLine::DeadlineExpired),
+            // The reader thread ended, which it only does on EOF or a read
+            // error on the pipe. Either way nothing more will arrive.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Ok(HelperLine::Eof),
+        }
+    }
+}
+
+// ───────────────────────────── HAL device facts ────────────────────────────
+
+/// The production [`DeviceFacts`]: two by-UID HAL reads.
+///
+/// Stateless, because both questions are asked of the HAL at the moment they
+/// are asked. Caching either one would be a way to answer "is the leaked device
+/// still there?" with a value read before it leaked.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeviceSeam;
+
+impl DeviceFacts for DeviceSeam {
+    /// **An unreadable answer is `true`.** The one caller is the verification
+    /// teardown asking whether the helper's private render aggregate is gone,
+    /// and the two ways to be wrong are not symmetric: a false report costs a
+    /// log line, a false clean leaves a private device wrapping the user's
+    /// output with nothing watching it.
+    fn device_exists(&self, uid: &str) -> bool {
+        match paraeq_coreaudio::properties::device_exists(uid) {
+            Ok(present) => present,
+            Err(e) => {
+                log::warn!("cannot tell whether '{uid}' still exists ({e}); reporting it present");
+                true
+            }
+        }
+    }
+
+    /// `None` covers both "no device carries this UID" and "the HAL refused",
+    /// which is what the seam asks for: the caller treats an unanswerable read
+    /// as an expected race, not as a rate failure.
+    fn nominal_sample_rate(&self, device_uid: &str) -> Option<f64> {
+        match paraeq_coreaudio::properties::nominal_sample_rate_for_uid(device_uid) {
+            Ok(rate) => rate,
+            Err(e) => {
+                log::warn!("cannot read '{device_uid}''s nominal rate: {e}");
+                None
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -839,6 +1249,72 @@ mod tests {
         );
     }
 
+    /// A5's "Export/engine agreement" row, DESKTOP HALF: the preamp in the
+    /// exported AutoEQ text equals `EngineState.auto_preamp_db` -- the number
+    /// the live engine is actually applying, read off a running controller
+    /// rather than off `build_correction`'s return value.
+    ///
+    /// The crate-side half of this test (`eq.rs`'s
+    /// `exported_preamp_equals_engine_state_auto_preamp_db`) compares the
+    /// export against `BuildReport::preamp_db`. That is one hop short of the
+    /// claim: it proves the BUILDER agrees, not that the field the UI reads and
+    /// the verification gate compares against carries the same number. This
+    /// closes the hop.
+    ///
+    /// Compared through the exporter's own formatter rather than as raw
+    /// numbers, for the reason that test gives: the engine publishes an f32 and
+    /// the exporter rewrites any preamp in `(-0.05, 0]` as `0.0`, so the
+    /// agreement that matters is the agreement of the RENDERED line.
+    #[test]
+    fn exported_preamp_equals_engine_state_auto_preamp_db() {
+        let (slot, seam) = live_seam(None);
+        assert!(wait_until(WAIT, || seam.engine_engaged()));
+
+        // A boosting set, so the preamp is a real number and the assertion is
+        // not vacuous.
+        let bands = vec![peaking(45.0, 9.0), peaking(1_000.0, 12.0)];
+        slot.lock()
+            .unwrap()
+            .as_ref()
+            .expect("a live handle")
+            .send(EngineCommand::SetCorrection(CorrectionConfig::Peq {
+                bands: vec![bands.clone()],
+                design_rate: RATE,
+            }));
+        assert!(wait_until(WAIT, || seam.installed_preamp_lin().is_some()));
+
+        let armed_db = slot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("a live handle")
+            .state()
+            .auto_preamp_db
+            .expect("an installed correction publishes its armed preamp");
+        assert!(armed_db < 0.0, "boosts must pull the output down");
+
+        let exported = paraeq_dsp::peq::ParametricEQ {
+            bands,
+            sample_rate: RATE,
+        }
+        .export_autoeq_format_with_preamp();
+        let exported_preamp = exported.lines().next().expect("a Preamp line");
+        assert_ne!(
+            exported_preamp, "Preamp: 0.0 dB",
+            "a boosting band set must export a real preamp, or this test is vacuous"
+        );
+
+        let engine_preamp = paraeq_dsp::peq::ParametricEQ {
+            bands: Vec::new(),
+            sample_rate: RATE,
+        }
+        .export_autoeq_format_with_preamp_db(f64::from(armed_db));
+        assert_eq!(
+            engine_preamp, exported_preamp,
+            "the engine is applying a preamp the export does not name"
+        );
+    }
+
     /// The lease is acquired through the seam, suspends the fail-open
     /// auto-disable, and suspends NOTHING ELSE -- `NoInputDetected` keeps being
     /// produced and published while it is held, because a genuine silent
@@ -1020,5 +1496,332 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Spawn a short-lived shell as a stand-in child.
+    ///
+    /// **Never the real helper.** Every property under test here — where the
+    /// binary is looked for, that SIGTERM precedes SIGKILL, that a reap is
+    /// idempotent, that a read carries a deadline — is about process
+    /// lifecycle and nothing about audio. Spawning `paraeq-stimulus` would
+    /// open a device and play a sweep to prove things a shell proves for free.
+    fn shell_child(script: &str) -> Helper {
+        let child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("/bin/sh spawns");
+        Helper::adopt(child).expect("the pipes are wired")
+    }
+
+    fn touch_executable(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+        std::fs::write(path, b"#!/bin/sh\nexit 0\n").expect("write");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    /// Both layouts, against fixture directory trees.
+    ///
+    /// The two branches compute the same path — the helper is always a SIBLING
+    /// of the running executable — and they are still two branches, because the
+    /// REASON differs and a packaging failure has to be able to say which
+    /// layout it expected. Pinning both is what stops someone "simplifying" the
+    /// bundle branch away and then reading `Contents/MacOS` in a bug report
+    /// with nothing in the code that ever mentions it.
+    #[test]
+    fn the_helper_path_resolves_in_dev_and_in_a_bundle() {
+        let root = tempfile::tempdir().expect("a scratch dir");
+
+        // Release: ParaEQ.app/Contents/MacOS/{ParaEQ, paraeq-stimulus}
+        let bundle_exec = root.path().join("ParaEQ.app/Contents/MacOS");
+        let bundled_helper = bundle_exec.join(HELPER_BIN);
+        touch_executable(&bundled_helper);
+        let found = resolve_helper(&bundle_exec);
+        assert_eq!(found.source, HelperSource::Bundle);
+        assert_eq!(found.path, bundled_helper);
+        assert_eq!(
+            HelperSpawner::with_exe_dir(&bundle_exec)
+                .locate()
+                .expect("the bundled helper is found")
+                .source,
+            HelperSource::Bundle
+        );
+
+        // Dev: target/debug/{paraeq-desktop, paraeq-stimulus}
+        let target_dir = root.path().join("target/debug");
+        let dev_helper = target_dir.join(HELPER_BIN);
+        touch_executable(&dev_helper);
+        let found = resolve_helper(&target_dir);
+        assert_eq!(found.source, HelperSource::TargetDir);
+        assert_eq!(found.path, dev_helper);
+        assert_eq!(
+            HelperSpawner::with_exe_dir(&target_dir)
+                .locate()
+                .expect("the dev helper is found")
+                .source,
+            HelperSource::TargetDir
+        );
+    }
+
+    /// A packaging mistake must report itself as one. Without the check, the
+    /// user meets a generic spawn failure at the one moment they are waiting to
+    /// hear a sweep, and the PR that forgot the bundler entry looks green.
+    #[test]
+    fn a_missing_or_unexecutable_helper_refuses_by_path_before_spawning() {
+        let root = tempfile::tempdir().expect("a scratch dir");
+        let dir: PathBuf = root.path().join("Contents/MacOS");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let error = HelperSpawner::with_exe_dir(&dir)
+            .locate()
+            .expect_err("nothing is there");
+        let message = error.to_string();
+        assert!(message.contains(HELPER_BIN), "names the file: {message}");
+        assert!(message.contains("Bundle"), "names the layout: {message}");
+
+        // Present but not executable is the same failure with a different
+        // cause, and it must not read as "found".
+        std::fs::write(dir.join(HELPER_BIN), b"not a program").expect("write");
+        HelperSpawner::with_exe_dir(&dir)
+            .locate()
+            .expect_err("a non-executable file is not a helper");
+    }
+
+    /// The packaging instructions and the runtime resolver must name the SAME
+    /// binary.
+    ///
+    /// They are two files that cannot see each other: `binaries/README.md`
+    /// tells the owner what the bundler will copy, and `HELPER_BIN` tells the
+    /// app what to look for. Rename one and the app ships a helper it cannot
+    /// find -- a failure that appears only in a real bundle, only at the moment
+    /// a user asks for a verification, and never in any test that does not
+    /// compare these two strings.
+    ///
+    /// It reads the README rather than `tauri.conf.json` because the
+    /// `externalBin` entry is deliberately NOT in the config yet: `tauri-build`
+    /// resolves that key in the BUILD SCRIPT, on every `cargo build`, so an
+    /// entry with nothing staged turns `cargo test --workspace` red for
+    /// everyone. The README carries the entry verbatim and the staging command
+    /// beside it; this test is what keeps that copy honest until it lands.
+    ///
+    /// The `-<target-triple>` suffix is the BUNDLER's, not the runtime's -- it
+    /// exists on disk before packaging so the bundler can pick the right
+    /// architecture, and the copy inside the bundle carries the plain name.
+    #[test]
+    fn the_packaged_helper_and_the_resolver_name_the_same_binary() {
+        let readme = include_str!("../binaries/README.md");
+        assert!(
+            readme.contains(&format!("\"externalBin\": [\"binaries/{HELPER_BIN}\"]")),
+            "the staging instructions must name '{HELPER_BIN}' in the bundler entry"
+        );
+        assert!(
+            readme.contains(&format!("{HELPER_BIN}-$(rustc --print host-tuple)")),
+            "and the staged file must carry the target-triple suffix"
+        );
+        // The config does not carry the entry yet, and the reason is in the
+        // README. When it lands, THIS assertion is the one to invert.
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("valid JSON");
+        assert!(
+            config["bundle"]["externalBin"].is_null(),
+            "externalBin landed in the config: stage the binary in the same \
+             commit and invert this assertion, or every cargo build fails"
+        );
+    }
+
+    /// Rung 1b is SIGTERM and rung 1c is SIGKILL, and the order is the whole
+    /// safety property: SIGTERM is a SECOND ramp request that the child handles
+    /// and fades on, while SIGKILL bypasses its `Drop` and leaves a private
+    /// render aggregate on the user's output device.
+    ///
+    /// The stand-in traps TERM and exits 42 — the shell's stand-in for "I
+    /// handled it and shut down on my own terms". A code of 42 with
+    /// `signalled == false` is only reachable if SIGTERM arrived and SIGKILL
+    /// did not.
+    #[test]
+    fn sigterm_is_sent_before_sigkill_and_the_child_exits_on_its_own_terms() {
+        // `armed` is not decoration: without it the SIGTERM can arrive before
+        // the shell has run `trap`, and the child then dies OF the signal --
+        // which is the very outcome this test exists to distinguish from
+        // handling it. Real helpers have the same window, which is why the
+        // ladder's SIGTERM rung is not the FIRST rung.
+        let mut child =
+            shell_child("trap 'exit 42' TERM; echo armed; while :; do sleep 0.02; done");
+        assert_eq!(
+            child.read_line(Duration::from_secs(5)).expect("a read"),
+            HelperLine::Line("armed".to_owned())
+        );
+        // It is alive: the non-blocking probe says so, which is also the probe
+        // the teardown ladder uses to decide whether to escalate.
+        assert_eq!(child.try_reap().expect("a status read"), None);
+
+        child.request_terminate().expect("SIGTERM");
+        let exit = child.reap().expect("it exits");
+        assert_eq!(
+            exit,
+            HelperExit {
+                code: Some(42),
+                signalled: false
+            },
+            "the child handled SIGTERM; a SIGKILL would have left code None and signalled true"
+        );
+    }
+
+    /// A child that ignores SIGTERM is why rung 1c exists at all.
+    #[test]
+    fn a_child_that_ignores_sigterm_is_still_killed() {
+        let mut child = shell_child("trap '' TERM; echo armed; while :; do sleep 0.02; done");
+        assert_eq!(
+            child.read_line(Duration::from_secs(5)).expect("a read"),
+            HelperLine::Line("armed".to_owned())
+        );
+        child.request_terminate().expect("SIGTERM is ignored");
+        assert_eq!(
+            child.try_reap().expect("a status read"),
+            None,
+            "it ignored the polite rung"
+        );
+        child.kill().expect("SIGKILL");
+        let exit = child.reap().expect("it dies");
+        assert!(exit.signalled, "SIGKILL shows up as signalled: {exit:?}");
+    }
+
+    /// `reap` is called from the teardown ladder, which runs on every exit path
+    /// including a panic — so it can run twice. A second `wait` on a reaped pid
+    /// blocks forever on some platforms and returns nonsense on others; the
+    /// cached status is the only safe answer.
+    #[test]
+    fn reap_is_idempotent_and_does_not_block_on_an_already_reaped_child() {
+        let mut child = shell_child("exit 3");
+        let first = child.reap().expect("the first reap");
+        assert_eq!(first.code, Some(3));
+
+        let started = Instant::now();
+        assert_eq!(child.reap().expect("the second reap"), first);
+        assert_eq!(child.try_reap().expect("and the probe"), Some(first));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a second reap must be answered from the cache, not by waiting again"
+        );
+    }
+
+    /// The seam's own contract, on a real corpse. A rung that failed loudly
+    /// here would abort the teardown ladder BEFORE the device-gone check — the
+    /// exact failure the ladder exists to prevent.
+    ///
+    /// The signal rungs are the sharp ones: after a reap the kernel may reuse
+    /// the pid, so `signal` must refuse to fire at all rather than deliver
+    /// SIGKILL to whatever process inherited the number.
+    #[test]
+    fn every_helper_process_method_is_safe_to_call_after_the_child_has_exited() {
+        let mut child = shell_child("exit 0");
+        let first = child.reap().expect("the first reap");
+
+        for _ in 0..2 {
+            child.request_abort().expect("abort on a dead child");
+            child
+                .request_terminate()
+                .expect("terminate on a dead child");
+            child.kill().expect("kill on a dead child");
+            child.send_play().expect("play on a dead child");
+            assert_eq!(child.reap().expect("reap"), first);
+            assert_eq!(child.try_reap().expect("try_reap"), Some(first));
+            let _ = child.read_line(Duration::from_millis(1));
+            let _ = child.pid();
+        }
+    }
+
+    /// A read carries a deadline, and an expired one is its OWN answer. Under
+    /// a two-state read this was spelled the same way as EOF, and the teardown
+    /// ladder then believed a wedged child had exited cleanly and stopped
+    /// escalating — leaving it playing.
+    #[test]
+    fn a_read_that_times_out_is_not_an_eof() {
+        let mut child = shell_child("while :; do sleep 0.02; done");
+        let started = Instant::now();
+        assert_eq!(
+            child.read_line(Duration::from_millis(50)).expect("a read"),
+            HelperLine::DeadlineExpired
+        );
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        child.kill().expect("SIGKILL");
+        child.reap().expect("reaped");
+
+        // ... and once the pipe really is closed, EOF is reported as EOF.
+        let mut gone = shell_child("exit 0");
+        gone.reap().expect("reaped");
+        assert_eq!(
+            gone.read_line(Duration::from_millis(250)).expect("a read"),
+            HelperLine::Eof
+        );
+    }
+
+    /// The protocol lines go over stdin verbatim, newline included, and the
+    /// child reads them one per line.
+    #[test]
+    fn play_and_abort_are_written_as_whole_protocol_lines() {
+        let mut child = shell_child("while read line; do echo \"got:$line\"; done");
+        child.send_play().expect("play");
+        assert_eq!(
+            child.read_line(Duration::from_secs(5)).expect("a read"),
+            HelperLine::Line("got:play".to_owned())
+        );
+        child.request_abort().expect("abort");
+        assert_eq!(
+            child.read_line(Duration::from_secs(5)).expect("a read"),
+            HelperLine::Line("got:abort".to_owned())
+        );
+        child.kill().expect("SIGKILL");
+        child.reap().expect("reaped");
+    }
+
+    /// The routing spelling is the SEAM's, never a local `format!`. A second
+    /// spelling is how a per-ear coupler verification silently differences a
+    /// per-ear baseline against an L+R sum.
+    #[test]
+    fn the_channel_argument_is_the_seams_own_spelling() {
+        assert_eq!(HelperRouting::Both.as_channel_arg(), "both");
+        assert_eq!(HelperRouting::Only(1).as_channel_arg(), "1");
+        let spawn_site = include_str!("verify_seam.rs")
+            .split_once("impl StimulusHelper for HelperSpawner")
+            .expect("the spawn site")
+            .1;
+        let spawn_site = spawn_site
+            .split_once("impl Helper {")
+            .expect("the impl that follows")
+            .0;
+        assert!(
+            spawn_site.contains("routing.as_channel_arg()"),
+            "the spawn site must call the seam's mapping"
+        );
+    }
+
+    /// The HAL can refuse a read. When it does, the teardown must report a
+    /// POSSIBLE leak rather than a clean one: the two ways to be wrong are not
+    /// symmetric. A UID nothing can carry exercises the same code path without
+    /// hardware.
+    #[test]
+    fn an_unreadable_device_is_never_reported_as_absent() {
+        let seam = DeviceSeam;
+        // Either the HAL answers "nobody has it" (false) or it refuses, in
+        // which case the seam answers `true`. What it may NEVER do is answer
+        // `false` because the read failed.
+        let _ = seam.device_exists("com.paraeq.no-such-device.deadbeef");
+        // The rate side has the opposite default: unanswerable is `None`, which
+        // the rate fence treats as permissive.
+        assert_eq!(
+            seam.nominal_sample_rate("com.paraeq.no-such-device.deadbeef"),
+            None
+        );
     }
 }

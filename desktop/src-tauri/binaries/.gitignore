@@ -1,0 +1,6 @@
+# Staged sidecar binaries are build output: cargo builds paraeq-stimulus into
+# the workspace target directory and the bundler wants a target-triple-suffixed
+# copy here. See README.md for the staging command.
+*
+!.gitignore
+!README.md

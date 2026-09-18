@@ -70,9 +70,14 @@ pub fn spawn_engine(settings: &Settings) -> (EngineHandle, ExclusionWitness) {
 /// dropped before any disk I/O or emit; no lock is held across the emit.
 pub fn publish(app: &tauri::AppHandle, engine: &EngineState) {
     let shared = app.state::<AppShared>();
+    // Read the verification slot BEFORE taking the data lock, and release it
+    // immediately: the verify worker publishes from its own thread while
+    // holding nothing, and nesting the two locks in opposite orders anywhere
+    // would be a deadlock.
+    let verification = shared.verify.lock().unwrap().state();
     let (app_state, durable) = {
         let data = shared.data.lock().unwrap();
-        (data.app_state(engine), data.to_settings())
+        (data.app_state(engine, verification), data.to_settings())
     };
     // Persist only when the durable subset actually changed. Compare against the
     // in-memory mirror of what is on disk (`AppShared::persisted`, seeded from
@@ -103,6 +108,54 @@ pub fn publish(app: &tauri::AppHandle, engine: &EngineState) {
     if let Err(e) = app.emit("app-state", app_state) {
         log::warn!("failed to emit app-state: {e}");
     }
+}
+
+/// Log a room transition that came from the FALLBACK rather than from the
+/// measurement -- the third of the three places the 200 Hz constant must be
+/// labelled a fallback.
+///
+/// The spec's sentence is unambiguous about where: "**it must be labelled a
+/// fallback in the code, the UI, and the log, never a rule**". Code and UI are
+/// the decision engine's (a named constant and a rationale string); the LOG is
+/// this crate's, because `paraeq-decide` may not perform I/O inside `decide()`
+/// at all -- its determinism test forbids it -- so a crate that cannot log
+/// cannot discharge a logging requirement.
+///
+/// The line carries the word "fallback" literally. That is not stylistic: it is
+/// what makes the requirement greppable in a user's log when someone asks why a
+/// correction transitions where it does, and it is what
+/// `a_fallback_transition_logs_the_word_fallback` asserts.
+///
+/// `Source::Auto` and `Source::UserOverride` log NOTHING. A line on every run
+/// would train the reader to skip it, and then the one run that mattered looks
+/// like all the others.
+pub fn log_transition_source(decisions: &paraeq_decide::decisions::Decisions) {
+    if let Some(line) = transition_fallback_line(
+        decisions.transition_hz.source,
+        decisions.transition_hz.value,
+    ) {
+        log::info!("{line}");
+    }
+}
+
+/// The line itself, rendered rather than logged, so the requirement is
+/// assertable without a `Decisions` and without a log capture.
+///
+/// `None` for `Source::Auto` and `Source::UserOverride`: a line on every run
+/// would train the reader to skip it, and then the one run that mattered looks
+/// like all the others.
+pub fn transition_fallback_line(
+    source: paraeq_decide::decision::Source,
+    value_hz: f64,
+) -> Option<String> {
+    use paraeq_decide::decision::Source;
+    if source != Source::Default {
+        return None;
+    }
+    Some(format!(
+        "room transition {value_hz} Hz is a fallback, not a measurement: the evidence was \
+         absent or inconclusive, so the path profile default was used"
+    ))
 }
 
 /// Compose the engine half of the snapshot from the live handle, or a disabled
@@ -242,5 +295,74 @@ fn stopped_state() -> EngineState {
         self_excluded: false,
         status: EngineStatus::Stopped,
         stream: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paraeq_decide::decision::Source;
+
+    /// The wizard spec's fallback sentence names three places the 200 Hz
+    /// constant must be labelled a fallback: "**in the code, the UI, and the
+    /// log, never a rule**". This is the LOG, and it lives here because
+    /// `paraeq-decide` may not perform I/O inside `decide()` at all -- a crate
+    /// that cannot log cannot discharge a logging requirement.
+    ///
+    /// The literal word is the assertion. It is what makes the requirement
+    /// greppable in a user's log when someone asks why a correction transitions
+    /// where it does.
+    #[test]
+    fn a_fallback_transition_logs_the_word_fallback() {
+        let line = transition_fallback_line(Source::Default, 200.0)
+            .expect("a defaulted transition must produce a line");
+        assert!(
+            line.contains("fallback"),
+            "the line must carry the literal word: {line}"
+        );
+        assert!(
+            line.contains("200"),
+            "and the value it fell back to: {line}"
+        );
+        assert!(
+            !line.contains("rule"),
+            "'never a rule' is the spec's own wording about this sentence: {line}"
+        );
+    }
+
+    /// A measured transition logs NOTHING, and neither does one the user set.
+    /// A line on every run would train the reader to skip it, and then the one
+    /// run that mattered looks like all the others.
+    #[test]
+    fn a_measured_or_overridden_transition_logs_nothing() {
+        assert_eq!(transition_fallback_line(Source::Auto, 143.0), None);
+        assert_eq!(transition_fallback_line(Source::UserOverride, 180.0), None);
+    }
+
+    /// The wrapper must actually LOG the rendered line. Without this, the
+    /// renderer above could keep passing while nothing reached a log file --
+    /// which is the requirement, not the string.
+    ///
+    /// A source grep rather than a log capture: `log` has no per-test capture
+    /// and installing a global logger from one test races every other test in
+    /// the binary.
+    #[test]
+    fn the_transition_log_leg_is_wired_to_log_info() {
+        let src = include_str!("engine_bridge.rs");
+        let body = src
+            .split_once("pub fn log_transition_source")
+            .expect("the log leg")
+            .1
+            .split_once("/// The line itself")
+            .expect("the renderer that follows")
+            .0;
+        assert!(
+            body.contains("transition_fallback_line"),
+            "the leg must render through the tested function: {body}"
+        );
+        assert!(
+            body.contains("log::info!"),
+            "and it must emit at info, beside this module's other log calls: {body}"
+        );
     }
 }

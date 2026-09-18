@@ -222,6 +222,23 @@ pub enum CaptureEnd {
 /// but a zero-frame read ends the run, because retrying it forever is how a
 /// dead stream becomes a hang.
 ///
+/// # A NON-BLOCKING source may not be handed to this function directly
+///
+/// The rule above makes zero mean "the stream ended", and a non-blocking ring
+/// drain — `paraeq_coreaudio::MicCapture::capture` is one — returns zero
+/// whenever the reader outruns the device, which on healthy hardware is most
+/// polls. Wired directly, a capture would end microseconds into its first
+/// block on a perfect rig.
+///
+/// The no-spin rule here is deliberate and is NOT relaxed for that: a capture
+/// loop that retries forever cannot tell a busy device from a dead one. The
+/// waiting belongs in an adapter between the two, which polls until a frame
+/// arrives and passes the zero through after its own deadline so a genuinely
+/// dead source still ENDS the run. `desktop/src-tauri/src/verify.rs`'s
+/// `WaitingCapture` is that adapter for the verification path, and
+/// `crates/paraeq-coreaudio/tests/test_measure_hardware.rs` carries the
+/// harness's twin of it.
+///
 /// Non-finite samples are zeroed and counted before they reach the caller
 /// (MS-4's boundary 2): a NaN in a recorded IR propagates through `deconvolve`
 /// into NaN correction coefficients, and one NaN poisons the DF2T feedback

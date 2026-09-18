@@ -1,0 +1,189 @@
+// The Verify panel: the minimum surface that can show a verification pass
+// honestly. Deliberately NOT the measurement wizard — Stage 7 owns the spine
+// that measures a baseline, and nothing here can produce one.
+//
+// What it is for until then: an armed pass gets its MS-18 acknowledgement, a
+// running pass gets an abort, and a finished pass shows its residual against
+// its limit, its verdict, the mandatory preamp disclosure, and every diagnostic
+// with the remedy Rust wrote for it.
+//
+// Arming is not reachable from here, and that is honest rather than
+// unfinished: `verify_arm` needs a baseline `MeasurementBundle` and an armed
+// `CorrectionPlan`, which only the wizard produces. The panel says so instead
+// of offering a button that cannot work.
+
+import { useEffect, useState } from "react";
+import type { JSX } from "react";
+
+import { Button } from "@/components/ui/button";
+import { verifyAbort, verifyRun } from "@/ipc/commands";
+import type { VerifyState } from "@/ipc/types";
+import {
+  acknowledgementPrompt,
+  canAbort,
+  orderedDiagnostics,
+  preampDisclosure,
+  residualLine,
+  verifyHeadline,
+} from "./verifyCopy";
+
+export function VerifyPanel({ state }: { state: VerifyState }): JSX.Element {
+  const [error, setError] = useState<string | null>(null);
+
+  // Esc aborts, which measurement-safety lists as a UI-owned abort trigger
+  // alongside the window close the shell already intercepts. It is bound while
+  // a pass exists and unbound the moment one does not, so Esc never fires a
+  // command that has nothing to stop.
+  const abortable = canAbort(state);
+  useEffect(() => {
+    if (!abortable) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") void verifyAbort().catch((e) => setError(String(e)));
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [abortable]);
+
+  const acknowledgement = acknowledgementPrompt(state);
+
+  return (
+    <div className="flex h-full flex-col gap-4 p-4">
+      <div>
+        <h2 className="text-lg font-medium">Verify</h2>
+        <p className="text-sm text-muted-foreground">{verifyHeadline(state)}</p>
+      </div>
+
+      {state.phase === "idle" && (
+        <p className="text-sm text-muted-foreground">
+          A verification pass re-measures your correction with the sweep played
+          from a separate helper process, so it goes through the EQ instead of
+          around it. It is started by the measurement wizard, which arrives in
+          the next stage.
+        </p>
+      )}
+
+      {state.phase === "armed" && acknowledgement && (
+        <div className="flex flex-col gap-3 rounded-md border bg-muted/30 p-3">
+          <p className="text-sm">{acknowledgement}</p>
+          {/* MS-18: a DELIBERATE action, never a default-focused button. No
+              autoFocus here, and the abort sits beside it rather than behind a
+              second click. */}
+          <div className="flex gap-2">
+            <Button
+              onClick={() => {
+                setError(null);
+                void verifyRun(state.device_name, state.projected_spl_db).catch((e) =>
+                  setError(String(e)),
+                );
+              }}
+              size="sm"
+              variant="default"
+            >
+              Play the sweep
+            </Button>
+            <Button
+              onClick={() => {
+                setError(null);
+                void verifyAbort().catch((e) => setError(String(e)));
+              }}
+              size="sm"
+              variant="outline"
+            >
+              Cancel
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {state.phase === "running" && (
+        <div className="flex items-center gap-3">
+          <span className="text-sm text-muted-foreground">
+            Keep the room quiet until this finishes.
+          </span>
+          <Button
+            onClick={() => {
+              setError(null);
+              void verifyAbort().catch((e) => setError(String(e)));
+            }}
+            size="sm"
+            variant="outline"
+          >
+            Stop (Esc)
+          </Button>
+        </div>
+      )}
+
+      {state.phase === "failed" && state.remedy && (
+        <p className="text-sm">
+          {state.remedy}
+          {state.code != null && (
+            <span className="ml-2 text-xs text-muted-foreground">
+              (code {state.code})
+            </span>
+          )}
+        </p>
+      )}
+
+      {state.phase === "complete" && <Report state={state} />}
+
+      {error && <p className="text-sm text-destructive">{error}</p>}
+    </div>
+  );
+}
+
+function Report({
+  state,
+}: {
+  state: Extract<VerifyState, { phase: "complete" }>;
+}): JSX.Element {
+  const { report } = state;
+  const residual = residualLine(report);
+  const diagnostics = orderedDiagnostics(report);
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col gap-3">
+      {/* The residual against its limit. Absent rather than zero when
+          `decide()` never got far enough to grade. */}
+      {residual ? (
+        <p className="text-sm">{residual}</p>
+      ) : (
+        <p className="text-sm text-muted-foreground">
+          No residual was computed — the checks below stopped the grading before
+          it could be.
+        </p>
+      )}
+
+      {/* Mandatory, not decorative. */}
+      <p className="text-sm text-muted-foreground">{preampDisclosure(report)}</p>
+
+      {diagnostics.length > 0 && (
+        <ul className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto">
+          {diagnostics.map((d) => (
+            <li
+              className="rounded-md border p-2 text-sm"
+              key={`${d.code}-${d.summary}`}
+            >
+              <div className="flex items-baseline gap-2">
+                <span
+                  className={
+                    d.severity === "refuse"
+                      ? "text-xs font-medium uppercase text-destructive"
+                      : "text-xs font-medium uppercase text-muted-foreground"
+                  }
+                >
+                  {d.severity === "refuse" ? "stops here" : "note"}
+                </span>
+                <span className="text-xs text-muted-foreground">
+                  {d.summary} (code {d.code})
+                </span>
+              </div>
+              {/* Rust's remedy, verbatim. The UI is a text field, not an
+                  author. */}
+              <p className="mt-1">{d.remedy}</p>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}

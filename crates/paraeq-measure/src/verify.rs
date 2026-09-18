@@ -98,8 +98,8 @@ use crate::capture::{record, CaptureEnd, CaptureMeter};
 use crate::diagnostic::{MeasurementDiagnostic, Refusal};
 use crate::engine_seam::{EngineControl, EngineFacts, GainPin, MeasurementLeaseToken, TapActivity};
 use crate::level::{caps_for, SweepLevel};
-use crate::seam::{CaptureSource, HelperExit, HelperProcess, HelperRouting, StimulusHelper};
-use crate::seam::{TapStatus, VolumeControl};
+use crate::seam::{CaptureSource, DeviceFacts, HelperExit, HelperLine, HelperProcess};
+use crate::seam::{HelperRouting, StimulusHelper, TapStatus, VolumeControl};
 use crate::session::{AbortHandle, SessionEvent, SessionLog, ABORT_RAMP_MS, ACK_SPL_TOLERANCE_DB};
 use crate::stimulus::{assemble_bracketed, assemble_sweep, AssembledStimulus, StimulusKind};
 use crate::MeasureError;
@@ -258,11 +258,14 @@ pub struct VerifyRequest {
     pub wav_path: PathBuf,
 }
 
-/// The five seams a verification pass drives, bundled so the constructor
+/// The six seams a verification pass drives, bundled so the constructor
 /// cannot be handed a partial set.
 pub struct VerifySeam {
     pub capture: Box<dyn CaptureSource>,
     pub control: Box<dyn EngineControl>,
+    /// HAL device facts, by UID. The rate fence and the teardown's
+    /// device-gone check ask it; nothing else does.
+    pub devices: Box<dyn DeviceFacts>,
     pub engine: Box<dyn EngineFacts>,
     pub helper: Box<dyn StimulusHelper>,
     pub tap: Box<dyn TapStatus>,
@@ -408,6 +411,7 @@ pub struct VerificationPass {
     /// Blocking findings collected during teardown, never masked.
     collected: Vec<MeasurementDiagnostic>,
     control: Box<dyn EngineControl>,
+    devices: Box<dyn DeviceFacts>,
     engine: Box<dyn EngineFacts>,
     helper_spawner: Box<dyn StimulusHelper>,
     log: SessionLog,
@@ -451,6 +455,7 @@ impl VerificationPass {
         let VerifySeam {
             capture,
             control,
+            devices,
             engine,
             helper,
             tap,
@@ -461,6 +466,7 @@ impl VerificationPass {
             capture_source: capture,
             collected: Vec::new(),
             control,
+            devices,
             engine,
             helper_spawner: helper,
             log: SessionLog::default(),
@@ -955,6 +961,30 @@ impl VerificationPass {
                 },
             )));
         }
+        // ... and on the RENDER DEVICE itself, which the engine cannot speak
+        // for: the child's aggregate is another process's object, and the HAL
+        // may renegotiate it independently of the engine's stream. The first
+        // half of this gate read the child's ECHO of that rate before a sample
+        // played; this reads the device directly, after.
+        //
+        // `None` is permissive HERE and nowhere else in this pass. The child is
+        // normally finished by now and destroys its aggregate on the way out,
+        // so "no such device" is the expected answer rather than a missing
+        // witness — and the engine's own rate, which cannot vanish, has already
+        // been checked one line above.
+        if let Some(render_rate_hz) = self.devices.nominal_sample_rate(&ready.render_device_uid) {
+            let expected_hz = f64::from(rate);
+            // `!=` rather than a negated `==`: NaN compares unequal to
+            // everything, which is the refusing arm we want.
+            if render_rate_hz != expected_hz {
+                return Err(VerifyError::Refused(Refusal::new(
+                    MeasurementDiagnostic::OutputRateChangedDuringVerify {
+                        expected_hz,
+                        observed_hz: render_rate_hz,
+                    },
+                )));
+            }
+        }
 
         // The engine's own ±1.0 output clamp, as a DELTA across the window.
         // The NEAR side of the transducer; the meter above is the far side.
@@ -1139,8 +1169,16 @@ impl VerificationPass {
             let remaining = end.saturating_duration_since(Instant::now());
             let child = self.child.as_mut().expect("a spawned child");
             let line = match child.read_line(remaining) {
-                Ok(Some(line)) => line,
-                Ok(None) | Err(_) => {
+                Ok(HelperLine::Line(line)) => line,
+                // The deadline, not a death: fall through to the timeout arm
+                // below so a child that opens its device slowly is reported as
+                // stalled rather than as having failed to start.
+                Ok(HelperLine::DeadlineExpired) => {
+                    return Err(VerifyError::Refused(Refusal::new(
+                        MeasurementDiagnostic::HelperStalled,
+                    )));
+                }
+                Ok(HelperLine::Eof) | Err(_) => {
                     self.child_exited = true;
                     return Err(VerifyError::Refused(Refusal::new(
                         MeasurementDiagnostic::HelperFailed { exit_code: -1 },
@@ -1204,7 +1242,7 @@ impl VerificationPass {
             let remaining = end.saturating_duration_since(Instant::now());
             let child = self.child.as_mut().expect("a spawned child");
             match child.read_line(remaining) {
-                Ok(Some(line)) => {
+                Ok(HelperLine::Line(line)) => {
                     let fields = parse_line(&line)
                         .ok_or_else(|| VerifyError::HelperProtocol { line: line.clone() })?;
                     match str_field(&fields, "event") {
@@ -1225,7 +1263,17 @@ impl VerificationPass {
                 }
                 // EOF: the child exited without a terminating line. Its exit
                 // status still speaks, so fall through to the reap below.
-                Ok(None) => terminated = true,
+                Ok(HelperLine::Eof) => terminated = true,
+                // The deadline expired with the child still holding the pipe
+                // open: a wedged child, which the check below reports as
+                // stalled. Distinguishing it from EOF is the point of the
+                // three-state read — under the old two-state one a wedged
+                // child read as a clean exit and its status was believed.
+                Ok(HelperLine::DeadlineExpired) => {
+                    return Err(VerifyError::Refused(Refusal::new(
+                        MeasurementDiagnostic::HelperStalled,
+                    )));
+                }
                 Err(_) => {
                     self.child_exited = true;
                     return Err(VerifyError::Refused(Refusal::new(
@@ -1388,23 +1436,21 @@ impl VerificationPass {
         // is not enough: a reaped child that leaked an aggregate still
         // satisfies "no zombie" while leaving a private device wrapping the
         // user's output.
-        match child.reap() {
-            Ok(exit) => {
-                if exit.signalled {
-                    // SIGKILL bypasses `Drop`, so the child's render-aggregate
-                    // RAII never ran and `com.paraeq.render.<pid>` is presumed
-                    // to have survived.
-                    self.collected
-                        .push(MeasurementDiagnostic::RenderDeviceLeaked { pid });
-                }
-            }
-            Err(e) => {
-                self.log.push(SessionEvent::SinkFault {
-                    error: e.to_string(),
-                });
-                self.collected
-                    .push(MeasurementDiagnostic::RenderDeviceLeaked { pid });
-            }
+        if let Err(e) = child.reap() {
+            self.log.push(SessionEvent::SinkFault {
+                error: e.to_string(),
+            });
+        }
+        // The real query, not an inference from the exit status. A SIGKILL
+        // bypassing `Drop` is the LIKELIEST way the aggregate survives, but it
+        // is neither necessary nor sufficient: a cleanly-exited child can still
+        // have failed to destroy it, and the HAL can reclaim one whose creator
+        // was killed. `device_exists` answers `true` when it cannot establish
+        // the answer, so an unverifiable teardown reports a possible leak
+        // rather than assuming a clean one.
+        if self.devices.device_exists(&expected_render_device_uid(pid)) {
+            self.collected
+                .push(MeasurementDiagnostic::RenderDeviceLeaked { pid });
         }
     }
 
@@ -1471,23 +1517,39 @@ impl Drop for VerificationPass {
     }
 }
 
-/// Wait for the child's stdout to close, which is the only liveness probe the
-/// seam offers: `reap` blocks on a live child, so it cannot be polled.
+/// Has the child exited within `budget_ms`?
+///
+/// The probe is [`HelperProcess::try_reap`] — the process's own status — and
+/// not stdout. Stdout is a proxy that is wrong in both directions: a child that
+/// closed its pipe while still rendering reads as dead (so the ladder stops
+/// before SIGTERM and leaves it playing), and a child that keeps emitting
+/// progress lines past the deadline reads as alive forever. The reads are still
+/// made, because they drain the pipe — a child blocked writing into a full
+/// stdout buffer can never reach its own teardown — but the ANSWER comes from
+/// the status.
 fn await_exit(child: &mut dyn HelperProcess, budget_ms: u64) -> bool {
     let end = Instant::now() + Duration::from_millis(budget_ms);
     loop {
+        match child.try_reap() {
+            Ok(Some(_)) => return true,
+            // The status cannot be read at all. The child is unreachable, so
+            // escalating the ladder is the safe direction: a SIGTERM to a
+            // corpse is harmless, and stopping here on a live child is not.
+            Err(_) => return false,
+            Ok(None) => {}
+        }
+        if Instant::now() >= end {
+            return false;
+        }
         let remaining = end.saturating_duration_since(Instant::now());
+        // Drain whatever is queued, bounded by what is left of the budget.
         match child.read_line(remaining) {
-            // EOF: stdout closed, so the child is gone.
-            Ok(None) => return true,
-            // A read failure means the pipe is gone, which means so is the
-            // child. Treating it as "still alive" would send a SIGKILL to a
-            // corpse and report a leak that did not happen.
-            Err(_) => return true,
-            Ok(Some(_)) => {
-                if Instant::now() >= end {
-                    return false;
-                }
+            Ok(HelperLine::Line(_)) => {}
+            // Nothing more will arrive on this pipe. One last status read, so
+            // a child that closed stdout microseconds before exiting is not
+            // reported as wedged.
+            Ok(HelperLine::DeadlineExpired) | Ok(HelperLine::Eof) | Err(_) => {
+                return matches!(child.try_reap(), Ok(Some(_)));
             }
         }
     }

@@ -2630,8 +2630,10 @@ dependencies = [
 name = "paraeq-desktop"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "log",
  "paraeq-coreaudio",
+ "paraeq-decide",
  "paraeq-dsp",
  "paraeq-engine",
  "paraeq-measure",

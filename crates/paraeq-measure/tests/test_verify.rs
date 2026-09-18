@@ -18,6 +18,7 @@ use std::time::Duration;
 use paraeq_dsp::peq::{EQBand, FilterType, ParametricEQ};
 use paraeq_dsp::targets::TransducerClass;
 use paraeq_dsp::two_clock::MarkerLayout;
+use paraeq_measure::seam::{DeviceFacts, HelperLine};
 use paraeq_measure::{
     assemble_bracketed, assemble_sweep, classify_exit, exit_diagnostic, expected_render_device_uid,
     margined_emit_dbfs, CalSensitivity, CalSummary, CaptureSource, EngineControl, EngineFacts,
@@ -458,9 +459,19 @@ struct ChildScript {
     /// When true, `read_line` never reports EOF — the wedged child the
     /// teardown ladder exists for.
     never_exits: Arc<AtomicBool>,
+    /// When true, the process never exits but its stdout IS at EOF. The
+    /// separation matters: a single flag cannot express "silent and alive",
+    /// which is exactly the state that used to read as a clean exit.
+    wedged_silent: Arc<AtomicBool>,
     exit: Arc<Mutex<HelperExit>>,
     flow: Flow,
     journal: Journal,
+    /// UIDs the HAL still carries. [`MockDevices`] reads it, and `kill`
+    /// writes into it: SIGKILL bypasses `Drop`, so the killed child's private
+    /// render aggregate survives it. Modelling the leak here rather than
+    /// asserting on `HelperExit::signalled` is the point — the pass asks the
+    /// HAL whether the device is gone instead of inferring it.
+    live_devices: Arc<Mutex<Vec<String>>>,
     pid: u32,
 }
 
@@ -469,18 +480,38 @@ impl ChildScript {
         Self {
             lines: Arc::new(Mutex::new(Vec::new())),
             never_exits: Arc::new(AtomicBool::new(false)),
+            wedged_silent: Arc::new(AtomicBool::new(false)),
             exit: Arc::new(Mutex::new(HelperExit {
                 code: Some(0),
                 signalled: false,
             })),
             flow,
             journal,
+            live_devices: Arc::new(Mutex::new(Vec::new())),
             pid: 4242,
         }
     }
 
     fn push(&self, line: String) {
         lock(&self.lines).push(line);
+    }
+}
+
+/// The HAL, as far as a verification pass can see it: which UIDs exist and what
+/// rate they run at.
+#[derive(Clone)]
+struct MockDevices {
+    rate_hz: f64,
+    script: ChildScript,
+}
+
+impl DeviceFacts for MockDevices {
+    fn device_exists(&self, uid: &str) -> bool {
+        lock(&self.script.live_devices).iter().any(|u| u == uid)
+    }
+
+    fn nominal_sample_rate(&self, _device_uid: &str) -> Option<f64> {
+        Some(self.rate_hz)
     }
 }
 
@@ -508,6 +539,9 @@ impl HelperProcess for MockChild {
         self.script.journal.record("helper.kill");
         lock(&self.script.exit).signalled = true;
         self.script.never_exits.store(false, Ordering::SeqCst);
+        self.script.wedged_silent.store(false, Ordering::SeqCst);
+        // SIGKILL bypasses `Drop`, so the child's render aggregate outlives it.
+        lock(&self.script.live_devices).push(expected_render_device_uid(self.script.pid));
         Ok(())
     }
 
@@ -521,13 +555,30 @@ impl HelperProcess for MockChild {
         Ok(exit)
     }
 
+    fn try_reap(&mut self) -> Result<Option<HelperExit>, MeasureError> {
+        if let Some(cached) = self.reaped {
+            return Ok(Some(cached));
+        }
+        // A wedged child has not exited, which is the whole of what the ladder
+        // needs to know. Everything else has: the mock has no live process, so
+        // "not wedged" is "done".
+        if self.script.never_exits.load(Ordering::SeqCst)
+            || self.script.wedged_silent.load(Ordering::SeqCst)
+        {
+            return Ok(None);
+        }
+        let exit = *lock(&self.script.exit);
+        self.reaped = Some(exit);
+        Ok(Some(exit))
+    }
+
     fn send_play(&mut self) -> Result<(), MeasureError> {
         self.script.journal.record("helper.send_play");
         self.script.flow.played.store(true, Ordering::SeqCst);
         Ok(())
     }
 
-    fn read_line(&mut self, _deadline: Duration) -> Result<Option<String>, MeasureError> {
+    fn read_line(&mut self, _deadline: Duration) -> Result<HelperLine, MeasureError> {
         let mut lines = lock(&self.script.lines);
         if lines.is_empty() {
             drop(lines);
@@ -535,13 +586,13 @@ impl HelperProcess for MockChild {
                 // A wedged child keeps talking. Sleep so the ladder's deadline
                 // is a real deadline rather than a spin.
                 std::thread::sleep(Duration::from_millis(1));
-                return Ok(Some(
+                return Ok(HelperLine::Line(
                     r#"{"event":"progress","frames_emitted":1}"#.to_owned(),
                 ));
             }
-            return Ok(None);
+            return Ok(HelperLine::Eof);
         }
-        Ok(Some(lines.remove(0)))
+        Ok(HelperLine::Line(lines.remove(0)))
     }
 }
 
@@ -747,6 +798,7 @@ fn recording(level: SweepLevel, plan: &VerifyPlan, layout: &MarkerLayout, pad_s:
 struct Rig {
     capture: MockCapture,
     control: MockControl,
+    devices: MockDevices,
     engine: MockEngine,
     flow: Flow,
     helper: MockHelper,
@@ -802,6 +854,10 @@ impl Rig {
         Rig {
             capture,
             control,
+            devices: MockDevices {
+                rate_hz: RATE_F,
+                script: script.clone(),
+            },
             engine,
             flow,
             helper,
@@ -817,6 +873,7 @@ impl Rig {
         VerifySeam {
             capture: Box::new(self.capture.clone()),
             control: Box::new(self.control.clone()),
+            devices: Box::new(self.devices.clone()),
             engine: Box::new(self.engine.clone()),
             helper: Box::new(self.helper.clone()),
             tap: Box::new(self.tap.clone()),
@@ -1437,6 +1494,122 @@ fn a_render_device_at_the_wrong_rate_refuses_and_names_which_rate() {
     }
 }
 
+/// Gate 8's SECOND read, on the render device itself.
+///
+/// The first read is the child's echo of its aggregate's rate, taken before a
+/// sample played. This one asks the HAL directly, after the capture, because
+/// the child's aggregate is another process's object and the HAL can
+/// renegotiate it without the engine's stream moving at all — so the engine
+/// cannot speak for it and the echo is by then minutes stale in HAL terms.
+#[test]
+fn a_render_device_that_renegotiated_after_the_capture_refuses() {
+    let scratch = Scratch::new("render-rate");
+    let mut rig = Rig::new("render-rate", &scratch, boost_plan());
+    // The child echoed the right rate at `ready`; the device disagrees now.
+    rig.devices.rate_hz = 44_100.0;
+    let mut pass = rig.acknowledged();
+    let error = pass.run().unwrap_err();
+    match refusal_of(&error) {
+        D::OutputRateChangedDuringVerify {
+            expected_hz,
+            observed_hz,
+        } => {
+            assert_eq!(expected_hz, RATE_F);
+            assert_eq!(observed_hz, 44_100.0);
+        }
+        other => panic!("expected OutputRateChangedDuringVerify, got {other:?}"),
+    }
+}
+
+/// A render device that has ALREADY been destroyed is not a rate failure.
+///
+/// The normal case: by the time this fence runs the child has finished and
+/// torn its aggregate down, so the read cannot be answered. `None` is
+/// permissive here and nowhere else in this pass, and this is the test that
+/// says so — without it, every healthy run would refuse.
+#[test]
+fn a_render_device_that_is_already_gone_does_not_refuse_the_rate() {
+    struct Gone;
+    impl DeviceFacts for Gone {
+        fn device_exists(&self, _uid: &str) -> bool {
+            false
+        }
+
+        fn nominal_sample_rate(&self, _device_uid: &str) -> Option<f64> {
+            None
+        }
+    }
+
+    let scratch = Scratch::new("render-gone");
+    let rig = Rig::new("render-gone", &scratch, boost_plan());
+    let seam = VerifySeam {
+        capture: Box::new(rig.capture.clone()),
+        control: Box::new(rig.control.clone()),
+        devices: Box::new(Gone),
+        engine: Box::new(rig.engine.clone()),
+        helper: Box::new(rig.helper.clone()),
+        tap: Box::new(rig.tap.clone()),
+        volume: Box::new(rig.volume.clone()),
+    };
+    let mut pass = VerificationPass::arm(rig.request_clone(), seam).expect("arms");
+    let projected = pass.projected_spl_db();
+    pass.acknowledge("Amp", projected).expect("ack");
+    pass.run()
+        .expect("an unreadable render rate is not a refusal");
+}
+
+/// The falsifier for teardown 1d's inference-to-query swap: a child that exited
+/// CLEANLY and still left its private aggregate behind.
+///
+/// `HelperExit::signalled` is `false` here, so the old rule — "a leak is a
+/// SIGKILL" — reports nothing at all, and a private device is left wrapping the
+/// user's output with no record that it happened. Asking the HAL catches it.
+#[test]
+fn a_clean_exit_that_left_its_render_device_behind_is_still_reported() {
+    let scratch = Scratch::new("clean-leak");
+    let rig = Rig::new("clean-leak", &scratch, boost_plan());
+    lock(&rig.script.live_devices).push(expected_render_device_uid(rig.script.pid));
+
+    let mut pass = rig.acknowledged();
+    let error = pass
+        .run()
+        .expect_err("a leaked render device is blocking even on a successful run");
+    match refusal_of(&error) {
+        D::RenderDeviceLeaked { pid } => assert_eq!(pid, rig.script.pid),
+        other => panic!("expected RenderDeviceLeaked, got {other:?}"),
+    }
+    assert!(
+        !lock(&rig.script.exit).signalled,
+        "the child exited cleanly: the old signalled-based inference would have missed this"
+    );
+}
+
+/// The falsifier for `await_exit`'s inference-to-probe swap: a wedged child
+/// that CLOSED ITS STDOUT.
+///
+/// Under the old stdout-as-liveness rule, EOF meant "gone", so the ladder
+/// stopped after the polite `abort` rung and a child that never read it was
+/// left rendering. The probe is now the process status, so the ladder
+/// escalates: SIGTERM, then SIGKILL.
+#[test]
+fn a_wedged_child_that_closed_its_stdout_still_escalates_past_the_ramp_rung() {
+    let scratch = Scratch::new("silent-wedge");
+    let rig = Rig::new("silent-wedge", &scratch, boost_plan());
+    // No more lines after `ready` + `done`: stdout is at EOF from the first
+    // teardown read onward, while the process itself never exits.
+    rig.flow.wake_at.store(u64::MAX, Ordering::SeqCst);
+    rig.script.wedged_silent.store(true, Ordering::SeqCst);
+    let mut pass = rig.acknowledged();
+    let error = pass.run().unwrap_err();
+    assert_eq!(refusal_of(&error), D::TapSilentDuringVerification);
+
+    let calls = rig.journal.calls();
+    assert!(
+        calls.contains(&"helper.request_terminate".to_owned()),
+        "an EOF on stdout must not be read as an exit: {calls:?}"
+    );
+}
+
 /// Gate 9's echoed half: the child must have understood the channel it was
 /// asked for. Refused before `play`.
 #[test]
@@ -1607,6 +1780,7 @@ fn a_silent_capture_is_floored_and_then_refused() {
     let seam = VerifySeam {
         capture: Box::new(capture),
         control: Box::new(rig.control.clone()),
+        devices: Box::new(rig.devices.clone()),
         engine: Box::new(rig.engine.clone()),
         helper: Box::new(rig.helper.clone()),
         tap: Box::new(rig.tap.clone()),
@@ -1631,6 +1805,7 @@ fn a_clipped_verification_capture_refuses_with_input_clipping() {
     let seam = VerifySeam {
         capture: Box::new(capture),
         control: Box::new(rig.control.clone()),
+        devices: Box::new(rig.devices.clone()),
         engine: Box::new(rig.engine.clone()),
         helper: Box::new(rig.helper.clone()),
         tap: Box::new(rig.tap.clone()),
@@ -1874,7 +2049,10 @@ fn every_helper_process_method_is_safe_to_call_after_the_child_has_exited() {
         reaped: None,
     };
     // Drain to EOF, then reap: the child is gone.
-    while child.read_line(Duration::from_millis(1)).unwrap().is_some() {}
+    while matches!(
+        child.read_line(Duration::from_millis(1)).unwrap(),
+        HelperLine::Line(_)
+    ) {}
     let first = child.reap().expect("the first reap");
 
     // Every method, twice, on a corpse.

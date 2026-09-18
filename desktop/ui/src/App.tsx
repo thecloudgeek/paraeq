@@ -14,6 +14,7 @@ import type { AppState } from "@/ipc/types";
 import { useAppState } from "@/ipc/useAppState";
 import { EqTab } from "@/tabs/EqTab";
 import { PlaceholderTab } from "@/tabs/PlaceholderTab";
+import { VerifyPanel } from "@/tabs/VerifyPanel";
 import { SetupWizard } from "@/wizard/SetupWizard";
 
 function App() {
@@ -43,8 +44,16 @@ function App() {
           <TabsTrigger value="profiles">Profiles</TabsTrigger>
         </TabsList>
 
-        <TabsContent value="measure">
-          <PlaceholderTab stage="stage 6" title="Measure" />
+        {/* The Measure tab is still Stage 7's, but the verification pass it
+            ends in is wired NOW, so the panel lives here rather than behind a
+            tab that does not exist. It shows the outcome of a pass and is
+            honest that it cannot start one yet. */}
+        <TabsContent value="measure" className="min-h-0 flex-1">
+          {state ? (
+            <VerifyPanel state={state.verification} />
+          ) : (
+            <PlaceholderTab stage="stage 6" title="Measure" />
+          )}
         </TabsContent>
         <TabsContent value="target">
           <PlaceholderTab stage="stage 5" title="Target" />
