@@ -67,6 +67,31 @@ pub const BLESS_ALIAS: &str = "PARAEQ_BLESS";
 /// [`BlessMode::To`].
 pub const BLESS_OUT_VAR: &str = "PARAEQ_BLESS_DECIDE_OUT";
 
+/// Who signed this freeze. Read at BLESS time and written into
+/// `manifest.json`'s `reviewed_by` (ruling R-A10).
+///
+/// `build_manifest(None, None)` at both call sites meant the freeze record
+/// could never be filled: `reviewed_by` and `frozen_at` were documented as
+/// "null until the bless fills them" and nothing in the bless filled them, so
+/// "owner-reviewed once and then frozen" had no artefact.
+pub const BLESS_REVIEWED_BY_VAR: &str = "PARAEQ_BLESS_REVIEWED_BY";
+
+/// When this freeze was taken, as the owner writes it. Read at BLESS time and
+/// written into `manifest.json`'s `frozen_at`.
+///
+/// Read from the environment rather than from a clock, for the reason
+/// `decide()` itself takes no clock: a test that stamps `SystemTime::now()`
+/// rewrites the manifest on every run and the freeze stops being a freeze.
+pub const BLESS_DATE_VAR: &str = "PARAEQ_BLESS_DATE";
+
+/// One bless-record variable, or `None` when it is unset or empty.
+pub fn bless_record_var(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 /// `fixtures/decide/`, resolved the same way every other fixture reader in this
 /// workspace resolves `fixtures/`.
 pub fn decide_dir() -> PathBuf {
@@ -376,8 +401,13 @@ pub fn bless_root(mode: &BlessMode) -> Option<PathBuf> {
 ///
 /// The bless rewrites `expected.json` **and** the manifest in one pass, so the
 /// PR shows the policy change and the re-freeze together rather than as two
-/// commits a reviewer has to correlate. `frozen_at` and `reviewed_by` are the
-/// owner's to fill at the bless; the generator leaves them null.
+/// commits a reviewer has to correlate.
+///
+/// **`frozen_at` and `reviewed_by` are CARRIED FORWARD when not given** (ruling
+/// R-A10). They are the owner's record, and the input generator rewrites this
+/// same file — so a plain `None` used to erase the signature on the next
+/// regeneration. Passing a value replaces it; passing `None` keeps whatever the
+/// file already says, which is `null` before the first bless.
 pub fn build_manifest(frozen_at: Option<&str>, reviewed_by: Option<&str>) -> Value {
     let mut cases = serde_json::Map::new();
     for case in CASES {
@@ -393,13 +423,52 @@ pub fn build_manifest(frozen_at: Option<&str>, reviewed_by: Option<&str>) -> Val
             Value::Object(files.into_iter().collect::<serde_json::Map<_, _>>()),
         );
     }
+    let previous = std::fs::read_to_string(manifest_path())
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    let carried = |key: &str, given: Option<&str>| -> Value {
+        match given {
+            Some(value) => Value::from(value),
+            None => previous
+                .as_ref()
+                .map(|p| p[key].clone())
+                .unwrap_or(Value::Null),
+        }
+    };
     serde_json::json!({
         "algorithm": "fnv1a64",
         "cases": Value::Object(cases),
-        "frozen_at": frozen_at,
-        "reviewed_by": reviewed_by,
+        "frozen_at": carried("frozen_at", frozen_at),
+        "reviewed_by": carried("reviewed_by", reviewed_by),
+        "root": Value::Object(root_digests()),
         "schema_version": 1,
     })
+}
+
+/// The files that live at the ROOT of `fixtures/decide/` rather than inside a
+/// case, digested under their own key.
+///
+/// Ruling R-A10. `README.md` is hand-written prose the owner signs, and the
+/// README claimed the manifest digested it — it did not: [`case_files`] walks
+/// case directories only, so an edit to the README was invisible to the freeze.
+/// `notes.md` WAS covered all along, because a case's notes live inside its
+/// case directory.
+///
+/// **`manifest.json` is deliberately absent and cannot be otherwise**: a file
+/// cannot contain its own digest. What protects it is the same thing that
+/// protects every other frozen artefact — it is in git, and
+/// `the_freeze_manifest_matches_every_file_on_disk` recomputes every row it
+/// claims.
+pub const ROOT_FILES: [&str; 1] = ["README.md"];
+
+fn root_digests() -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    for name in ROOT_FILES {
+        let bytes = std::fs::read(decide_dir().join(name))
+            .unwrap_or_else(|e| panic!("fixtures/decide/{name}: {e}"));
+        out.insert(name.to_string(), digest_entry(&bytes));
+    }
+    out
 }
 
 pub fn read_manifest() -> Value {

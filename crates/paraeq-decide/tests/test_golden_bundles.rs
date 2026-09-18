@@ -201,7 +201,18 @@ fn decide_reproduces_expected_json_byte_for_byte() {
         // The bless rewrites expected.json AND the manifest in one pass, so the
         // PR shows the policy change and the re-freeze together instead of as
         // two commits a reviewer has to correlate.
-        let manifest = golden::build_manifest(None, None);
+        //
+        // The freeze RECORD is filled here and nowhere else (ruling R-A10):
+        // `reviewed_by` and `frozen_at` are read from the environment at bless
+        // time, because "owner-reviewed once and then frozen" needs an artefact
+        // and `build_manifest(None, None)` could never produce one. The date
+        // comes from the owner rather than from a clock, for the reason
+        // `decide()` takes no clock: a `SystemTime::now()` stamp rewrites the
+        // manifest on every run and the freeze stops being one.
+        let manifest = golden::build_manifest(
+            golden::bless_record_var(golden::BLESS_DATE_VAR).as_deref(),
+            golden::bless_record_var(golden::BLESS_REVIEWED_BY_VAR).as_deref(),
+        );
         std::fs::write(golden::manifest_path(), golden::canonical_json(&manifest))
             .expect("fixtures/decide/manifest.json is writable");
         eprintln!("rebuilt {}", golden::manifest_path().display());
@@ -263,6 +274,30 @@ fn the_freeze_manifest_matches_every_file_on_disk() {
     assert_eq!(manifest["algorithm"], "fnv1a64");
     assert_eq!(manifest["schema_version"], 1);
 
+    // The ROOT files, under their own key (ruling R-A10). The README used to
+    // claim the manifest digested it and the manifest did not: `case_files`
+    // walks case directories only. `manifest.json` itself is deliberately not
+    // listed — a file cannot contain its own digest.
+    let root = manifest["root"]
+        .as_object()
+        .expect("the manifest carries a `root` map");
+    let mut named: Vec<&str> = root.keys().map(String::as_str).collect();
+    named.sort();
+    assert_eq!(
+        named,
+        golden::ROOT_FILES.to_vec(),
+        "manifest root file list"
+    );
+    for (name, entry) in root {
+        let bytes = std::fs::read(golden::decide_dir().join(name))
+            .unwrap_or_else(|e| panic!("fixtures/decide/{name} is in the manifest but: {e}"));
+        assert_eq!(
+            golden::digest_entry(&bytes),
+            *entry,
+            "fixtures/decide/{name} does not match its frozen digest"
+        );
+    }
+
     let cases = manifest["cases"]
         .as_object()
         .expect("the manifest carries a `cases` map");
@@ -299,6 +334,45 @@ fn the_freeze_manifest_matches_every_file_on_disk() {
         assert!(
             unlisted.is_empty() || unlisted == vec!["expected.json".to_string()],
             "{case}: files on disk that the freeze manifest does not cover: {unlisted:?}"
+        );
+    }
+}
+
+/// Once a freeze exists, it names who took it and when.
+///
+/// Ruling R-A10. `manifest.json`'s `reviewed_by` and `frozen_at` are documented
+/// as "null until the bless fills them", and nothing in the bless filled them —
+/// `build_manifest(None, None)` at both call sites. A freeze whose record is
+/// permanently null is a signature nobody signed, which is precisely what the
+/// mechanism exists to produce.
+///
+/// Pre-bless the assertion does not apply and this reports and passes, the same
+/// shape as the two `expected.json` comparisons.
+#[test]
+fn the_freeze_record_names_a_reviewer_and_a_date_once_a_freeze_exists() {
+    let blessed: Vec<&str> = CASES
+        .into_iter()
+        .filter(|case| GoldenCase::load(case).expected_text().is_some())
+        .collect();
+    if blessed.is_empty() {
+        eprintln!(
+            "SKIPPED the freeze-record check: no case carries an expected.json yet, which is \
+             the designed pre-bless state. Set {} and {} when the owner-gated bless runs.",
+            golden::BLESS_REVIEWED_BY_VAR,
+            golden::BLESS_DATE_VAR
+        );
+        return;
+    }
+    let manifest = golden::read_manifest();
+    for key in ["frozen_at", "reviewed_by"] {
+        let value = &manifest[key];
+        assert!(
+            value.is_string() && !value.as_str().unwrap_or_default().trim().is_empty(),
+            "{} case(s) are blessed but manifest.json's `{key}` is {value}. Re-run the bless \
+             with {}=<name> {}=<date>.",
+            blessed.len(),
+            golden::BLESS_REVIEWED_BY_VAR,
+            golden::BLESS_DATE_VAR
         );
     }
 }

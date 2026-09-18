@@ -44,7 +44,11 @@ cargo test -p paraeq-decide --test test_golden_bundles -- --ignored \
 
 `git status` must be clean afterwards. Only `notes.md` and this README are
 written by hand, because they are prose the owner signs rather than data — and
-the freeze manifest digests them too, so an edit to either is visible.
+the freeze manifest digests both, so an edit to either is visible: `notes.md`
+because it lives inside its case directory, and this README under the manifest's
+own `root` key. `manifest.json` is **not** in that list and cannot be: a file
+cannot contain its own digest. What protects it is that it is in git and that
+`the_freeze_manifest_matches_every_file_on_disk` recomputes every row it claims.
 
 The collision with the Python generator was real and is closed on the other
 side as well: `generate_fixtures.py` used to `shutil.rmtree(OUT)`, so the
@@ -106,7 +110,29 @@ Capture width also differs by path, and honestly: a room run captures through
 one correction applied as one), while an EARS jig captures **both ear capsules
 at once** and the installed plan carries the matching two channels.
 
-The whole directory is ~21 MB.
+### Size, and what the budget is about
+
+| | size |
+|---|---|
+| the INPUTS — `bundle.json`, `ir/*.f64`, `notes.md`, this file, the manifest | ~21 MB |
+| the eight `expected.json` a bless adds | ~4.8 MiB |
+| the directory once frozen | ~26 MB |
+
+**The 24 MB budget is an INPUTS budget.** It is about what a clone pays for
+data that never changes: the sidecars are the shipped store window at 48 kHz and
+their size is a property of the window, not of a choice anyone is free to
+revisit. `expected.json` is the owner's frozen answer and its size is a
+consequence of `Analysis` — one 957-point grid, a curve per position, a curve per
+channel, σ(f), the excess-group-delay trace, and one `Evidence` curve per
+decision that plots one. Recording the two separately is the honest accounting;
+collapsing them into one number would make a policy change look like a size
+regression.
+
+**About 99.7 % of an `expected.json` is curve data.** That is why every
+`notes.md` ends with a "what to look at" paragraph naming the three keys a review
+actually reads. Trimming `Analysis` to a coarser grid would shrink the files and
+would also drop the data the drawer plots and a bug report attaches, so it is
+recorded here as a possible saving that is **not** taken.
 
 ---
 
@@ -141,7 +167,7 @@ else. They belong in unit tests.
 
 ## The freeze
 
-Four mechanisms, all in `crates/paraeq-decide/tests/test_golden_bundles.rs`:
+Five mechanisms, all in `crates/paraeq-decide/tests/test_golden_bundles.rs`:
 
 1. **`decide_reproduces_expected_json_byte_for_byte`** — the characterization
    assertion, compared as text. Byte-exactness is available because
@@ -155,6 +181,8 @@ Four mechanisms, all in `crates/paraeq-decide/tests/test_golden_bundles.rs`:
    would simply bless to a different `expected.json` and look legitimate.
 4. **`blessing_is_off_unless_the_env_var_is_set`** — CI sets no such variable,
    so CI can never silently re-bless.
+5. **`the_freeze_record_names_a_reviewer_and_a_date_once_a_freeze_exists`** — a
+   freeze that cannot say who took it or when is a signature nobody signed.
 
 ### `manifest.json`
 
@@ -164,12 +192,18 @@ Four mechanisms, all in `crates/paraeq-decide/tests/test_golden_bundles.rs`:
   "cases": { "<case>": { "<file>": { "bytes": 1234, "fnv1a64": "0x…" } } },
   "frozen_at": null,
   "reviewed_by": null,
+  "root": { "README.md": { "bytes": 1234, "fnv1a64": "0x…" } },
   "schema_version": 1
 }
 ```
 
+`root` covers the files that are not inside a case directory. `manifest.json` is
+absent from it because a file cannot contain its own digest.
+
 `frozen_at` and `reviewed_by` are `null` until the bless fills them; they are the
-owner's record, not the generator's.
+owner's record, not the generator's. **The bless reads them from the
+environment** — see below — and the input generator CARRIES THEM FORWARD rather
+than clearing them, so a regeneration cannot erase a signature.
 
 The digest is **FNV-1a 64, inline in the test helper**, because the workspace has
 no hashing crate and CLAUDE.md carries a forbidden-dependency list. It is a
@@ -190,10 +224,23 @@ into a re-format that reads as a policy diff.
 ## The bless
 
 ```
-PARAEQ_BLESS_DECIDE=1 cargo test -p paraeq-decide --test test_golden_bundles
+PARAEQ_BLESS_DECIDE=1 \
+    PARAEQ_BLESS_REVIEWED_BY="Ronak Patel" \
+    PARAEQ_BLESS_DATE=2026-09-18 \
+    cargo test -p paraeq-decide --test test_golden_bundles
 ```
 
-`PARAEQ_BLESS=1` is accepted as an alias. It rewrites all eight `expected.json`
+`PARAEQ_BLESS=1` is accepted as an alias.
+
+`PARAEQ_BLESS_REVIEWED_BY` and `PARAEQ_BLESS_DATE` fill `manifest.json`'s
+`reviewed_by` and `frozen_at`. They are the freeze record — "owner-reviewed once
+and then frozen" is a claim about a person and a date, and without them it has no
+artefact. `the_freeze_record_names_a_reviewer_and_a_date_once_a_freeze_exists`
+fails if any `expected.json` is present and either is still null, so a bless that
+forgets them is caught on the next `cargo test` rather than a year later. The
+date comes from the owner rather than from a clock for the same reason `decide()`
+takes no clock: a `SystemTime::now()` stamp rewrites the manifest on every run,
+and a file that changes on every run is not a freeze. It rewrites all eight `expected.json`
 files **and** `manifest.json` in one pass, so the PR shows the policy change and
 the re-freeze together rather than as two commits a reviewer has to correlate.
 A variable that is set but empty, or set to `0`, is off.

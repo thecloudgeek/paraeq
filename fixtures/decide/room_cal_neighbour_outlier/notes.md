@@ -19,10 +19,26 @@ produced it. `correction` is `None`, and everything else is populated as far as
 it got — that is what lets guided mode pick up where auto stopped, and it is
 what the owner should check in `expected.json` first.
 
-**Expected verdict: `Refuse`.**
+**Expected verdict: `Refuse`, with exactly two diagnostics, in this order:**
+`CalNeighbourOutlier` at `Severity::Refuse` with `value: 3.12`, naming 19.611 Hz
+so the drawer can show the margin; and `FewPositions` at `Severity::Warn` with
+`value: 5.0`.
 
-**Diagnostics it should raise:** `CalNeighbourOutlier` at `Severity::Refuse`,
-naming 19.611 Hz and carrying the deviation as `Diagnostic::value` so the drawer
-can show the margin. Nothing else: the captures, the noise floor, the position
-count, the clock estimate and the sensitivity are all ordinary here, on purpose,
-so that the refusal has exactly one cause.
+**One REFUSAL, one warning, and the distinction is the case.** The refusal has
+exactly one cause — the vendor's bogus zero — which is what this directory is
+for. `FewPositions` rides along because five positions is below the room path's
+default of nine, the same warning every five-position room case here carries; it
+is a `Warn`, so it changes no verdict and takes nothing away from the single
+cause. The captures, the noise floor, the clock estimate and the sensitivity are
+all ordinary on purpose.
+
+`correction` is `None`, and everything else is populated as far as it got — that
+is what lets guided mode pick up where auto stopped, and it is what the owner
+should check in `expected.json` first.
+
+**What to look at in `expected.json`.** Three keys, in this order:
+`verdict`; `diagnostics` (each row's `code`, `severity`, `position` and
+`value`); and the twenty-one non-`authority` entries under `decisions` — each
+one's `value` and `source`. Everything else in the file is curve data: the
+`analysis` block and the `evidence` arrays are there to be plotted, and they are
+about 99.7 % of the bytes. Reading them is not the review.

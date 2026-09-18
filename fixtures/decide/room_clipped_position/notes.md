@@ -17,12 +17,26 @@ normalised to −0.006 dBFS while every other IR in the whole fixture set sits a
 of contradicting it. Neither of those is the engine's ±1.0 output clamp, which
 watches the near side and is a different counter entirely.
 
-**Expected verdict: `ProceedWithWarnings`.**
+**Expected verdict: `ProceedWithWarnings`, with exactly two diagnostics, in
+this order:** `ClippingPosition` at `Severity::RefusePosition` scoped to
+position 3 with `value: -0.006`, and `FewPositions` at `Severity::Warn` with
+`value: 4.0`.
 
-**Diagnostics it should raise:** `ClippingPosition` scoped to position 3, at
-`Severity::Refuse` for that position — the session proceeds on the four
-survivors, which is above the hard minimum of three. `ClippingSession` must NOT
-fire: one railed position out of five is a bad position, not a bad session, and
-collapsing the two would refuse a run that is perfectly recoverable. Since four
-survivors is below the room path's default of nine, a position-count warning is
-expected alongside it.
+`RefusePosition` is the spec's own third Severity value — "Refuse *that
+position*" — so position 3 is REMOVED from the cohort and
+`analysis.per_position_db` carries **four** curves. That is what the row's own
+copy has always promised ("We dropped it — re-measure just that one"), and the
+four survivors are above the hard minimum of three, so the session produces an
+installable correction. `FewPositions` grades the SURVIVOR count, four, against
+the room default of nine.
+
+`ClippingSession` must NOT fire: one railed position out of five is a bad
+position, not a bad session, and collapsing the two would refuse a run that is
+perfectly recoverable.
+
+**What to look at in `expected.json`.** Three keys, in this order:
+`verdict`; `diagnostics` (each row's `code`, `severity`, `position` and
+`value`); and the twenty-one non-`authority` entries under `decisions` — each
+one's `value` and `source`. Everything else in the file is curve data: the
+`analysis` block and the `evidence` arrays are there to be plotted, and they are
+about 99.7 % of the bytes. Reading them is not the review.

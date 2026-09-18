@@ -18,8 +18,26 @@ store window — honest, because the energy is gone inside ~30 ms, and the
 `right_window_ms` the analysis applies is bounded by the data the recording
 holds.
 
-**Expected verdict: `Proceed`.**
+**Expected verdict: `Proceed`, with no diagnostics at all** —
+`verdict: "Proceed"`, `diagnostics: []`.
 
-**Diagnostics it should raise: none.** Five positions IS the coupler default, so
-`FewPositions` must not fire here even though the same count warns on the room
-path — that asymmetry is a profile fact and this case is where it shows.
+Five positions IS the coupler default, so `FewPositions` must not fire here even
+though the same count warns on the room path — that asymmetry is a profile fact
+and this case is where it shows.
+
+**The correction carries one band per channel, and the count is the point.** This
+is the case that caught a fit defect worth naming: the cascade ceiling used to be
+checked with a float-equality epsilon, and `COUPLER_EXCURSION_DB` is exactly zero
+above 10 kHz, so no realizable filter could ever satisfy it and BOTH coupler
+paths emitted nothing at all. One band is what the coupler envelope licenses
+here: it allows 2 dB of cut above 500 Hz and nothing above 10 kHz, and this
+capture's largest deviation sits just under that cutoff, so a high shelf is what
+survives. The eleven `clamps` rows are the candidates the envelope shaped or
+refused, which is exactly the reporting the Advanced drawer exists to render.
+
+**What to look at in `expected.json`.** Three keys, in this order:
+`verdict`; `diagnostics` (each row's `code`, `severity`, `position` and
+`value`); and the twenty-one non-`authority` entries under `decisions` — each
+one's `value` and `source`. Everything else in the file is curve data: the
+`analysis` block and the `evidence` arrays are there to be plotted, and they are
+about 99.7 % of the bytes. Reading them is not the review.

@@ -14,10 +14,18 @@ the position-count warning is part of what this case is for.
 `tests/test_arithmetic_pins.rs` asserts the spec's literal (−6.0 dB by dB mean,
 −0.97 dB by power) against this directory.
 
-**Expected verdict: `ProceedWithWarnings`.**
+**Expected verdict: `ProceedWithWarnings`, with exactly one diagnostic:**
+`FewPositions` at `Severity::Warn`, `value: 5.0`.
 
-**Diagnostics it should raise:** `FewPositions` at `Severity::Warn` — five is
-below `positions_default` (9) and at or above the hard minimum of three. The
-null itself is NOT a diagnostic: a single deep seat-specific null is what the
+Five is below `positions_default` (9) and at or above the hard minimum of three.
+The null itself is NOT a diagnostic: a single deep seat-specific null is what the
 power average exists to survive, and refusing it would refuse an ordinary room.
-`TwoClock` must not fire (`clock_skew_ppm: Some(9.8)`).
+`TwoClock` must not fire (`clock_skew_ppm: Some(9.8)`). The correction carries
+one band.
+
+**What to look at in `expected.json`.** Three keys, in this order:
+`verdict`; `diagnostics` (each row's `code`, `severity`, `position` and
+`value`); and the twenty-one non-`authority` entries under `decisions` — each
+one's `value` and `source`. Everything else in the file is curve data: the
+`analysis` block and the `evidence` arrays are there to be plotted, and they are
+about 99.7 % of the bytes. Reading them is not the review.

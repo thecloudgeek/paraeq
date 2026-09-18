@@ -394,6 +394,16 @@ fn umik_cal() -> CalFile {
     )
 }
 
+/// **The 10 kHz row is 0.75 dB, and it was 1.42.** On this coarse
+/// twelve-point grid the neighbour-outlier rule reads `|g[i] − (g[i−1]+g[i+1])/2|`
+/// against its 1.5 dB threshold, and 10 kHz is the LOG MIDPOINT of 5 kHz and
+/// 20 kHz — so a 1.42 dB point between +0.63 and −2.08 deviates by 2.145 dB and
+/// was a cal DEFECT in five of the eight cases (ruling R-A10). That is not what
+/// a UMIK-1 file looks like and it is not what those cases are for: the vendor
+/// defect belongs to `room_cal_neighbour_outlier` alone, which carries the real
+/// `7005770_90deg.txt` zero at 19.611 Hz. 0.75 deviates by 1.475 dB, inside the
+/// threshold with 0.025 dB to spare, and leaves the curve's shape — a gentle
+/// HF rise then a top-octave roll-off — intact.
 const UMIK_PAIRS: [(f64, f64); 12] = [
     (20.0, -3.13),
     (31.5, -1.86),
@@ -405,7 +415,7 @@ const UMIK_PAIRS: [(f64, f64); 12] = [
     (1000.0, 0.00),
     (2000.0, 0.21),
     (5000.0, 0.63),
-    (10000.0, 1.42),
+    (10000.0, 0.75),
     (20000.0, -2.08),
 ];
 
@@ -1094,14 +1104,33 @@ fn room_clipped_position() -> MeasurementBundle {
 
 pub const CLIPPED_POSITION: usize = 3;
 
-/// A noisy room, just above the hard SNR floor.
+/// A noisy room, in the middle of the soft SNR band.
 ///
-/// The floor is raised 22 dB relative to every other room case, which puts the
-/// capture-to-floor margin inside the soft SNR band rather than past the hard
-/// refusal. The same case carries `clock_skew_ppm: None`, and the pairing is
-/// physical rather than convenient: the marker fit that produces the ppm
-/// estimate is a matched filter against the same noise, and a floor this high
-/// is exactly where it fails to converge.
+/// **`noise_offset_db = 52.0`, and the number is measured rather than chosen.**
+/// The SNR rows compare the analysed per-position curve against the silence
+/// capture's own spectrum, both reduced to a band RMS (ruling R-A8), so the
+/// offset that places this case inside the soft window is a property of this
+/// fixture's analysed level and not a round number. At 52.0 the in-band SNR is
+/// **22.24 dB**: 2.76 dB under the 25 dB soft gate, 7.24 dB over the 15 dB hard
+/// refusal, and the floor's own band RMS is −26.11 dBFS, 2.11 dB under Dirac's
+/// −24 dBFS gate. All three margins are stated in `notes.md` because all three
+/// are what the case is for — `LowSnrHard` and `NoiseFloorTooHigh` must not
+/// fire, and the window between them is only about 5 dB wide on this capture
+/// level.
+///
+/// The old value, 22.0, was ABSOLUTE on the −70 dB reference like every other
+/// case's, not a 22 dB raise as the comment beside it used to claim; under the
+/// broadband SNR rule it put this case 0.33 dB past the HARD refusal.
+///
+/// The capture carries its own broadband bed as well. It is deliberately NOT a
+/// calibrated match for the reported floor — the reported spectrum is what the
+/// spec's Detection column grades against ("capture RMS − floor RMS"), and the
+/// bed is there so the captures are not artificially silent.
+///
+/// The same case carries `clock_skew_ppm: None`, and the pairing is physical
+/// rather than convenient: the marker fit that produces the ppm estimate is a
+/// matched filter against the same noise, and a floor this high is exactly
+/// where it fails to converge.
 fn room_noisy_snr_boundary() -> MeasurementBundle {
     let positions = build_positions(
         &PositionPlan {
@@ -1113,8 +1142,9 @@ fn room_noisy_snr_boundary() -> MeasurementBundle {
             seed: SEED_NOISY,
         },
         |_, _, mut samples| {
-            // The noise the raised floor describes, in the capture itself: a
-            // broadband bed 22 dB above the other room cases' tail.
+            // A broadband bed in the capture itself, so the captures of a noisy
+            // room are not artificially silent. Not a calibrated match for the
+            // reported floor spectrum — see this function's doc comment.
             let mut rng = Rng::new(SEED_NOISY ^ 0x9E37_79B9_7F4A_7C15);
             for sample in samples.iter_mut() {
                 *sample += 2.0e-3 * rng.next();
@@ -1128,10 +1158,14 @@ fn room_noisy_snr_boundary() -> MeasurementBundle {
         umik_cal(),
         TransducerClass::Bookshelf,
         None,
-        22.0,
+        NOISY_FLOOR_OFFSET_DB,
         positions,
     )
 }
+
+/// The noisy case's `noise_offset_db`. See [`room_noisy_snr_boundary`] for how
+/// it was measured and what the three margins are.
+pub const NOISY_FLOOR_OFFSET_DB: f64 = 52.0;
 
 // ---------------------------------------------------------------------------
 // Writing

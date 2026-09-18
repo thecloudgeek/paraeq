@@ -41,10 +41,28 @@ the gain stage), `installed` with per-channel `clamps` and a `dropped` band,
   residual recipe is wrong, and this note is the record of which one this
   fixture claims.
 
-**Expected verdict: `ProceedWithWarnings`.**
+**Expected verdict: `ProceedWithWarnings`, with exactly two diagnostics, in
+this order:** `PositionOutlierCouplerLf` at `Severity::RefusePosition` scoped to
+position 2, and `FewPositions` at `Severity::Warn` with `value: 4.0`.
 
-**Diagnostics it should raise:** `PositionOutlierCouplerLf` at `Severity::Refuse`
-scoped to position 2, with the surviving four still producing a correction. No
-verification diagnostic: the routing matches the baseline's, the channel counts
-agree, the band rows are identical, the capture did not clip, and the residual
-is zero by construction. `TwoClock` must not fire — the fit was formed.
+`RefusePosition` is the spec's own third Severity value — "Refuse *that
+position*" — and it is what makes the copy true: position 2 is REMOVED from the
+cohort, the analysis re-runs over the survivors, and `analysis.per_position_db`
+carries **four** curves rather than five. `FewPositions` then grades the SURVIVOR
+count against the coupler default of five, which is why it appears here and did
+not before the position was dropped. Four is comfortably above the hard minimum
+of three, so the session still produces an installable correction.
+
+No verification diagnostic: the routing matches the baseline's, the channel
+counts agree, the band rows are identical, the capture did not clip, and the
+residual is zero by construction. `TwoClock` must not fire — the fit was formed.
+
+The correction's two channels carry different band counts. That is the jig
+hearing two ears, not a bug: each channel is fitted to its own curve.
+
+**What to look at in `expected.json`.** Three keys, in this order:
+`verdict`; `diagnostics` (each row's `code`, `severity`, `position` and
+`value`); and the twenty-one non-`authority` entries under `decisions` — each
+one's `value` and `source`. Everything else in the file is curve data: the
+`analysis` block and the `evidence` arrays are there to be plotted, and they are
+about 99.7 % of the bytes. Reading them is not the review.
