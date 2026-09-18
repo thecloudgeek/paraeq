@@ -196,6 +196,27 @@ pub trait RenderSink: Send {
     fn write(&mut self, block: &[f32]) -> Result<(), MeasureError>;
 }
 
+/// What one [`HelperProcess::read_line`] call found.
+///
+/// THREE states, not two, and the third is the whole reason this type exists.
+/// A `Result<Option<String>, _>` cannot tell "the deadline expired and the
+/// child is still alive" apart from "stdout closed, so the child is gone", and
+/// the teardown ladder turns on exactly that distinction: it escalates from the
+/// polite `abort` rung to SIGTERM only when the child did NOT exit inside the
+/// ramp deadline. Conflating the two makes a wedged child read as a dead one,
+/// the ladder stops after rung 1, and a helper is left playing into the user's
+/// output device — which is the failure the ladder exists to prevent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HelperLine {
+    /// The deadline passed with nothing to read. The child may still be alive;
+    /// ask [`HelperProcess::try_reap`] if you need to know.
+    DeadlineExpired,
+    /// Stdout closed. The child has exited (or closed the pipe on its way out).
+    Eof,
+    /// One line, with its trailing newline already stripped.
+    Line(String),
+}
+
 /// Spawns and owns the verification helper child process.
 ///
 /// Declared here and implemented by the shell for the same reason
@@ -265,17 +286,33 @@ pub trait HelperProcess: Send {
     /// forever on an already-reaped pid.
     fn reap(&mut self) -> Result<HelperExit, MeasureError>;
 
+    /// The NON-BLOCKING twin of [`reap`](Self::reap): `None` means "still
+    /// running", `Some` means "exited, and here is the status".
+    ///
+    /// The ladder needs a liveness probe it can poll against a deadline, and
+    /// [`reap`](Self::reap) blocks on a live child so it cannot be one.
+    /// Inferring liveness from stdout instead — treating EOF as "gone" — is
+    /// wrong in both directions: a child that closed stdout but is still
+    /// rendering reads as dead, and a child that keeps emitting progress lines
+    /// past its deadline reads as alive forever.
+    ///
+    /// Idempotent for the same reason `reap` is: once a status has been
+    /// observed it is cached and returned again rather than re-waited.
+    fn try_reap(&mut self) -> Result<Option<HelperExit>, MeasureError>;
+
     /// Write one protocol line to stdin (`play\n`).
     ///
     /// Separate from [`request_abort`](Self::request_abort) so the abort path
     /// cannot be reached by a typo in a string.
     fn send_play(&mut self) -> Result<(), MeasureError>;
 
-    /// Read one line from stdout, or `None` on EOF, with a deadline.
+    /// Read one line from stdout, with a deadline.
     ///
     /// The parent never blocks forever on a wedged child: every read that can
-    /// hang carries the deadline of the gate that made it.
-    fn read_line(&mut self, deadline: Duration) -> Result<Option<String>, MeasureError>;
+    /// hang carries the deadline of the gate that made it, and an expired
+    /// deadline is its own answer ([`HelperLine::DeadlineExpired`]) rather than
+    /// being spelled the same way as EOF.
+    fn read_line(&mut self, deadline: Duration) -> Result<HelperLine, MeasureError>;
 }
 
 /// The child's routing argument.
@@ -317,4 +354,49 @@ impl HelperRouting {
 pub struct HelperExit {
     pub code: Option<i32>,
     pub signalled: bool,
+}
+
+/// Read-only facts about audio devices, by UID.
+///
+/// # Why a seam and not a call
+///
+/// Both answers are HAL property reads, and MS-1 forbids this crate from
+/// naming CoreAudio at all ("depends on `paraeq-dsp`, no Tauri dep, no
+/// CoreAudio dep, no `unsafe`"). So the questions are declared here and
+/// answered by the platform side, exactly as [`VolumeControl`] is.
+///
+/// # Why this is not [`EngineFacts`](crate::engine_seam::EngineFacts)
+///
+/// The engine's facts describe the CHAIN — what the controller has installed
+/// and what its stream is doing. These describe the HARDWARE, under UIDs the
+/// engine may never have heard of: the helper's private render aggregate is
+/// created and destroyed by a different process entirely, and the engine has
+/// no field that could report it.
+pub trait DeviceFacts: Send {
+    /// Is a device with this UID present in the HAL right now?
+    ///
+    /// The verification teardown asks it about `com.paraeq.render.<pid>` — the
+    /// private aggregate the helper wraps the output device in. A SIGKILLed
+    /// child bypasses `Drop`, so its aggregate can survive its process and be
+    /// left wrapping the user's output; a child that exited cleanly can still
+    /// have failed to destroy it. Neither case is inferable from an exit
+    /// status, which is why this is asked rather than deduced.
+    ///
+    /// Contract: **when the answer cannot be established, say `true`.** A
+    /// teardown that could not verify the device is gone must report a possible
+    /// leak, not assume a clean one — the cost of a false report is a log line,
+    /// and the cost of a false clean is a private device left on the user's
+    /// output with nothing watching it.
+    fn device_exists(&self, uid: &str) -> bool;
+
+    /// The device's nominal sample rate, or `None` when it cannot be read —
+    /// including when no device carries this UID.
+    ///
+    /// `None` is "cannot answer", never "0 Hz", and callers decide what that
+    /// means for them. The verification rate fence treats it as permissive on
+    /// purpose: it asks about the helper's render aggregate at a moment the
+    /// helper may already have destroyed it, so an unanswerable read there is
+    /// an expected benign race rather than a missing witness, and the same
+    /// fence has already refused on the engine's own stream rate.
+    fn nominal_sample_rate(&self, device_uid: &str) -> Option<f64>;
 }
