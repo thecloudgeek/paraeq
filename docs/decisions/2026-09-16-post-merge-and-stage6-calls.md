@@ -4,8 +4,11 @@
 **Status:** ruled. Everything in *Phase A* and *Phase B* below is a
 precedent-following default that ships now; a later owner ruling on any of them
 costs one line or one named constant. §"Escalated to the owner" is **not** a set
-of decisions — those seven items are questions that no precedent in this repo
-can answer safely, and they are recorded here so they do not dissolve.
+of decisions — those thirty-one items are questions that no precedent in this
+repo can answer safely, and they are recorded here so they do not dissolve.
+**Updated 2026-09-18:** §"Escalated to the owner" grew from seven items to
+thirty-one (E2-bis and E8–E31, raised while Stage 6 was built), and §"Rulings
+from the Stage-6 review" is new.
 
 **Source.** The merged post-merge + Stage-6 build plan written 2026-09-16 over
 the `feature/integration` merge (rescope `crates/` + shell `desktop/`), itself
@@ -394,8 +397,12 @@ that found them, in the commit that made the correction.
 
 ## Escalated to the owner
 
-Seven items. **None of these is a decision.** Everything above ships on a
-precedent; these cannot, and each says why.
+**Thirty-one items** — E1–E7 from 2026-09-16, plus **E2-bis** and **E8–E31**
+raised while Stage 6 was built (2026-09-17/18). **E16 is withdrawn and its number
+is retired, not reused.** **None of these is a decision.** Everything above ships
+on a precedent; these cannot, and each says why. Where an item was implemented
+while still open, its row says what shipped — **implementing it is not closing
+it**.
 
 ### E1. The verification residual threshold — the `2×` multiplier
 
@@ -468,6 +475,44 @@ during playback**. No nonzero blocks while the helper plays ⇒ TCC silent failu
 **Recommendation: (c)** — it replaces a state the session itself causes with a
 precise, testable one. Escalated because it **reinterprets a safety sentence**,
 not because the engineering is unclear.
+
+### E2-bis. May `NoInputDetected` be non-blocking during a `Direct` capture?
+
+**Blocks:** nothing in the build — B13 implements the recommended split — but it
+must not be closed by an agent. E2 asked *how* a genuine TCC silent failure is
+detected; E2-bis asks you to ratify the two halves that shipped.
+
+**Summary.** The sentence, `wizard:418` verbatim: "a genuine TCC silent failure
+during a measurement session is **still a `Refuse`**". The problem, `wizard:416`:
+a `Direct` capture is tap-excluded **by design** ("so the tap sees zeros"), and
+`EngineStatus::NoInputDetected` means "no nonzero sample **ever** captured since
+start" — quoted from `AutoDisabledNoInput`'s doc block at
+`crates/paraeq-engine/src/status.rs:37-38`, because `NoInputDetected` itself
+carries no doc comment, so the doc of the state it decays into is the only
+written definition of the term. Read literally, the sentence **refuses 100% of
+wizard runs**.
+
+**Why no default is safe.** The engineering is clear; what is not clear is
+whether **reinterpreting a safety sentence** in the spec is the agent's call. It
+is not — the same ground as E17 and E19.
+
+**What shipped meanwhile, both halves.** (1) The TCC witness moved to the
+**Verify** gate, where it is falsifiable: the helper has its own PID and is not
+tap-excluded, so while it plays the tap **must** see nonzero blocks within ~1 s.
+Measured ground: 0 callbacks/s idle vs ~94/s during playback
+(`crates/paraeq-engine/src/status.rs:14-19`). (2) `NoInputDetected` keeps being
+reported and logged but is **not blocking** during `Direct` capture —
+`engine_engaged()` (E17) treats it as engaged, and
+`the_lease_suspends_only_the_fail_open_watchdog` pins the lease half.
+
+**Options.** (a) Ratify the split. (b) Keep the literal reading and accept that
+every wizard run refuses — not viable. (c) Drop the requirement — loses a real
+safety property.
+
+**Recommendation: (a)**, and note the general point: a status this machine
+documents as "informational by construction" (`status.rs:14-15`: "Every state
+this machine produces is informational -- NONE is a rebuild trigger") should not
+be load-bearing in a safety gate.
 
 ### E3. MMM scope and sequencing
 
@@ -606,6 +651,600 @@ exists to stop.
 9 and 10, plan items 13, 14 and 15, the item-11 type reconciliations, **plan
 cross-spec Open Question 5**, E3's `CaptureMethod` call, and the merged wire form
 (snake_case `FilterType`) are all settled.
+
+### E8. The abort acoustic budget — what number is acceptable?
+
+**Blocks:** B16's acceptance, not the build.
+
+**Summary.** B13 computes and reports `abort_acoustic_budget_ms` per run — one
+helper block + `ABORT_RAMP_MS` (5 ms) + `EngineFacts::latency_ms()` + slack.
+Nobody can make the engine term zero across a process boundary plus the engine
+round trip, so MS-14's "~5 ms" cannot hold literally on the verification path and
+B16's test is named to say so. The number is **reported, never asserted**.
+
+**Why no default is safe.** It is a judgement about exposure to the owner's own
+ears on the owner's own hardware, not a constant derivable from the documents.
+
+**Options.** (a) Accept the measured figure as the budget and record it. (b) Set
+a hard ceiling and refuse to arm verification when the engine's reported latency
+would exceed it. (c) Different ceilings for a sealed IEM and for speakers.
+
+**Recommendation:** price it off B16's printed numbers rather than deciding in
+advance. Two mitigating facts to weigh: `L_verify ≤ L_measure` always, so
+exposure during those milliseconds is bounded below the Direct path's, which the
+ladder already accepts; and the SIGTERM rung (E20) adds one more block-plus-slack
+to the worst case while removing a leaked-aggregate failure — **rung 1a's
+process-exit deadline is a separate number from the acoustic budget** (§ R-B3),
+and B16 prints the two contributions separately so you can price them apart.
+
+### E9. Does a bare output IOProc raise a mic prompt on your hardware?
+
+**Blocks:** R4's default. This is an **observation only you can make** — it needs
+AirPods or a USB headset as the default output and a fresh TCC state
+(`tccutil reset Microphone`).
+
+**Summary.** B0-1 runs the spike twice, `--bare` and `--wrapped`, and prints one
+`PROBE ...: PASS|FAIL|OBSERVE` line each. The microphone-permission question is
+the single `OBSERVE` line, because no API can answer it.
+
+**Why no default is safe.** It is an empirical fact about CoreAudio and TCC on
+your machine, not a policy question.
+
+**Options.** If `--bare` prompts, R4's wrapper is **mandatory**. If `--wrapped`
+is not tapped and `--bare` is, the choice is between a spurious permission prompt
+and no feature — and `measurement-safety:383` calls that prompt "**now a safety
+issue**", because a novice trained to dismiss one will dismiss the real one.
+
+### E10. Which ear does auto-mode verify on the coupler path?
+
+**Blocks:** B13's routing fence and the wizard copy.
+
+**Summary.** `wizard:380` says auto mode runs verification at **one position**;
+it is silent on **one channel**. `crates/paraeq-coreaudio/src/measure_aggregate.rs:166-169`
+is decisive that L and R are separate measurements, and the shipped fence
+(`verify.rs`'s gate 9) forces the verification routing to equal the baseline's,
+so whichever ear is chosen must be an ear the baseline actually measured.
+
+**Why no default is safe.** It trades run time against which failure gets caught,
+and both are product calls.
+
+**Options.** (a) The last-seated ear only — fast, asymmetric. (b) Both ears in
+sequence — one extra sweep, ~8 s. (c) The ear whose correction has the larger
+peak boost.
+
+**Recommendation: (c)** per **P4** — it verifies the side that can hurt someone.
+That is the default if this goes unruled.
+
+### E11. The two-clock credibility ladder — `[NEEDS DATA]`
+
+**Blocks:** nothing (**P3** ships the values); it will be retuned from the first
+real runs.
+
+**Summary.** Five rungs (B13 item 6): `locate` returns `None` ⇒ Refuse;
+`|skew_ppm| > MAX_CLOCK_ADJUST_PPM` (200) ⇒ Refuse; residual `≤ 2` samples
+silent; `> 2` Warn; `> 20` Refuse. All named constants, all guesses shaped like
+the existing `[NEEDS DATA]` constants; the 200 ppm bound is cut against DR1's own
+measured ~12 ppm with an order of magnitude of headroom.
+
+**Why no default is safe.** The numbers are guesses about hardware nobody has
+measured on this path; they are shipped, flagged, and named so one line moves
+each.
+
+**Retune signal.** Once H5 (B16) has run, the Direct path's known `t = 0` gives
+the residual distribution the ladder should be cut against, and S8 gives the
+`None`-branch threshold.
+
+### E12. May the capture fallback destroy and re-create the live tap aggregate?
+
+**Blocks:** only the fallback ladder's ranking, and only if B0-2 fails.
+
+**Summary.** Fallback **B1** — the mic as a sub-device of the *tap* aggregate —
+is better physics: one IOProc, one `AudioTimeStamp`, no markers needed. But it
+rebuilds a **live** tap aggregate mid-session, on the one path whose failure mode
+is "the user's system is left muted", and it re-opens the mic-TCC surface
+`crates/paraeq-coreaudio/src/tap.rs:57-70` was hardened against.
+
+**Why no default is safe.** It weighs measurement accuracy against the program's
+single worst failure mode; **P4** ranks it below the software fallback, but that
+ranking is a product call.
+
+**Options.** (a) B2, the pure-software resample with a `Warn(TwoClock)` —
+ranked first here. (b) B1's accuracy at that lifecycle risk.
+
+### E13. Marker level vs marker SNR at low `L_verify`
+
+**Blocks:** nothing yet; a trade only rig data settles.
+
+**Summary.** R8 rules the markers down to the sweep's realized peak, because a
+peak-1.0 50 ms chirp is louder than anything the caps table validated. But on a
+heavily boosted correction `L_verify` can sit 20 dB below `L_measure`, and the
+matched filter's SNR falls with it: `find_marker_train`'s own credibility floor
+is "6× the off-peak correlation RMS (≈15.6 dB)"
+(`crates/paraeq-coreaudio/src/two_clock.rs:92-100`), below which the answer is
+`None` — now its own diagnostic rather than a silent generic failure.
+
+**Why no default is safe.** Raising the marker level to buy SNR is exactly the
+move `measurement-safety:83` forbids on the tap-excluded Direct path.
+
+**Options.** (a) Leave it and accept `None` ⇒ Refuse at very low `L_verify`.
+(b) A longer marker — more energy at the same peak. (c) A 12–18 kHz marker band,
+where `decision-engine:391` gives the coupler zero authority, so the template
+needs no correction-filtering at all.
+
+**Ask after S8:** at the quietest `L_verify` you can produce, does
+`find_marker_train` still locate all four markers?
+
+### E14. +2.20 s per position to bracket the baseline — acceptable?
+
+**Blocks:** B12's "bracket the baseline too" requirement, which exists so both
+captures are aligned by the **same** means and so H5 has ground truth.
+
+**Summary.** Cost: 2.20 s per position, ≈11 s on a five-position room run.
+
+**Why no default is safe.** It spends the user's time on every run to buy one
+error model; how much wizard time is acceptable is a product call.
+
+**Options.** (a) Bracket every `Direct` capture — uniform, one code path, one
+error model. (b) Bracket only the position that will be verified — saves the
+time, costs a second code path and a "which position gets verified" decision made
+**before** the correction exists.
+
+**Recommendation: (a)**.
+
+### E15. Sidecar packaging — one action, not a decision — **AMENDED 2026-09-18**
+
+**Blocks:** release packaging (R7), not development.
+
+**Summary.** B14 verified against the Tauri 2 documentation that
+`bundle.externalBin` is the right key, that the staged file must carry the
+`-<target-triple>` suffix, that no shell plugin is needed for
+`std::process::Command`, and that the bundler signs sidecars inside-out with
+notarization required for distribution. The docs do **not** state the in-bundle
+destination path `wizard:370` assumes.
+
+**What the build changed, and why this row is amended.** The `externalBin` entry
+is deliberately **not** in `desktop/src-tauri/tauri.conf.json`: `tauri-build`
+resolves that key **in the build script**, on every `cargo build`, so an entry
+with nothing staged turns `cargo test --workspace` red for everyone. The entry
+and the staging command live verbatim in `desktop/src-tauri/binaries/README.md`,
+and `desktop/src-tauri/src/verify_seam.rs`'s
+`the_packaged_helper_and_the_resolver_name_the_same_binary` pins the README
+against `HELPER_BIN` and asserts the config key is still null — with the note
+that inverting that assertion is what lands the key.
+
+**Action (owner).** One `tauri build`, then
+`ls target/release/bundle/macos/ParaEQ.app/Contents/MacOS/`, pasted into the PR.
+If the binary lands somewhere other than `Contents/MacOS/`, only the resolver
+changes. **And one call that is yours:** when the key lands — it must land in the
+same commit that stages a built binary and inverts that assertion, or every
+`cargo build` in the repo fails.
+
+### E16. **WITHDRAWN (v5). The number is retired, not reused.**
+
+Raised on a mis-read and retracted here rather than deleted, so the retraction is
+visible. It asked whether the Advanced drawer's clamp explanation is a v1 promise
+or a v1.1 one. The plan's **B6 item 4** already answers it — `CorrectionPlan`
+gains `clamps` + `dropped` and `Clamp` gains its serde derive, **pre-freeze** —
+so the answer is **v1**, decided when B6 item 4 was written. Asking again would
+invite un-deciding a settled item. **No cross-reference may re-point to E16.**
+
+### E17. `wizard:382` says the engine must be `Running`. It cannot be.
+
+**Blocks:** nothing (B13 implements the only satisfiable reading), but it is a
+**spec sentence about a safety gate**, so it gets your eye rather than an
+agent's.
+
+**Summary.** `EngineStatus::Running` is set **only** when `nonzero_blocks`
+advances (`crates/paraeq-engine/src/status.rs:188-193`, verbatim: "Nonzero input
+is the ground truth for 'audio is flowing': gate `Running` on it, never on
+`start()` having returned"), and it decays to `InputSilent` after
+`silence_window_ms` and to `Idle` after `idle_window_ms`. B13's verification
+pre-roll (Window A) **requires** `nonzero_blocks` to be **stationary**, because
+the tap is global and excludes only ParaEQ, so any other app's audio would land
+in `measured_corrected`. The spec asks for audio to be flowing and the gate asks
+for silence, at the same instant.
+
+**Why no default is safe.** Same class as E2-bis: it reinterprets a safety
+sentence.
+
+**Implemented reading (R15).** "`Running`" means **engaged** — a live stream with
+the correction installed: `enabled && stream.is_some() && status ∉ {Stopped,
+Failed, AutoDisabledNoInput}`. Under it `Idle`, `InputSilent`, `NoInputDetected`
+and `Starting` pass, and the three states in which no audio can be processed at
+all refuse with `EngineNotRunning`.
+
+**Options.** (a) Confirm the engaged reading and the one-line spec note that
+records it (landed at `wizard:382`). (b) Keep the literal reading, which means
+the wizard must play a second of audio before verifying — defeating Window A and
+re-opening the "another app's audio lands in `measured_corrected`" hole.
+
+**Recommendation: (a).**
+
+### E18. The desktop crate gains its first `unsafe` block
+
+**Blocks:** nothing (R19 rules it allowed and B14 implements it), but it is a
+**crate-posture change** and you should see it once rather than find it in a
+diff.
+
+**Summary.** The teardown ladder's SIGTERM rung exists so a child that missed the
+stdin `abort\n` still **ramps** rather than being hard-stopped —
+`measurement-safety:258`: "**A hard stop is itself a full-scale click.**" `std`
+has no SIGTERM: `std::process::Child::kill()` is SIGKILL, which also bypasses
+`Drop` and leaks the private render aggregate onto your output device. So
+`desktop/src-tauri/src/verify_seam.rs` carries one
+`unsafe { libc::kill(pid, libc::SIGTERM) }`, guarded on the cached exit status
+and tolerating `ESRCH`, with a SAFETY comment naming both preconditions.
+
+**Why it is not a CLAUDE.md violation.** The standing rule is "`paraeq-coreaudio`:
+the **ONLY** crate with unsafe **CoreAudio FFI**". A process-signal call is not
+CoreAudio FFI, and both alternatives are worse: shelling out to `/bin/kill`
+spawns a second process on the abort path, and hiding the call in
+`paraeq-coreaudio` would put verification lifecycle policy below the controller.
+
+**Options.** (a) Confirm the one block. (b) Pay the extra process spawn on the
+abort path to keep the shell crate `unsafe`-free — which changes the budget E8 is
+priced against.
+
+**Recommendation: (a).** CLAUDE.md now records both sanctioned blocks.
+
+### E19. `paraeq-stimulus` "must not depend on `paraeq-measure`" cannot be honoured as a `cargo tree` property
+
+**Blocks:** nothing in the build (B11 ships under reading (a) below), but it is a
+**spec sentence you pinned at High confidence** three weeks ago, as **D-I**, and
+an agent overturned it in a ruling rather than bringing it to you. That is the
+same class of call as E17 and E2-bis and it gets the same treatment.
+
+**The sentence**, `docs/specs/2026-07-15-measurement-suite-design.md:162-164`,
+verbatim: "the **`paraeq-stimulus`** helper binary as its own workspace member
+**`crates/paraeq-stimulus`** (one `[[bin]]`; may depend on `paraeq-coreaudio`,
+must not depend on `paraeq-measure`, `paraeq-decide` or Tauri)" — and **D-I**
+above says the same, at confidence **High**, kind **Pin now**.
+
+**The problem, which is a fact about the shipped graph.**
+`crates/paraeq-coreaudio/Cargo.toml` depends on **both** `paraeq-engine` and
+`paraeq-measure`, unconditionally. So the moment `paraeq-stimulus` depends on
+`paraeq-coreaudio` — which the same sentence explicitly **permits** —
+`cargo tree -p paraeq-stimulus -e normal` shows `paraeq-measure` and
+`paraeq-engine`. **The rule's two clauses cannot both be true of the dependency
+graph.** Feature-gating does not rescue it: `resolver = "2"` unifies features
+across the workspace CI runs, so `paraeq-coreaudio` compiles once with everything
+on and the child links that.
+
+**Why no default is safe.** Reading (a) is an *interpretation of the owner's own
+pinned rule*, and the alternative (b) moves five items between crates. An agent
+picking either silently re-writes a High-confidence pin.
+
+**What ships while this is open**, chosen so your answer changes one line and no
+design: `crates/paraeq-stimulus/Cargo.toml` names `paraeq-coreaudio` only among
+workspace crates (`hound`, `libc`, `log`, `paraeq-coreaudio`, `serde`,
+`serde_json` — and no `[dev-dependencies]` section at all), so the sentence is
+honoured to the letter at the one place it names a manifest. Every
+`paraeq-measure` item the child needs — the `RenderSink` trait, `StreamFormat`,
+`MeasureError`, `ABSOLUTE_MAX_DBFS_RMS`, and the abort-envelope pair
+`abort_envelope` / `abort_ramp_len` with `ABORT_RAMP_MS` — crosses through
+**`paraeq-coreaudio`'s own documented re-export**, so from the child's side they
+are `paraeq-coreaudio` items. The crate has a `src/lib.rs` beside its
+`src/main.rs` because an integration test links the package's *library* target;
+"one `[[bin]]`" is untouched and now countable.
+
+**Options — one of three.**
+
+- **(a) The re-export reading (recommended, and what ships).** The rule binds the
+  child's **manifest** and its **use of policy** — no `SweepLevel`, no
+  `TransducerClass`, no `caps_for`, no `LevelLadder`, no `MeasurementSession`, no
+  SPL anywhere in `crates/paraeq-stimulus/src/` — and the transitive link through
+  `paraeq-coreaudio` is out of scope, because the sentence itself licenses that
+  dependency. Enforced by four CI gates: **R-B11-a** (`cargo tree` shows no
+  `tauri` and no `paraeq-decide`), **R-B11-b** (no policy identifier appears in
+  the child's sources), **R-B11-c**, and **R-B11-d** (a *manifest + `use`* gate:
+  no `paraeq-(measure|decide)` dependency line, exactly one `[[bin]]`, and no
+  `paraeq_measure::` / `paraeq_decide::` path under `src/` or `tests/`). Cost:
+  one `pub use` in `crates/paraeq-coreaudio/src/lib.rs`.
+- **(b) Strict — not even transitively.** The re-exported items move **down**
+  into `paraeq-dsp` and are re-exported upward from `paraeq-measure`, so today's
+  callers are untouched. Cost: five items change crates. **Note it does not make
+  `cargo tree` clean either** — the transitive edges remain, because they are
+  `paraeq-coreaudio`'s.
+- **(c) Rewrite the rule to say what is enforceable** — "must not **depend on or
+  name a path into** `paraeq_measure`, `paraeq_decide` or `tauri`, and must
+  contain no level, class or session policy". This is (a) with the spec text
+  corrected instead of interpreted, and R-B11-d is that sentence written as
+  commands. A doc comment in `crates/paraeq-stimulus/` **may** name a
+  `paraeq-measure` file — that pointer is the anti-drift device, and a file path
+  is not a dependency.
+
+**Recommendation: (a)**, with (c) as the same answer written into the spec.
+
+**Owed edits — not made here, because these two files belong to another fixer.**
+Both currently disagree with each other; under (a) they must read as "open,
+shipping under (a)" and point at this row.
+
+1. `crates/paraeq-stimulus/Cargo.toml:10` — replace "re-pinned as an owner
+   decision." with: **"open as owner question E19
+   (`docs/decisions/2026-09-16-post-merge-and-stage6-calls.md` §E19) and shipping
+   meanwhile under its reading (a): the rule binds this manifest and this crate's
+   use of policy, not the transitive link through paraeq-coreaudio."**
+2. `.github/workflows/ci.yml:51-52` — replace "and whether the TRANSITIVE link is
+   in scope is an open owner question." with: **"and whether the TRANSITIVE link
+   is in scope is open owner question E19
+   (docs/decisions/2026-09-16-post-merge-and-stage6-calls.md §E19), which ships
+   under its reading (a): manifest and use, not cargo tree."**
+
+### E20. `paraeq-stimulus` gains its first `unsafe` block — one `libc::signal`
+
+**Blocks:** nothing (R21 rules it allowed and B11 implements it), but it is the
+**second** crate-posture change in this feature, and you saw the first as E18.
+
+**Summary.** Teardown rung 1b sends **SIGTERM** to the helper before any SIGKILL,
+and it only helps if the child **handles** it: SIGTERM's default disposition
+terminates the process without unwinding, so `RenderAggregate::drop` never runs
+and the **private render aggregate is left wrapping your output device** — the
+leak `RenderDeviceLeaked` exists to report. `std` has no way for a process to
+install a signal handler, so `crates/paraeq-stimulus/src/signals.rs` carries one
+`unsafe { libc::signal(libc::SIGTERM, on_sigterm as libc::sighandler_t) }`, with
+a SAFETY comment naming its preconditions. The handler's body is a single atomic
+store, which is async-signal-safe; the module header says in one line that
+allocating, locking or logging inside a handler is not, so the body cannot grow.
+
+**Why it is not a CLAUDE.md violation.** Installing a POSIX signal handler is not
+CoreAudio FFI — the same reasoning as E18. `libc` is already a workspace
+dependency and already `paraeq-coreaudio`'s, so **nothing new enters the
+dependency graph** and D-I's three forbidden names are untouched.
+
+**Options.** (a) Confirm the one block. (b) Drop the SIGTERM rung — **say so
+explicitly**, because the consequence is concrete: an abort that escalates past
+the stdin deadline goes straight to SIGKILL, and a SIGKILLed child leaks a
+private aggregate onto your output device every time.
+
+**Recommendation: (a).**
+
+### E21. The per-position refusal mechanism — **RULED for the build (§ R-A1); confirm**
+
+**Blocks:** the `fixtures/decide/` freeze, because it adds a `Severity` variant
+that lands in every `expected.json`.
+
+**Summary.** decision-engine's refusal table has two rows whose Severity column
+reads "Refuse *that position*" — Clipping (position) and Position outlier —
+coupler LF — and whose copy promises exactly that: "Position {i} clipped. We
+dropped it — re-measure just that one." The shipped code emitted
+`Severity::Refuse`, which `verdict_for` maps to a **session** Refuse, so the
+correction was `None` and the offending position was still averaged in. Two
+`notes.md` files promise the survivors still produce a correction.
+
+**Why no default is safe.** It changes which real runs produce a correction at
+all, and it is a **user-visible** behaviour change on the most common room
+failure (one clipped position out of five).
+
+**Options.** (a) Implement the spec: a position-scoped row drops the position and
+the survivors are re-analysed — § R-A1, **what the build does**. (b) Reword the
+copy so it says the run was refused — rejected, because the spec's Severity
+column and the golden-case notes both say the position is dropped.
+
+**Recommendation: (a)**, and confirm it: the new `Severity::RefusePosition` is a
+wire change and it must be settled **before** the bless, not after.
+
+### E22. MS-20 wants two strings per diagnostic; `paraeq_decide::Diagnostic` carries one
+
+**Blocks:** the freeze — `Diagnostic` is serde-visible in every `expected.json`.
+
+**Summary.** MS-20 is the numbered append-only diagnostic contract, and it says
+each variant maps to "a plain-language fix (**easy mode**) and an explanation
+(**guided mode**)". `paraeq-measure`'s `MeasurementDiagnostic` carries both
+strings. `paraeq_decide::Diagnostic` carries **one** `remedy: String`, and the
+asymmetry is recorded in the mapping comment but never ruled.
+
+**Why no default is safe.** Adding the second string after the freeze
+regenerates every `expected.json`; leaving it out silently makes guided mode
+render easy-mode copy.
+
+**Options.** (a) Add `explanation: String` to `Diagnostic` now, before the bless.
+(b) Rule that `Rationale` **is** the guided-mode explanation for decision-engine
+diagnostics and that MS-20's two-string requirement binds only
+`MeasurementDiagnostic`. (c) Leave the gap and accept easy-mode copy in guided
+mode for v1.
+
+**Recommendation: (b)** if it is true of the product you want — it costs nothing
+and the mapping comment already documents the split — otherwise (a), now.
+
+### E23. `pivot_hz` has no home on `TargetChoice::Parametric`
+
+**Blocks:** the freeze (the variant's wire shape).
+
+**Summary.** The decision table's `Parametric` variant carries **four** numbers —
+shelf gain, shelf fc, shelf Q and tilt — and `RoomTargetSpec::pivot_hz` is not
+among them. `build_room_target` reads the pivot from the spec it is handed, so an
+override of the room target **cannot move the pivot**. The omission is
+deliberate and pinned by a test rather than silent, but nothing rules it.
+
+**Why no default is safe.** Adding a fifth number later moves the wire shape and
+every frozen fixture; leaving it out permanently means the tilt pivot is not a
+drawer control, which brushes against **P7** ("every automated decision is also a
+drawer control").
+
+**Options.** (a) Keep four numbers and rule the pivot a constant of the room
+target's *definition*, not a decision. (b) Add `pivot_hz` as the fifth number now.
+
+**Recommendation: (a)**, on the ground that the pivot is where the tilt is
+*defined* from rather than a thing a user tunes — but it is your call, and it is
+cheap only before the bless.
+
+### E24. `PerChannel`'s `#[serde(transparent)]` bypasses its own non-empty guard
+
+**Blocks:** nothing today; it is a known hole in a frozen wire shape.
+
+**Summary.** `PerChannel::new` refuses an empty channel list — "a zero-channel
+value has no meaning anywhere downstream, so emptiness is unrepresentable" — but
+a `transparent` deserialization does not route through the constructor, so `[]`
+on the wire produces exactly the value the constructor refuses. Guarding it needs
+`serde(try_from = …)`, which **cannot be combined with `transparent`**, and
+`transparent` is what keeps the wire form the bare array the fixtures already
+carry.
+
+**Why no default is safe.** Every option either moves a pinned wire form or
+leaves a typed invariant false on the deserialize path.
+
+**Options.** (a) Leave it, documented, and have consumers check
+`PerChannel::channels` — **what ships**. (b) `try_from` and accept the wire-form
+move (every fixture re-blesses). (c) Validate at the one decode boundary that
+matters (the fixture hydrator and any future profile load) rather than in the
+type.
+
+**Recommendation: (a)** for v1, with (c) as the cheap hardening if you want the
+guarantee without the fixture churn.
+
+### E25. `CaptureStats.peak_dbfs` is floored at −180 dBFS rather than `-inf`
+
+**Blocks:** the freeze — the floor is baked into every `expected.json`.
+
+**Summary.** `CaptureMeter::peak_dbfs` answers `f64::NEG_INFINITY` on digital
+silence, which is right for a meter and wrong for a wire: a non-finite `f64`
+serializes as `null` and then refuses to read back. `CAPTURE_FLOOR_DBFS` is
+**−180.0**, two orders of magnitude below a 24-bit converter's own LSB
+(≈ −144 dBFS), so a floored reading means digital silence and nothing else — and
+a digitally silent capture is refused one step later anyway.
+
+**Why no default is safe.** It is a convention frozen into the fixtures, and it
+makes a refusal threshold comparison (`peak_dbfs < NO_SIGNAL_PEAK_DBFS`) true by
+construction on silence rather than by measurement.
+
+**Options.** (a) Keep −180.0. (b) Keep the sentinel but make the field
+`Option<f64>` so "no signal at all" is structurally distinct from "very quiet".
+
+**Recommendation: (a)**, recorded so the number is a decision rather than a
+constant nobody chose.
+
+### E26. IR sidecars: `.f64` arrays or WAVs — **D-S, revisited before the freeze**
+
+**Blocks:** the freeze. This is the last cheap moment to change it.
+
+**Summary.** D-S ships per-position IR samples as **`.f64` sidecars** in the
+repo's existing convention, referenced as `{file, len, shape}` and hydrated by
+`tests/common/golden.rs`. The alternative — f32 WAVs at `store.rs`'s exact
+naming — would make decision-engine's premise that "the fixture **is** a saved
+profile" literally true, at the cost of a `hound` dev-dependency and f32
+precision.
+
+**Why no default is safe.** After the bless, changing the carrier re-blesses
+every case; the trade (byte-exactness and zero dependencies vs. a fixture that is
+a real saved profile) is a taste call about what the corpus is *for*.
+
+**Options.** (a) Keep `.f64` sidecars — what ships. (b) Move to WAVs now.
+
+**Recommendation: (a)**, flagged only because D-S itself flagged the alternative
+as the better long-term shape.
+
+### E27. FNV-1a or `sha2` for the fixture manifest digests — **D-U, revisited**
+
+**Blocks:** the freeze.
+
+**Summary.** D-U digests each fixture file with **FNV-1a 64 inline** (~10 lines)
+rather than `sha2`, because the workspace has no hashing crate and CLAUDE.md
+carries a forbidden-deps list, and the mechanism is a **drift detector against
+accidents, not a security boundary**.
+
+**Why no default is safe.** "Owner-reviewed and frozen" is a signature-shaped
+promise, and which guarantee it carries is yours to set.
+
+**Options.** (a) Keep FNV-1a. (b) Add `sha2` as a dev-dependency and digest with
+SHA-256.
+
+**Recommendation: (a)**, with the reason recorded: nobody is defending these
+files against a forger, only against an accidental regeneration.
+
+### E28. The verification capture is **mono** — what does it grade on a two-channel correction?
+
+**Blocks:** the wizard copy and how the residual is reported; not the build.
+
+**Summary.** The verification pass produces one mono `ImpulseResponse`, which the
+caller lifts into the bundle's per-channel shape. With
+`HelperRouting::Only(channel)` that is one ear (E10 picks which). With
+`HelperRouting::Both` — the room path's normal routing — the single microphone
+capture is of the **summed** acoustic output, so the residual grades the sum, not
+either channel, while the correction it is compared against is per channel.
+
+**Why no default is safe.** It decides what the product's "single most important
+refusal" is actually a statement about.
+
+**Options.** (a) Rule that `Both` grades the sum, and say so in the copy ("we
+checked the two together"). (b) Refuse to verify a per-channel room correction
+with a single mono capture and verify each channel in turn (+1 sweep). (c) Verify
+`Both` only when the two channels' corrections are identical.
+
+**Recommendation: (a)** for v1 — a room correction is listened to as a sum — but
+the copy must not claim a per-channel check it did not make.
+
+### E29. `transition_hz` clamps the **answer**, not the scan
+
+**Blocks:** nothing; it is a one-line reading of the decision table.
+
+**Summary.** The table says the crossing is "clamped to `[80, 400]`" when room
+volume is unknown, and the code clamps the **scan's answer**:
+`crossing.map(|f| f.clamp(80.0, 400.0))`. So a genuine sustained σ crossing
+measured at 500 Hz is **reported as 400 Hz**, with the measured-source label and
+the measured copy, because the crossing exists. The alternative reading —
+restrict the scan to `[80, 400]` and report "no crossing" outside it — produces
+the fallback copy and `Source::Default` instead.
+
+**Why no default is safe.** One reading reports a number that was not measured;
+the other discards a measurement that was. Both are defensible and the copy the
+user reads differs.
+
+**Options.** (a) Clamp the answer — **what ships**. (b) Restrict the scan and
+fall back outside it. (c) Report the unclamped value and warn.
+
+**Recommendation: (a)**, because the clamp exists to keep the authority crossover
+sane and 400 Hz is the sanest available answer — but the user-facing sentence
+should not read as a measurement to three significant figures.
+
+### E30. `low_corner_hz`'s 200 Hz fallback — **RULED for the build (§ R-A5); confirm**
+
+**Blocks:** nothing; it is load-bearing enough to be seen once.
+
+**Summary.** When the scan finds no frequency that gets within 10 dB of midband
+and stays there, `low_corner_hz` answers the **top** of the scan (200 Hz) with
+`Source::Default`. It is load-bearing: it sets `correction_range`'s low edge and
+the band the AbsurdCurve and ExcessiveVariance refusals are measured over, and it
+is reachable on any bundle the analysis could not read.
+
+**Why it is here.** It is an invented default with no spec row, and it decides
+how much of the bass a degenerate measurement is allowed to correct.
+
+**Options.** (a) 200 Hz, the top of the scan — "nothing below 200 Hz is worth
+correcting" — **what ships (§ R-A5)**; narrowing is the safe direction (**P4**)
+and widening burns excursion. (b) The lowest valid bin, which claims the
+opposite. (c) Refuse outright when the scan finds nothing.
+
+**Recommendation: (a)**, now recorded in the decision-engine `low_corner_hz` row
+so it is a ruling rather than a constant.
+
+### E31. The AutoEQ import preamp double-count — **D-24's two candidate fixes**
+
+**Blocks:** nothing; it is a live, shipped, user-visible defect that only you can
+choose the fix for, because both fixes carry a persistence decision.
+
+**Summary.** D-24 records that an imported preset's `Preamp:` line keeps riding
+`gain_bits` as the user's trim while R1-1 derives `Correction.preamp_lin` from
+the **same bands**, so the two stack: measured −6.8 dB (file, both paths) +
+−6.78 dB (engine, corrected path) = **−13.58 dB**. Confirmed on this tip at three
+sites: `desktop/src-tauri/src/commands.rs`'s `eq_import_autoeq` and
+`profiles_activate`, and `desktop/ui/src/tabs/AutoEqBrowser.tsx`. It fails quiet,
+never loud.
+
+**Why no default is safe.** Either fix changes what a **saved** profile means, so
+it needs a settings/profile migration call, and the "correct" loudness of an
+imported preset is a taste judgement.
+
+**Options.** (a) **Ignore the file's `Preamp:` line on import** — the engine
+derives the number from the bands anyway, and the file's value is by construction
+the same quantity. Simplest; silently changes the loudness of every already-saved
+imported profile unless migrated. (b) **Trim = file preamp − computed preamp** —
+preserves the user's intent when the file's preamp differs from ours (a
+hand-edited file, or another tool's convention), at the cost of a number that is
+hard to explain in the one field that shows it.
+
+**Recommendation: (a)** with a migration that zeroes `preamp_db` on profiles
+whose bands the engine can re-derive — but this is a product call, and until it
+is made an imported AutoEq preset is roughly twice as quiet as it should be.
 
 **Adjacent owner *actions*** (not decisions; listed so they are not lost):
 
