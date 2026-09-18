@@ -643,3 +643,484 @@ mod tests {
         assert_ne!(lifted.running_rate_hz, lifted.installed.design_rate);
     }
 }
+
+// ══════════════════════════ the verification runtime ═══════════════════════
+//
+// Arming, running and aborting one pass, with the result graded by `decide()`
+// and published on the existing `app-state` event.
+
+use crate::state::{AppShared, VerifyDiagnostic, VerifyReport, VerifyState};
+use paraeq_decide::bundle::MeasurementBundle;
+use paraeq_decide::outcome::{DecisionSet, Severity, Verdict};
+use paraeq_dsp::two_clock::DEFAULT_MARKER_LAYOUT;
+use paraeq_measure::{
+    AbortHandle, AbortReason, CalSensitivity, CalSummary, MeasurementDiagnostic, SweepLevel,
+    SweepShape, VerificationPass, VerifyError, VerifyPlan, VerifyRequest, VerifySeam, VerifyTiming,
+};
+
+/// Everything the Verify screen must supply to arm a pass.
+///
+/// **The baseline bundle is the source for almost all of it**, deliberately: it
+/// is the frozen record of the Direct session this pass re-measures, so the
+/// sweep shape, the level, the class, the cal file, the noise floor and the
+/// routing all come from the one artefact that recorded them. Re-supplying any
+/// of those over IPC would be a second place for them to disagree with the
+/// baseline, and a verification that re-measures a different sweep is not a
+/// verification.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct VerifyArmRequest {
+    /// The frozen Direct session this pass re-measures.
+    pub bundle: MeasurementBundle,
+    /// The output device's human name, for the MS-18 acknowledgement.
+    pub device_name: String,
+    /// The physical output device the helper renders to.
+    pub device_uid: String,
+    /// The mic input-gain read-back at the time the cal was pinned.
+    pub input_gain_read_back: f64,
+    /// `L_measure`'s projected SPL, from the Direct session's solve.
+    /// `L_verify`'s projection is this plus the engine's armed preamp.
+    pub l_measure_projected_spl_db: f64,
+    /// The plan the engine is RUNNING.
+    pub plan: paraeq_decide::outcome::CorrectionPlan,
+    /// Which baseline position to re-measure. Auto mode verifies one.
+    pub position_index: usize,
+}
+
+/// What arming produced, for the acknowledgement dialog.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct VerifyArmed {
+    pub device_name: String,
+    pub level_dbfs: f64,
+    pub projected_spl_db: f64,
+}
+
+/// One pass, armed and waiting on MS-18.
+struct ArmedPass {
+    bundle: MeasurementBundle,
+    /// Rows of `positions[position_index].ir.samples`. The lift replicates the
+    /// mono capture to this width, and `decide()` refuses if the two disagree.
+    capture_channels: usize,
+    pass: VerificationPass,
+    plan: paraeq_decide::outcome::CorrectionPlan,
+}
+
+/// The app's single verification slot.
+///
+/// **There is at most one pass, ever.** Two passes would mean two helpers
+/// rendering to the same device and two leases contending, and the second would
+/// refuse anyway -- but refusing early is cheaper than refusing after a spawn.
+#[derive(Default)]
+pub struct VerifyRuntime {
+    /// The trigger for a pass currently RUNNING. Held here rather than on the
+    /// pass because the pass has moved onto the worker thread by then, and an
+    /// abort that cannot reach a running sweep is not an abort.
+    abort: Option<AbortHandle>,
+    /// The armed pass, until `run` takes it. Dropping it runs the full MS-14
+    /// teardown, which is why `abort` and `shutdown` take it rather than
+    /// clearing it.
+    armed: Option<ArmedPass>,
+    pub state: VerifyState,
+    /// The worker running a pass, so shutdown can wait for its teardown.
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl VerifyRuntime {
+    /// A snapshot for the UI.
+    pub fn state(&self) -> VerifyState {
+        self.state.clone()
+    }
+}
+
+/// Build the measurement crate's request from the bundle and the plan.
+fn build_request(
+    request: &VerifyArmRequest,
+    wav_path: std::path::PathBuf,
+) -> Result<(VerifyRequest, usize), String> {
+    let bundle = &request.bundle;
+    let position = bundle
+        .positions
+        .get(request.position_index)
+        .ok_or_else(|| format!("position {} is not in this bundle", request.position_index))?;
+
+    // MS-9: the sensitivity is the sole path to an SPL, and a bundle with no
+    // cal file cannot produce one. `CalSummary::validate` is the gate; it
+    // refuses rather than defaulting, which is the whole of MS-9.
+    let cal_file = bundle
+        .cal
+        .as_ref()
+        .ok_or_else(|| "this measurement carries no calibration file".to_owned())?;
+    let sensitivity = match cal_file.sensitivity_db {
+        Some(db) => CalSensitivity::Parsed(db),
+        None => CalSensitivity::Unparseable,
+    };
+    let cal = CalSummary::validate(
+        bundle.class,
+        cal_file
+            .serial
+            .clone()
+            .unwrap_or_else(|| "<unidentified cal file>".to_owned()),
+        sensitivity,
+        cal_file.gain_db.unwrap_or(request.input_gain_read_back),
+    )
+    .map_err(|refusal| {
+        let diagnostic = refusal.diagnostic();
+        format!("{diagnostic:?}: {}", diagnostic.fix_easy())
+    })?;
+
+    let l_measure = SweepLevel::new(bundle.capture.sweep.level_dbfs, bundle.class)
+        .map_err(|e| format!("the baseline's own level is not legal: {e}"))?;
+
+    // The broadband floor, as the WORST channel. A mean would let a quiet ear
+    // pay for a noisy one, and the SNR budget exists to refuse a pass that
+    // cannot produce a meaningful residual on the ear that is being measured.
+    let noise_floor_dbfs = bundle
+        .noise_floor
+        .rms_dbfs
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold(f64::NEG_INFINITY, f64::max);
+    if !noise_floor_dbfs.is_finite() {
+        return Err("this measurement carries no usable noise floor".to_owned());
+    }
+
+    let routing = capture_routing_to_helper(position.routing);
+    let capture_channels = position.ir.samples.len();
+
+    Ok((
+        VerifyRequest {
+            baseline_routing: routing,
+            cal,
+            device_uid: request.device_uid.clone(),
+            input_gain_read_back: request.input_gain_read_back,
+            l_measure,
+            l_measure_projected_spl_db: request.l_measure_projected_spl_db,
+            // The baseline's own layout, which the bundle does not yet carry:
+            // the Direct path has no layout selector, so there is exactly one
+            // and it is this one. **When a layout choice lands, the bundle must
+            // record it and this line must read it** -- two captures aligned by
+            // different means cannot be subtracted.
+            layout: DEFAULT_MARKER_LAYOUT,
+            noise_floor_dbfs,
+            plan: VerifyPlan {
+                bands: request.plan.bands.as_slice().to_vec(),
+                design_rate_hz: request.plan.design_rate,
+                preamp_db: request.plan.preamp_db,
+            },
+            position_index: request.position_index,
+            routing,
+            sweep: SweepShape {
+                duration_s: bundle.capture.sweep.duration_s,
+                f_end_hz: bundle.capture.sweep.f_end_hz,
+                f_start_hz: bundle.capture.sweep.f_start_hz,
+                sample_rate_hz: bundle.capture.sweep_rate,
+            },
+            timing: VerifyTiming::default(),
+            wav_path,
+        },
+        capture_channels,
+    ))
+}
+
+/// Compose the six seams from the live app.
+fn build_seam(
+    shared: &AppShared,
+    app: tauri::AppHandle,
+    mic_uid: &str,
+) -> Result<VerifySeam, String> {
+    use paraeq_coreaudio::measure_aggregate::{MeasureAggregateConfig, MicSelector};
+
+    let mic = paraeq_coreaudio::measure_aggregate::MicCapture::create(MeasureAggregateConfig {
+        drift_compensation: true,
+        mic: if mic_uid.is_empty() {
+            MicSelector::DefaultInput
+        } else {
+            MicSelector::Uid(mic_uid.to_owned())
+        },
+        // The stimulus side of this aggregate stays SILENT: the helper renders
+        // to the physical device in its own process, which is the whole point.
+        // `take_stimulus_sink` is never called.
+        routing: paraeq_coreaudio::measure_aggregate::StimulusRouting::Both,
+    })
+    .map_err(|e| format!("cannot open the measurement microphone: {e}"))?;
+
+    let volume = paraeq_coreaudio::volume::DeviceVolume::for_default_output()
+        .map_err(|e| format!("cannot reach the output device's volume: {e}"))?;
+
+    Ok(VerifySeam {
+        // WRAPPED, always. A raw `MicCapture` is a non-blocking ring drain and
+        // `record` reads its zero as the end of the stream -- see
+        // `WaitingCapture`'s own doc.
+        capture: Box::new(WaitingCapture::new(Box::new(mic))),
+        control: Box::new(crate::verify_seam::EngineSeam::managed(app.clone())),
+        devices: Box::new(crate::verify_seam::DeviceSeam),
+        engine: Box::new(crate::verify_seam::EngineSeam::managed(app)),
+        helper: Box::new(crate::verify_seam::HelperSpawner::new()),
+        tap: crate::verify_seam::tap_status(shared),
+        volume: Box::new(volume),
+    })
+}
+
+/// Gates 1-6. No process is spawned and no sample is emitted.
+pub fn arm(app: &tauri::AppHandle, request: VerifyArmRequest) -> Result<VerifyArmed, String> {
+    use tauri::Manager;
+    let shared = app.state::<AppShared>();
+
+    {
+        let runtime = shared.verify.lock().unwrap();
+        if runtime.armed.is_some() || matches!(runtime.state, VerifyState::Running) {
+            return Err("a verification pass is already armed or running".to_owned());
+        }
+    }
+
+    let wav_path = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("verify")
+        .join(format!("verify-{}.wav", std::process::id()));
+    let mic_uid = request.bundle.capture.input_uid.clone();
+    let (measure_request, capture_channels) = build_request(&request, wav_path)?;
+    let seam = build_seam(&shared, app.clone(), &mic_uid)?;
+
+    let pass = match VerificationPass::arm(measure_request, seam) {
+        Ok(pass) => pass,
+        Err(failure) => {
+            let state = failed_state(&failure.error);
+            let summary = match &state {
+                VerifyState::Failed { summary, .. } => summary.clone(),
+                _ => failure.to_string(),
+            };
+            set_state(app, state);
+            return Err(summary);
+        }
+    };
+
+    let armed = VerifyArmed {
+        device_name: request.device_name.clone(),
+        level_dbfs: pass.level().map(|l| l.dbfs_rms()).unwrap_or(f64::NAN),
+        projected_spl_db: pass.projected_spl_db(),
+    };
+    {
+        let mut runtime = shared.verify.lock().unwrap();
+        runtime.abort = Some(pass.abort_handle());
+        runtime.armed = Some(ArmedPass {
+            bundle: request.bundle,
+            capture_channels,
+            pass,
+            plan: request.plan,
+        });
+        runtime.state = VerifyState::Armed {
+            device_name: armed.device_name.clone(),
+            level_dbfs: armed.level_dbfs,
+            projected_spl_db: armed.projected_spl_db,
+        };
+    }
+    crate::engine_bridge::publish_current(app);
+    Ok(armed)
+}
+
+/// MS-18, then the sweep.
+///
+/// The acknowledgement is not a parameter for form's sake: it carries the SPL
+/// the user was actually shown, and the pass refuses a stale one. The run
+/// itself moves to a worker thread -- it plays a multi-second sweep and then
+/// runs an O(N·M) matched filter over the capture, and a command that did that
+/// inline would freeze the window for the whole of it.
+pub fn run(
+    app: &tauri::AppHandle,
+    device_name: String,
+    acknowledged_spl_db: f64,
+) -> Result<(), String> {
+    use tauri::Manager;
+    let shared = app.state::<AppShared>();
+
+    let mut armed = {
+        let mut runtime = shared.verify.lock().unwrap();
+        runtime
+            .armed
+            .take()
+            .ok_or_else(|| "no verification pass is armed".to_owned())?
+    };
+
+    if let Err(e) = armed.pass.acknowledge(&device_name, acknowledged_spl_db) {
+        // Dropping `armed` here runs the full teardown: helper down, capture
+        // stopped, volume and trim restored, lease released.
+        let state = failed_state(&e);
+        set_state(app, state);
+        return Err(e.to_string());
+    }
+
+    {
+        let mut runtime = shared.verify.lock().unwrap();
+        runtime.state = VerifyState::Running;
+    }
+    crate::engine_bridge::publish_current(app);
+
+    let worker_app = app.clone();
+    let worker = std::thread::Builder::new()
+        .name("paraeq-verify".into())
+        .spawn(move || {
+            let outcome = armed.pass.run();
+            // `finish` runs teardown again (idempotent) and hands back the
+            // MS-23 log by value, so the pass is fully terminated before the
+            // state is published.
+            let ArmedPass {
+                bundle,
+                capture_channels,
+                pass,
+                plan,
+            } = armed;
+            let _log = pass.finish();
+            let state = match outcome {
+                Ok(outcome) => VerifyState::Complete {
+                    report: grade(&outcome, bundle, plan, capture_channels),
+                },
+                Err(e) => failed_state(&e),
+            };
+            {
+                let shared = worker_app.state::<AppShared>();
+                let mut runtime = shared.verify.lock().unwrap();
+                runtime.abort = None;
+                runtime.state = state;
+            }
+            crate::engine_bridge::publish_current(&worker_app);
+        })
+        .map_err(|e| format!("cannot start the verification worker: {e}"))?;
+
+    shared.verify.lock().unwrap().worker = Some(worker);
+    Ok(())
+}
+
+/// Abort whatever is armed or running, through the MS-14 ladder.
+///
+/// Two paths, because there are two states to be in. A RUNNING pass is reached
+/// through its abort handle -- the capture polls it once per block and the
+/// helper is asked to RAMP, never hard-stopped. An ARMED pass has no helper
+/// yet, so taking it and dropping it is the abort: `Drop` runs the same
+/// teardown, which restores the volume and the trim and releases the lease.
+pub fn abort(app: &tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+    let shared = app.state::<AppShared>();
+    let armed = {
+        let mut runtime = shared.verify.lock().unwrap();
+        if let Some(abort) = runtime.abort.as_ref() {
+            abort.trigger(AbortReason::UserRequest);
+        }
+        runtime.armed.take()
+    };
+    if let Some(armed) = armed {
+        // Explicit rather than relying on the drop order of a `let`: this is
+        // the line that tears the pass down, and it should read like it.
+        drop(armed);
+        let mut runtime = shared.verify.lock().unwrap();
+        runtime.abort = None;
+        runtime.state = VerifyState::Idle;
+    }
+    crate::engine_bridge::publish_current(app);
+    Ok(())
+}
+
+/// The app is quitting: abort, and WAIT for the teardown to finish.
+///
+/// Waiting is the point. A helper rendering into a private aggregate outlives
+/// this process if nobody tears it down, and it would be left wrapping the
+/// user's output device with nothing watching it. The wait is bounded by the
+/// pass's own deadlines -- the ramp rung, the SIGTERM rung and the kill rung
+/// all carry one -- so this cannot hang the quit path indefinitely.
+///
+/// Called BEFORE the engine teardown, so the app's existing never-leave-muted
+/// exit path still runs afterwards exactly as it did.
+pub fn shutdown(shared: &AppShared) {
+    let (armed, worker) = {
+        let mut runtime = shared.verify.lock().unwrap();
+        if let Some(abort) = runtime.abort.as_ref() {
+            abort.trigger(AbortReason::UserRequest);
+        }
+        (runtime.armed.take(), runtime.worker.take())
+    };
+    drop(armed);
+    if let Some(worker) = worker {
+        let _ = worker.join();
+    }
+}
+
+/// Grade a finished pass: lift it into the bundle and run `decide()`.
+fn grade(
+    outcome: &paraeq_measure::VerifyOutcome,
+    mut bundle: MeasurementBundle,
+    plan: paraeq_decide::outcome::CorrectionPlan,
+    capture_channels: usize,
+) -> VerifyReport {
+    bundle.verification = Some(lift_verification(outcome, plan, capture_channels));
+    let decided: DecisionSet = paraeq_decide::decide(&bundle);
+    let report = decided.verification.as_ref();
+    VerifyReport {
+        abort_acoustic_budget_ms: outcome.abort_acoustic_budget_ms,
+        diagnostics: decided
+            .diagnostics
+            .iter()
+            .map(|d| VerifyDiagnostic {
+                code: d.code.code(),
+                remedy: d.remedy.clone(),
+                severity: match d.severity {
+                    Severity::Refuse => "refuse".to_owned(),
+                    Severity::Warn => "warn".to_owned(),
+                },
+                summary: match d.value {
+                    Some(value) => format!("{:?} ({value})", d.code),
+                    None => format!("{:?}", d.code),
+                },
+            })
+            // The pass's own non-blocking findings ride along: they are
+            // capture-layer facts `decide()` never sees, and dropping them
+            // would hide (say) a clamped emit behind a clean residual.
+            .chain(outcome.warnings.iter().map(|w| VerifyDiagnostic {
+                code: w.code(),
+                remedy: w.fix_easy(),
+                severity: "warn".to_owned(),
+                summary: format!("{w:?}"),
+            }))
+            .collect(),
+        gate_db: report.map(|r| r.gate_db),
+        installed_preamp_db: outcome.installed_preamp_db,
+        level_dbfs: outcome.level_dbfs,
+        residual_rms_db: report.map(|r| r.residual_rms_db),
+        verdict: match decided.verdict {
+            Verdict::Proceed => "proceed".to_owned(),
+            Verdict::ProceedWithWarnings => "proceed_with_warnings".to_owned(),
+            Verdict::Refuse => "refuse".to_owned(),
+        },
+    }
+}
+
+/// A pass failure as the Verify screen shows it.
+///
+/// A refusal carries a numbered `MeasurementDiagnostic` and therefore a remedy;
+/// everything else is a seam or protocol failure, which has a message but no
+/// code and no canned fix. Inventing one for those would be worse than saying
+/// nothing -- a remedy the user follows that cannot help is a remedy that
+/// teaches them to ignore remedies.
+fn failed_state(error: &VerifyError) -> VerifyState {
+    match error {
+        VerifyError::Refused(refusal) => {
+            let diagnostic: MeasurementDiagnostic = (*refusal).diagnostic();
+            VerifyState::Failed {
+                code: Some(diagnostic.code()),
+                remedy: Some(diagnostic.fix_easy()),
+                summary: format!("{diagnostic:?}"),
+            }
+        }
+        other => VerifyState::Failed {
+            code: None,
+            remedy: None,
+            summary: other.to_string(),
+        },
+    }
+}
+
+fn set_state(app: &tauri::AppHandle, state: VerifyState) {
+    use tauri::Manager;
+    app.state::<AppShared>().verify.lock().unwrap().state = state;
+    crate::engine_bridge::publish_current(app);
+}

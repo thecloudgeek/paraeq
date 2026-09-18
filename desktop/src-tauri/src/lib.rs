@@ -86,6 +86,7 @@ pub fn run() {
                 probe: setup::ProbeState::new(),
                 profiles_dir,
                 settings_path,
+                verify: Mutex::new(verify::VerifyRuntime::default()),
             });
 
             // Build the tray from the initial snapshot and manage it BEFORE the
@@ -94,8 +95,9 @@ pub fn run() {
             let initial_state = {
                 let shared = app.state::<AppShared>();
                 let engine = engine_bridge::current_engine_state(&shared);
+                let verification = shared.verify.lock().unwrap().state();
                 let data = shared.data.lock().unwrap();
-                data.app_state(&engine)
+                data.app_state(&engine, verification)
             };
             let handles = tray::build_tray(app.handle(), &initial_state)?;
             app.manage(handles);
@@ -140,6 +142,10 @@ pub fn run() {
             commands::setup_probe_start,
             commands::setup_probe_stop,
             commands::setup_probe_verdict,
+            commands::verify_abort,
+            commands::verify_arm,
+            commands::verify_report,
+            commands::verify_run,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -156,7 +162,15 @@ pub fn run() {
             // the controller thread) BEFORE the process exits.
             tauri::RunEvent::Exit => {
                 let shared = app_handle.state::<AppShared>();
-                // Stop the chime probe first: kill any live afplay child and
+                // Tear down any verification pass FIRST, and wait for it. A
+                // helper rendering into a private aggregate outlives this
+                // process if nobody stops it, and would be left wrapping the
+                // user's output device with nothing watching it. Bounded by the
+                // pass's own ramp/SIGTERM/kill deadlines, and it runs BEFORE
+                // the engine teardown below so the never-leave-muted exit path
+                // is unchanged.
+                verify::shutdown(&shared);
+                // Stop the chime probe: kill any live afplay child and
                 // join its loop so no helper process outlives the app.
                 shared.probe.stop();
                 let handle = shared.engine.lock().unwrap().take();

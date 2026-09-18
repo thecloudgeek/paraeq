@@ -36,6 +36,92 @@ pub struct EqState {
     pub preamp_db: f64,
 }
 
+/// One diagnostic the Verify screen shows, with the copy the user acts on.
+///
+/// A flat projection rather than the typed enum: `code` is the stable wire
+/// number and `remedy` is the plain-language fix, both rendered in Rust. The
+/// UI is a text field, not an author -- a second remedy vocabulary in
+/// TypeScript is a second place for the wrong advice to be given.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct VerifyDiagnostic {
+    pub code: u16,
+    pub remedy: String,
+    /// `"refuse"` or `"warn"`. Snake case because everything else on this wire
+    /// is; the Rust enum is `paraeq_decide::Severity`.
+    pub severity: String,
+    pub summary: String,
+}
+
+/// What a graded verification pass produced.
+///
+/// Both `gate_db` and `residual_rms_db` are `Option` because `decide()` only
+/// produces them when it got far enough to grade: a bundle it refuses on
+/// routing or on a dropped band carries diagnostics and no residual, and
+/// showing `0.0` there would read as a perfect result.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct VerifyReport {
+    /// The abort budget THIS run computed: one helper block + the 5 ms ramp +
+    /// the engine's reported latency + slack. Reported, never asserted -- no
+    /// process can guarantee the acoustic tail.
+    pub abort_acoustic_budget_ms: f64,
+    pub diagnostics: Vec<VerifyDiagnostic>,
+    /// The threshold `residual_rms_db` was compared against.
+    pub gate_db: Option<f64>,
+    /// The engine's OWN armed preamp during the pass, dB. **The preamp
+    /// disclosure is mandatory**, not decorative: the user is being told the
+    /// number their music is now being played through.
+    pub installed_preamp_db: f64,
+    /// `L_verify`, sweep-span RMS, dBFS.
+    pub level_dbfs: f64,
+    /// RMS of `residual_vs_prediction` over the authority band, as the WORST
+    /// capture channel. Never the mean: one bad ear must not be rescued by a
+    /// good one.
+    pub residual_rms_db: Option<f64>,
+    /// `"proceed"`, `"proceed_with_warnings"` or `"refuse"`.
+    pub verdict: String,
+}
+
+/// Where a verification pass is, as the Verify screen sees it.
+///
+/// Internally tagged on `phase`, mirroring `EngineStatus`'s `kind` tagging so
+/// the UI reads one discriminated-union convention and not two.
+///
+/// `Armed` is its own phase because MS-18 makes it one: the acknowledgement
+/// names the device and the projected SPL, it is a deliberate action rather
+/// than a default-focused button, and **no sweep is reachable without it**.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case", tag = "phase")]
+pub enum VerifyState {
+    /// No pass exists. Nothing has been armed and nothing can play.
+    ///
+    /// `#[default]`, and it must stay so: a slot that defaulted to any other
+    /// phase would claim a pass exists before one has been armed.
+    #[default]
+    Idle,
+    /// Gates 1-6 passed and the level is decided. Awaiting MS-18.
+    Armed {
+        device_name: String,
+        /// `L_verify`, sweep-span RMS, dBFS.
+        level_dbfs: f64,
+        /// The SPL this level projects at the mic -- the number the
+        /// acknowledgement must show and the number the user acknowledges.
+        projected_spl_db: f64,
+    },
+    /// Acknowledged: the helper is spawning, playing, or the capture is being
+    /// analysed. One phase rather than three because the pass is one blocking
+    /// call and reporting a sub-phase we cannot observe would be a guess.
+    Running,
+    /// The pass refused, or a seam failed. `code` is the stable
+    /// `MeasurementDiagnostic` number when the failure had one.
+    Failed {
+        code: Option<u16>,
+        remedy: Option<String>,
+        summary: String,
+    },
+    /// The pass completed and `decide()` graded it.
+    Complete { report: VerifyReport },
+}
+
 /// THE snapshot the UI renders. Serialized whole on every change (`app-state`
 /// event) and returned by `get_app_state`. NO permission field -- TCC is
 /// undetectable; `engine.status` carries the honest proxies.
@@ -48,6 +134,10 @@ pub struct AppState {
     pub eq: EqState,
     pub profiles: Vec<String>,
     pub setup_complete: bool,
+    /// The verification pass, if one has been armed this session. Rides the
+    /// existing `app-state` event rather than minting a second channel: the UI
+    /// already has exactly one subscription and one snapshot to reconcile.
+    pub verification: VerifyState,
 }
 
 /// Everything mutable the app owns, behind ONE Mutex (commands are rare and
@@ -120,6 +210,17 @@ pub struct AppShared {
     pub probe: crate::setup::ProbeState,
     pub profiles_dir: PathBuf,
     pub settings_path: PathBuf,
+    /// The single verification slot: at most one armed or running pass, plus
+    /// the abort trigger and the worker that runs it.
+    ///
+    /// Unlike the `MeasurementLease` this deliberately IS parked in shared
+    /// state, and the distinction is the reason the paragraph above gives. A
+    /// lease parked here is not released by a panic and would disable fail-open
+    /// forever; a verification pass parked here holds its lease inside itself
+    /// as an RAII token, so the only way to drop the pass -- which `abort` and
+    /// `shutdown` both do explicitly -- is also the way the lease is released.
+    /// Nothing here outlives a run: `Idle` is the state between passes.
+    pub verify: Mutex<crate::verify::VerifyRuntime>,
 }
 
 /// The mutable app model. Persisted fields (`active_profile`, `bands`,
@@ -182,8 +283,14 @@ impl AppData {
         }
     }
 
-    /// Compose the UI snapshot from this model plus the latest engine state.
-    pub fn app_state(&self, engine: &EngineState) -> AppState {
+    /// Compose the UI snapshot from this model plus the latest engine state
+    /// and the verification slot.
+    ///
+    /// `verification` is passed in rather than read here for the same reason
+    /// `engine` is: this type is the persisted model, and both of those live
+    /// behind their own locks in `AppShared`. Threading them through keeps this
+    /// function pure and unit-testable without an app.
+    pub fn app_state(&self, engine: &EngineState, verification: VerifyState) -> AppState {
         AppState {
             active_profile: self.active_profile.clone(),
             default_output_uid: self.default_output_uid.clone(),
@@ -195,6 +302,7 @@ impl AppData {
             },
             profiles: self.profiles.clone(),
             setup_complete: self.setup_complete,
+            verification,
         }
     }
 }
@@ -328,7 +436,26 @@ mod tests {
         };
 
         assert_eq!(
-            serde_json::to_value(data.app_state(&engine)).unwrap(),
+            serde_json::to_value(data.app_state(
+                &engine,
+                VerifyState::Complete {
+                    report: VerifyReport {
+                        abort_acoustic_budget_ms: 21.7,
+                        diagnostics: vec![VerifyDiagnostic {
+                            code: 41,
+                            remedy: "Re-run the measurement.".into(),
+                            severity: "refuse".into(),
+                            summary: "VerificationResidual (2.9)".into(),
+                        }],
+                        gate_db: Some(2.0),
+                        installed_preamp_db: -6.0,
+                        level_dbfs: -21.0,
+                        residual_rms_db: Some(2.9),
+                        verdict: "refuse".into(),
+                    },
+                },
+            ))
+            .unwrap(),
             serde_json::json!({
                 "active_profile": "hd650",
                 "default_output_uid": "uid-1",
@@ -372,7 +499,86 @@ mod tests {
                     "preamp_db": -3.0
                 },
                 "profiles": ["hd650", "hd800"],
-                "setup_complete": true
+                "setup_complete": true,
+                "verification": {
+                    "phase": "complete",
+                    "report": {
+                        "abort_acoustic_budget_ms": 21.7,
+                        "diagnostics": [
+                            {
+                                "code": 41,
+                                "remedy": "Re-run the measurement.",
+                                "severity": "refuse",
+                                "summary": "VerificationResidual (2.9)"
+                            }
+                        ],
+                        "gate_db": 2.0,
+                        "installed_preamp_db": -6.0,
+                        "level_dbfs": -21.0,
+                        "residual_rms_db": 2.9,
+                        "verdict": "refuse"
+                    }
+                }
+            })
+        );
+    }
+
+    /// Every `VerifyState` phase on the wire, because `desktop/ui/src/ipc/
+    /// types.ts` mirrors this union BY HAND and the golden above only exercises
+    /// one arm of it. A phase whose tag or payload drifts fails here, in the
+    /// same PR as the TypeScript that has to change with it.
+    #[test]
+    fn every_verify_phase_is_pinned_on_the_wire() {
+        let json = |state: VerifyState| serde_json::to_value(state).unwrap();
+
+        assert_eq!(
+            json(VerifyState::Idle),
+            serde_json::json!({"phase": "idle"})
+        );
+        assert_eq!(
+            json(VerifyState::Armed {
+                device_name: "AirPods Max".into(),
+                level_dbfs: -21.0,
+                projected_spl_db: 78.0,
+            }),
+            serde_json::json!({
+                "phase": "armed",
+                "device_name": "AirPods Max",
+                "level_dbfs": -21.0,
+                "projected_spl_db": 78.0
+            })
+        );
+        assert_eq!(
+            json(VerifyState::Running),
+            serde_json::json!({"phase": "running"})
+        );
+        assert_eq!(
+            json(VerifyState::Failed {
+                code: Some(24),
+                remedy: Some("Turn ParaEQ on, then measure again.".into()),
+                summary: "EngineNotRunning".into(),
+            }),
+            serde_json::json!({
+                "phase": "failed",
+                "code": 24,
+                "remedy": "Turn ParaEQ on, then measure again.",
+                "summary": "EngineNotRunning"
+            })
+        );
+        // A seam failure has a message and NO code and NO remedy -- and both
+        // must serialize as `null` rather than being omitted, or the hand-
+        // mirrored TypeScript reads them as optional keys.
+        assert_eq!(
+            json(VerifyState::Failed {
+                code: None,
+                remedy: None,
+                summary: "seam failure: cannot spawn the helper".into(),
+            }),
+            serde_json::json!({
+                "phase": "failed",
+                "code": null,
+                "remedy": null,
+                "summary": "seam failure: cannot spawn the helper"
             })
         );
     }

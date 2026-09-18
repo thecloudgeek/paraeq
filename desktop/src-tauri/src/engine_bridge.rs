@@ -70,9 +70,14 @@ pub fn spawn_engine(settings: &Settings) -> (EngineHandle, ExclusionWitness) {
 /// dropped before any disk I/O or emit; no lock is held across the emit.
 pub fn publish(app: &tauri::AppHandle, engine: &EngineState) {
     let shared = app.state::<AppShared>();
+    // Read the verification slot BEFORE taking the data lock, and release it
+    // immediately: the verify worker publishes from its own thread while
+    // holding nothing, and nesting the two locks in opposite orders anywhere
+    // would be a deadlock.
+    let verification = shared.verify.lock().unwrap().state();
     let (app_state, durable) = {
         let data = shared.data.lock().unwrap();
-        (data.app_state(engine), data.to_settings())
+        (data.app_state(engine, verification), data.to_settings())
     };
     // Persist only when the durable subset actually changed. Compare against the
     // in-memory mirror of what is on disk (`AppShared::persisted`, seeded from

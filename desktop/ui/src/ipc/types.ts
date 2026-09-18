@@ -9,8 +9,10 @@
 //           snake_case EngineStatus union.
 //   2. crates/paraeq-dsp/tests/test_peq.rs (band_serde_roundtrip_and_golden_json)
 //        -- the EQBand golden JSON: { filter_type, fc, gain_db, q }.
-//   3. desktop/src-tauri/src/state.rs (app_state_wire_format_is_pinned)
-//        -- the full AppState envelope + EqState + OutputDeviceInfo.
+//   3. desktop/src-tauri/src/state.rs (app_state_wire_format_is_pinned, and
+//        every_verify_phase_is_pinned_on_the_wire for the VerifyState union)
+//        -- the full AppState envelope + EqState + OutputDeviceInfo +
+//           VerifyState/VerifyReport/VerifyDiagnostic.
 //
 // Command arg/return shapes (IndexEntry, ResponseData, ParsedPresetDto) mirror
 // desktop/src-tauri/src/{commands.rs,eq.rs,autoeq.rs}. All fields are snake_case.
@@ -105,6 +107,64 @@ export interface EqState {
   preamp_db: number;
 }
 
+/** One diagnostic the Verify panel shows (state::VerifyDiagnostic).
+ *
+ *  `remedy` is rendered in Rust and displayed verbatim. The decision engine is
+ *  the author of this copy; the UI is a text field, not an author -- a second
+ *  remedy vocabulary here is a second place for the wrong advice to be given.
+ */
+export interface VerifyDiagnostic {
+  code: number;
+  remedy: string;
+  /** `paraeq_decide::Severity`, snake_cased on this wire. */
+  severity: "refuse" | "warn";
+  summary: string;
+}
+
+/** What a graded verification pass produced (state::VerifyReport).
+ *
+ *  `gate_db` and `residual_rms_db` are nullable because `decide()` only
+ *  produces them when it got far enough to grade -- a bundle refused on routing
+ *  or on a dropped band carries diagnostics and no residual, and rendering 0.0
+ *  there would read as a perfect result.
+ */
+export interface VerifyReport {
+  abort_acoustic_budget_ms: number;
+  diagnostics: VerifyDiagnostic[];
+  gate_db: number | null;
+  /** The engine's OWN armed preamp during the pass, dB. The preamp disclosure
+   *  is mandatory: it is the number the user's music is now played through. */
+  installed_preamp_db: number;
+  /** `L_verify`, sweep-span RMS, dBFS. */
+  level_dbfs: number;
+  /** RMS of `residual_vs_prediction` over the authority band, as the WORST
+   *  capture channel -- never the mean. */
+  residual_rms_db: number | null;
+  verdict: "proceed" | "proceed_with_warnings" | "refuse";
+}
+
+/** Where a verification pass is (state::VerifyState).
+ *
+ *  Internally tagged on `phase` (snake_case), the same convention `EngineStatus`
+ *  uses for `kind`. `armed` is its own phase because MS-18 makes it one: the
+ *  acknowledgement names the device and the projected SPL, and NO sweep is
+ *  reachable without it.
+ */
+export type VerifyState =
+  | { phase: "armed"; device_name: string; level_dbfs: number; projected_spl_db: number }
+  | { phase: "complete"; report: VerifyReport }
+  | { phase: "failed"; code: number | null; remedy: string | null; summary: string }
+  | { phase: "idle" }
+  | { phase: "running" };
+
+/** What `verify_arm` returns: the MS-18 acknowledgement's content
+ *  (verify::VerifyArmed). */
+export interface VerifyArmed {
+  device_name: string;
+  level_dbfs: number;
+  projected_spl_db: number;
+}
+
 /** THE snapshot the UI renders: pushed on the `app-state` event and returned
  *  by the `get_app_state` command. */
 export interface AppState {
@@ -115,6 +175,7 @@ export interface AppState {
   eq: EqState;
   profiles: string[];
   setup_complete: boolean;
+  verification: VerifyState;
 }
 
 /** The setup wizard's three-way probe read (setup::ProbeVerdict, serialized

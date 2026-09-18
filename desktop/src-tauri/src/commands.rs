@@ -82,8 +82,9 @@ fn apply_bands(app: &tauri::AppHandle, bands: Vec<EQBand>) -> Result<(), String>
 pub fn get_app_state(app: tauri::AppHandle) -> Result<AppState, String> {
     let shared = app.state::<AppShared>();
     let engine = engine_bridge::current_engine_state(&shared);
+    let verification = shared.verify.lock().unwrap().state();
     let data = shared.data.lock().unwrap();
-    Ok(data.app_state(&engine))
+    Ok(data.app_state(&engine, verification))
 }
 
 /// Enable the EQ (records persisted intent -- survives fail-open across
@@ -503,4 +504,65 @@ pub fn setup_complete(app: tauri::AppHandle, enable: bool) -> Result<(), String>
     }
     engine_bridge::publish_current(&app);
     Ok(())
+}
+
+// --- Verification ---------------------------------------------------------
+//
+// Four commands, and the split between them is MS-18's. `verify_arm` runs every
+// gate that can refuse before a process exists and reports the device and the
+// projected SPL; `verify_run` takes the acknowledgement of exactly those two
+// facts and is the ONLY door to a sweep. Collapsing them into one command would
+// make the acknowledgement a parameter of the thing it is supposed to gate.
+
+/// Arm a verification pass: gates 1-6, the level, and the SNR budget.
+///
+/// **No process is spawned and no sample is emitted.** What comes back is the
+/// MS-18 acknowledgement's content -- the output device's name and the SPL the
+/// sweep will project at the mic -- for the UI to show and the user to confirm.
+#[tauri::command]
+pub fn verify_arm(
+    app: tauri::AppHandle,
+    request: crate::verify::VerifyArmRequest,
+) -> Result<crate::verify::VerifyArmed, String> {
+    crate::verify::arm(&app, request)
+}
+
+/// Record the MS-18 acknowledgement and run the pass.
+///
+/// `acknowledgedSplDb` is the number the user was actually shown. The pass
+/// refuses a stale one rather than trusting the caller: an acknowledgement of a
+/// different level authorizes nothing.
+///
+/// Returns as soon as the worker is started. The outcome arrives on the
+/// `app-state` event, because the run plays a multi-second sweep and then runs
+/// a matched filter over the capture -- a command that did that inline would
+/// freeze the window for the whole of it.
+#[tauri::command]
+pub fn verify_run(
+    app: tauri::AppHandle,
+    device_name: String,
+    acknowledged_spl_db: f64,
+) -> Result<(), String> {
+    crate::verify::run(&app, device_name, acknowledged_spl_db)
+}
+
+/// Abort whatever is armed or running.
+///
+/// Wired to Esc, to the panel's own control, and to app exit. The helper is
+/// asked to RAMP, never hard-stopped -- a hard stop is itself a full-scale
+/// click -- and the full MS-14 restore sequence runs whichever path gets here.
+#[tauri::command]
+pub fn verify_abort(app: tauri::AppHandle) -> Result<(), String> {
+    crate::verify::abort(&app)
+}
+
+/// The verification slot, for a UI that mounted after the last event.
+///
+/// The same value `AppState::verification` carries; this exists for the same
+/// reason `get_app_state` does -- events emitted before `listen` are lost.
+#[tauri::command]
+pub fn verify_report(app: tauri::AppHandle) -> Result<crate::state::VerifyState, String> {
+    let shared = app.state::<AppShared>();
+    let report = shared.verify.lock().unwrap().state();
+    Ok(report)
 }

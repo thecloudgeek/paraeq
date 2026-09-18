@@ -21,6 +21,8 @@ import type {
   ParsedPresetDto,
   ProbeVerdict,
   ResponseData,
+  VerifyArmed,
+  VerifyState,
 } from "./types";
 
 // --- AutoEq ---------------------------------------------------------------
@@ -105,3 +107,34 @@ export const setupProbeStop = () => invoke<void>("setup_probe_stop");
 // Rust `elapsed_ms` param).
 export const setupProbeVerdict = (elapsedMs: number) =>
   invoke<ProbeVerdict>("setup_probe_verdict", { elapsedMs });
+
+// --- Verification ---------------------------------------------------------
+
+// `request` is the whole arm request: the baseline bundle, the armed correction
+// plan, the device, and the position to re-measure. It is passed through
+// opaquely because every field of it is the decision engine's or the
+// measurement crate's shape, and re-modelling those here would be a fourth
+// hand-mirrored wire.
+//
+// Arming runs every gate that can refuse BEFORE a process exists. What comes
+// back is the MS-18 acknowledgement's content: the output device's name and the
+// SPL the sweep will project at the mic.
+export const verifyArm = (request: unknown) =>
+  invoke<VerifyArmed>("verify_arm", { request });
+
+// `deviceName` and `acknowledgedSplDb` are multi-word → camelCase keys on this
+// side (Tauri maps them to the Rust `device_name` / `acknowledged_spl_db`).
+//
+// `acknowledgedSplDb` must be the number the user was ACTUALLY SHOWN: the pass
+// refuses a stale one, because an acknowledgement of a different level
+// authorizes nothing. Resolves as soon as the worker starts; the outcome
+// arrives on the `app-state` event.
+export const verifyRun = (deviceName: string, acknowledgedSplDb: number) =>
+  invoke<void>("verify_run", { deviceName, acknowledgedSplDb });
+
+// Abort whatever is armed or running. The helper is asked to RAMP, never
+// hard-stopped, and the full restore sequence runs whichever path gets here.
+export const verifyAbort = () => invoke<void>("verify_abort");
+
+// The verification slot, for a UI that mounted after the last event.
+export const verifyReport = () => invoke<VerifyState>("verify_report");
