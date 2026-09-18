@@ -422,3 +422,220 @@ fn an_assembled_stimulus_only_exists_via_the_pipeline() {
     let stim = assemble_pilot(0.25, 48_000, TransducerClass::InEar).unwrap();
     takes_verified(&stim);
 }
+
+// ── The marker bracket (Stage 6) ──────────────────────────────────────────
+//
+// `assemble_bracketed` is the ONE constructor for both bracketed paths: the
+// Direct baseline and the Helper verification file. What is pinned here is the
+// order (the MS-3 assertion set runs on the sweep span, never on the spliced
+// buffer), the three whole-buffer checks, the marker LEVEL rule, and the fact
+// that the level rides through the splice exactly.
+
+/// A 1.0 s sweep, short enough to keep the bracketed buffers cheap and long
+/// enough to carry the policy fades and a real span RMS.
+fn short_sweep(class: TransducerClass, dbfs: f64) -> AssembledStimulus {
+    assemble_sweep(
+        1.0,
+        48_000,
+        20.0,
+        20_000.0,
+        SweepLevel::new(dbfs, class).expect("a legal level"),
+    )
+    .expect("a legal sweep assembles")
+}
+
+fn layout() -> paraeq_dsp::two_clock::MarkerLayout {
+    paraeq_dsp::two_clock::DEFAULT_MARKER_LAYOUT
+}
+
+/// R14's falsifier, and the second half is what makes it one. `scale_to` set
+/// the SWEEP's RMS to exactly the solved level; splicing markers and silence
+/// around it must not move that number, and the whole FILE's RMS must be
+/// strictly lower — otherwise the two readings are indistinguishable and the
+/// −1.46 dB the bracket costs a whole-file RMS would sit inside a 2.0 dB gate.
+#[test]
+fn the_bracketed_buffers_sweep_span_rms_is_exactly_its_level() {
+    let sweep = short_sweep(TransducerClass::OverEar, -20.0);
+    let (bracketed, span) =
+        paraeq_measure::assemble_bracketed(sweep, &layout(), StimulusKind::VerificationSweep)
+            .expect("a verified sweep brackets");
+
+    assert_eq!(
+        bracketed.level().dbfs_rms(),
+        -20.0,
+        "the level rides through the splice unchanged"
+    );
+    let samples = bracketed.samples();
+    let span_rms = rms_dbfs(&samples[span.start..span.start + span.len]);
+    assert!(
+        (span_rms - bracketed.level().dbfs_rms()).abs() < 1e-12,
+        "span RMS {span_rms} must equal the level {} exactly",
+        bracketed.level().dbfs_rms()
+    );
+    let whole = rms_dbfs(samples);
+    assert!(
+        whole < span_rms - 1.0,
+        "the whole-file RMS ({whole}) must be strictly lower than the span's \
+         ({span_rms}) — the bracket is mostly silence"
+    );
+}
+
+/// The MS-3 assertion set must NOT be re-run on the spliced buffer. This test
+/// is the falsifier for the order: `verify_stimulus` asserts
+/// `samples.len() == envelope.len()` and checks fade monotonicity over the
+/// envelope's tail, so calling it with the bracketed buffer and the sweep's
+/// own envelope panics — which is exactly why `assemble_bracketed` calls
+/// `finish()` on the sweep first and checks the assembled file differently.
+#[test]
+fn ms3_assertions_run_on_the_sweep_span_not_the_whole_buffer() {
+    let sweep = short_sweep(TransducerClass::OverEar, -20.0);
+    let sweep_len = sweep.len();
+    let (bracketed, span) =
+        paraeq_measure::assemble_bracketed(sweep, &layout(), StimulusKind::BracketedSweep)
+            .expect("a verified sweep brackets");
+
+    assert_eq!(span.len, sweep_len, "the span is the sweep, unresampled");
+    assert!(
+        bracketed.len() > sweep_len,
+        "the bracketed file is longer than the sweep it carries"
+    );
+
+    // The span still satisfies MS-3 on its own terms: it is bit-identical to
+    // the buffer `verify_stimulus` already passed.
+    let span_samples = &bracketed.samples()[span.start..span.start + span.len];
+    let fade_out = (FADE_OUT_MS / 1000.0 * 48_000.0).round() as usize;
+    let mut envelope = vec![1.0; span_samples.len()];
+    paraeq_dsp::sweep::apply_fade(
+        &mut envelope,
+        (FADE_IN_MS / 1000.0 * 48_000.0).round() as usize,
+        fade_out,
+    );
+    verify_stimulus(span_samples, &envelope, fade_out)
+        .expect("the span is the verified sweep, bit for bit");
+
+    // And the whole buffer is NOT a legal `verify_stimulus` input: its length
+    // does not match the sweep's envelope. A caller that "just re-verified"
+    // the file would be asserting a property of a different buffer.
+    assert_ne!(
+        bracketed.len(),
+        envelope.len(),
+        "the whole-buffer length must differ from the sweep envelope's, which \
+         is why the assertion set cannot simply be re-run"
+    );
+}
+
+/// Asserted on the assembled file rather than argued from the Hann window:
+/// the third whole-buffer check exists because an argument by construction is
+/// not a check.
+#[test]
+fn the_bracketed_buffer_starts_and_ends_at_exactly_zero() {
+    for kind in [
+        StimulusKind::BracketedSweep,
+        StimulusKind::VerificationSweep,
+    ] {
+        let sweep = short_sweep(TransducerClass::InEar, -24.0);
+        let (bracketed, _) = paraeq_measure::assemble_bracketed(sweep, &layout(), kind)
+            .expect("a verified sweep brackets");
+        let samples = bracketed.samples();
+        assert_eq!(samples[0], 0.0, "{kind:?} first sample");
+        assert_eq!(samples[samples.len() - 1], 0.0, "{kind:?} last sample");
+        assert!(peak(samples) <= 1.0, "{kind:?} peak");
+        assert!(samples.iter().all(|v| v.is_finite()), "{kind:?} finiteness");
+    }
+}
+
+/// R8: the markers are scaled to the realized peak of the LEVELLED sweep, not
+/// spliced at their documented peak 1.0. A full-scale 50 ms burst into a
+/// transducer is louder than anything the caps table validated, and on the
+/// Direct path it is tap-excluded — the one signal the engine's clamps never
+/// see. `marker_scale` is computed inside `assemble_bracketed` precisely so it
+/// cannot be passed the wrong number.
+#[test]
+fn the_bracketed_markers_never_exceed_the_realized_sweep_peak() {
+    // Every level here is at or below the Bookshelf cap of −12 dBFS RMS.
+    for dbfs in [-12.0, -20.0, -40.0] {
+        let sweep = short_sweep(TransducerClass::Bookshelf, dbfs);
+        let sweep_peak = peak(sweep.samples());
+        let (bracketed, span) =
+            paraeq_measure::assemble_bracketed(sweep, &layout(), StimulusKind::BracketedSweep)
+                .expect("a verified sweep brackets");
+        let samples = bracketed.samples();
+        // Everything OUTSIDE the sweep span is marker or silence.
+        let lead = peak(&samples[..span.start]);
+        let tail = peak(&samples[span.start + span.len..]);
+        assert!(
+            lead <= sweep_peak + 1e-12,
+            "lead-in markers peak at {lead}, sweep peaks at {sweep_peak}"
+        );
+        assert!(
+            tail <= sweep_peak + 1e-12,
+            "trailing markers peak at {tail}, sweep peaks at {sweep_peak}"
+        );
+        assert!(
+            lead > 0.0 && tail > 0.0,
+            "the markers must actually be there"
+        );
+    }
+}
+
+/// One order, one function, both paths — item 5b. The Direct baseline and the
+/// Helper verification file differ ONLY in the kind they carry (and, outside
+/// this function, in the matched-filter template `locate` is handed). A second
+/// assembly path would be a second place for the marker level rule, the splice
+/// order and the three checks to be got wrong, and on the Direct path a splice
+/// defect is a SAFETY defect.
+#[test]
+fn the_baseline_and_the_verification_buffer_are_assembled_by_one_function() {
+    let baseline = short_sweep(TransducerClass::OverEar, -26.0);
+    let verification = short_sweep(TransducerClass::OverEar, -26.0);
+    let (baseline, base_span) =
+        paraeq_measure::assemble_bracketed(baseline, &layout(), StimulusKind::BracketedSweep)
+            .expect("baseline brackets");
+    let (verification, verify_span) = paraeq_measure::assemble_bracketed(
+        verification,
+        &layout(),
+        StimulusKind::VerificationSweep,
+    )
+    .expect("verification brackets");
+
+    assert_eq!(base_span, verify_span, "identical layout, identical span");
+    assert_eq!(
+        baseline.samples(),
+        verification.samples(),
+        "at the same level the two files are bit-identical; only the kind differs"
+    );
+    assert_eq!(baseline.kind(), StimulusKind::BracketedSweep);
+    assert_eq!(verification.kind(), StimulusKind::VerificationSweep);
+}
+
+/// The provenance chain must get longer, not shorter: the only route into a
+/// bracketed stimulus runs through `assemble_sweep` → `finish` →
+/// `verify_stimulus` and THEN through this function's own three checks.
+#[test]
+fn assemble_bracketed_refuses_a_pilot_and_refuses_an_unbracketed_kind() {
+    let pilot = assemble_pilot(0.5, 48_000, TransducerClass::OverEar).expect("a legal pilot");
+    let err = paraeq_measure::assemble_bracketed(pilot, &layout(), StimulusKind::BracketedSweep)
+        .expect_err("a pilot is not a sweep");
+    assert!(
+        matches!(
+            err,
+            StimulusError::NotASweep {
+                kind: StimulusKind::Pilot
+            }
+        ),
+        "got {err:?}"
+    );
+
+    let sweep = short_sweep(TransducerClass::OverEar, -20.0);
+    let err = paraeq_measure::assemble_bracketed(sweep, &layout(), StimulusKind::Sweep)
+        .expect_err("Sweep is not a bracketed kind");
+    assert!(
+        matches!(
+            err,
+            StimulusError::NotABracketedKind {
+                kind: StimulusKind::Sweep
+            }
+        ),
+        "got {err:?}"
+    );
+}

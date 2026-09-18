@@ -97,8 +97,8 @@ pub use session::{
     SessionPhase, SessionSeam, SolveOutcome, SweepOutcome, ABORT_RAMP_MS, ACK_SPL_TOLERANCE_DB,
 };
 pub use stimulus::{
-    assemble_pilot, assemble_sweep, emit_guard, verify_stimulus, AssembledStimulus, GuardCounts,
-    StimulusError, StimulusKind,
+    assemble_bracketed, assemble_pilot, assemble_sweep, emit_guard, verify_stimulus,
+    AssembledStimulus, GuardCounts, StimulusError, StimulusKind,
 };
 pub use store::{IrStore, StoreError, StoredIr, StoredWindow};
 
