@@ -113,6 +113,21 @@ struct CountingAllocator;
 // Only `alloc` and `dealloc` are overridden: `GlobalAlloc`'s default
 // `alloc_zeroed` and `realloc` are defined in terms of those two, so every
 // allocation event still passes through the counters.
+//
+// SAFETY: `GlobalAlloc`'s contract is discharged by delegating it wholesale.
+// - Every call FORWARDS to `System`, unchanged: the same `Layout` goes in, the
+//   pointer that comes back is returned verbatim with `System`'s provenance,
+//   and `dealloc` hands `System` back exactly the pointer and layout pair it
+//   issued. Nothing here allocates, adjusts, aligns or reinterprets anything,
+//   so this impl is safe exactly to the degree `System` is.
+// - The counting is NON-RE-ENTRANT by construction: the three cells are
+//   `thread_local!` `Cell<_>`s, `const`-initialized and `Copy` with no
+//   destructor, so touching one from inside the allocator cannot allocate.
+//   A lazily-`Box`ed or destructor-registering thread-local would re-enter
+//   `alloc` on first access and recurse forever.
+// - Being the `#[global_allocator]` makes this process-wide, and the counters
+//   are per-thread, which is what the benchmark wants: it asserts about
+//   allocations on the realtime thread and must not see the harness's.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if COUNTING.with(Cell::get) {

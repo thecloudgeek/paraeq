@@ -140,9 +140,13 @@ pub struct AppState {
     pub verification: VerifyState,
 }
 
-/// Everything mutable the app owns, behind ONE Mutex (commands are rare and
-/// cheap; no lock ordering to get wrong). The `EngineHandle` lives in its own
-/// slot so `RunEvent::Exit` can `.take()` it and drive teardown to completion.
+/// Everything mutable the app owns. `data` is the ONE Mutex commands normally
+/// touch (they are rare and cheap), and the other four slots each own their own
+/// lock for a reason stated on the field. **There is no lock ORDER to get
+/// wrong, because there is no nesting** — every field below states the rule
+/// that keeps it that way, and `verify`'s is the newest. The `EngineHandle`
+/// lives in its own slot so `RunEvent::Exit` can `.take()` it and drive
+/// teardown to completion.
 ///
 /// # There is deliberately no `MeasurementLease` slot here
 ///
@@ -212,6 +216,14 @@ pub struct AppShared {
     pub settings_path: PathBuf,
     /// The single verification slot: at most one armed or running pass, plus
     /// the abort trigger and the worker that runs it.
+    ///
+    /// **Never nested with `data`: read into a value and released before the
+    /// data lock is taken.** `engine_bridge.rs`'s snapshot path is where that
+    /// matters — it needs both the verification state and the model in one
+    /// frame, and it takes `verify`, clones the state out, drops the guard, and
+    /// only then takes `data`. Holding this across a `data` acquisition would
+    /// be the first ordering constraint in the app, and the worker thread
+    /// publishes into exactly these two locks from the other direction.
     ///
     /// Unlike the `MeasurementLease` this deliberately IS parked in shared
     /// state, and the distinction is the reason the paragraph above gives. A

@@ -484,7 +484,10 @@ impl DeviceRenderer {
         // 4. Bounded SPSC ring + counters + the realtime closure. Shallow on
         //    purpose: `write` is paced, so depth buys nothing and costs abort
         //    latency.
-        let capacity = frames_per_block.max(1) * config.ring_capacity_blocks.max(2) * channels;
+        // Frames, not samples: the ring carries ONE MONO sample per frame (see
+        // `RenderFill::fill`), so multiplying by the channel count made the
+        // depth a multiple of what the doc says it is.
+        let capacity = frames_per_block.max(1) * config.ring_capacity_blocks.max(2);
         let (producer, consumer) = RingBuffer::<f32>::new(capacity);
         let inner = Arc::new(RenderInner::default());
         let cb = render_callback(
@@ -518,6 +521,18 @@ impl DeviceRenderer {
         //    mismatch so the caller rebuilds. The still-live locals drop in the
         //    invariant order on the early return.
         if properties::translate_uid_to_device(&device_uid)? != out_dev {
+            return Err(RenderError::DeviceChangedDuringBuild { uid: device_uid });
+        }
+        // `DefaultOutput` asked for "whatever is the default right now", so the
+        // UID check above is not the whole question: the device it names can
+        // still exist, unchanged, and no longer BE the default. The cited
+        // precedent re-queries the default too (`measure_aggregate`'s step 7),
+        // and the two must not diverge — production uses `Uid`, but the probe
+        // example uses this arm, and an example that measures the wrong route
+        // teaches the wrong thing.
+        if config.target == RenderTarget::DefaultOutput
+            && properties::default_output_device()? != out_dev
+        {
             return Err(RenderError::DeviceChangedDuringBuild { uid: device_uid });
         }
 

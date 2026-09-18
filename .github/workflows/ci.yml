@@ -47,10 +47,11 @@ jobs:
       # depends on paraeq-measure unconditionally, so the moment the helper
       # depends on paraeq-coreaudio — which the architecture spec explicitly
       # permits — `cargo tree` shows paraeq-measure whatever the helper's own
-      # manifest says. That is a fact about the shipped graph, not an opinion,
-      # and whether the TRANSITIVE link is in scope is an open owner question.
+      # manifest says. That is a fact about the shipped graph, not an opinion:
+      # the transitive paraeq-measure link is OPEN owner question E19; shipping
+      # under reading (a): the LINK is allowed, USE is forbidden and gated.
       # A gate that cannot pass is not a gate: do not "fix" this by adding the
-      # word. The manifest half of the rule is R-B11-d below.
+      # word. The USE half is R-B11-b and the manifest half is R-B11-d below.
       - name: paraeq-stimulus links no Tauri and no paraeq-decide
         run: |
           if cargo tree -p paraeq-stimulus -e normal | grep -Eiq 'tauri|paraeq-decide'; then

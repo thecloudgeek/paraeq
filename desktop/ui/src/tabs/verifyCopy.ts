@@ -71,10 +71,13 @@ export function preampDisclosure(report: VerifyReport): string {
   if (!Number.isFinite(db) || db >= 0) {
     return "No headroom was needed: the correction only cuts.";
   }
+  // The MAGNITUDE, not the signed value: "-6.0 dB ... turned down by this much"
+  // is a double negative, and wizard-design.md's own wording uses the positive
+  // number. The sign lives in the sentence, where a reader can use it.
   return (
-    `Headroom: ${db.toFixed(1)} dB. The correction boosts some frequencies, so ` +
-    `everything is turned down by this much first to leave room for them — ` +
-    `otherwise the loud parts would clip.`
+    `Headroom: ${Math.abs(db).toFixed(1)} dB. The correction boosts some ` +
+    `frequencies, so everything is turned down by this much first to leave ` +
+    `room for them — otherwise the loud parts would clip.`
   );
 }
 

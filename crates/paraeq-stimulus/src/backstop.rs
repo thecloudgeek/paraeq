@@ -104,10 +104,32 @@ pub fn max_window_rms_dbfs(samples: &[f32], sample_rate_hz: u32) -> f64 {
 
 /// Refuse a file that is too hot, BEFORE any device is opened.
 ///
-/// Two independent bounds, because they fail differently: the windowed RMS
-/// catches a file levelled above the ceiling, and the peak catches a file whose
-/// average is fine but which contains a full-scale transient.
+/// Three independent bounds, because they fail differently: a non-finite sample
+/// makes the other two blind, the windowed RMS catches a file levelled above
+/// the ceiling, and the peak catches a file whose average is fine but which
+/// contains a full-scale transient.
+///
+/// **Non-finite first, and it is a refusal rather than a repair.** Both of the
+/// other bounds are NaN-blind: one NaN makes a window's `mean_square` NaN, and
+/// `NaN > 0.0` is false, so the window is SKIPPED rather than failing; the peak
+/// fold drops non-finites the same way. A file carrying one NaN per 400 ms hop
+/// therefore cleared both bounds while holding ±1.0 content at about 0 dBFS —
+/// the exact file this interlock exists to stop. `guard_block` would zero those
+/// samples at emit time, but by then the device is open and the level was never
+/// measured. A non-finite sample in a file the parent generated is a bug
+/// upstream, not a blemish to sanitize past.
 pub fn check(samples: &[f32], sample_rate_hz: u32) -> Result<(), Refusal> {
+    let non_finite = samples.iter().filter(|v| !v.is_finite()).count();
+    if non_finite > 0 {
+        return Err(Refusal::new(
+            ExitCode::BackstopRefused,
+            format!(
+                "{non_finite} of {} samples are not finite — the level bounds below cannot \
+                 measure a file that contains one, so this is refused rather than played",
+                samples.len()
+            ),
+        ));
+    }
     let peak = samples.iter().fold(
         0.0f32,
         |acc, &v| {

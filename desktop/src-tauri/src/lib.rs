@@ -1,3 +1,10 @@
+//! This crate gained its first `unsafe` block with the verification helper's
+//! SIGTERM rung (`verify_seam.rs`'s `libc::kill` — `std`'s `Child::kill()` is
+//! SIGKILL), so it takes the same lint `paraeq-coreaudio` and `paraeq-stimulus`
+//! carry: a second one cannot arrive undocumented.
+
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 mod autoeq;
 mod commands;
 mod engine_bridge;

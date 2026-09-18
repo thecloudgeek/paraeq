@@ -118,6 +118,26 @@ fn write_frame_is_the_only_place_routing_is_interpreted() {
 // These need a real HAL. They never play audio: they create the render
 // aggregate, look at it, and destroy it.
 
+/// Selector validation BEFORE any HAL call (the volume.rs shape).
+///
+/// NOT `#[ignore]`d, and that is the point: the guard it exercises returns
+/// before `DeviceRenderer::open` resolves anything, so it touches no device by
+/// construction. It sat with the hardware tests for proximity and was therefore
+/// never run — leaving `render.rs`'s `EmptyUid` guard with no automated cover
+/// at all on a machine with no rig attached.
+#[test]
+fn an_empty_uid_is_refused_before_any_hal_call() {
+    let opened = DeviceRenderer::open(RenderConfig {
+        target: RenderTarget::Uid(String::new()),
+        ..RenderConfig::default()
+    });
+    match opened {
+        Err(paraeq_coreaudio::render::RenderError::EmptyUid) => {}
+        Err(other) => panic!("wrong refusal: {other}"),
+        Ok(_) => panic!("an empty UID is a caller bug, not a device question"),
+    }
+}
+
 #[test]
 #[ignore = "requires audio hardware"]
 fn render_aggregate_create_and_destroy_round_trips() {
@@ -201,21 +221,4 @@ fn a_renderer_opens_on_the_default_output_and_reports_a_usable_format() {
         0,
         "stop destroyed the render aggregate"
     );
-}
-
-#[test]
-#[ignore = "requires audio hardware"]
-fn an_empty_uid_is_refused_before_any_hal_call() {
-    // Selector validation BEFORE any HAL call (the volume.rs shape). Listed
-    // with the hardware tests because it sits beside them, but it touches no
-    // device by construction — which is exactly what it asserts.
-    let opened = DeviceRenderer::open(RenderConfig {
-        target: RenderTarget::Uid(String::new()),
-        ..RenderConfig::default()
-    });
-    match opened {
-        Err(paraeq_coreaudio::render::RenderError::EmptyUid) => {}
-        Err(other) => panic!("wrong refusal: {other}"),
-        Ok(_) => panic!("an empty UID is a caller bug, not a device question"),
-    }
 }

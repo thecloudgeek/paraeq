@@ -8,10 +8,12 @@
 //! has no way for a process to install a signal handler (`Child::kill()` is the
 //! parent's side, and it is SIGKILL), so this is one `libc::signal` call.
 //!
-//! **The handler body is one relaxed-ordering store and it must stay that way.**
-//! A store to an `AtomicBool` is async-signal-safe. Allocating, locking,
+//! **The handler body is one atomic store — `SeqCst` — and it must stay that
+//! way.** A store to an `AtomicBool` is async-signal-safe. Allocating, locking,
 //! logging and formatting are not: a handler that took a lock the interrupted
 //! thread already held would deadlock the process with the device still open.
+//! (The ordering is `SeqCst` in the code and `tests/test_signals.rs` pins that
+//! string; this header used to say "relaxed", which the code never was.)
 //!
 //! There is no way to CLEAR the flag, deliberately. A reset hook would be a
 //! second way to un-arm a safety abort, and the process is short-lived enough
@@ -33,16 +35,32 @@ pub extern "C" fn on_sigterm(_sig: libc::c_int) {
     ABORT.store(true, Ordering::SeqCst);
 }
 
-/// Install the handler. Called once, from `run`, before any other thread
-/// exists.
+/// Install the handler.
+///
+/// `run` calls it once, first, before anything can be interrupted — but the
+/// SAFETY argument below deliberately does NOT rest on that, because
+/// `tests/test_signals.rs` calls it twice from a worker thread and a
+/// precondition the crate's own tests falsify is not a precondition.
 pub fn arm() {
     // A function ITEM cast straight to an integer is a lint (and the pointer
     // is what `sighandler_t` actually holds), so go through a pointer.
     let handler = on_sigterm as *const () as libc::sighandler_t;
-    // SAFETY: `on_sigterm` is `extern "C"`, never unwinds, and touches only a
-    // `static AtomicBool`; `SIGTERM` is a valid signal number on every
-    // supported target; and `signal` is called exactly once, from the main
-    // thread, before this process spawns any other.
+    // SAFETY: what `libc::signal` actually requires here, and why repeat calls
+    // from any thread are fine.
+    // - `on_sigterm` is `extern "C"` and cannot unwind: its whole body is one
+    //   `AtomicBool` store, which is async-signal-safe, and a panic crossing a
+    //   signal frame would be undefined behaviour.
+    // - `SIGTERM` is a valid, catchable signal number on every supported
+    //   target.
+    // - The disposition is PROCESS-WIDE and this call is IDEMPOTENT: it
+    //   installs the same handler pointer every time, so a second install from
+    //   any thread is a no-op in effect. Repeat installs are intentional —
+    //   `run` arms once, and the tests arm again to prove the flag survives.
+    // - The handler shares exactly one piece of state with the rest of the
+    //   process — the `ABORT` cell below — and never reads or writes it
+    //   through a lock. (Spelled that way on purpose: `tests/test_signals.rs`
+    //   counts the declarations of that cell in this file, and there must be
+    //   exactly one.)
     unsafe { libc::signal(libc::SIGTERM, handler) };
 }
 

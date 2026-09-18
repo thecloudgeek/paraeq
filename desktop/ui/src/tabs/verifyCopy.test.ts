@@ -85,9 +85,14 @@ describe("residualLine", () => {
 describe("preampDisclosure", () => {
   // Mandatory, not decorative: this is the number the user's music is now
   // being played through.
-  it("names the number and explains it in the user's terms", () => {
+  // The MAGNITUDE, not the signed value: "-6.0 dB ... turned down by this
+  // much" is a double negative, and the spec's own wording uses the positive
+  // number. The sign lives in the sentence.
+  it("names the number as a magnitude and explains it in the user's terms", () => {
     const text = preampDisclosure(report());
-    expect(text).toContain("-6.0 dB");
+    expect(text).toContain("6.0 dB");
+    expect(text).not.toContain("-6.0 dB");
+    expect(text).toContain("turned down");
     expect(text).toContain("clip");
   });
 

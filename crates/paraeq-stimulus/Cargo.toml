@@ -19,6 +19,13 @@ version.workspace = true
 # surface, so from here they are paraeq-coreaudio items. A missing re-export is
 # a build error rather than a silent re-addition of the dependency.
 #
+# paraeq-coreaudio itself depends on paraeq-measure unconditionally, so the
+# shipped dependency GRAPH contains the edge whatever this file says:
+# the transitive paraeq-measure link is OPEN owner question E19; shipping
+# under reading (a): the LINK is allowed, USE is forbidden and gated.
+# The gates are R-B11-a/b/c/d in .github/workflows/ci.yml, which carries the
+# same sentence.
+#
 # `libc` is the SIGTERM handler's mechanism: std has no way for a process to
 # install a signal handler, and without one SIGTERM's default disposition
 # terminates without unwinding, so the render aggregate's Drop never runs and a

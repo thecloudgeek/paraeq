@@ -202,6 +202,37 @@ fn a_full_scale_transient_is_refused_even_at_a_quiet_average() {
     assert!(refusal.message.contains("peak"), "{}", refusal.message);
 }
 
+/// Both level bounds are NaN-BLIND, which is what makes this a refusal rather
+/// than a nit.
+///
+/// A window holding one NaN has a NaN `mean_square`, and `NaN > 0.0` is false,
+/// so the window is SKIPPED rather than failing. The peak fold drops non-finite
+/// samples the same way. Salt a hot file with one NaN per 400 ms hop and it
+/// clears both bounds while carrying full-scale content — the exact file this
+/// interlock exists to stop, waved through by the interlock itself.
+#[test]
+fn a_file_with_a_nan_is_refused_rather_than_skipped() {
+    // Full scale throughout: this file is as hot as a file gets.
+    let mut hot = vec![1.0f32; RATE as usize];
+    hot[7] = f32::NAN;
+    let refusal = check(&hot, RATE).expect_err("a non-finite sample is refused");
+    assert_eq!(refusal.code, ExitCode::BackstopRefused);
+    assert!(
+        refusal.message.contains("not finite"),
+        "the refusal must name the reason: {}",
+        refusal.message
+    );
+
+    // The falsifier for the old behaviour: hide a NaN in EVERY window and the
+    // windowed RMS sees nothing at all, while the peak fold skips it too.
+    let mut salted = vec![1.0f32; RATE as usize];
+    let hop = (BACKSTOP_WINDOW_MS / 1000.0 * f64::from(RATE)) as usize;
+    for i in (0..salted.len()).step_by(hop.max(1)) {
+        salted[i] = f32::INFINITY;
+    }
+    check(&salted, RATE).expect_err("and an infinity is refused on the same rung");
+}
+
 #[test]
 fn silence_is_accepted_and_reads_as_negative_infinity() {
     let silence = vec![0.0f32; RATE as usize];

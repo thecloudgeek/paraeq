@@ -1787,9 +1787,12 @@ mod tests {
     /// Deleting either compare left the whole workspace green. This is the
     /// direct guard: one field moved, one verdict.
     ///
-    /// This array must list EVERY field `effectively_equal` compares exactly:
-    /// adding a compare without adding a row here leaves that compare
-    /// unguarded, and nothing else in the suite will notice.
+    /// This array lists every exactly-compared field **that no controller-level
+    /// script can isolate on its own** — eight of the thirteen. The other five
+    /// (`bypass`, `correction`, `gain_db`, `status`, `stream`) are compared
+    /// exactly too, and are covered because an integration script CAN move each
+    /// of them alone. Adding a compare that no script isolates without adding a
+    /// row here leaves it unguarded, and nothing else in the suite will notice.
     #[test]
     fn every_exact_compare_publishes_on_its_own() {
         assert!(
