@@ -954,6 +954,14 @@ mod tests {
     /// activity counters need. Splitting one safety fact across two seams that
     /// can disagree is the defect that put `tap_activity` on `EngineFacts`
     /// instead; this grep is what stops it coming back.
+    ///
+    /// The list below carries the ONE production implementor plus every MOCK.
+    /// `tests/test_verify.rs` is the verification pass's, added with that pass:
+    /// its gate 3 reads `TapStatus::self_excluded()` and the whole pass is
+    /// mock-driven, so it needs one, and an integration test is its own crate
+    /// and cannot borrow `test_session.rs`'s. A row under `tests/` is a mock,
+    /// which is what this assertion permits; a row under any `src/` is a second
+    /// production implementor, which is what it forbids.
     #[test]
     fn there_is_exactly_one_production_tap_status_impl() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -971,9 +979,11 @@ mod tests {
             vec![
                 "crates/paraeq-coreaudio/src/backend.rs".to_string(),
                 "crates/paraeq-measure/tests/test_session.rs".to_string(),
+                "crates/paraeq-measure/tests/test_verify.rs".to_string(),
             ],
             "exactly one production `TapStatus` impl (paraeq-coreaudio) plus the \
-             one mock; anything else splits one safety fact across two seams"
+             mocks under tests/; anything else splits one safety fact across two \
+             seams"
         );
     }
 

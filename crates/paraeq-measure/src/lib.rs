@@ -68,6 +68,7 @@ pub mod seam;
 pub mod session;
 pub mod stimulus;
 pub mod store;
+pub mod verify;
 
 pub use align::{
     align, AlignRequest, Alignment, MARKER_SNR_WARN_DB, TWO_CLOCK_RESIDUAL_REFUSE_SAMPLES,
@@ -106,6 +107,12 @@ pub use stimulus::{
     AssembledStimulus, GuardCounts, StimulusError, StimulusKind,
 };
 pub use store::{IrStore, StoreError, StoredIr, StoredWindow};
+pub use verify::{
+    classify_exit, exit_diagnostic, expected_render_device_uid, ArmingFailure, HelperExitKind,
+    HelperReady, SweepShape, VerificationPass, VerifyCaptureStats, VerifyError, VerifyOutcome,
+    VerifyPhase, VerifyPlan, VerifyRequest, VerifySeam, VerifyTiming, VerifyTwoClockFit,
+    CAPTURE_FLOOR_DBFS, PREAMP_MATCH_TOLERANCE, VERIFY_MIN_SNR_DB,
+};
 
 /// Error type shared by this crate's entry points.
 ///
