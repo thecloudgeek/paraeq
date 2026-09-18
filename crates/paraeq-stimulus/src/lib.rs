@@ -169,8 +169,9 @@ fn play(args: &Args) -> Result<u8, Refusal> {
         }
         Ok(Command::Unknown) => {
             // Unknown lines are ignored, never fatal. Wait again rather than
-            // guessing what the parent meant.
-            return wait_then_play(args, player, commands);
+            // guessing what the parent meant. The VETTED file goes with it —
+            // see `wait_then_play`.
+            return wait_then_play(args, &file, player, commands);
         }
     }
     emit_started(args);
@@ -185,8 +186,22 @@ fn play(args: &Args) -> Result<u8, Refusal> {
 }
 
 /// Keep waiting for a decision after an unrecognized line.
-fn wait_then_play(
+///
+/// **`file` is the already-vetted `Wav` from [`play`], and it is a parameter
+/// for exactly that reason (R-B5).** This used to call `wav::read` again and
+/// play whatever came back: no [`backstop::check`], no [`wav::check_rate`],
+/// and the device already open — so the one code path in this process that
+/// makes sound had a branch with the level interlock missing from in front of
+/// it. Handing the checked value in makes the vetted bytes the only bytes
+/// there are. The second read's `?` was a second defect in the same line: it
+/// returned past `player.stop()`, leaving the render device to `Drop` instead
+/// of the explicit teardown every other exit path runs.
+///
+/// `pub` because the crate's integration tests are a separate crate — the
+/// module header's own rule — and this is where a regression would live.
+pub fn wait_then_play(
     args: &Args,
+    file: &wav::Wav,
     mut player: player::Player,
     commands: Receiver<Command>,
 ) -> Result<u8, Refusal> {
@@ -206,7 +221,6 @@ fn wait_then_play(
             }
         }
     }
-    let file = wav::read(&args.wav)?;
     emit_started(args);
     let outcome = player.play(&file.samples, &abort_poll(&commands), |frames| {
         if args.json {
