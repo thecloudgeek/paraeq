@@ -7,6 +7,9 @@ mod settings;
 mod setup;
 mod state;
 mod tray;
+// `pub` for the same reason `verify_seam` is: the verification wiring's only
+// consumers live outside this module tree.
+pub mod verify;
 // `pub`, unlike its neighbours: this is the measurement crate's seam, whose
 // only consumers live outside this module tree (the wizard spine, once it
 // lands, and a future headless driver).

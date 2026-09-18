@@ -82,7 +82,12 @@ pub trait StimulusSink: Send {
 ///
 /// Contract:
 /// - `capture` fills `block` and returns the frames written. A short read is
-///   not an error; the session decides what an underrun means.
+///   not an error; the session decides what an underrun means. **Zero frames
+///   means the stream ENDED**, which is how [`record`](crate::capture::record)
+///   reads it — so a non-blocking implementation whose zero means "nothing
+///   queued yet" must be wrapped in an adapter that waits, with its own
+///   deadline, before passing a zero through. See `record`'s own doc for why
+///   the waiting may not live in the capture loop.
 /// - Non-finite samples are sanitized before they reach a caller (MS-4's
 ///   boundary 2): a NaN in a recorded IR propagates through `deconvolve` into
 ///   NaN correction coefficients, and one NaN poisons the DF2T feedback state

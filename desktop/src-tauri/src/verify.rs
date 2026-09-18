@@ -1,0 +1,645 @@
+//! The desktop's half of the closed-loop verification pass: the type mappings
+//! nobody else can write, the capture adapter the two shipped contracts need
+//! between them, and the lift from a finished pass into a `decide()` bundle.
+//!
+//! # Why these live HERE and nowhere else
+//!
+//! Each item below names two crates that may not name each other:
+//!
+//! - `CaptureRouting` is `paraeq-decide`'s and `StimulusRouting` is
+//!   `paraeq-coreaudio`'s, and neither crate depends on the other.
+//! - `CorrectionPlan` is `paraeq-decide`'s and `CorrectionConfig` is
+//!   `paraeq-engine`'s, and `paraeq-decide` may not depend on `paraeq-engine`.
+//! - `VerifyOutcome` is `paraeq-measure`'s and `bundle::Verification` is
+//!   `paraeq-decide`'s, and those two may not depend on each other either --
+//!   which is why they are documented twins, field for field, rather than one
+//!   re-export.
+//!
+//! The desktop is the one crate that can see every side, so the mappings are
+//! written once, here, with the tests that pin them.
+
+use paraeq_decide::bundle::{
+    CaptureRouting, CaptureStats, ImpulseResponse as BundleIr, TwoClockFit, Verification,
+};
+use paraeq_decide::outcome::CorrectionPlan;
+use paraeq_engine::controller::CorrectionConfig;
+use paraeq_measure::seam::HelperRouting;
+use paraeq_measure::{CaptureSource, MeasureError, StreamFormat, VerifyOutcome};
+use std::time::{Duration, Instant};
+
+/// How long [`WaitingCapture`] waits for a mic that has stopped delivering
+/// before it reports the stream ended.
+///
+/// Long enough that no scheduling hiccup reaches it, short enough that a dead
+/// mic ENDS the run rather than hanging it. Taken verbatim from the hardware
+/// harness's own `CAPTURE_STALL_TIMEOUT`, so the rig and the app wait the same
+/// amount of time for the same fact.
+const CAPTURE_STALL_TIMEOUT: Duration = Duration::from_secs(2);
+
+// ─────────────────────────── the capture adapter ───────────────────────────
+
+/// A [`CaptureSource`] that WAITS for the device rather than reporting an empty
+/// ring as the end of the stream.
+///
+/// # Why this exists — two shipped contracts that disagree about zero
+///
+/// `paraeq_measure::record` treats a zero-frame read as
+/// `CaptureEnd::SourceExhausted`, and its own doc gives the reason: "retrying
+/// it forever is how a dead stream becomes a hang". That is the right rule for
+/// a capture loop, which must not spin, and it is deliberately not changed
+/// here.
+///
+/// `paraeq_coreaudio::MicCapture::capture` is a NON-BLOCKING ring drain. It
+/// returns 0 frames whenever the caller outruns the device, which on healthy
+/// hardware is most polls — the reader is a control-plane loop and the device
+/// fills the ring one IOProc callback at a time.
+///
+/// Wired to each other directly, a verification pass refuses `MicDisconnected`
+/// microseconds into its first capture span, **on every run, on a perfect
+/// rig**. The waiting has to live somewhere, and it may not live in `record`
+/// (whose no-spin rule is the safety property) nor in `MicCapture` (whose
+/// non-blocking drain is what keeps it usable from a realtime-adjacent
+/// caller). So it lives in the adapter between them: poll until at least one
+/// frame arrives, and give up after [`CAPTURE_STALL_TIMEOUT`] so a genuinely
+/// dead mic still reaches `SourceExhausted` instead of hanging the app.
+///
+/// Found by the hardware-test lane, which closed it test-side with an adapter
+/// of exactly this shape in `crates/paraeq-coreaudio/tests/`. This is the
+/// production twin it said the wiring owed.
+pub struct WaitingCapture {
+    inner: Box<dyn CaptureSource>,
+    /// Overridable so the unit tests below are milliseconds rather than
+    /// seconds. Production always uses [`CAPTURE_STALL_TIMEOUT`].
+    stall_timeout: Duration,
+}
+
+impl WaitingCapture {
+    pub fn new(inner: Box<dyn CaptureSource>) -> WaitingCapture {
+        WaitingCapture {
+            inner,
+            stall_timeout: CAPTURE_STALL_TIMEOUT,
+        }
+    }
+
+    /// For tests: the same adapter with a shorter patience.
+    #[cfg(test)]
+    fn with_timeout(inner: Box<dyn CaptureSource>, stall_timeout: Duration) -> WaitingCapture {
+        WaitingCapture {
+            inner,
+            stall_timeout,
+        }
+    }
+}
+
+impl CaptureSource for WaitingCapture {
+    fn format(&self) -> StreamFormat {
+        self.inner.format()
+    }
+
+    fn capture(&mut self, block: &mut [f64]) -> Result<usize, MeasureError> {
+        let deadline = Instant::now() + self.stall_timeout;
+        loop {
+            let got = self.inner.capture(block)?;
+            if got > 0 {
+                return Ok(got);
+            }
+            if Instant::now() >= deadline {
+                // Genuinely exhausted as far as any caller can tell, which is
+                // what `record` needs to hear in order to STOP rather than
+                // spin. Passing the zero through is the whole point: this
+                // adapter delays that verdict, it never suppresses it.
+                return Ok(0);
+            }
+            // A millisecond is well under one IOProc block at any supported
+            // rate, so no frame waits long, and it is long enough that this
+            // loop is a sleep rather than a spin on a control-plane thread.
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn stop(&mut self) -> Result<(), MeasureError> {
+        self.inner.stop()
+    }
+}
+
+// ───────────────────────────── routing mappings ────────────────────────────
+
+/// A routing that cannot be represented on the other side.
+///
+/// Hand-written `Display` rather than a `thiserror` derive: this crate carries
+/// no error-derive dependency today, and one enum with one variant does not
+/// earn one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoutingError {
+    ChannelTooWide { channel: usize },
+}
+
+impl std::fmt::Display for RoutingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RoutingError::ChannelTooWide { channel } => write!(
+                f,
+                "channel index {channel} does not fit the wire's u32 -- refusing rather than \
+                 truncating, because a truncated index re-routes the sweep to another ear with \
+                 no symptom"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RoutingError {}
+
+/// `CaptureRouting` -> `StimulusRouting`. TOTAL, and infallible on every
+/// supported target: `u32` -> `usize` widens.
+///
+/// This is the direction the product uses -- the plan says which channel the
+/// baseline measured, and the helper is told to play there.
+pub fn capture_routing_to_stimulus(
+    routing: CaptureRouting,
+) -> paraeq_coreaudio::measure_aggregate::StimulusRouting {
+    use paraeq_coreaudio::measure_aggregate::StimulusRouting;
+    match routing {
+        CaptureRouting::Both => StimulusRouting::Both,
+        CaptureRouting::Only(channel) => StimulusRouting::Only(channel as usize),
+    }
+}
+
+/// `StimulusRouting` -> `CaptureRouting`. FALLIBLE, and the failure is the
+/// point.
+///
+/// `StimulusRouting::Only` carries a platform-width `usize` and `CaptureRouting`
+/// carries a `u32`, because the latter is a frozen wire shape in
+/// `fixtures/decide/` and a platform-width integer does not belong in one. So
+/// the narrowing can lose information, and losing it silently would re-route
+/// audio: `Only(2^32)` truncates to `Only(0)`, which is a wrong-ear
+/// measurement that produces a plausible-looking residual and no symptom
+/// whatsoever. It refuses instead.
+pub fn stimulus_routing_to_capture(
+    routing: paraeq_coreaudio::measure_aggregate::StimulusRouting,
+) -> Result<CaptureRouting, RoutingError> {
+    use paraeq_coreaudio::measure_aggregate::StimulusRouting;
+    match routing {
+        StimulusRouting::Both => Ok(CaptureRouting::Both),
+        StimulusRouting::Only(channel) => u32::try_from(channel)
+            .map(CaptureRouting::Only)
+            .map_err(|_| RoutingError::ChannelTooWide { channel }),
+    }
+}
+
+/// `CaptureRouting` -> the helper seam's own spelling.
+///
+/// A third enum for the same idea would be wrong, which is why
+/// `HelperRouting::Only` is already the same width as `CaptureRouting::Only`:
+/// this map is total in both directions and carries no refusal.
+pub fn capture_routing_to_helper(routing: CaptureRouting) -> HelperRouting {
+    match routing {
+        CaptureRouting::Both => HelperRouting::Both,
+        CaptureRouting::Only(channel) => HelperRouting::Only(channel),
+    }
+}
+
+/// The helper seam's spelling -> `CaptureRouting`. Total, same widths.
+pub fn helper_routing_to_capture(routing: HelperRouting) -> CaptureRouting {
+    match routing {
+        HelperRouting::Both => CaptureRouting::Both,
+        HelperRouting::Only(channel) => CaptureRouting::Only(channel),
+    }
+}
+
+// ────────────────────────── plan -> engine correction ──────────────────────
+
+/// `decide()`'s plan as the engine's install command.
+///
+/// **`design_rate` is provenance, not an instruction.** Since R1-6 the engine
+/// re-derives every band at whatever rate its stream is actually running, so
+/// this field records the rate the bands were FITTED at and never the rate the
+/// coefficients are designed at. Carrying it is what lets the engine report a
+/// `correction_rate_mismatch` instead of silently running coefficients from
+/// another rate.
+///
+/// **`preamp_db` is deliberately NOT mapped.** It reaches the engine as
+/// `Correction.preamp_lin`, computed by the engine itself from the bands that
+/// survived at the live rate, and applied on the corrected path only. Passing
+/// the plan's number through as a separate `SetGainDb` would apply it on BOTH
+/// chain paths, leaving the bypassed side of an A/B quieter by the whole
+/// preamp -- and it would be the wrong number besides, because `decide()`
+/// computed it at `design_rate` over all bands. The verification gate's whole
+/// job is to check that the engine's own number agrees with a recomputation,
+/// so handing it ours would be marking our own homework.
+///
+/// `clamps` and `dropped` are the drawer's evidence and mean nothing to the
+/// realtime chain, so they do not cross.
+pub fn correction_plan_to_peq_config(plan: &CorrectionPlan) -> CorrectionConfig {
+    CorrectionConfig::Peq {
+        bands: plan.bands.as_slice().to_vec(),
+        design_rate: plan.design_rate,
+    }
+}
+
+// ─────────────────────── outcome -> bundle verification ────────────────────
+
+/// Lift a finished pass into the bundle block `decide()` grades.
+///
+/// # The mono-to-per-channel lift, which is the only real decision here
+///
+/// [`VerifyOutcome::ir`] is MONO: one microphone measured one acoustic path,
+/// so there is exactly one row of samples. `bundle::Verification::ir` is
+/// per-capture-channel, and `decide()`'s verification gate refuses outright
+/// unless it has the same number of rows as
+/// `bundle.positions[position_index].ir` -- "differencing captures of different
+/// width is not a residual".
+///
+/// So the row is replicated to `capture_channels`, which the caller reads off
+/// the BASELINE position this pass re-measured. That is the honest lift rather
+/// than a convenient one: the baseline at that position was recorded through
+/// the same single mic and is per-channel for the same reason, so the two sides
+/// are the same measurement replicated the same way, and the gate's per-channel
+/// residual is then comparing like with like. Under `Only(n)` every row is
+/// predicted by `installed.bands[n]` and under `Both` every row is predicted by
+/// the common band set, so the prediction is row-independent either way -- the
+/// replication cannot smuggle in a per-channel difference that was not
+/// measured.
+///
+/// # What `installed` is, and why it is an argument
+///
+/// The plan the engine was RUNNING when this pass captured -- the ARMED plan,
+/// supplied by the caller that armed it. It is not derivable from the outcome:
+/// the pass deliberately carries the engine's own preamp
+/// ([`VerifyOutcome::installed_preamp_db`]) and not the plan, because those are
+/// two different numbers whenever the design rate and the live rate differ, and
+/// `decide()` refuses when they disagree by more than it allows. Passing the
+/// plan in keeps both on the record.
+pub fn lift_verification(
+    outcome: &VerifyOutcome,
+    installed: CorrectionPlan,
+    capture_channels: usize,
+) -> Verification {
+    Verification {
+        capture: CaptureStats {
+            clipped_samples: outcome.capture.clipped_samples,
+            peak_dbfs: outcome.capture.peak_dbfs,
+            rms_dbfs: outcome.capture.rms_dbfs,
+        },
+        gain_db: f64::from(outcome.gain_db),
+        installed,
+        installed_preamp_db: outcome.installed_preamp_db,
+        ir: BundleIr {
+            // `peak` is a fractional, parabolic-refined index on the measure
+            // side and a whole sample on the wire. `peak_index()` is the
+            // rounding the DSP crate itself defines, so the two sides cannot
+            // round differently.
+            peak: outcome.ir.peak_index(),
+            sample_rate: outcome.ir.sample_rate,
+            samples: vec![outcome.ir.samples.clone(); capture_channels.max(1)],
+        },
+        level_dbfs: outcome.level_dbfs,
+        position_index: outcome.position_index,
+        routing: helper_routing_to_capture(outcome.routing),
+        running_rate_hz: outcome.running_rate_hz,
+        two_clock: outcome.two_clock.map(|fit| TwoClockFit {
+            intercept_samples: fit.intercept_samples,
+            residual_peak_samples: fit.residual_peak_samples,
+            residual_rms_samples: fit.residual_rms_samples,
+            skew_ppm: fit.skew_ppm,
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paraeq_coreaudio::measure_aggregate::StimulusRouting;
+    use paraeq_dsp::peq::{EQBand, FilterType};
+    use paraeq_dsp::PerChannel;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    // ── the capture adapter ────────────────────────────────────────────────
+
+    /// A source that returns 0 frames `empties` times and then delivers.
+    struct Stuttering {
+        delivered: Arc<AtomicUsize>,
+        empties: usize,
+        polls: Arc<AtomicUsize>,
+    }
+
+    impl CaptureSource for Stuttering {
+        fn format(&self) -> StreamFormat {
+            StreamFormat {
+                channels: 1,
+                frames_per_block: 512,
+                sample_rate_hz: 48_000.0,
+            }
+        }
+
+        fn capture(&mut self, block: &mut [f64]) -> Result<usize, MeasureError> {
+            let n = self.polls.fetch_add(1, Ordering::SeqCst);
+            if n < self.empties {
+                return Ok(0);
+            }
+            block[0] = 0.5;
+            self.delivered.fetch_add(1, Ordering::SeqCst);
+            Ok(1)
+        }
+
+        fn stop(&mut self) -> Result<(), MeasureError> {
+            Ok(())
+        }
+    }
+
+    /// The healthy rig. A non-blocking ring drain returns 0 whenever the reader
+    /// outruns the device, which is MOST polls -- so without the wait, a
+    /// verification pass refuses `MicDisconnected` microseconds into its first
+    /// span on every run.
+    #[test]
+    fn an_empty_ring_is_waited_out_rather_than_reported_as_the_end_of_the_stream() {
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mut capture = WaitingCapture::with_timeout(
+            Box::new(Stuttering {
+                delivered: Arc::clone(&delivered),
+                empties: 3,
+                polls: Arc::clone(&polls),
+            }),
+            Duration::from_millis(500),
+        );
+
+        let mut block = [0.0f64; 8];
+        assert_eq!(
+            capture.capture(&mut block).expect("no error"),
+            1,
+            "the adapter must hand back the frame that eventually arrived"
+        );
+        assert_eq!(block[0], 0.5, "and the samples with it");
+        assert!(
+            polls.load(Ordering::SeqCst) > 3,
+            "it polled through the empties"
+        );
+        assert_eq!(delivered.load(Ordering::SeqCst), 1);
+    }
+
+    /// The dead mic. The adapter DELAYS the verdict; it must never suppress it,
+    /// or a disconnected microphone hangs the app instead of ending the run.
+    #[test]
+    fn a_source_that_never_delivers_still_ends_as_exhausted_after_the_deadline() {
+        struct Silent;
+        impl CaptureSource for Silent {
+            fn format(&self) -> StreamFormat {
+                StreamFormat {
+                    channels: 1,
+                    frames_per_block: 512,
+                    sample_rate_hz: 48_000.0,
+                }
+            }
+
+            fn capture(&mut self, _block: &mut [f64]) -> Result<usize, MeasureError> {
+                Ok(0)
+            }
+
+            fn stop(&mut self) -> Result<(), MeasureError> {
+                Ok(())
+            }
+        }
+
+        let mut capture = WaitingCapture::with_timeout(Box::new(Silent), Duration::from_millis(50));
+        let started = Instant::now();
+        let mut block = [0.0f64; 8];
+        assert_eq!(
+            capture.capture(&mut block).expect("no error"),
+            0,
+            "a zero must still reach `record`, which is what ends the run"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "and only after the deadline, not on the first empty poll"
+        );
+    }
+
+    /// An error is not an empty ring. It propagates immediately rather than
+    /// being retried for two seconds -- a mic that has gone away reports itself.
+    #[test]
+    fn a_capture_error_is_not_waited_out() {
+        struct Broken;
+        impl CaptureSource for Broken {
+            fn format(&self) -> StreamFormat {
+                StreamFormat {
+                    channels: 1,
+                    frames_per_block: 512,
+                    sample_rate_hz: 48_000.0,
+                }
+            }
+
+            fn capture(&mut self, _block: &mut [f64]) -> Result<usize, MeasureError> {
+                Err(MeasureError::Capture("the mic went away".to_owned()))
+            }
+
+            fn stop(&mut self) -> Result<(), MeasureError> {
+                Ok(())
+            }
+        }
+
+        let mut capture = WaitingCapture::with_timeout(Box::new(Broken), Duration::from_secs(60));
+        let started = Instant::now();
+        let mut block = [0.0f64; 8];
+        capture.capture(&mut block).expect_err("errors propagate");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    // ── the routing mappings ───────────────────────────────────────────────
+
+    /// TOTAL: every `CaptureRouting` has an image, including the widths a
+    /// `usize` payload makes reachable from the other side.
+    #[test]
+    fn capture_routing_maps_totally_to_stimulus_routing() {
+        assert_eq!(
+            capture_routing_to_stimulus(CaptureRouting::Both),
+            StimulusRouting::Both
+        );
+        for channel in [0u32, 1, 7, 255, u32::MAX] {
+            assert_eq!(
+                capture_routing_to_stimulus(CaptureRouting::Only(channel)),
+                StimulusRouting::Only(channel as usize),
+                "channel {channel} must survive the widening"
+            );
+            // And it round-trips, which is what makes "total" a useful claim
+            // rather than a statement about one direction.
+            assert_eq!(
+                stimulus_routing_to_capture(StimulusRouting::Only(channel as usize)),
+                Ok(CaptureRouting::Only(channel))
+            );
+        }
+        assert_eq!(
+            stimulus_routing_to_capture(StimulusRouting::Both),
+            Ok(CaptureRouting::Both)
+        );
+    }
+
+    /// The narrowing REFUSES. Truncation would silently re-route the sweep to
+    /// channel 0 -- a wrong-ear measurement that differences a per-ear baseline
+    /// against the other ear's response and produces no symptom at all.
+    ///
+    /// Only reachable on a 64-bit target, which is every target this app ships
+    /// on; on a 32-bit one the conversion is already infallible and there is
+    /// nothing to refuse.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn stimulus_routing_narrowing_refuses_rather_than_truncating() {
+        let too_wide = u32::MAX as usize + 1;
+        assert_eq!(
+            stimulus_routing_to_capture(StimulusRouting::Only(too_wide)),
+            Err(RoutingError::ChannelTooWide { channel: too_wide }),
+            "the refusal names the channel it could not carry"
+        );
+        // The specific accident this guards: `too_wide as u32` is 0.
+        assert_eq!(too_wide as u32, 0);
+        assert_ne!(
+            stimulus_routing_to_capture(StimulusRouting::Only(too_wide)),
+            Ok(CaptureRouting::Only(0)),
+            "truncating to channel 0 is the failure, not the fallback"
+        );
+    }
+
+    // ── plan -> engine correction ──────────────────────────────────────────
+
+    fn plan() -> CorrectionPlan {
+        CorrectionPlan {
+            bands: PerChannel::new(vec![
+                vec![EQBand {
+                    fc: 120.0,
+                    filter_type: FilterType::Peaking,
+                    gain_db: 6.0,
+                    q: 1.5,
+                }],
+                vec![EQBand {
+                    fc: 3200.0,
+                    filter_type: FilterType::LowShelf,
+                    gain_db: -2.0,
+                    q: 0.7,
+                }],
+            ])
+            .expect("two channels"),
+            clamps: vec![Vec::new(), Vec::new()],
+            design_rate: 48_000.0,
+            dropped: Vec::new(),
+            preamp_db: -6.0,
+        }
+    }
+
+    /// The bands and the design rate cross; nothing else does.
+    #[test]
+    fn correction_plan_maps_to_peq_config() {
+        let plan = plan();
+        match correction_plan_to_peq_config(&plan) {
+            CorrectionConfig::Peq { bands, design_rate } => {
+                assert_eq!(bands, plan.bands.as_slice().to_vec());
+                assert_eq!(
+                    bands.len(),
+                    2,
+                    "per ENGINE channel index, in the plan's own order"
+                );
+                assert_eq!(design_rate, 48_000.0);
+            }
+            other => panic!("a PEQ plan must install as PEQ, got {other:?}"),
+        }
+    }
+
+    /// The preamp does NOT ride the config. It is the engine's own number,
+    /// recomputed at the live rate over the surviving bands and applied inside
+    /// `Correction` on the corrected path -- and the verification gate exists
+    /// to check that number against a recomputation, so handing it ours would
+    /// be marking our own homework.
+    #[test]
+    fn the_plans_preamp_does_not_cross_into_the_engine_config() {
+        let plan = plan();
+        assert_eq!(plan.preamp_db, -6.0, "the plan carries a real preamp");
+        let json = format!("{:?}", correction_plan_to_peq_config(&plan));
+        assert!(
+            !json.contains("preamp"),
+            "no preamp field may reach the engine config: {json}"
+        );
+    }
+
+    // ── outcome -> bundle verification ─────────────────────────────────────
+
+    fn outcome() -> VerifyOutcome {
+        VerifyOutcome {
+            abort_acoustic_budget_ms: 21.7,
+            capture: paraeq_measure::VerifyCaptureStats {
+                clipped_samples: 0,
+                peak_dbfs: -12.5,
+                rms_dbfs: -31.0,
+            },
+            gain_db: 0.0,
+            installed_preamp_db: -6.0,
+            ir: paraeq_dsp::gating::ImpulseResponse {
+                peak: 2304.4,
+                sample_rate: 48_000,
+                samples: vec![0.0, 1.0, 0.25, -0.125],
+            },
+            level_dbfs: -21.0,
+            position_index: 2,
+            routing: HelperRouting::Only(1),
+            running_rate_hz: 44_100.0,
+            two_clock: Some(paraeq_measure::VerifyTwoClockFit {
+                intercept_samples: 2304.5,
+                residual_peak_samples: 0.8,
+                residual_rms_samples: 0.31,
+                skew_ppm: 12.5,
+            }),
+            warnings: Vec::new(),
+        }
+    }
+
+    /// Every field of the bundle block comes from the pass, and the mono IR is
+    /// replicated to the baseline's channel count -- which is what makes the
+    /// gate's per-channel precondition satisfiable.
+    #[test]
+    fn a_finished_pass_lifts_into_the_bundles_per_channel_shape() {
+        let outcome = outcome();
+        let lifted = lift_verification(&outcome, plan(), 2);
+
+        assert_eq!(lifted.capture.clipped_samples, 0);
+        assert_eq!(lifted.capture.peak_dbfs, -12.5);
+        assert_eq!(lifted.capture.rms_dbfs, -31.0);
+        assert_eq!(lifted.gain_db, 0.0);
+        assert_eq!(lifted.installed.design_rate, 48_000.0);
+        assert_eq!(lifted.installed_preamp_db, -6.0);
+        assert_eq!(lifted.level_dbfs, -21.0);
+        assert_eq!(lifted.position_index, 2);
+        assert_eq!(lifted.routing, CaptureRouting::Only(1));
+        assert_eq!(lifted.running_rate_hz, 44_100.0);
+        assert_eq!(lifted.two_clock.expect("carried").skew_ppm, 12.5);
+
+        assert_eq!(
+            lifted.ir.peak, 2304,
+            "the fractional peak is rounded by the DSP crate's own rule"
+        );
+        assert_eq!(lifted.ir.sample_rate, 48_000);
+        assert_eq!(lifted.ir.samples.len(), 2, "one row per capture channel");
+        assert_eq!(lifted.ir.samples[0], outcome.ir.samples);
+        assert_eq!(
+            lifted.ir.samples[0], lifted.ir.samples[1],
+            "one mic measured one path: the rows are the same measurement"
+        );
+    }
+
+    /// The gate refuses on a zero-width IR before it can say anything useful,
+    /// so a caller that reads a channel count off an empty baseline must not be
+    /// able to produce one.
+    #[test]
+    fn the_lift_never_produces_a_zero_channel_impulse_response() {
+        let lifted = lift_verification(&outcome(), plan(), 0);
+        assert_eq!(lifted.ir.samples.len(), 1);
+    }
+
+    /// The running rate is the pass's, never the plan's `design_rate`. `H(f)`
+    /// is evaluated at the rate the engine RAN at, and the two legitimately
+    /// differ -- this fixture has them 3.9 kHz apart on purpose.
+    #[test]
+    fn the_lift_carries_the_live_rate_not_the_design_rate() {
+        let lifted = lift_verification(&outcome(), plan(), 1);
+        assert_eq!(lifted.running_rate_hz, 44_100.0);
+        assert_eq!(lifted.installed.design_rate, 48_000.0);
+        assert_ne!(lifted.running_rate_hz, lifted.installed.design_rate);
+    }
+}

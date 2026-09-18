@@ -14,8 +14,21 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+# `libc`: the verification teardown's SIGTERM rung. `std` has no SIGTERM --
+# `Child::kill()` is SIGKILL, which bypasses the helper's `Drop` and leaves its
+# private render aggregate wrapping the user's output device. SIGTERM is a
+# SECOND ramp request, not a stop, so the child fades rather than clicking.
+# Already a workspace dep and already paraeq-coreaudio's, so nothing new enters
+# the graph. This is the crate's first (and only) `unsafe`; see verify_seam.rs.
+libc = { workspace = true }
 log = { workspace = true }
 paraeq-coreaudio = { path = "../../crates/paraeq-coreaudio" }
+# `paraeq-decide`: this crate lifts a completed verification pass into
+# `bundle::Verification` and calls `decide()` on the result. The lift and the
+# `CorrectionPlan -> CorrectionConfig::Peq` mapping live here because this is
+# the only crate that can see both sides -- paraeq-decide may not depend on
+# paraeq-engine, and paraeq-measure may depend on neither.
+paraeq-decide = { path = "../../crates/paraeq-decide" }
 # `serde`: this crate persists and IPCs `EQBand` (state.rs, profiles.rs,
 # settings.rs). The feature is off by default on paraeq-dsp, so every
 # consumer with a wire asks for it explicitly -- this one, paraeq-decide,
