@@ -34,8 +34,8 @@ use common::{
     verified_bundle, VerifiedSpec,
 };
 use paraeq_decide::{
-    decide, CaptureRouting, DiagnosticCode, Evidence, EvidenceLabel, MeasurementBundle, Severity,
-    TransducerClass, Unit, Verdict, VERIFICATION_RESIDUAL_MULTIPLE,
+    decide, CaptureRouting, CaptureStats, DiagnosticCode, Evidence, EvidenceLabel,
+    MeasurementBundle, Severity, TransducerClass, Unit, Verdict, VERIFICATION_RESIDUAL_MULTIPLE,
 };
 use paraeq_dsp::peq::{EQBand, FilterType};
 
@@ -750,6 +750,81 @@ fn a_capture_channel_count_mismatch_between_baseline_and_verification_refuses() 
     assert_eq!(
         only_diagnostic(&set, DiagnosticCode::VerificationRoutingMismatch).severity,
         Severity::Refuse
+    );
+}
+
+/// A capture the refusal table set aside is a capture whose railed sample or
+/// broken seal the check is about to be graded against.
+///
+/// `position_index` indexes the ORIGINAL bundle, which is correct and is what
+/// keeps it naming the capture the user took — but nothing checked that the
+/// capture was still in the cohort, so a check aimed at a dropped position
+/// differenced itself against a baseline this run discarded, published a
+/// residual, and said nothing about where the number came from. It is refused
+/// with the routing code, which is the one the other "we cannot line these two
+/// up" failures already use.
+#[test]
+fn a_verification_against_a_dropped_baseline_refuses_and_computes_no_residual() {
+    let mut bundle = verified_bundle(&VerifiedSpec::default());
+    // `verified_bundle` points the check at position 0, so rail position 0: the
+    // peak row removes it, and the gate's baseline goes with it.
+    bundle.positions[0].capture = CaptureStats {
+        clipped_samples: 4_096,
+        peak_dbfs: -0.006,
+        rms_dbfs: -11.2,
+    };
+    let set = decide(&bundle);
+
+    assert_eq!(
+        only_diagnostic(&set, DiagnosticCode::ClippingPosition).position,
+        Some(0),
+        "precondition: the baseline this check names is the one that was dropped"
+    );
+    let diagnostic = only_diagnostic(&set, DiagnosticCode::VerificationRoutingMismatch);
+    assert_eq!(diagnostic.severity, Severity::Refuse);
+    assert!(
+        diagnostic.remedy.contains("was set aside"),
+        "the remedy must say what happened to the baseline: {}",
+        diagnostic.remedy
+    );
+    assert_eq!(set.verdict, Verdict::Refuse);
+
+    let report = set.verification.as_ref().expect("carried");
+    assert_eq!(report.residual_rms_db, None);
+    assert!(
+        !report.evidence.iter().any(|e| matches!(
+            e,
+            Evidence::Scalar {
+                label: EvidenceLabel::ResidualVsPrediction,
+                ..
+            }
+        )),
+        "no residual was computed, and the absence of the evidence is the witness"
+    );
+}
+
+/// The other half, so the refusal is not over-broad: a drop somewhere ELSE in
+/// the cohort leaves the check's own baseline standing and the pass grades.
+#[test]
+fn a_verification_against_a_surviving_baseline_grades_normally_after_a_drop() {
+    let mut bundle = verified_bundle(&VerifiedSpec::default());
+    bundle.positions[1].capture = CaptureStats {
+        clipped_samples: 4_096,
+        peak_dbfs: -0.006,
+        rms_dbfs: -11.2,
+    };
+    let set = decide(&bundle);
+
+    assert_eq!(
+        only_diagnostic(&set, DiagnosticCode::ClippingPosition).position,
+        Some(1)
+    );
+    assert!(!has_code(&set, DiagnosticCode::VerificationRoutingMismatch));
+    assert!(
+        graded_residual(&set) < SHAPE_TOLERANCE_DB,
+        "the baseline survived, so the residual is the pipeline's own rendering \
+         error and nothing else: {}",
+        graded_residual(&set)
     );
 }
 

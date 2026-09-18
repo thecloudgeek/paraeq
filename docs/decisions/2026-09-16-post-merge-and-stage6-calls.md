@@ -452,6 +452,13 @@ without it, so it sorts under the refusals and above the notes and its badge
 reads "one position was set aside". Still escalated as **E21**: the variant must
 settle before the bless, and so must this third value.
 
+*Round three closed two holes the loop had opened:* `ClippingSession`, `NoSignal`
+and `SweepRateMismatch` are now graded once against the ORIGINAL bundle and
+carried into every round (a railed position also peaks at full scale, so the peak
+row removed it before the session row could see it), and the verification gate
+now takes the excluded set and refuses rather than differencing the check against
+a baseline this run discarded. No `expected.json` moves.
+
 ---
 
 ## Escalated to the owner

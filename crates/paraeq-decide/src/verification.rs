@@ -96,6 +96,13 @@
 //! ([`DiagnosticCode::VerificationRoutingMismatch`]). Differencing captures of
 //! different width is not a residual.
 //!
+//! **PRECONDITION.** The baseline must still be in the cohort. `position_index`
+//! names one of the captures the user took, which is why it is resolved against
+//! the ORIGINAL bundle rather than against a list the drop loop shortened — but
+//! ruling R-A1 lets the refusal table set one of those captures aside, and a
+//! baseline this run discarded is not one `C` may be differenced against. Refuse
+//! ([`DiagnosticCode::VerificationRoutingMismatch`]) and compute no residual.
+//!
 //! **THE MAP**, from `verification.routing`, which the capture layer has already
 //! forced equal to `positions[position_index].routing`:
 //!
@@ -231,8 +238,15 @@ pub(crate) struct VerificationOutcome {
 /// **A verification block only ever ADDS refusals.** Nothing here can turn a
 /// `Refuse` into a `Proceed` or remove a row the refusal table earned; the
 /// verdict is still the worst severity over the whole list.
+///
+/// `excluded` is the drop loop's set (ruling R-A1), in the ORIGINAL bundle's
+/// numbering — the same numbering `Verification::position_index` uses. It is
+/// needed here because the two are independent: the gate resolves its baseline
+/// against the captures the user took, and the table may have set one of those
+/// captures aside since. See [`predict`].
 pub(crate) fn verify(
     bundle: &MeasurementBundle,
+    excluded: &[usize],
     decisions: &Decisions,
     authority: &AuthorityCurve,
     grid: &LogGrid,
@@ -255,7 +269,7 @@ pub(crate) fn verify(
     // residual to compute at all?), then the numbers the bundle carries, then
     // the capture itself, then the residual. The emitted order is this order,
     // and it is fixed for the same reason the refusal table's is.
-    let prediction = match predict(bundle, verification) {
+    let prediction = match predict(bundle, excluded, verification) {
         Ok(prediction) => prediction,
         Err(diagnostic) => {
             diagnostics.push(diagnostic);
@@ -414,8 +428,15 @@ struct Prediction {
 
 /// Resolve the channel rule and build `D(f)`, or answer the routing refusal
 /// that says why no residual exists.
+///
+/// Every one of these is a `VerificationRoutingMismatch`, including the
+/// set-aside baseline: the code space is frozen and append-only, and they are
+/// all one claim — *we cannot line this check up against the measurement it is
+/// supposed to confirm*. Each carries its own sentence, which is where the
+/// difference belongs.
 fn predict(
     bundle: &MeasurementBundle,
+    excluded: &[usize],
     verification: &Verification,
 ) -> Result<Prediction, Diagnostic> {
     let routing_refusal = |reason: &str| Diagnostic {
@@ -437,6 +458,26 @@ fn predict(
             "the check names a measurement position that is not in this session",
         ));
     };
+
+    // The same reading, one step less degenerate: the position IS in the
+    // bundle, and the refusal table set it aside (ruling R-A1). Its curves are
+    // not in the published analysis and the correction was never fitted to it,
+    // so differencing the check against it would grade the plan on a capture the
+    // plan ignored — and would do it silently, because indexing the original
+    // bundle is exactly what keeps `position_index` naming the right capture.
+    //
+    // The reason is NOT restated here. The rows that did the dropping are
+    // emitted first in `DecisionSet::diagnostics` and carry the user's own
+    // sentence for it ("Position 3 clipped. We dropped it — reduce input gain by
+    // 6 dB"); a second copy of that reason inside this module would be a second
+    // source of truth about why a capture left the cohort, and it would fall
+    // behind the day a third row learns to drop one.
+    if excluded.contains(&verification.position_index) {
+        return Err(routing_refusal(
+            "the position the check was run against was set aside by the checks \
+             on the measurement itself, which are listed above this one",
+        ));
+    }
     if position.routing != verification.routing {
         return Err(routing_refusal(
             "the check played to different speakers than the measurement did",

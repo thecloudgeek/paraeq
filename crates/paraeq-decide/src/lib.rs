@@ -184,7 +184,12 @@ pub fn decide(bundle: &MeasurementBundle) -> DecisionSet {
     // against the wrong baseline. The verification's own `ClippingPosition` row
     // stays session-scoped for the same reason — the verification pass is not a
     // member of the cohort and there is nothing to drop it from.
-    let verified = verification::verify(bundle, &decisions, &authority_curve, &grid);
+    //
+    // The EXCLUDED set travels with the bundle, though: indexing the original
+    // list is what keeps `position_index` naming the right capture, and knowing
+    // which of those captures the table set aside is what stops the gate
+    // differencing against a baseline this run threw away.
+    let verified = verification::verify(bundle, &excluded, &decisions, &authority_curve, &grid);
     if let Some(outcome) = &verified {
         diagnostics.extend(outcome.diagnostics.iter().cloned());
     }
