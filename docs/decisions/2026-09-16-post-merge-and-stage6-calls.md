@@ -6,9 +6,9 @@ precedent-following default that ships now; a later owner ruling on any of them
 costs one line or one named constant. §"Escalated to the owner" is **not** a set
 of decisions — those thirty-one items are questions that no precedent in this
 repo can answer safely, and they are recorded here so they do not dissolve.
-**Updated 2026-09-18:** §"Escalated to the owner" grew from seven items to
-thirty-one (E2-bis and E8–E31, raised while Stage 6 was built), and §"Rulings
-from the Stage-6 review" is new.
+**Updated 2026-09-18:** §"Escalated to the owner" grew from seven to
+thirty-one (E2-bis and E8–E31, raised while Stage 6 was built), and
+§"Rulings from the Stage-6 review" is new.
 
 **Source.** The merged post-merge + Stage-6 build plan written 2026-09-16 over
 the `feature/integration` merge (rescope `crates/` + shell `desktop/`), itself
