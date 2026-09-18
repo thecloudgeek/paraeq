@@ -729,6 +729,60 @@ fn cal_missing_and_malformed_and_neighbour_outlier_refuse() {
     ));
 }
 
+/// The neighbour-outlier row does not fire on the three EARS variants, because
+/// on those a "neighbour outlier" is the TARGET.
+///
+/// Ruling R-A2, `OPEN [OWNER]` and reversible. An HEQ/HPN/IDF calibration has
+/// the Harman target subtracted into the curve — that is the premise of the
+/// `over_ear_ears_heq_cal` case — so the 5 kHz dip the target carries reads as
+/// a 4.7 dB neighbour deviation on a twelve-point vendor grid. The rule cannot
+/// distinguish that from a defect: both are "one point far from the line
+/// through its neighbours", and the variant is the only evidence there is. The
+/// `CalHasTargetBakedIn` warning is what the user is told instead, and it says
+/// the right thing.
+///
+/// The exemption is exactly these three variants. A `Plain` cal carrying the
+/// identical curve still refuses, which is the second half of this test and the
+/// thing that keeps the exemption from being a hole.
+#[test]
+fn the_neighbour_outlier_row_exempts_the_three_ears_variants() {
+    // A shape a target puts in a cal: a deep, narrow dip between two ordinary
+    // neighbours, far past the 1.5 dB the row refuses at.
+    let curve = || cal_with_curve(vec![2000.0, 5000.0, 10000.0], vec![-1.94, -8.42, -5.11]);
+
+    for variant in [
+        CalVariant::EarsHeq,
+        CalVariant::EarsHpn,
+        CalVariant::EarsIdf,
+    ] {
+        let mut bundle = clean();
+        let mut cal = curve();
+        cal.variant = variant;
+        bundle.cal = Some(cal);
+        let set = decide(&bundle);
+        assert!(
+            !has_code(&set, DiagnosticCode::CalNeighbourOutlier),
+            "{variant:?}: the baked-in target is not a cal defect; {:?}",
+            set.diagnostics
+        );
+        // The user is still told what happened, by the row that is about it.
+        assert!(
+            has_code(&set, DiagnosticCode::CalHasTargetBakedIn),
+            "{variant:?}"
+        );
+    }
+
+    // …and the same curve on a PLAIN cal is still a defect, because on a plain
+    // cal there is no target to explain it.
+    let mut plain = clean();
+    plain.cal = Some(curve());
+    let set = decide(&plain);
+    assert_eq!(
+        only_diagnostic(&set, DiagnosticCode::CalNeighbourOutlier).severity,
+        Severity::Refuse
+    );
+}
+
 /// An EARS HEQ/HPN/IDF cal already carries a target. Applying another would
 /// apply it twice — a Warn, because the measurement is still usable.
 #[test]

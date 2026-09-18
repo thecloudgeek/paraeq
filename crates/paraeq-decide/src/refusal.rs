@@ -821,6 +821,30 @@ fn cal_defects(bundle: &MeasurementBundle) -> Vec<Diagnostic> {
         }
     };
 
+    // **The neighbour-outlier half does not run on the three EARS variants**
+    // (ruling R-A2, `OPEN [OWNER]` and reversible). An HEQ/HPN/IDF calibration
+    // has a target subtracted into the curve — that is what
+    // `CalHasTargetBakedIn` is about — so the target's own shape (the Harman
+    // 5 kHz dip, 4.7 dB from the line through its neighbours on a twelve-point
+    // vendor grid) is indistinguishable from a bad point: both are "one value
+    // far from its neighbours", and the variant is the only evidence there is.
+    // Refusing here would refuse every EARS jig shipped with the calibration
+    // its own vendor supplies, for carrying the shape it is supposed to carry.
+    //
+    // The MALFORMED half still runs: a duplicate or non-monotonic frequency is
+    // a defect in the FILE's structure and no target explains one.
+    //
+    // **To reverse this**, delete the `skip_outliers` guard below. What would
+    // justify reversing it is a density rule — the row is only meaningful on a
+    // grid fine enough that a target's slope cannot look like a step — which
+    // needs a number nobody has yet.
+    let skip_outliers = matches!(
+        cal.variant,
+        crate::bundle::CalVariant::EarsHeq
+            | crate::bundle::CalVariant::EarsHpn
+            | crate::bundle::CalVariant::EarsIdf
+    );
+
     let mut out = Vec::new();
     for warning in paraeq_dsp::compensation::validate_cal_with_threshold(&parsed, CAL_OUTLIER_DB) {
         let f = warning.freq_hz;
@@ -832,12 +856,20 @@ fn cal_defects(bundle: &MeasurementBundle) -> Vec<Diagnostic> {
             CalWarningKind::Outlier {
                 neighbours_db: (a, b),
                 value_db,
-            } => out.push(outlier(f, value_db, a, b)),
+            } => {
+                if !skip_outliers {
+                    out.push(outlier(f, value_db, a, b));
+                }
+            }
             // Exact zero by construction, which is why the variant carries no
             // value of its own.
             CalWarningKind::SuspectZero {
                 neighbours_db: (a, b),
-            } => out.push(outlier(f, 0.0, a, b)),
+            } => {
+                if !skip_outliers {
+                    out.push(outlier(f, 0.0, a, b));
+                }
+            }
         }
     }
     out
