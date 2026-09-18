@@ -124,7 +124,7 @@ pub fn decide(bundle: &MeasurementBundle) -> DecisionSet {
         },
     );
 
-    let (design, authority_curve) = rules::design_decisions(
+    let (mut design, authority_curve) = rules::design_decisions(
         bundle,
         analysis_decisions.class.value,
         &grid,
@@ -132,19 +132,31 @@ pub fn decide(bundle: &MeasurementBundle) -> DecisionSet {
         &products,
     );
 
-    // B7b's `autofit::auto_fit_room` call lands here, between the design
-    // decisions and the preamp: it is the one step that turns the decided
-    // authority, Q cap, correction range, filter budget, flatness target and
-    // shelf policy into bands. Until it does, the plan carries no bands, and
-    // `preamp_db` is correspondingly 0.0 — the same answer a pure-cut cascade
-    // gets, and not a guess about one.
+    // `autofit::auto_fit_room`, between the design decisions and the preamp: it
+    // is the one step that turns the decided authority, Q cap, correction range,
+    // filter budget, flatness target and shelf policy into bands. Everything
+    // safety-related is already composed into `authority_curve`; see
+    // `rules::fit_correction` for the `min_gain_db = flatness/2` binding and for
+    // why the correction is level-matched to the target first.
     //
-    // `.max(1)`: `PerChannel` is non-empty by construction, and a bundle the
-    // analysis could not read reports zero channels. One channel of zero bands
-    // is the honest shape for "there is a plan and it contains nothing".
-    let bands: Vec<Vec<paraeq_dsp::peq::EQBand>> = vec![Vec::new(); products.channels.max(1)];
+    // `PerChannel` is non-empty by construction, and a bundle the analysis could
+    // not read reports zero channels — so the fit answers one channel of zero
+    // bands, which is the honest shape for "there is a plan and it contains
+    // nothing".
     let design_rate = geometry.sample_rate;
-    let preamp_db = rules::preamp_decision(bundle, &bands, design_rate);
+    let fit = rules::fit_correction(
+        bundle,
+        &design,
+        &products,
+        &authority_curve,
+        &grid,
+        profile,
+        design_rate,
+    );
+    // Two rationales count the bands the fit EMITTED rather than the cap it was
+    // given, so they are rendered here and nowhere else.
+    rules::render_realized(&mut design, &fit);
+    let preamp_db = rules::preamp_decision(bundle, &fit.bands, design_rate);
     let decisions = rules::assemble(analysis_decisions, design, preamp_db);
 
     let diagnostics = refusal::diagnostics(bundle, &decisions, &products);
@@ -164,11 +176,22 @@ pub fn decide(bundle: &MeasurementBundle) -> DecisionSet {
             // installable correction, so the system stays as it was.
             Verdict::Refuse => None,
             _ => Some(CorrectionPlan {
-                bands: paraeq_dsp::PerChannel::new(bands)
+                bands: paraeq_dsp::PerChannel::new(fit.bands)
                     .expect("at least one channel by construction"),
-                clamps: Vec::new(),
+                // `auto_fit_room`'s own reporting, carried across the crate
+                // boundary: "'your +6 dB became +1 dB' is not an explanation
+                // without saying whether the excursion envelope or the
+                // seat-to-seat disagreement did it".
+                clamps: fit.clamps,
                 design_rate,
-                dropped: Vec::new(),
+                // PER CHANNEL, and the field's doc says "indices": `RoomFitReport`
+                // reports `dropped` as a COUNT, not as a candidate index, so the
+                // count is what there is to carry. In a healthy fit it is 0 on
+                // every channel — "a nonzero value is a bug report, not a tuning
+                // outcome" — so the two readings agree on every plan that is not
+                // already a defect. Flagged for B6/B9: the field's doc comment is
+                // the thing that should move, not this call.
+                dropped: fit.dropped,
                 preamp_db: decisions.preamp_db.value,
             }),
         },
